@@ -2461,8 +2461,11 @@ function baselineCases() {
       assert.deepEqual(fs.readFileSync(f.paths[0].source), sourceBytes);
       assert.equal((await callIpcRaw('projects:package', f.project.id, TEST_HOME, previousReview.token)).error,
         'package_review_stale');
-      // The link was captured only as this excluded file's dependency, so it is
-      // withheld with it and an engaged project with nothing selected cannot issue.
+      // The link was captured only as this excluded file's dependency and was
+      // admitted without owner intent (no flag, marker, Include or acceptance
+      // record), so it is withheld and nothing selected cannot issue.
+      const excludedProject = storeInstance.data.projects.find(p => p.id === f.project.id);
+      assertNoOwnerIntent(excludedProject, excludedProject.files.find(file => file.name === 'Link_0.png'));
       const assetOnly = await callIpcRaw('projects:prepare-package-review', f.project.id);
       assert.equal(assetOnly.materializable, false);
       assert.deepEqual(assetOnly.files.map(file => file.name), []);
@@ -3340,17 +3343,13 @@ function baselineCases() {
         assert.equal(f.current().workingSourceSelections?.[logicalKey], undefined);
         assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id,
           root.visualIdentity, { action: 'exclude', expectedRevision: 0 })).success, true);
-        // The logical child reads only the explicitly excluded parent: it is
-        // withheld with it. Owner Include keeps it; a second click excludes it.
+        // Accepted through production accept-pending, the child keeps owner
+        // intent although it reads only the explicitly excluded parent.
         child = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(row => row.name === logical.name);
-        assert.equal(child.included, false); assert.equal(child.excludedSourceOnly, true); assert.equal(child.excluded, false);
-        await callIpcRaw('projects:remove-file', f.project.id, child.visualIdentity);
-        assert.equal(f.current().files.find(row => row.fileId === 'logical-child').keptAfterSourceExclusion, true);
-        assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(row => row.name === logical.name).included, true);
+        assert.equal(child.included, true); assert.equal(child.excludedSourceOnly, true);
         // Asset exclusion is independent of source intent. A hidden logical row
         // must not intercept the physical parent's Restore scan by shared path.
         await callIpcRaw('projects:remove-file', f.project.id, child.visualIdentity);
-        assert.equal(Object.hasOwn(f.current().files.find(row => row.fileId === 'logical-child'), 'keptAfterSourceExclusion'), false);
         const restored = await callIpcRaw('projects:set-working-source-selection', f.project.id,
           root.visualIdentity, { action: 'restore', expectedRevision: 1 });
         assert.equal(restored.success, true);
@@ -3367,11 +3366,7 @@ function baselineCases() {
         await callIpcRaw('projects:set-working-source-selection', f.project.id,
           root.visualIdentity, { action: 'exclude', expectedRevision: 2 });
         ws = await callIpcRaw('projects:get-asset-workspace', f.project.id);
-        assert.equal(ws.semanticCounts.relationshipHolds, 0, 'a logical asset withheld with its excluded parent leaves the hold dormant');
-        assert.ok(!(await metadataTestHooks.selectProjectFilesForPackaging(f.current())).some(row => row.fileId === 'logical-child'));
-        await callIpcRaw('projects:remove-file', f.project.id, child.visualIdentity);
-        ws = await callIpcRaw('projects:get-asset-workspace', f.project.id);
-        assert.equal(ws.semanticCounts.relationshipHolds, 1, 'owner-included logical asset retains concrete parent read hold');
+        assert.equal(ws.semanticCounts.relationshipHolds, 1, 'included logical asset retains concrete parent read hold');
         assert.ok((await metadataTestHooks.selectProjectFilesForPackaging(f.current())).some(row => row.fileId === 'logical-child'));
         await callIpcRaw('projects:remove-file', f.project.id, child.visualIdentity);
         assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).semanticCounts.relationshipHolds, 0);
@@ -3632,6 +3627,191 @@ function baselineCases() {
         ['AiOnly.png', 'Layer-01.png', 'Poster.ai', 'Shared.png']);
     } finally { f.cleanup(); }
   });
+
+  function assertNoOwnerIntent(project, row) {
+    assert.ok(row);
+    for (const field of ['acceptedPending', 'keptAfterSourceExclusion', 'individualContentInclude', 'explicitUserAuthority']) {
+      assert.equal(row[field], undefined, `${row.name} ${field}`);
+    }
+    assert.ok(['ai-linked', 'indd-poll', 'indd-linked', 'ps-poll', 'psd-linked', 'psd-embedded', 'scan-on-open',
+      'scan-on-save-linked', 'scan-on-save-embedded', 'scan-on-save-presentation', 'embedded-media', 'figma-auto'].includes(row.source),
+    `${row.name} is dependency-captured (${row.source})`);
+    const records = (project.provenance?.observations || []).filter(item =>
+      ['projects:accept-pending', 'projects:set-existing-assets-decision'].includes(item?.observer?.method) &&
+      project.provenance.nodes[item.objectNodeId]?.path === row.path);
+    assert.deepEqual(records, [], `${row.name} has no owner acceptance record`);
+  }
+
+  // Accepted dependency assets of an excluded working file stay (owner
+  // decision). Pending rows use the live-capture shape; acceptance, scan,
+  // selection, review and packaging run through the real IPC routes.
+  async function acceptedLinkFixture(label, { acceptedOrigin = 'added', baselineStatus = 'legacy-included' } = {}) {
+    resetTestHomeWorkspace(); setChildProcessHandler(() => ({ stdout: '' }));
+    const created = await createProject('Accepted link ' + label);
+    await callIpcRaw('projects:pause', created.id); clearTrackedTimers();
+    const current = () => storeInstance.data.projects.find(p => p.id === created.id);
+    const desk = name => path.join(TEST_HOME, 'Desktop', name);
+    for (const name of ['A.psd', 'Accepted.png', 'Sibling.png']) fs.writeFileSync(desk(name), `synthetic ${name}`);
+    fs.writeFileSync(desk('Keep.ai'), '%PDF-1.7\n%%EOF\n');
+    const source = name => ({ fileId: name, path: desk(name), name, ext: path.extname(name), projectRole: 'source', source: 'user-added', addedAt: Date.now() });
+    const pendingRow = (name, assetOrigin) => ({ fileId: name, path: desk(name), name, ext: '.png', projectRole: 'asset', source: 'psd-linked', assetOrigin,
+      addedAt: Date.now() - 60000, captureState: 'needs-save', captureReason: 'linked-asset-observed',
+      captureEvidence: { schemaVersion: 1, source: 'psd-linked', appFamily: 'photoshop', relationshipSourcePath: desk('A.psd'), documentModified: true } });
+    current().files = [source('A.psd'), source('Keep.ai')];
+    current().pendingFiles = [pendingRow('Accepted.png', acceptedOrigin), pendingRow('Sibling.png', 'added')];
+    current().assetBaseline = { schemaVersion: 1, status: baselineStatus, decision: baselineStatus === 'legacy-included' ? 'include' : null, establishedAt: Date.now() };
+    roundTripFakeStore();
+    currentPsdFixture = { children: [], linkedFiles: ['Accepted.png', 'Sibling.png'].map(name => ({ name, linkedFile: { fullPath: desk(name) } })) };
+    const workspace = () => callIpcRaw('projects:get-asset-workspace', created.id);
+    const select = async action => {
+      const row = (await workspace()).files.find(file => file.name === 'A.psd');
+      const response = await callIpcRaw('projects:set-working-source-selection', created.id, row.visualIdentity,
+        { action, expectedRevision: row.selectionRevision });
+      assert.equal(response.success, true, JSON.stringify(response)); return response;
+    };
+    const methods = method => (current().provenance?.observations || []).filter(item => item?.observer?.method === method)
+      .map(item => current().provenance.nodes[item.objectNodeId]?.name).sort();
+    const out = desk('accepted-link-out'); fs.mkdirSync(out, { recursive: true });
+    return { project: created, current, desk, workspace, select, methods, out,
+      stored: name => current().files.find(file => file.name === name),
+      async scanThenExclude() {
+        await select('exclude');
+        assert.equal((await select('restore')).verificationStatus, 'scanned');
+        const record = metadataTestHooks.getWorkingSourceVerification(current(), current().files.find(file => file.name === 'A.psd'));
+        assert.deepEqual(record.requiredReferences.map(ref => path.basename(ref.path)).sort(), ['Accepted.png', 'Sibling.png'],
+          'the scan receipt lists both links only under A.psd');
+        for (const name of ['Accepted.png', 'Sibling.png']) assert.ok(current().files.some(file => file.name === name), name);
+        await select('exclude');
+      } };
+  }
+
+  baselineTest('an asset accepted through accept-pending stays in review and package after its only working file is excluded', { timeout: 120000 }, async () => {
+    const f = await acceptedLinkFixture('accept');
+    try {
+      assert.ok(await callIpcRaw('projects:accept-pending', f.project.id, f.desk('Accepted.png')));
+      const accepted = f.stored('Accepted.png');
+      assert.equal(accepted.acceptedPending, true);
+      assert.equal(accepted.captureEvidence, undefined, 'production acceptance strips capture evidence');
+      assert.deepEqual(f.methods('projects:accept-pending'), ['Accepted.png']);
+      await f.scanThenExclude();
+      // The scan admitted the sibling directly; nothing records owner intent on it.
+      const sibling = f.stored('Sibling.png');
+      for (const field of ['acceptedPending', 'keptAfterSourceExclusion', 'individualContentInclude', 'explicitUserAuthority']) {
+        assert.equal(sibling[field], undefined, field);
+      }
+      const ws = await f.workspace();
+      const fact = name => ws.files.find(file => file.name === name);
+      assert.equal(fact('Accepted.png').included, true); assert.equal(fact('Accepted.png').excludedSourceOnly, true);
+      assert.equal(fact('Accepted.png').excluded, false);
+      assert.equal(fact('Sibling.png').included, false); assert.equal(fact('Sibling.png').excludedSourceOnly, true);
+      assert.equal(fact('A.psd').sourceSelection, 'excluded');
+      assert.deepEqual(f.current().excludedAssetKeys || [], []);
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id, f.out);
+      assert.equal(review.materializable, true, review.error || review.message);
+      assert.deepEqual(review.files.map(file => file.name).sort(), ['Accepted.png', 'Keep.ai']);
+      const packaged = await callIpcRaw('projects:package', f.project.id, f.out, review.token);
+      assert.equal(packaged.success, true, packaged.error);
+      assert.equal(packaged.copiedCount, 2); assert.deepEqual(packaged.errors || [], []);
+      const written = fs.readdirSync(packaged.folderPath, { recursive: true }).map(name => path.basename(name)).filter(name => /\.(png|ai)$/.test(name)).sort();
+      assert.deepEqual(written, ['Accepted.png', 'Keep.ai']);
+      roundTripFakeStore();
+      assert.equal((await f.workspace()).files.find(file => file.name === 'Accepted.png').included, true, 'kept after reload');
+    } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+  });
+
+  baselineTest('existing assets included through the existing-assets decision stay after their only working file is excluded', { timeout: 120000 }, async () => {
+    const f = await acceptedLinkFixture('existing', { acceptedOrigin: 'existing', baselineStatus: 'decision-required' });
+    try {
+      const decided = await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include');
+      assert.equal(decided.success, true);
+      assert.equal(f.stored('Accepted.png').acceptedPending, true);
+      assert.equal(f.stored('Accepted.png').captureEvidence, undefined);
+      assert.deepEqual(f.methods('projects:set-existing-assets-decision'), ['Accepted.png']);
+      const record = f.current().provenance.observations.find(item => item.observer.method === 'projects:set-existing-assets-decision');
+      assert.equal(record.observer.kind, 'manual_user_action'); assert.equal(record.payload.decision, 'include');
+      assert.deepEqual(f.methods('projects:accept-pending'), [], 'bulk Include writes no accept-pending record');
+      assert.ok(f.current().pendingFiles.some(file => file.name === 'Sibling.png'), 'an added-origin row is not an existing asset');
+      await f.scanThenExclude();
+      const ws = await f.workspace();
+      assert.equal(ws.files.find(file => file.name === 'Accepted.png').included, true);
+      assert.equal(ws.files.find(file => file.name === 'Accepted.png').excludedSourceOnly, true);
+      assert.equal(ws.files.find(file => file.name === 'Sibling.png').included, false);
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id, f.out);
+      assert.equal(review.materializable, true, review.error || review.message);
+      assert.deepEqual(review.files.map(file => file.name).sort(), ['Accepted.png', 'Keep.ai']);
+    } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+  });
+
+  // A byte-changing save replaces an output row at a new path. Owner intent on
+  // the predecessor travels as the keep marker; a same-bytes save retains it.
+  for (const intent of ['include', 'accept']) {
+    baselineTest(`replaced PSD output carries owner ${intent} intent across a changed-bytes save`, { timeout: 120000 }, async () => {
+      const kept = { id: psdId, name: 'Kept.png', data: embeddedPng };
+      const sibling = { id: '33333333-3333-4333-8333-333333333334', name: 'Sibling.png', data: Buffer.from('sibling bytes') };
+      const f = await workingPsdFixture([kept, sibling], [], false, intent === 'accept');
+      try {
+        const output = producerId => f.current().files.find(row => row.source === 'psd-embedded' && row.psdResource?.producerId === producerId);
+        const workspace = () => callIpcRaw('projects:get-asset-workspace', f.project.id);
+        const fact = async row => (await workspace()).files.find(file =>
+          file.visualIdentity === metadataTestHooks.createProjectFileVisualIdentity(f.project.id, row));
+        const select = async action => {
+          const row = (await workspace()).files.find(file => file.name === path.basename(f.filePath));
+          const response = await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity,
+            { action, expectedRevision: row.selectionRevision });
+          assert.equal(response.success, true, JSON.stringify(response)); return response;
+        };
+        const save = async objects => {
+          metadataTestHooks.clearPsdParseDebounce(f.filePath);
+          const result = await f.save(objects); assert.equal(result.skipped, undefined); return result;
+        };
+        if (intent === 'accept') {
+          const pending = f.current().pendingFiles.find(row => row.psdResource?.producerId === psdId);
+          assert.ok(pending, 'outputs are pending under forced pending admission');
+          assert.ok(await callIpcRaw('projects:accept-pending', f.project.id, pending.path));
+          assert.equal(output(psdId).acceptedPending, true);
+        }
+        await select('exclude');
+        const predecessor = output(psdId);
+        assert.equal((await fact(predecessor)).excludedSourceOnly, true);
+        if (intent === 'include') {
+          assert.equal((await fact(predecessor)).included, false);
+          assert.equal((await fact(output(sibling.id))).included, false);
+          await callIpcRaw('projects:remove-file', f.project.id, (await fact(predecessor)).visualIdentity);
+          assert.equal(output(psdId).keptAfterSourceExclusion, true);
+        }
+        assert.equal((await fact(output(psdId))).included, true);
+        assert.equal((await select('restore')).verificationStatus, 'scanned');
+        // Control: unchanged bytes retain the exact row and its intent.
+        const retained = { ...output(psdId) };
+        await save([kept, sibling]);
+        assert.equal(output(psdId).path, retained.path); assert.equal(output(psdId).fileId, retained.fileId);
+        assert.equal(output(psdId).keptAfterSourceExclusion, retained.keptAfterSourceExclusion);
+        assert.equal(output(psdId).acceptedPending, retained.acceptedPending);
+        // Changed bytes for that object: a new row at a new path replaces it.
+        await save([{ ...kept, data: Buffer.from('replacement bytes') }, sibling]);
+        const replacement = output(psdId);
+        assert.notEqual(replacement.path, retained.path);
+        assert.equal(f.current().files.some(row => row.path === retained.path), false, 'the predecessor row is retired');
+        assert.equal(replacement.fileId, retained.fileId);
+        assert.equal(replacement.keptAfterSourceExclusion, true, 'keep marker carried onto the replacement');
+        for (const field of ['acceptedPending', 'explicitUserAuthority', 'individualContentInclude']) {
+          assert.equal(Object.hasOwn(replacement, field), false, `${field} is not copied`);
+        }
+        await select('exclude');
+        const replacementFact = await fact(replacement);
+        assert.equal(replacementFact.included, true); assert.equal(replacementFact.excludedSourceOnly, true);
+        if (intent === 'include') {
+          const siblingRow = output(sibling.id);
+          assert.equal(siblingRow.keptAfterSourceExclusion, undefined);
+          assert.equal((await fact(siblingRow)).included, false, 'a sibling without intent is withheld');
+          assert.deepEqual((await metadataTestHooks.selectProjectFilesForPackaging(f.current())).map(row => row.name), [replacement.name]);
+        } else {
+          assert.ok(f.current().pendingFiles.some(row => row.psdResource?.producerId === sibling.id), 'the unaccepted sibling stays pending');
+          assert.deepEqual((await metadataTestHooks.selectProjectFilesForPackaging(f.current())).map(row => row.name), [replacement.name]);
+        }
+      } finally { f.cleanup(); }
+    });
+  }
 
   baselineTest('cycle2: PSD identical saves reuse one output and removal/empty retire exact membership', async () => {
     const objects = [{ id: psdId, name: 'Embedded.png', data: embeddedPng }];
@@ -4916,6 +5096,9 @@ function baselineCases() {
       currentPsdFixture = () => f.actual.readPsd(fs.readFileSync(f.filePath), { skipLayerImageData: true, skipCompositeImageData: true });
       await metadataTestHooks.runScanOnSave(f.project.id, f.filePath);
       const logical = f.current().files.find(row => row.source === 'scan-on-save-embedded'); assert.ok(logical);
+      // Admitted directly by the save scan: no flag, marker, Include or owner
+      // acceptance record on its node, so the decided rule withholds it.
+      assertNoOwnerIntent(f.current(), logical);
       const safe = path.join(TEST_HOME, 'Desktop', 'Safe.txt'); fs.writeFileSync(safe, 'independent asset');
       f.current().files.push({ path: safe, name: 'Safe.txt', ext: '.txt', source: 'user-added', acceptedPending: true, projectRole: 'asset' });
       const q = path.join(TEST_HOME, 'Desktop', 'Unrelated.ai'); fs.writeFileSync(q, '%PDF-1.7\n%%EOF\n');

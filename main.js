@@ -4037,6 +4037,37 @@ function hasWorkingSourceRecoveryHold(project) {
   return Object.keys(state.records).length > 0;
 }
 
+// File node ids carrying a recorded owner acceptance: individual/bulk accept or
+// the existing-assets Include. One pass over the append-only observations.
+function getOwnerAcceptedFileNodeIds(project) {
+  const ids = new Set();
+  const observations = project?.provenance?.observations;
+  if (!Array.isArray(observations)) return ids;
+  for (const observation of observations) {
+    const observer = observation?.observer;
+    if (observer?.kind !== OBSERVER_KINDS.MANUAL_USER_ACTION || typeof observation.objectNodeId !== 'string') continue;
+    if (observer.method === 'projects:accept-pending' ||
+        (observer.method === 'projects:set-existing-assets-decision' && observation.payload?.decision === 'include')) {
+      ids.add(observation.objectNodeId);
+    }
+  }
+  return ids;
+}
+
+// The owner chose this row: explicit addition, Include after exclusion, accept
+// (flag or record), existing-assets Include record, or a per-asset Include.
+// Partial or mixed signals resolve to keep. `memo` lets one caller build the
+// observation set at most once and only when a cheap row signal is absent.
+function isOwnerKeptAfterSourceExclusion(project, file, memo = {}) {
+  if (!file) return false;
+  if (isExplicitUserCapturedFile(file) || file.keptAfterSourceExclusion === true || file.acceptedPending === true ||
+      (typeof file.individualContentInclude === 'string' && file.individualContentInclude)) return true;
+  const normalizedPath = normalizeTrackedFilePath(file.path);
+  if (!normalizedPath) return false;
+  memo.acceptedNodeIds ||= getOwnerAcceptedFileNodeIds(project);
+  return memo.acceptedNodeIds.has(createNodeId(NODE_TYPES.FILE, { normalizedPath }));
+}
+
 function getWorkingSourceMembership(project, packageFiles = null) {
   const scopedProject = getIllustratorScopedProjectView(project);
   const files = deduplicateFiles(scopedProject?.files || []);
@@ -4139,7 +4170,7 @@ function getWorkingSourceMembership(project, packageFiles = null) {
       for (const output of verification?.requiredEmbeddedOutputs || []) { edge(row.path,output.path); queue.push(normalizeTrackedFilePath(output.path)); }
     }
   }
-  const facts = new Map();
+  const facts = new Map(), ownerIntentMemo = {};
   const counts = { selectedWorkingSources: 0, excludedWorkingSources: 0, invalidWorkingSources: 0, includedAssets: 0,
     excludedAssets: 0, unresolvedVerification: 0, missingRequiredReferences: 0, relationshipHolds: 0 };
   for (const file of files) {
@@ -4161,9 +4192,9 @@ function getWorkingSourceMembership(project, packageFiles = null) {
       const contradicted = !!producerKey && !unretainedExcludedRoots.has(producerKey) && !excludedOnlyPaths.has(producerKey);
       excludedSourceOnly = owned && !contradicted;
     }
-    const keptByOwner = isExplicitUserCapturedFile(file) || file.keptAfterSourceExclusion === true;
+    const withheld = excludedSourceOnly && !isOwnerKeptAfterSourceExclusion(project, file, ownerIntentMemo);
     const eligible = source ? (selectedSource || includedAsDependency)
-      : ((!isAssetReviewFileExcluded(project, file) && !(excludedSourceOnly && !keptByOwner)) || includedAsDependency);
+      : ((!isAssetReviewFileExcluded(project, file) && !withheld) || includedAsDependency);
     const included = eligible && (!packageKeys || packageKeys.has(getTrackedFileDedupKey(file)));
     const verification = getWorkingSourceVerification(project, file);
     const persistedVerification = Object.hasOwn(project.workingSourceVerification || {}, getAssetBaselineSourceRecoveryRouteKey(project, file));
@@ -17444,7 +17475,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         assertScanPublicationSource(psdSourceReceipt);
         acceptance?.check(proj);
         workingReconciliation?.apply(proj);
-        const acceptedFiles = [];
+        const acceptedFiles = [], ownerIntentMemo = {};
         let changed = !!workingReconciliation;
         for (const asset of psdAssets) {
           const reconciled = workingReconciliation?.items.find(item => item.asset === asset);
@@ -17484,6 +17515,11 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
               reconciled.previous.assetBaselineSourcePath;
             if (normalizeTrackedFilePath(priorProducer) === normalizeTrackedFilePath(filePath)) {
               fileEntry.assetBaselineSourcePath = filePath;
+            }
+            // Owner intent on the replaced output survives its new path. Carry
+            // only the keep marker; acceptance and authority stay on the old row.
+            if (reconciled.collection === 'files' && isOwnerKeptAfterSourceExclusion(proj, reconciled.previous, ownerIntentMemo)) {
+              fileEntry.keptAfterSourceExclusion = true;
             }
             proj[reconciled.collection].push(fileEntry);
             if (reconciled.collection === 'files') acceptedFiles.push(fileEntry);
@@ -19505,8 +19541,7 @@ registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileI
         // as Excluded; Include records the owner's choice on the row itself.
         const fact = hasWorkingSourceSelectionState(project)
           ? getWorkingSourceMembership(project).facts.get(getTrackedFileDedupKey(removedFile)) : null;
-        const withheld = fact?.excludedSourceOnly === true &&
-          !(isExplicitUserCapturedFile(removedFile) || removedFile.keptAfterSourceExclusion === true);
+        const withheld = fact?.excludedSourceOnly === true && !isOwnerKeptAfterSourceExclusion(project, removedFile);
         const reviewExcluded = isAssetReviewFileExcluded(project, removedFile);
         if (reviewExcluded || withheld) {
           if (reviewExcluded) {

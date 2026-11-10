@@ -13,6 +13,7 @@ const Module = require('node:module');
 const vm = require('node:vm');
 const { extractLinkedAssetsFromBuffer } = require('../parsers/add-files-regex-worker');
 const { runBoundedAddFilesScan } = require('../parsers/add-files-operation');
+const { createNodeId, createObservationRecord, NODE_TYPES, OBSERVER_KINDS } = require('../provenance');
 const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
 
 function between(start, end) {
@@ -135,6 +136,12 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
     isObservedPrimarySourceFile: () => false,
     shouldKeepObservedSourceFileForPackaging: async () => true,
     deduplicatePackageSourceMastersForOutput: (project, files) => files,
+    // Real provenance node identity for owner-intent records; modeled asset
+    // review identity (path) and no content fingerprint for the asset toggle.
+    createNodeId, NODE_TYPES, OBSERVER_KINDS,
+    inferProjectFileRole: file => file?.projectRole,
+    getAssetReviewExclusionKey: file => file?.path,
+    getAssetReviewContentFingerprint: () => null,
     console: { log() {} },
   });
   vm.runInContext(
@@ -148,6 +155,11 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
     between('function getAssetBaselineSourceRecoveryRouteKey(', 'function getWorkingSourceSelection(') +
     between('function getWorkingSourceSelection(', 'function getAssetBaselineSourcePhysicalIdentityHash(') +
     between('async function selectProjectFilesForPackaging(', 'function isDesignAppFile(') , context);
+  // The production asset Include/Exclude toggle body of projects:remove-file,
+  // run against the in-memory project (the IPC wrapper is not loaded).
+  vm.runInContext('function toggleAssetForTest(project, removedFile) { let changed = false;\n' +
+    between("    if (removedFile && inferProjectFileRole(removedFile) === 'asset') {",
+      '    project.files = project.files.filter(file => (\n      !matchesProjectFileIdentity') + '  return changed; }', context);
   api = vm.runInContext('({getWorkingSourceSelection, getWorkingSourceVerification, getWorkingSourceMembership, setWorkingSourceSelection, resolveWorkingFileChoice, getAssetBaselineSourceRecoveryRouteKey, selectProjectFilesForPackaging, beginWorkingSourceScan, collectWorkingSourceScanEvidence, publishWorkingSourceScan, failWorkingSourceScan, workingSourceScanLeases, workingSourceScanOperations, getWorkingSourceDiskIdentity, recordWorkingSourceContinuationCandidate, resolveWorkingSourceContinuation, getWorkingSourceContinuationPresentation, observeIllustratorWorkingSourceContinuation, refreshWorkingSourceLocators, retireInterruptedWorkingSourceScan: typeof retireInterruptedWorkingSourceScan === "function" ? retireInterruptedWorkingSourceScan : null, refreshWorkingSourceVerification, getWorkingFileVerificationReason})', context);
   const source = (name, fileId = name) => {
     const file = { path: `/Users/synthetic/${name}`, name, fileId, ext: path.extname(name), projectRole: 'source' };
@@ -179,6 +191,10 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
     failAfterStoreWrite() { failAfterStoreWrite = true; },
     afterStoreWrite(callback) { afterStoreWrite = callback; },
     snapshot() { return structuredClone(context.getProjects()[0]); },
+    toggleAsset(file) {
+      const current = context.getProjects()[0];
+      return context.toggleAssetForTest(current, current.files.find(row => row.path === file.path));
+    },
     revoke() { authorized = false; },
     changeGeneration() { epoch++; },
     setDigestGate(callback) { digestGate = callback; },
@@ -1518,4 +1534,147 @@ test('a retained file rescan that newly references a withheld asset brings it ba
   assert.equal(fact.included, true); assert.equal(fact.includedAsDependency, true);
   assert.equal(fact.excludedSourceOnly, false);
   assert.deepEqual(plain(fact.requiredBy), ['Poster.ai']);
+});
+
+// Owner intent keeps a dependency asset of an excluded working file. Records use
+// the production observation shape and node identity (provenance.js); the
+// writers that append them are exercised through real IPC in the main harness.
+function ownerRecord(project, file, method, payload, kind = OBSERVER_KINDS.MANUAL_USER_ACTION) {
+  project.provenance ||= { nodes: {}, edges: {}, observations: [] };
+  project.provenance.observations.push(createObservationRecord({ observer: { kind, method },
+    objectNodeId: createNodeId(NODE_TYPES.FILE, { normalizedPath: file.path.toLowerCase() }), payload }));
+}
+const ACCEPT = 'projects:accept-pending', BULK = 'projects:set-existing-assets-decision';
+
+test('owner intent matrix: every acceptance signal keeps the asset; absent or other records do not', async () => {
+  const f = fixture(), root = f.source('Art.ai');
+  const rows = {
+    never: dependencyAsset(f, 'Never.png'),
+    flagAndAccept: dependencyAsset(f, 'FlagAccept.png', { acceptedPending: true }),
+    flagAndBulk: dependencyAsset(f, 'FlagBulk.png', { acceptedPending: true }),
+    flagOnly: dependencyAsset(f, 'FlagOnly.png', { acceptedPending: true }),
+    acceptOnly: dependencyAsset(f, 'AcceptOnly.png'),
+    bulkOnly: dependencyAsset(f, 'BulkOnly.png'),
+    bulkSkip: dependencyAsset(f, 'BulkSkip.png'),
+    bulkNoDecision: dependencyAsset(f, 'BulkNoDecision.png'),
+    parserAccept: dependencyAsset(f, 'ParserAccept.png'),
+    individualInclude: dependencyAsset(f, 'IndividualInclude.png', { individualContentInclude: 'sha256:' + 'a'.repeat(64) }),
+    marked: dependencyAsset(f, 'Marked.png', { keptAfterSourceExclusion: true }),
+  };
+  f.project.files.push(root, ...Object.values(rows));
+  ownerRecord(f.project, rows.flagAndAccept, ACCEPT);
+  ownerRecord(f.project, rows.flagAndBulk, BULK, { decision: 'include' });
+  ownerRecord(f.project, rows.acceptOnly, ACCEPT);
+  ownerRecord(f.project, rows.bulkOnly, BULK, { decision: 'include' });
+  ownerRecord(f.project, rows.bulkSkip, BULK, { decision: 'skip' });
+  ownerRecord(f.project, rows.bulkNoDecision, BULK);
+  ownerRecord(f.project, rows.parserAccept, ACCEPT, undefined, OBSERVER_KINDS.PARSER);
+  await scanWorkingFile(f, root, Object.values(rows));
+  await f.command(root, 'exclude');
+  const kept = ['flagAndAccept', 'flagAndBulk', 'flagOnly', 'acceptOnly', 'bulkOnly', 'individualInclude', 'marked'];
+  for (const [label, file] of Object.entries(rows)) {
+    const fact = factOf(f, file);
+    assert.equal(fact.excludedSourceOnly, true, `${label} ownership fact is unchanged`);
+    assert.equal(fact.included, kept.includes(label), label);
+  }
+  assert.deepEqual(await selectedNames(f), kept.map(label => rows[label].name).sort());
+  assert.deepEqual(f.snapshot().excludedAssetKeys, []);
+  f.reload();
+  for (const [label, file] of Object.entries(rows)) assert.equal(factOf(f, file).included, kept.includes(label), `${label} after reload`);
+});
+
+test('an owner-kept asset that is also explicitly excluded is omitted until Include', async () => {
+  const f = fixture(), root = f.source('Art.ai');
+  const accepted = dependencyAsset(f, 'Accepted.png', { acceptedPending: true });
+  const recorded = dependencyAsset(f, 'Recorded.png');
+  f.project.files.push(root, accepted, recorded);
+  ownerRecord(f.project, recorded, ACCEPT);
+  f.project.excludedAssetKeys = [accepted.path, recorded.path];
+  await scanWorkingFile(f, root, [accepted, recorded]);
+  await f.command(root, 'exclude');
+  for (const file of [accepted, recorded]) assert.equal(factOf(f, file).included, false, file.name);
+  assert.deepEqual(await selectedNames(f), []);
+  for (const file of [accepted, recorded]) f.toggleAsset(file);
+  assert.deepEqual(f.snapshot().excludedAssetKeys, []);
+  for (const file of [accepted, recorded]) assert.equal(factOf(f, file).included, true, file.name);
+  assert.deepEqual(await selectedNames(f), ['Accepted.png', 'Recorded.png']);
+});
+
+test('the asset toggle shares the owner predicate: every click flips accepted and withheld rows', async () => {
+  const f = fixture(), root = f.source('Art.ai');
+  const flagged = dependencyAsset(f, 'Flagged.png', { acceptedPending: true });
+  const recorded = dependencyAsset(f, 'Recorded.png');
+  const bulk = dependencyAsset(f, 'Bulk.png');
+  const never = dependencyAsset(f, 'Never.png');
+  f.project.files.push(root, flagged, recorded, bulk, never);
+  ownerRecord(f.project, recorded, ACCEPT);
+  ownerRecord(f.project, bulk, BULK, { decision: 'include' });
+  await scanWorkingFile(f, root, [flagged, recorded, bulk, never]);
+  await f.command(root, 'exclude');
+  const stored = file => f.snapshot().files.find(row => row.path === file.path);
+  for (const file of [flagged, recorded, bulk, never]) {
+    let expected = file !== never;
+    assert.equal(factOf(f, file).included, expected, `${file.name} initial`);
+    for (let click = 0; click < 4; click++) {
+      f.toggleAsset(file);
+      expected = !expected;
+      assert.equal(factOf(f, file).included, expected, `${file.name} click ${click + 1}`);
+      assert.equal(f.snapshot().excludedAssetKeys.includes(file.path), !expected, `${file.name} key after click ${click + 1}`);
+      assert.equal(stored(file).keptAfterSourceExclusion === true, expected, `${file.name} marker after click ${click + 1}`);
+      if (click === 1) { f.reload(); assert.equal(factOf(f, file).included, expected, `${file.name} reload`); }
+    }
+    assert.equal(factOf(f, file).excludedSourceOnly, true);
+  }
+  // The flag and records are never removed by the toggle.
+  assert.equal(stored(flagged).acceptedPending, true);
+  assert.equal(f.snapshot().provenance.observations.length, 2);
+});
+
+test('owner-intent records are read lazily and in one bounded pass', async () => {
+  const f = fixture(), root = f.source('Art.ai'), kept = f.source('Poster.ai');
+  const required = dependencyAsset(f, 'Required.png');
+  f.project.files.push(root, kept, required);
+  await scanWorkingFile(f, root, []);
+  await scanWorkingFile(f, kept, [required]);
+  const observations = [];
+  let reads = 0, indexReads = 0;
+  const counted = new Proxy(observations, { get(target, key, receiver) {
+    if (typeof key === 'string' && /^\d+$/.test(key)) indexReads++;
+    return Reflect.get(target, key, receiver);
+  } });
+  const project = f.project;
+  project.provenance = {};
+  Object.defineProperty(project.provenance, 'observations', { enumerable: true, get() { reads++; return counted; } });
+  // No exclusion, then an exclusion whose only dependency stays required: no
+  // reads. (The modeled signature serializes the project, so count per call.)
+  f.api.getWorkingSourceMembership(project);
+  assert.equal(reads, 0, 'no exclusion reads no records');
+  await f.command(root, 'exclude');
+  reads = 0;
+  assert.equal(f.api.getWorkingSourceMembership(project).facts.get(required.path.toLowerCase()).included, true);
+  assert.equal(reads, 0, 'no withheld candidate reads no records');
+  // Candidates already kept by a row signal read no records either.
+  const flagged = Array.from({ length: 50 }, (_, i) => dependencyAsset(f, `Flagged-${i}.png`, { acceptedPending: true }));
+  project.files.push(...flagged);
+  await f.command(root, 'restore');
+  await scanWorkingFile(f, root, flagged);
+  await f.command(root, 'exclude');
+  reads = 0;
+  const flaggedFacts = f.api.getWorkingSourceMembership(project).facts;
+  assert.ok(flagged.every(file => flaggedFacts.get(file.path.toLowerCase()).included));
+  assert.equal(reads, 0, 'row signals short-circuit record lookup');
+  // Many unresolved candidates and a large record log cost one pass in total.
+  const candidates = Array.from({ length: 200 }, (_, i) => dependencyAsset(f, `Candidate-${i}.png`));
+  project.files.push(...candidates);
+  for (let i = 0; i < 20000; i++) observations.push({ observer: { kind: 'parser', method: 'scan-on-open-psd-parser' }, objectNodeId: `node-${i}` });
+  ownerRecord({ provenance: { observations } }, candidates[7], ACCEPT);
+  await f.command(root, 'restore');
+  await scanWorkingFile(f, root, [...flagged, ...candidates]);
+  await f.command(root, 'exclude');
+  reads = 0; indexReads = 0;
+  const facts = f.api.getWorkingSourceMembership(project).facts;
+  assert.equal(reads, 1, 'one observation pass per membership call');
+  assert.equal(indexReads, observations.length, 'each record is visited once');
+  assert.equal(facts.get(candidates[7].path.toLowerCase()).included, true);
+  assert.equal(candidates.filter(file => facts.get(file.path.toLowerCase()).included).length, 1);
 });
