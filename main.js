@@ -16263,10 +16263,13 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       // An output name that belongs to another file's row is never handed to
       // this file, even when that row's cached file is missing: the row keeps
       // its own parent's record. Reuse within the same parent is unchanged.
-      const psdKey = normalizeTrackedFilePath(psdFilePath);
+      // The comparison is made per row, only for a row that names a parent.
+      let psdKey = null;
       for (const row of priorEmbeddedRows) {
         const parentPath = row.psdExtractionReceipt?.parentPath ?? row.psdResource?.parentPath;
-        if (typeof parentPath === 'string' && normalizeTrackedFilePath(parentPath) !== psdKey && isDirectCacheChild(extractDir, row.path)) {
+        if (typeof parentPath !== 'string') continue;
+        psdKey ??= normalizeTrackedFilePath(psdFilePath);
+        if (normalizeTrackedFilePath(parentPath) !== psdKey && isDirectCacheChild(extractDir, row.path)) {
           usedEmbeddedNames.add(path.basename(row.path).toLowerCase());
         }
       }
