@@ -4038,6 +4038,112 @@ function hasWorkingSourceRecoveryHold(project) {
   return Object.keys(state.records).length > 0;
 }
 
+// File node ids carrying a recorded owner acceptance: individual/bulk accept or
+// the existing-assets Include. One pass over the append-only observations.
+function getOwnerAcceptanceRecords(project) {
+  const accepted = new Set(), bulk = new Set(), logicalChildAccepted = new Set();
+  const observations = project?.provenance?.observations;
+  if (!Array.isArray(observations)) return { accepted, bulk, logicalChildAccepted };
+  for (const observation of observations) {
+    const observer = observation?.observer;
+    if (observer?.kind !== OBSERVER_KINDS.MANUAL_USER_ACTION || typeof observation.objectNodeId !== 'string') continue;
+    if (observer.method === 'projects:accept-pending') {
+      accepted.add(observation.objectNodeId);
+      if (observation.payload?.source === 'scan-on-save-embedded') logicalChildAccepted.add(observation.objectNodeId);
+    } else if (observer.method === 'projects:set-existing-assets-decision' && observation.payload?.decision === 'include') {
+      bulk.add(observation.objectNodeId);
+    }
+  }
+  return { accepted, bulk, logicalChildAccepted };
+}
+
+// The owner chose this row: explicit addition, Include after exclusion, accept
+// (flag or record), existing-assets Include record, or a per-asset Include.
+// Partial or mixed signals resolve to keep. `memo` lets one caller build the
+// observation set at most once and only when a cheap row signal is absent.
+function isOwnerKeptAfterSourceExclusion(project, file, memo = {}) {
+  if (!file) return false;
+  if (isExplicitUserCapturedFile(file) || file.keptAfterSourceExclusion === true ||
+      (typeof file.individualContentInclude === 'string' && file.individualContentInclude)) return true;
+  const logical = isScanOnSaveEmbeddedPsdFile(file);
+  const normalizedPath = normalizeTrackedFilePath(logical ? file.parentPsd || file.path : file.path);
+  if (!normalizedPath) return file.acceptedPending === true;
+  memo.records ||= getOwnerAcceptanceRecords(project);
+  const node = createNodeId(NODE_TYPES.FILE, { normalizedPath });
+  // A logical row shares its parent's path: only a record naming a logical child counts.
+  if (logical) return file.acceptedPending === true || memo.records.logicalChildAccepted.has(node);
+  if (memo.records.accepted.has(node)) return true;
+  if (memo.records.bulk.has(node)) return false;
+  return file.acceptedPending === true;
+}
+
+// "Include All Existing" while assets are withheld keeps them for the exclusion
+// current at that click only: `existingIncludeEpisode.owners` maps each excluded
+// owner's selection route key to its selection revision at the click. Selection
+// revisions only grow (every Exclude/Restore adds one; records are never
+// deleted; a rename moves the record and this map together), so a later
+// Restore + Exclude can never match again.
+const MAX_EXISTING_INCLUDE_EPISODE_OWNERS = 64;
+// Beyond the bound the click stores a digest of its sorted (route key,
+// revision) pairs; it keeps the asset only while the current excluded owners
+// produce the same digest. It never becomes a lasting per-asset keep.
+function getExistingIncludeEpisodeDigest(owners) {
+  const pairs = Object.entries(owners).sort(([a], [b]) => a.localeCompare(b));
+  return crypto.createHash('sha256').update(JSON.stringify(pairs)).digest('hex');
+}
+function getExistingIncludeEpisodeOverflow(file) {
+  const episode = file?.existingIncludeEpisode;
+  return episode && typeof episode === 'object' && !Array.isArray(episode) && episode.version === 1 && episode.owners === undefined &&
+    /^[a-f0-9]{64}$/.test(episode.ownersDigest || '') && Number.isSafeInteger(episode.ownerCount) &&
+    episode.ownerCount > MAX_EXISTING_INCLUDE_EPISODE_OWNERS ? episode : null;
+}
+function hasExistingIncludeEpisode(file) {
+  return !!(getExistingIncludeEpisodeOwners(file) || getExistingIncludeEpisodeOverflow(file));
+}
+function getExistingIncludeEpisodeOwners(file) {
+  const episode = file?.existingIncludeEpisode;
+  if (!episode || typeof episode !== 'object' || Array.isArray(episode) || episode.version !== 1 ||
+      !episode.owners || typeof episode.owners !== 'object' || Array.isArray(episode.owners)) return null;
+  const entries = Object.entries(episode.owners);
+  if (!entries.length || entries.length > MAX_EXISTING_INCLUDE_EPISODE_OWNERS ||
+      !entries.every(([key, revision]) => /^[a-f0-9]{64}$/.test(key) && Number.isSafeInteger(revision) && revision >= 1)) return null;
+  return episode.owners;
+}
+
+// Bounded owner records written by routes that observe a row on a working
+// file's behalf. Read only for withholding; never an obligation edge.
+const MAX_DEPENDENCY_OWNERS = 8;
+// Figma captures keep their own reason and scope rules: never owner records.
+const OWNER_RECORD_ELIGIBLE_SOURCES = new Set([...DEPENDENCY_CAPTURE_SOURCES, 'linked-asset', 'pre-package-doublecheck']
+  .filter(source => source !== 'figma-auto'));
+// A recorded owner counts for as long as it is a project file. No scan receipt
+// retires it (an ordinary receipt is not the reader that recorded it).
+function noteDependencyOwner(row, ownerPath) {
+  // A Photoshop output belongs to exactly one PSD by construction; its
+  // relationship and resource metadata already name it.
+  if (!row || typeof ownerPath !== 'string' || !path.isAbsolute(ownerPath) || isScanOnSaveEmbeddedPsdFile(row) || row.source === 'psd-embedded') return false;
+  if (!OWNER_RECORD_ELIGIBLE_SOURCES.has(getFileCaptureSource(row))) return false;
+  const key = normalizeTrackedFilePath(ownerPath);
+  if (!key || key === normalizeTrackedFilePath(row.path) || row.dependencyOwnersOverflow === true) return false;
+  const owners = Array.isArray(row.dependencyOwners) ? row.dependencyOwners : [];
+  if (owners.some(owner => normalizeTrackedFilePath(owner) === key)) return false;
+  if (owners.length >= MAX_DEPENDENCY_OWNERS) { row.dependencyOwnersOverflow = true; return true; }
+  row.dependencyOwners = [...owners, ownerPath];
+  return true;
+}
+function noteDependencyOwnerOnRows(rows, assetPath, ownerPath) {
+  const key = normalizeTrackedFilePath(assetPath);
+  let changed = false;
+  for (const row of rows || []) if (normalizeTrackedFilePath(row?.path) === key) changed = noteDependencyOwner(row, ownerPath) || changed;
+  return changed;
+}
+// Guard for scans run on a working file's behalf (G1/G3/G4).
+function isUnretainedExcludedScanSource(membership, file) {
+  const fact = file && membership?.facts.get(getTrackedFileDedupKey(file));
+  return !!fact && !fact.included &&
+    ((fact.sourceSelection === 'excluded' && fact.selectionReason === 'user-excluded') || fact.excludedSourceOnly === true);
+}
+
 function getWorkingSourceMembership(project, packageFiles = null) {
   const scopedProject = getIllustratorScopedProjectView(project);
   const files = deduplicateFiles(scopedProject?.files || []);
@@ -4102,6 +4208,113 @@ function getWorkingSourceMembership(project, packageFiles = null) {
       }
     }
   }
+  // Assets reachable only from working files the owner explicitly excluded.
+  // Each working file governs its own closure; Replace history, invalid roots
+  // and excluded roots retained as dependencies contribute nothing here.
+  const unretainedExcludedRoots = new Map(), excludedOnlyPaths = new Set(), keptBridgePaths = new Set(), bridgeMemo = {};
+  const sourcePaths = new Set(sources.map(file => normalizeTrackedFilePath(file.path)));
+  // Owners recorded on a row count only while they are still project files:
+  // a removed file cannot need an asset in the package.
+  const projectPhysicalPaths = new Set((project?.files || []).filter(file => !isScanOnSaveEmbeddedPsdFile(file))
+    .map(file => normalizeTrackedFilePath(file.path)));
+  const recordedOwnerMemo = new Map();
+  const recordedOwnerKeys = file => {
+    if (recordedOwnerMemo.has(file)) return recordedOwnerMemo.get(file);
+    let keys = [];
+    if (file.dependencyOwnersOverflow !== true && Array.isArray(file.dependencyOwners) && !isScanOnSaveEmbeddedPsdFile(file) &&
+        OWNER_RECORD_ELIGIBLE_SOURCES.has(getFileCaptureSource(file))) {
+      keys = file.dependencyOwners.map(normalizeTrackedFilePath).filter(key => key && projectPhysicalPaths.has(key));
+    }
+    recordedOwnerMemo.set(file, keys);
+    return keys;
+  };
+  // Recorded owners join receipt and row-evidence edges for retention and the
+  // excluded-only walk only; never for requirements, counts or verification.
+  const ownershipEdges = new Map();
+  for (const [source, links] of edges) ownershipEdges.set(source, new Map(links));
+  if (engaged) for (const file of physicalFiles) {
+    for (const ownerKey of recordedOwnerKeys(file)) {
+      const links = ownershipEdges.get(ownerKey) || new Map(); links.set(normalizeTrackedFilePath(file.path), file.path); ownershipEdges.set(ownerKey, links);
+    }
+  }
+  // Everything an included working file reaches through that relation stays.
+  const retainedPaths = new Set();
+  if (engaged) {
+    const queue = sources.filter(file => getWorkingSourceSelection(project, file).state !== 'excluded').map(file => normalizeTrackedFilePath(file.path));
+    for (const key of queue) retainedPaths.add(key);
+    for (let index = 0; index < queue.length; index++) {
+      for (const [target] of ownershipEdges.get(queue[index]) || []) if (!retainedPaths.has(target)) { retainedPaths.add(target); queue.push(target); }
+    }
+  }
+  // Assets kept by an existing-assets Include for the exclusion current at the
+  // click act as kept bridges too, settled below in at most one pass per row.
+  const episodeBridges = new Set(), rootClosures = new Map();
+  const walkExcludedOnly = (roots, visited, bridges) => {
+    const queue = [...roots];
+    for (let index = 0; index < queue.length; index++) {
+      for (const [target] of ownershipEdges.get(queue[index]) || []) {
+        if (sourcePaths.has(target) || requiredByPath.has(target) || retainedPaths.has(target) || visited.has(target)) continue;
+        visited.add(target);
+        // An asset the owner kept keeps what it needs: do not walk past it.
+        const targetRow = byPath.get(target);
+        if (targetRow && (episodeBridges.has(target) || isOwnerKeptAfterSourceExclusion(project, targetRow, bridgeMemo))) { bridges?.add(target); continue; }
+        queue.push(target);
+      }
+    }
+    return visited;
+  };
+  const closureOf = rootKey => {
+    if (!rootClosures.has(rootKey)) rootClosures.set(rootKey, walkExcludedOnly([rootKey], new Set(), null));
+    return rootClosures.get(rootKey);
+  };
+  const ownerCandidateKeys = file => {
+    const evidence = file.captureEvidence || {};
+    return [normalizeTrackedFilePath(isScanOnSaveEmbeddedPsdFile(file) ? file.parentPsd || file.path : file.path),
+      normalizeTrackedFilePath(evidence.relationshipSourcePath || evidence.sourceDocumentPath || file.assetBaselineSourcePath),
+      ...recordedOwnerKeys(file)].filter(Boolean);
+  };
+  // Excluded working files that make this row an excluded-only asset, as their
+  // selection route keys and current revisions (the exclusion episode).
+  let rootsByPath = null;
+  const getExcludedOwnerSelections = file => {
+    if (!rootsByPath) {
+      rootsByPath = new Map();
+      for (const rootKey of unretainedExcludedRoots.keys()) for (const key of [rootKey, ...closureOf(rootKey)]) {
+        const roots = rootsByPath.get(key) || []; roots.push(rootKey); rootsByPath.set(key, roots);
+      }
+    }
+    const owners = {};
+    for (const key of ownerCandidateKeys(file)) for (const rootKey of rootsByPath.get(key) || []) {
+      const root = unretainedExcludedRoots.get(rootKey);
+      owners[getAssetBaselineSourceRecoveryRouteKey(project, root)] = getWorkingSourceSelection(project, root).revision;
+    }
+    return owners;
+  };
+  const isExistingIncludeEpisodeCurrent = file => {
+    const recorded = getExistingIncludeEpisodeOwners(file), overflow = !recorded && getExistingIncludeEpisodeOverflow(file);
+    if (!recorded && !overflow) return false;
+    const currentOwners = getExcludedOwnerSelections(file), current = Object.entries(currentOwners);
+    if (overflow) return current.length === overflow.ownerCount && getExistingIncludeEpisodeDigest(currentOwners) === overflow.ownersDigest;
+    return current.length > 0 && current.every(([key, revision]) => recorded[key] === revision);
+  };
+  if (engaged) {
+    for (const root of sources) {
+      const selection = getWorkingSourceSelection(project, root), rootKey = normalizeTrackedFilePath(root.path);
+      if (selection.state === 'excluded' && selection.reason === 'user-excluded' && rootKey && !requiredByPath.has(rootKey)) {
+        unretainedExcludedRoots.set(rootKey, root);
+      }
+    }
+    walkExcludedOnly(unretainedExcludedRoots.keys(), excludedOnlyPaths, keptBridgePaths);
+    const episodeRows = unretainedExcludedRoots.size ? physicalFiles.filter(hasExistingIncludeEpisode) : [];
+    for (let pass = 0; pass < episodeRows.length; pass++) {
+      const added = episodeRows.map(file => normalizeTrackedFilePath(file.path)).filter((key, index) =>
+        excludedOnlyPaths.has(key) && !keptBridgePaths.has(key) && isExistingIncludeEpisodeCurrent(episodeRows[index]));
+      if (!added.length) break;
+      for (const key of added) episodeBridges.add(key);
+      excludedOnlyPaths.clear(); keptBridgePaths.clear(); rootClosures.clear(); rootsByPath = null;
+      walkExcludedOnly(unretainedExcludedRoots.keys(), excludedOnlyPaths, keptBridgePaths);
+    }
+  }
   for (const key of recoveryGuardKeys || []) {
     const matches = (project.files || []).filter(file=>getAssetBaselineSourceRecoveryRouteKey(project,file)===key);
     if (matches.length !== 1 || !isWorkingSourceFile(matches[0])) { recoveryGuardInvalid = true; continue; }
@@ -4120,7 +4333,7 @@ function getWorkingSourceMembership(project, packageFiles = null) {
       for (const output of verification?.requiredEmbeddedOutputs || []) { edge(row.path,output.path); queue.push(normalizeTrackedFilePath(output.path)); }
     }
   }
-  const facts = new Map();
+  const facts = new Map(), ownerIntentMemo = bridgeMemo;
   const counts = { selectedWorkingSources: 0, excludedWorkingSources: 0, invalidWorkingSources: 0, includedAssets: 0,
     excludedAssets: 0, unresolvedVerification: 0, missingRequiredReferences: 0, relationshipHolds: 0 };
   for (const file of files) {
@@ -4130,7 +4343,32 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     const selectedSource = source && selection.state === 'selected';
     const recoveryGuarded = recoveryGuardPaths.has(normalizeTrackedFilePath(file.path));
     const includedAsDependency = (engaged || recoveryGuarded) && requiredBy.length > 0;
-    const eligible = source ? (selectedSource || includedAsDependency) : (!isAssetReviewFileExcluded(project, file) || includedAsDependency);
+    // Withhold a dependency-captured asset only when its own evidence ties it to
+    // an explicitly excluded working file and nothing ties it to another file.
+    let excludedSourceOnly = false;
+    if (engaged && !source && !includedAsDependency && !retainedPaths.has(normalizeTrackedFilePath(file.path))) {
+      const ownerExcluded = key => unretainedExcludedRoots.has(key) || (excludedOnlyPaths.has(key) && !keptBridgePaths.has(key));
+      const captureSource = getFileCaptureSource(file), logicalEmbedded = isScanOnSaveEmbeddedPsdFile(file);
+      let owned = false, contradicted = false;
+      if (DEPENDENCY_CAPTURE_SOURCES.has(captureSource)) {
+        const evidence = file.captureEvidence || {};
+        const producerKey = normalizeTrackedFilePath(evidence.relationshipSourcePath || evidence.sourceDocumentPath || file.assetBaselineSourcePath);
+        const ownerKey = normalizeTrackedFilePath(logicalEmbedded ? file.parentPsd || file.path : file.path);
+        owned = !!ownerKey && (excludedOnlyPaths.has(ownerKey) || (logicalEmbedded && unretainedExcludedRoots.has(ownerKey)));
+        contradicted = !!producerKey && !ownerExcluded(producerKey);
+      }
+      if (!logicalEmbedded && OWNER_RECORD_ELIGIBLE_SOURCES.has(captureSource)) {
+        const recorded = recordedOwnerKeys(file);
+        if (excludedOnlyPaths.has(normalizeTrackedFilePath(file.path)) && recorded.length) owned = true;
+        if (file.dependencyOwnersOverflow === true) contradicted = true;
+        else if (recorded.length) { if (recorded.every(ownerExcluded)) owned = true; else contradicted = true; }
+      }
+      excludedSourceOnly = owned && !contradicted;
+    }
+    const withheld = excludedSourceOnly && !isOwnerKeptAfterSourceExclusion(project, file, ownerIntentMemo) &&
+      !isExistingIncludeEpisodeCurrent(file);
+    const eligible = source ? (selectedSource || includedAsDependency)
+      : ((!isAssetReviewFileExcluded(project, file) && !withheld) || includedAsDependency);
     const included = eligible && (!packageKeys || packageKeys.has(getTrackedFileDedupKey(file)));
     const verification = getWorkingSourceVerification(project, file);
     const persistedVerification = Object.hasOwn(project.workingSourceVerification || {}, getAssetBaselineSourceRecoveryRouteKey(project, file));
@@ -4156,7 +4394,7 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     const unresolved = packageSelectionOmitted || selection?.state === 'invalid' || (verificationRequired &&
       (!verification || !['scanned', 'no-extractor'].includes(verificationStatus) || verification.unresolved.length > 0));
     facts.set(getTrackedFileDedupKey(file), { sourceSelection: selection?.state || null, selectionReason: selection?.reason || null,
-      selectionRevision: selection?.revision ?? null, includedAsDependency, included,
+      selectionRevision: selection?.revision ?? null, includedAsDependency, included, excludedSourceOnly,
       ...(selection?.state === 'invalid' && selection.reason === 'continuation-identity-changed' &&
         selection.revision < Number.MAX_SAFE_INTEGER &&
         canonicalSourceCounts.get(getAssetBaselineSourceRecoveryRouteKey(project, file)) === 1 ? { selectionRecovery: {
@@ -4212,7 +4450,9 @@ function getWorkingSourceMembership(project, packageFiles = null) {
   const records = project?.workingSourceSelections;
   const selectionInvalid = engaged && (!records || typeof records !== 'object' || Array.isArray(records) || Object.entries(records).some(([key, record]) =>
     !/^[a-f0-9]{64}$/.test(key) || !isValidWorkingSourceSelectionRecord(project, key, record)));
-  const membership = { facts, counts, requiredByPath, blocked: recoveryGuardInvalid || hasWorkingSourceRecoveryHold(project) || selectionInvalid || counts.relationshipHolds > 0 ||
+  const choiceReviewNames = files.filter(file => file.individualChoiceReview !== undefined)
+    .map(file => sanitizeRendererSourceName(file.name || path.basename(file.path || '')) || 'Asset');
+  const membership = { facts, counts, requiredByPath, getExcludedOwnerSelections, choiceReviewNames, blocked: recoveryGuardInvalid || hasWorkingSourceRecoveryHold(project) || selectionInvalid || counts.relationshipHolds > 0 ||
     (engaged && (counts.unresolvedVerification > 0 || counts.missingRequiredReferences > 0)) ||
     [...recoveryGuardPaths].some(key=>{ const row=byPath.get(key), fact=row&&facts.get(getTrackedFileDedupKey(row));
       return !row || !fs.existsSync(row.path) || (packagePaths&&!packagePaths.has(key)) || (isWorkingSourceFile(row)&&
@@ -4655,6 +4895,12 @@ async function setWorkingSourceSelection(projectId, visualIdentity, request) {
     sendToRenderer('project:updated', { projectId });
     if (request.action === 'restore' && result.file) {
       await verifyRestoredWorkingSource(projectId, result.file, result.attempt, operation);
+      // Presentation saves are skipped while excluded. Restore captures the
+      // current media through the same save route, so a change made while
+      // excluded reaches its choice guard instead of only package extraction.
+      const activationToken = ['.pptx', '.key'].includes(path.extname(result.file.path || '').toLowerCase()) &&
+        getActiveWatchingActivationToken(projectId);
+      if (activationToken) await runScanOnSavePresentation(projectId, result.file.path, activationToken).catch(() => null);
     }
     const project = getProjects().find(item => item.id === projectId);
     const currentFile = project && resolveProjectOwnedFileVisualRecord(projectId, visualIdentity, project);
@@ -5469,8 +5715,24 @@ async function refreshWorkingSourceLocators(projectId, observedPaths = null, par
           relocated.some(item => fs.existsSync(project.files.find(file => getAssetBaselineSourceRecoveryRouteKey(project, file) === item.oldKey)?.path || '') ||
             getWorkingSourceContinuationPhysicalIdentity(latest, item.file) !== records[item.key].physicalIdentity)) return { changed: false };
       latest.workingSourceLocators = nextState;
+      // An episode above the owner bound is a digest of (route key, revision)
+      // pairs. A proven rename moves the selection record with its revision, so
+      // a digest current before the rename is recomputed with the new key.
+      const overflowEpisodes = new Map();
+      if (relocated.length && (latest.files || []).some(row => getExistingIncludeEpisodeOverflow(row))) {
+        const before = getWorkingSourceMembership(latest), moved = new Map(relocated.map(item => [item.oldKey, item.key]));
+        for (const row of latest.files) {
+          const episode = getExistingIncludeEpisodeOverflow(row);
+          if (!episode) continue;
+          const current = before.getExcludedOwnerSelections(row);
+          if (Object.keys(current).length !== episode.ownerCount || getExistingIncludeEpisodeDigest(current) !== episode.ownersDigest) continue;
+          const renamed = Object.fromEntries(Object.entries(current).map(([key, revision]) => [moved.get(key) || key, revision]));
+          overflowEpisodes.set(getTrackedFileDedupKey(row), { version: 1, ownersDigest: getExistingIncludeEpisodeDigest(renamed), ownerCount: episode.ownerCount });
+        }
+      }
       if (relocated.length || changedBytes.length) {
         latest.files = files;
+        for (const row of latest.files) if (overflowEpisodes.has(getTrackedFileDedupKey(row))) row.existingIncludeEpisode = overflowEpisodes.get(getTrackedFileDedupKey(row));
         if (latest.workingFileChoices) latest.workingFileChoices = { ...latest.workingFileChoices, records: choices };
         if (latest.workingFileDirtyHolds || Object.keys(dirtyHolds).length) latest.workingFileDirtyHolds = { ...(latest.workingFileDirtyHolds || { version: 1 }), records: dirtyHolds,
           ...(migratedEvidence === undefined ? {} : { migratedEvidence }) };
@@ -5482,6 +5744,14 @@ async function refreshWorkingSourceLocators(projectId, observedPaths = null, par
         for (const item of relocated) for (const row of latest.files) {
           for (const field of ['relationshipSourcePath', 'sourceDocumentPath']) if (normalizeTrackedFilePath(row.captureEvidence?.[field]) === normalizeTrackedFilePath(item.oldPath)) row.captureEvidence = { ...row.captureEvidence, [field]: item.file.path };
           if (normalizeTrackedFilePath(row.assetBaselineSourcePath) === normalizeTrackedFilePath(item.oldPath)) row.assetBaselineSourcePath = item.file.path;
+          if (Array.isArray(row.dependencyOwners) && row.dependencyOwners.some(owner => normalizeTrackedFilePath(owner) === normalizeTrackedFilePath(item.oldPath))) {
+            row.dependencyOwners = row.dependencyOwners.map(owner => normalizeTrackedFilePath(owner) === normalizeTrackedFilePath(item.oldPath) ? item.file.path : owner);
+          }
+          // The selection record moved to the new key with its revision.
+          if (Object.hasOwn(getExistingIncludeEpisodeOwners(row) || {}, item.oldKey)) {
+            const { [item.oldKey]: revision, ...owners } = row.existingIncludeEpisode.owners;
+            row.existingIncludeEpisode = { version: 1, owners: { ...owners, [item.key]: revision } };
+          }
         }
         for (const receipt of latest.assetBaseline?.failedRequiredSources || []) for (const item of relocated) if (receipt.sourceKeyHash === item.oldKey) receipt.sourceKeyHash = item.key;
       }
@@ -6362,7 +6632,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
     pendingFiles,
     trackedFigmaFiles,
     semanticCounts: membership.counts,
-    workingSourceSelectionBlocked: membership.blocked,
+    workingSourceSelectionBlocked: membership.blocked || membership.choiceReviewNames.length > 0,
     watchCoverage: { accountGeneration: workspaceAccountGeneration,
       activationToken: workspaceActivationToken, exactPathLimit: MAX_ACCEPTED_SOURCE_WATCH_PATHS,
       nativeDelivery: 'unverified' },
@@ -7467,6 +7737,22 @@ function setProjectExistingAssetsDecision(projectId, decision) {
       status: decision === 'include' ? 'included' : 'skipped',
       decision,
     };
+    // Include while existing assets are withheld with an excluded working file
+    // keeps them for that exclusion only (see getExistingIncludeEpisodeOwners).
+    // Skip is the later bulk choice and ends any such keep.
+    if (hasWorkingSourceSelectionState(project)) {
+      const membership = decision === 'include' ? getWorkingSourceMembership(project) : null;
+      for (const file of getExistingAssetReviewFiles(project)) {
+        if (!project.files.includes(file)) continue;
+        if (!membership) { delete file.existingIncludeEpisode; continue; }
+        const fact = membership.facts.get(getTrackedFileDedupKey(file));
+        if (fact?.excludedSourceOnly !== true || fact.included || isAssetReviewFileExcluded(project, file)) continue;
+        const owners = membership.getExcludedOwnerSelections(file), count = Object.keys(owners).length;
+        if (count > MAX_EXISTING_INCLUDE_EPISODE_OWNERS) {
+          file.existingIncludeEpisode = { version: 1, ownersDigest: getExistingIncludeEpisodeDigest(owners), ownerCount: count };
+        } else if (count > 0) file.existingIncludeEpisode = { version: 1, owners };
+      }
+    }
     return { success: true };
   });
 
@@ -13750,6 +14036,9 @@ function collectLiveAppEvidenceCandidates(liveEvidenceRecords = []) {
       continue;
     }
     if (batchPaths.has(normalizedFilePath)) {
+      // Another document reporting the same link is another owner of it.
+      const first = candidates.find(candidate => candidate.normalizedFilePath === normalizedFilePath);
+      if (first && typeof evidence.relationshipSourcePath === 'string') (first.owners ||= []).push(evidence.relationshipSourcePath);
       incrementLiveAppSkipCount(skipped, 'duplicate-batch-path');
       continue;
     }
@@ -13800,16 +14089,29 @@ async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], 
     const baselineSourcePaths = [];
     const newSavedSourcePaths = [];
     const previouslyAccepted = getNormalizedPathSet(proj.files);
+    const liveMembership = hasWorkingSourceSelectionState(proj) && candidates.some(({ evidence }) => evidence.relationshipSourcePath)
+      ? getWorkingSourceMembership(proj) : null;
 
-    for (const { evidence, ext } of candidates) {
+    for (const { evidence, ext, owners: batchOwners = [] } of candidates) {
       const fileEntry = buildAutoCaptureFileEntry(evidence.filePath, evidence.source, { ext });
-      const shouldForcePending = evidence.forcePending === true || (
+      // A link reported for a document the owner excluded (and that no
+      // included file retains) is never admitted directly; record which
+      // documents reported it for every live link, new or existing.
+      const reportedOwners = [evidence.relationshipSourcePath, ...batchOwners].filter(owner => typeof owner === 'string');
+      // Pending only when every reporting document is an excluded working file
+      // that nothing included retains; any other reporter admits as usual.
+      const liveOwnerExcluded = !!liveMembership && reportedOwners.length > 0 && reportedOwners.every(owner => {
+        const ownerRow = proj.files.find(row => !isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.path) === normalizeTrackedFilePath(owner));
+        return isWorkingSourceFile(ownerRow) && isUnretainedExcludedScanSource(liveMembership, ownerRow);
+      });
+      for (const owner of reportedOwners) noteDependencyOwner(fileEntry, owner);
+      const shouldForcePending = liveOwnerExcluded || evidence.forcePending === true || (
         evidence.forcePending !== false &&
         !(evidence.savedEvidence === true && evidence.documentModified !== true)
       );
       const staged = stageLiveObservedFile(proj, fileEntry, {
         forcePending: shouldForcePending,
-        allowDirect: evidence.allowDirect === true,
+        allowDirect: !liveOwnerExcluded && evidence.allowDirect === true,
         appFamily: evidence.appFamily,
         savedEvidence: evidence.savedEvidence === true,
         filesystemSaved: evidence.filesystemSaved === true,
@@ -13821,6 +14123,9 @@ async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], 
       if (staged.evidenceChanged) {
         evidenceChanged = true;
         changed = true;
+      }
+      for (const owner of reportedOwners) {
+        if (noteDependencyOwnerOnRows([...proj.files, ...(proj.pendingFiles || [])], evidence.filePath, owner)) changed = true;
       }
       if (!staged.changed) continue;
       stagedCount++;
@@ -16670,6 +16975,81 @@ async function preparePsdBaselineAcceptance(projectId, filePath, baselineScan, v
 }
 // Preserve the legacy save reconciler's exact retain/replace/remove model,
 // using worker-bound physical outputs for root and layer resources alike.
+// An individual choice on an asset row: per-asset Include or Exclude (marker,
+// content fingerprints or an explicit exclusion key other than Skip All
+// Existing), acceptance, explicit authority, or an unresolved choice review.
+function hasIndividualAssetChoice(project, file, excludedKeys = new Set(project?.excludedAssetKeys || []), memo = {}) {
+  if (!file) return false;
+  // An accept flag counts unless the records prove it was the bulk Include.
+  return file.keptAfterSourceExclusion === true || hasExplicitUserAuthority(file) ||
+    (file.acceptedPending === true && isOwnerKeptAfterSourceExclusion(project, file, memo)) ||
+    isPackageContentFingerprint(file.individualContentInclude) || isPackageContentFingerprint(file.individualContentExclusion) ||
+    file.individualChoiceReview !== undefined ||
+    (excludedKeys.has(getAssetReviewExclusionKey(file)) && !(project?.assetBaseline?.decision === 'skip' && file.assetOrigin === 'existing'));
+}
+// When an asset that carried an individual choice is replaced by rows whose
+// identity cannot be proven, those rows hold packaging until the owner chooses
+// Include or Exclude for each with the per-asset control.
+const INDIVIDUAL_CHOICE_REVIEW_REASONS = new Set(['psd-embedded-restaged', 'presentation-media-changed']);
+function holdIndividualChoiceReview(row, reason) {
+  if (!row || !INDIVIDUAL_CHOICE_REVIEW_REASONS.has(reason)) return false;
+  row.individualChoiceReview = { version: 1, reason };
+  return true;
+}
+function getIndividualChoiceReviewMessage(names) {
+  const shown = names.slice(0, 3).map(name => `“${name}”`).join(', ');
+  return `An asset changed in its working file, so Crate cannot carry your earlier Include or Exclude to it: ${shown}` +
+    `${names.length > 3 ? ` and ${names.length - 3} more` : ''}. Choose Include or Exclude for each to continue packaging.`;
+}
+
+// A rename or reorder inside a legacy PSD restages its logical rows under new
+// identities. A per-asset choice recorded as a content fingerprint follows the
+// same embedded bytes of this same PSD onto the restaged row; changed bytes, or
+// retired rows whose choices for the same bytes disagree, carry nothing.
+function getRestagedEmbeddedPsdChoices(project, isStaleEntry) {
+  const excluded = new Set(project.excludedAssetKeys || []), choices = new Map(), unchosen = new Set();
+  let unproven = false;
+  for (const row of project.files || []) {
+    if (!isStaleEntry(row)) continue;
+    if (!hasIndividualAssetChoice(project, row, excluded)) {
+      if (isPackageContentFingerprint(row.embeddedContentFingerprint)) unchosen.add(row.embeddedContentFingerprint);
+      continue;
+    }
+    const exclusion = excluded.has(getAssetReviewExclusionKey(row)) && isPackageContentFingerprint(row.individualContentExclusion)
+      ? row.individualContentExclusion : null;
+    const fingerprint = exclusion || (isPackageContentFingerprint(row.individualContentInclude) ? row.individualContentInclude : null);
+    // A choice without recorded bytes (or a pending review) has no proof to carry.
+    if (!fingerprint || row.individualChoiceReview !== undefined) { if (hasIndividualAssetChoice(project, row, excluded)) unproven = true; continue; }
+    const choice = exclusion ? 'exclude' : 'include';
+    choices.set(fingerprint, choices.has(fingerprint) && choices.get(fingerprint) !== choice ? 'ambiguous' : choice);
+  }
+  return { choices, unchosen, unproven, size: choices.size + (unproven ? 1 : 0) };
+}
+function carryRestagedEmbeddedPsdChoices(project, restaged, entries, linkedFiles) {
+  const staged = new Map(entries.filter(isScanOnSaveEmbeddedPsdFile).map(entry => [entry.fileId, entry]));
+  const excluded = new Set(project.excludedAssetKeys || []), carried = new Set(), uncarried = [];
+  let changed = false;
+  const accepted = new Set(project.files || []);
+  for (const row of [...(project.files || []), ...(project.pendingFiles || [])]) {
+    const entry = isScanOnSaveEmbeddedPsdFile(row) && staged.get(row.fileId);
+    const data = entry && linkedFiles?.[entry.embeddedIndex]?.data;
+    if (!entry) continue;
+    const fingerprint = data ? getPackageContentFingerprint(data) : null, choice = fingerprint && restaged.choices.get(fingerprint);
+    if (choice === 'exclude') {
+      excluded.add(getAssetReviewExclusionKey(row));
+      row.individualContentExclusion = fingerprint; delete row.individualContentInclude; carried.add(fingerprint); changed = true;
+    } else if (choice === 'include') {
+      row.individualContentInclude = fingerprint; carried.add(fingerprint); changed = true;
+    } else if (!(fingerprint && restaged.unchosen.has(fingerprint)) && accepted.has(row)) uncarried.push(row);
+  }
+  if (changed) project.excludedAssetKeys = [...excluded];
+  // Any choice without a proven successor holds every restaged row it could
+  // have moved to; the owner resolves each with Include or Exclude.
+  const lost = restaged.unproven || [...restaged.choices].some(([fingerprint, choice]) => choice === 'ambiguous' || !carried.has(fingerprint));
+  if (lost) for (const row of uncarried) changed = holdIndividualChoiceReview(row, 'psd-embedded-restaged') || changed;
+  return changed;
+}
+
 function reconcilePsdEmbeddedMembership(project, isStaleEntry) {
   const filesBefore = project.files.length;
   const pendingBefore = (project.pendingFiles || []).length;
@@ -17442,7 +17822,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         assertScanPublicationSource(psdSourceReceipt);
         acceptance?.check(proj);
         workingReconciliation?.apply(proj);
-        const acceptedFiles = [];
+        const acceptedFiles = [], ownerIntentMemo = {};
         let changed = !!workingReconciliation;
         for (const asset of psdAssets) {
           const reconciled = workingReconciliation?.items.find(item => item.asset === asset);
@@ -17482,6 +17862,11 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
               reconciled.previous.assetBaselineSourcePath;
             if (normalizeTrackedFilePath(priorProducer) === normalizeTrackedFilePath(filePath)) {
               fileEntry.assetBaselineSourcePath = filePath;
+            }
+            // Owner intent on the replaced output survives its new path. Carry
+            // only the keep marker; acceptance and authority stay on the old row.
+            if (reconciled.collection === 'files' && isOwnerKeptAfterSourceExclusion(proj, reconciled.previous, ownerIntentMemo)) {
+              fileEntry.keptAfterSourceExclusion = true;
             }
             proj[reconciled.collection].push(fileEntry);
             if (reconciled.collection === 'files') acceptedFiles.push(fileEntry);
@@ -17707,6 +18092,8 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null, ope
           embeddedOriginalName: lf.name || '',
           embeddedIndex,
           fileId: crypto.randomUUID(), // C2: unique key so embedded entries can be individually removed
+          // The object's bytes at this save: proves identity across a later rename or reorder.
+          embeddedContentFingerprint: getPackageContentFingerprint(lf.data),
         });
       }
     }
@@ -17725,7 +18112,15 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null, ope
         normalizeTrackedFilePath(entry.parentPsd || entry.path) === normalizeTrackedFilePath(psdFilePath) &&
         !currentEmbeddedKeys.has(getEmbeddedPsdDedupKey(entry))
       );
+      const restagedChoices = getRestagedEmbeddedPsdChoices(proj, isStaleEmbeddedEntry);
       let changed = reconcilePsdEmbeddedMembership(proj, isStaleEmbeddedEntry);
+      // Rows that keep their identity record their current bytes once.
+      for (const entry of newEntries) {
+        if (entry.source !== 'scan-on-save-embedded') continue;
+        const key = getEmbeddedPsdDedupKey(entry);
+        for (const row of proj.files) if (isScanOnSaveEmbeddedPsdFile(row) && row.embeddedContentFingerprint === undefined &&
+          getEmbeddedPsdDedupKey(row) === key) { row.embeddedContentFingerprint = entry.embeddedContentFingerprint; changed = true; }
+      }
 
       for (const entry of newEntries) {
         const staged = stageLiveObservedFile(proj, entry, {
@@ -17738,6 +18133,7 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null, ope
         }
         changed = true;
       }
+      if (restagedChoices.size) carryRestagedEmbeddedPsdChoices(proj, restagedChoices, newEntries, psd.linkedFiles);
 
       if (changed) {
         proj.files = deduplicateFiles(proj.files);
@@ -17764,13 +18160,75 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null, ope
  * When a presentation is saved (Cmd+S), extract embedded media immediately
  * to a temp dir and add to project.files mid-session. Debounced 2s like PSD.
  */
+// Presentation media identity is its bytes. A save (1) records the
+// presentation as an owner of every media row whose bytes it still contains,
+// and (2) when it admits new media while an earlier media row of the same
+// presentation that carried an individual choice is no longer among its bytes
+// (or the save could not read all media), holds the new rows for an explicit
+// choice: archive member names are not a stable picture identity. Each earlier
+// row raises this once (re-armed when its bytes return).
+function isPresentationMediaRowOf(project, row, presentationPath) {
+  const key = normalizeTrackedFilePath(presentationPath);
+  if (!key || !row || !['scan-on-save-presentation', 'embedded-media'].includes(row.source) || isScanOnSaveEmbeddedPsdFile(row)) return false;
+  const evidence = row.captureEvidence || {};
+  if ([row.assetBaselineSourcePath, evidence.relationshipSourcePath, evidence.sourceDocumentPath, ...(Array.isArray(row.dependencyOwners) ? row.dependencyOwners : [])]
+    .some(value => normalizeTrackedFilePath(value) === key)) return true;
+  const source = (project.files || []).find(file => normalizeTrackedFilePath(file.path) === key && isWorkingSourceFile(file));
+  if (!source) return false;
+  const rowKey = normalizeTrackedFilePath(row.path), verification = getWorkingSourceVerification(project, source);
+  return [...(verification?.requiredReferences || []), ...(verification?.requiredEmbeddedOutputs || []),
+    ...(project.workingFileMediaAttribution?.[getAssetBaselineSourceRecoveryRouteKey(project, source)]?.targets || [])]
+    .some(item => normalizeTrackedFilePath(item?.path) === rowKey);
+}
+// Earlier media rows of this presentation that carried an individual choice
+// and whose bytes are no longer among its media (or could not be confirmed).
+// Content fingerprints recorded on a row for its bytes (independent of the cache file).
+function getRecordedPresentationContentFingerprints(row) {
+  return [row?.presentationContentFingerprint, row?.individualContentExclusion, row?.individualContentInclude].filter(isPackageContentFingerprint);
+}
+// A row's bytes are proven present when its cached bytes or a recorded
+// fingerprint of them are among the presentation's media. Unknown is not present.
+function isPresentationRowBytesPresent(row, state) {
+  const fingerprint = state.rowFingerprints.get(row.path);
+  return (!!fingerprint && state.deckFingerprints.has(fingerprint)) ||
+    getRecordedPresentationContentFingerprints(row).some(value => state.deckContentFingerprints?.has(value));
+}
+function getSupersededPresentationChoiceRows(project, state, stagedPaths = new Set()) {
+  if (!project) return [];
+  const excluded = new Set(project.excludedAssetKeys || []), memo = {};
+  return (project.files || []).filter(row => !stagedPaths.has(row.path) && isPresentationMediaRowOf(project, row, state.presentationPath) &&
+    !isPresentationRowBytesPresent(row, state) && row.presentationChoiceSuperseded === undefined &&
+    hasIndividualAssetChoice(project, row, excluded, memo));
+}
+function applyPresentationMediaOwnership(project, state, stagedPaths) {
+  let changed = false;
+  const superseded = getSupersededPresentationChoiceRows(project, state, stagedPaths);
+  for (const row of project.files || []) {
+    // Only media extracted from a presentation can be this presentation's
+    // media; byte equality never makes a deck the owner of another asset.
+    if (stagedPaths.has(row.path) || !['scan-on-save-presentation', 'embedded-media'].includes(row.source)) continue;
+    const present = isPresentationRowBytesPresent(row, state);
+    if (present) changed = noteDependencyOwner(row, state.presentationPath) || changed;
+    if (present && row.presentationChoiceSuperseded !== undefined && isPresentationMediaRowOf(project, row, state.presentationPath)) {
+      delete row.presentationChoiceSuperseded; changed = true;
+    }
+  }
+  if (!superseded.length || !stagedPaths.size) return changed;
+  for (const row of superseded) row.presentationChoiceSuperseded = { version: 1 };
+  for (const row of project.files) if (stagedPaths.has(row.path)) holdIndividualChoiceReview(row, 'presentation-media-changed');
+  return true;
+}
+
 function scheduleScanOnSavePresentation(projectId, filePath, activationToken = null, operation = null) {
   return scheduleOwnedSaveScan(scanOnSavePresentationTimers, projectId, filePath, activationToken, operation, runScanOnSavePresentation);
 }
 
-async function runScanOnSavePresentation(projectId, presentationPath, activationToken = null, operation = null) {
+async function runScanOnSavePresentation(projectId, presentationPath, activationToken = null, operation = null, { choiceCapture = false } = {}) {
   const ownedOperation = operation || captureProjectOperation(projectId);
-  const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && !!ownedOperation?.current();
+  // `choiceCapture`: the pre-package scan's capture for a deck whose chosen
+  // media changed. It runs in any watch status and changes nothing unless an
+  // earlier individual choice lost its media and new media needs a choice.
+  const isCurrent = () => (choiceCapture || isBoundWatchingActivationCurrent(projectId, activationToken)) && !!ownedOperation?.current();
   const invocationFiles = [];
   let keepInvocationFiles = false;
   try {
@@ -17780,6 +18238,8 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
     const base = path.basename(presentationPath, ext);
     const currentProject = getProjects().find(p => p.id === projectId);
     if (!currentProject || !isAcceptedProjectFilePath(currentProject, presentationPath)) return;
+    if (hasWorkingSourceSelectionState(currentProject) && isUnretainedExcludedScanSource(getWorkingSourceMembership(currentProject),
+      currentProject.files.find(file => normalizeTrackedFilePath(file.path) === normalizeTrackedFilePath(presentationPath)))) return;
 
     // Ensure temp dir exists: ~/.crate/presentation-assets/{projectId}/
     const tempDir = ensurePresentationAssetsDir(projectId);
@@ -17815,6 +18275,11 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
     // cleaned display base. Content identity is the safe cross-save dedupe key.
     const contentFingerprints = new Set();
     const capturedSizes = new Set();
+    // Per-row media bytes and the media this save finds in the presentation.
+    const rowFingerprints = new Map(), deckFingerprints = new Set(), deckContentFingerprints = new Set();
+    let deckIncomplete = false;
+    // A row's cache path stays reserved even if the cached file is missing.
+    const rowCachePaths = new Set(projectFiles.map(file => typeof file?.path === 'string' ? path.resolve(file.path) : null).filter(Boolean));
     if (ext === '.pptx' || ext === '.key') {
       for (const f of projectFiles) {
         const candidateExt = path.extname(f && (f.path || f.name) || '').toLowerCase();
@@ -17839,6 +18304,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
           capturedSizes.add(size);
           const hash = crypto.createHash('md5').update(buf).digest('hex');
           contentFingerprints.add(`${size}:${hash}`);
+          if (typeof f.path === 'string') rowFingerprints.set(f.path, `${size}:${hash}`);
         } catch (e) { /* file may no longer exist */ }
       }
     }
@@ -17913,7 +18379,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
           .replace(/-small(\.[a-z]+)$/i, '$1');
         const baseName = path.basename(cleanedName, path.extname(cleanedName))
           .toLowerCase().replace(/\s+/g, ' ').trim();
-        if (alreadyCapturedBases.has(baseName)) continue;
+        if (alreadyCapturedBases.has(baseName)) { deckIncomplete = true; continue; }
       }
 
       try {
@@ -17931,6 +18397,8 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
           const extractedSize = data.length;
           const extractedHash = crypto.createHash('md5').update(data).digest('hex');
           extractedFingerprint = `${extractedSize}:${extractedHash}`;
+          deckFingerprints.add(extractedFingerprint);
+          deckContentFingerprints.add(getPackageContentFingerprint(data));
           if (extractedPresentationFingerprints.has(extractedFingerprint)) continue;
           if (cacheHasMatchingPresentationMedia(extractedFingerprint)) continue;
           extractedPresentationFingerprints.add(extractedFingerprint);
@@ -17946,7 +18414,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
         // Write to temp dir, handle collisions
         let destPath = path.join(tempDir, outputName);
         let counter = 1;
-        while (fs.existsSync(destPath)) {
+        while (fs.existsSync(destPath) || rowCachePaths.has(path.resolve(destPath))) {
           hardenPresentationCacheFileIfPresent(destPath, tempDir);
           if (ext === '.pptx' || ext === '.key') {
             try {
@@ -17995,11 +18463,17 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
       }
     }
 
+    const mediaState = { presentationPath, rowFingerprints, deckFingerprints, deckContentFingerprints, complete: !deckIncomplete && !displayScanFailed };
+    if (choiceCapture && (newEntries.length === 0 || !getSupersededPresentationChoiceRows(getProjects().find(item => item.id === projectId), mediaState).length)) return;
     if (newEntries.length === 0) {
       const current = getProjects().find(proj => proj.id === projectId);
-      if (isCurrent() && !displayScanFailed && current && displayAttribution.next(current)) {
-        const result = mutateProject(projectId, proj => ({ changed: isCurrent() && displayAttribution.publish(proj) }),
-          { persistIfChanged: true, trustResultChanged: true });
+      const attribute = isCurrent() && !displayScanFailed && current && displayAttribution.next(current);
+      if (isCurrent() && current && (attribute || applyPresentationMediaOwnership(structuredClone(current), mediaState, new Set()))) {
+        const result = mutateProject(projectId, proj => {
+          if (!isCurrent()) return { changed: false };
+          const attributed = attribute ? displayAttribution.publish(proj) : false;
+          return { changed: applyPresentationMediaOwnership(proj, mediaState, new Set()) || attributed };
+        }, { persistIfChanged: true, trustResultChanged: true });
         if (result?.changed) sendToRenderer('project:updated', { projectId });
       }
       return;
@@ -18008,15 +18482,18 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
 
     const result = mutateProject(projectId, (proj) => {
       if (!isCurrent()) return null;
+      if (choiceCapture && !getSupersededPresentationChoiceRows(proj, mediaState).length) return null;
       if (!displayScanFailed) displayAttribution.publish(proj);
       let changed = false;
 
       for (const entry of newEntries) {
         const { internalPath, presentationPath: sourcePresentationPath, ...fileEntry } = entry;
+        noteDependencyOwner(fileEntry, sourcePresentationPath);
         const staged = stageLiveObservedFile(proj, fileEntry, {
           relationshipSourcePath: sourcePresentationPath,
           appFamily: getPrimaryDesignAppFamilyForExt(path.extname(sourcePresentationPath)) || 'generic',
           reason: 'scan-on-save-presentation',
+          ...(choiceCapture ? { allowDirect: true, forcePending: false } : {}),
         });
         if (!staged.changed) continue;
         if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
@@ -18031,6 +18508,8 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
         changed = true;
       }
 
+      const stagedPaths = new Set(newEntries.map(entry => entry.path).filter(entryPath => proj.files.some(row => row.path === entryPath)));
+      if (applyPresentationMediaOwnership(proj, mediaState, stagedPaths)) changed = true;
       if (changed) proj.files = deduplicateFiles(proj.files);
       return changed ? { files: proj.files, pendingFiles: proj.pendingFiles || [] } : null;
     });
@@ -18658,6 +19137,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
           let currentType = null;
           const LINKABLE_EXTS_SNAPSHOT = new Set(['.ai', '.indd', '.idml', '.psd', '.pdf', '.afdesign', '.afpub', '.afphoto']);
           const linkableForParse = [];
+          const snapshotMembership = hasWorkingSourceSelectionState(project) ? getWorkingSourceMembership(project) : null;
 
           for (const line of lsofOut.trim().split('\n')) {
             if (line.length === 0) continue;
@@ -18712,7 +19192,8 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
             }
 
             if (sourceAcceptedBefore) {
-              if (LINKABLE_EXTS_SNAPSHOT.has(ext)) {
+              const acceptedRow = project.files.find(row => !isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.path) === normalizedFilePath);
+              if (LINKABLE_EXTS_SNAPSHOT.has(ext) && !(snapshotMembership && isUnretainedExcludedScanSource(snapshotMembership, acceptedRow))) {
                 linkableForParse.push({
                   path: filePath,
                   name: path.basename(filePath),
@@ -18769,10 +19250,14 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
                 while ((match = LINKED_ASSET_REGEX_SNAPSHOT.exec(content)) !== null) {
                   const linkedPath = match[0];
                   const normalizedLinkedPath = normalizeTrackedFilePath(linkedPath);
-                  if (existingPaths.has(normalizedLinkedPath) || pendingPaths.has(normalizedLinkedPath)) continue;
+                  if (existingPaths.has(normalizedLinkedPath) || pendingPaths.has(normalizedLinkedPath)) {
+                    if (noteDependencyOwnerOnRows([...project.files, ...(project.pendingFiles || [])], linkedPath, designFile.path)) snapshotChanged = true;
+                    continue;
+                  }
                   if (!fs.existsSync(linkedPath)) continue;
 
                   const fileEntry = buildAutoCaptureFileEntry(linkedPath, 'linked-asset');
+                  noteDependencyOwner(fileEntry, designFile.path);
                   const staged = stageLiveObservedFile(project, fileEntry, {
                     relationshipSourcePath: designFile.path,
                     appFamily: getExplicitCaptureAppFamily(designFile) || 'generic',
@@ -19499,14 +19984,27 @@ registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileI
       if (exclusionKey) {
         const priorExclusions = new Set(project.excludedAssetKeys || []);
         const fingerprint = getAssetReviewContentFingerprint(removedFile);
-        if (isAssetReviewFileExcluded(project, removedFile)) {
-          priorExclusions.delete(exclusionKey);
-          delete removedFile.individualContentExclusion;
-          if (fingerprint) removedFile.individualContentInclude = fingerprint;
+        // An asset withheld with its explicitly excluded working file presents
+        // as Excluded; Include records the owner's choice on the row itself.
+        const fact = hasWorkingSourceSelectionState(project)
+          ? getWorkingSourceMembership(project).facts.get(getTrackedFileDedupKey(removedFile)) : null;
+        const withheld = fact?.excludedSourceOnly === true && fact.included !== true;
+        const reviewExcluded = isAssetReviewFileExcluded(project, removedFile);
+        // An explicit per-asset choice resolves a pending choice review.
+        delete removedFile.individualChoiceReview;
+        if (reviewExcluded || withheld) {
+          if (reviewExcluded) {
+            priorExclusions.delete(exclusionKey);
+            delete removedFile.individualContentExclusion;
+            if (fingerprint) removedFile.individualContentInclude = fingerprint;
+          }
+          if (fact?.excludedSourceOnly === true) removedFile.keptAfterSourceExclusion = true;
         } else {
           priorExclusions.add(exclusionKey);
           delete removedFile.individualContentInclude;
           if (fingerprint) removedFile.individualContentExclusion = fingerprint;
+          delete removedFile.keptAfterSourceExclusion;
+          delete removedFile.existingIncludeEpisode;
         }
         project.excludedAssetKeys = [...priorExclusions];
         changed = true;
@@ -19863,7 +20361,11 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   }
   const operation = captureProjectOperation(projectId); if (!operation) return null;
   const operationCurrent = operation.current;
-  const ordinaryPsdOutputBatches = [];
+  const ordinaryPsdOutputBatches = [], ownerNotes = [];
+  const scanSkipper = scanProject => {
+    const membership = hasWorkingSourceSelectionState(scanProject) ? getWorkingSourceMembership(scanProject) : null;
+    return file => !!membership && isUnretainedExcludedScanSource(membership, file);
+  };
   const stagePrePackageFile = (project, file, observation, stageIndex = null) => {
     if (!operationCurrent()) return null;
     const staged = stageLiveObservedFile(project, file, observation, stageIndex);
@@ -20295,7 +20797,9 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   // Works even when Photoshop is not running.
   try {
     const psdFiles = project.files.filter(f => f.ext === '.psd');
+    const skipPsd = scanSkipper(project);
     for (const psdFile of psdFiles) {
+      if (skipPsd(psdFile)) continue;
       if (!fs.existsSync(psdFile.path)) continue;
       const psdAssets = await extractPsdAssets(psdFile.path, projectId, operationCurrent, {
         onOrdinaryPsdOutputs: outputs => ordinaryPsdOutputBatches.push(outputs),
@@ -20303,9 +20807,10 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
       if (!operationCurrent()) return;
       for (const asset of psdAssets) {
         const normalizedAssetPath = normalizeTrackedFilePath(asset.filePath);
-        if (existingPaths.has(normalizedAssetPath) || pendingPaths.has(normalizedAssetPath)) continue;
+        if (existingPaths.has(normalizedAssetPath) || pendingPaths.has(normalizedAssetPath)) { ownerNotes.push([asset.filePath, psdFile.path]); continue; }
         const fileEntry = buildAutoCaptureFileEntry(asset.filePath, asset.source);
         if (asset.psdExtractionReceipt) fileEntry.psdExtractionReceipt = asset.psdExtractionReceipt;
+        noteDependencyOwner(fileEntry, psdFile.path);
         const staged = stagePrePackageFile(project, fileEntry, {
           relationshipSourcePath: psdFile.path,
           appFamily: 'photoshop',
@@ -20414,9 +20919,11 @@ end tell`;
   const linkableFiles = project.files.filter(f => LINKABLE_EXTENSIONS.has(f.ext));
   if (linkableFiles.length > 0) {
     const linkExisting = getNormalizedPathSet(project.files);
+    const skipLinkable = scanSkipper(project);
 
     for (const designFile of linkableFiles) {
       try {
+        if (skipLinkable(designFile)) continue;
         if (!fs.existsSync(designFile.path)) continue;
         const buf = await fs.promises.readFile(designFile.path);
         if (!operationCurrent()) return null;
@@ -20427,16 +20934,17 @@ end tell`;
           const linkedPath = match[0];
           if (isAutoCaptureExcludedPath(linkedPath)) continue;
           const normalizedLinkedPath = normalizeTrackedFilePath(linkedPath);
-          if (linkExisting.has(normalizedLinkedPath) || pendingPaths.has(normalizedLinkedPath)) continue;
+          if (linkExisting.has(normalizedLinkedPath) || pendingPaths.has(normalizedLinkedPath)) { ownerNotes.push([linkedPath, designFile.path]); continue; }
           if (!fs.existsSync(linkedPath)) continue;
 
           const fileEntry = buildAutoCaptureFileEntry(linkedPath, 'linked-asset');
+          noteDependencyOwner(fileEntry, designFile.path);
           const staged = stagePrePackageFile(project, fileEntry, {
             relationshipSourcePath: designFile.path,
             appFamily: getExplicitCaptureAppFamily(designFile) || 'generic',
             reason: 'pre-package-linked-regex',
           });
-          if (!staged || !staged.changed) continue;
+          if (!staged || !staged.changed) { ownerNotes.push([linkedPath, designFile.path]); continue; }
           if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
             linkExisting.add(normalizedLinkedPath);
             existingPaths.add(normalizedLinkedPath);
@@ -20461,8 +20969,10 @@ end tell`;
   try {
     const existingPathsCheck = getNormalizedPathSet(project.files);
     let doubleCheckCount = 0;
+    const skipDoubleCheck = scanSkipper(project);
     for (const file of project.files.slice()) {
       if (!SCAN_ON_OPEN_EXTENSIONS.has(file.ext)) continue;
+      if (skipDoubleCheck(file)) continue;
       try {
         if (!fs.existsSync(file.path)) continue;
         const linkedPaths = await extractLinkedAssets(file.path);
@@ -20470,7 +20980,7 @@ end tell`;
         for (const lp of linkedPaths) {
           if (isAutoCaptureExcludedPath(lp)) continue;
           const normalizedLinkedPath = normalizeTrackedFilePath(lp);
-          if (existingPathsCheck.has(normalizedLinkedPath) || pendingPaths.has(normalizedLinkedPath)) continue;
+          if (existingPathsCheck.has(normalizedLinkedPath) || pendingPaths.has(normalizedLinkedPath)) { ownerNotes.push([lp, file.path]); continue; }
           if (!lp.startsWith('/Users/')) continue;
           const lpExt = path.extname(lp).toLowerCase();
           if (!DESIGN_FILE_EXTENSIONS.has(lpExt)) continue;
@@ -20478,6 +20988,7 @@ end tell`;
           const fileEntry = buildAutoCaptureFileEntry(lp, 'pre-package-doublecheck', {
             ext: lpExt,
           });
+          noteDependencyOwner(fileEntry, file.path);
           const staged = stagePrePackageFile(project, fileEntry, {
             relationshipSourcePath: file.path,
             appFamily: getExplicitCaptureAppFamily(file) || 'generic',
@@ -20555,6 +21066,7 @@ end tell`;
       for (const outputs of ordinaryPsdOutputBatches) {
         retainReferencedPsdOutputs(outputs, proj);
       }
+      for (const [assetPath, ownerPath] of ownerNotes) noteDependencyOwnerOnRows([...proj.files, ...(proj.pendingFiles || [])], assetPath, ownerPath);
       return { files: proj.files };
     }, { packageStageContext: true });
     if (!operationCurrent()) return null;
@@ -20563,6 +21075,18 @@ end tell`;
       clearFileVisualProjectCache(projectId);
     }
   }
+
+  if (newCount === 0 && ownerNotes.length > 0 && operationCurrent()) {
+    const noted = mutateProject(projectId, proj => {
+      if (!operationCurrent()) return null;
+      let changed = false;
+      for (const [assetPath, ownerPath] of ownerNotes) changed = noteDependencyOwnerOnRows([...proj.files, ...(proj.pendingFiles || [])], assetPath, ownerPath) || changed;
+      return { changed };
+    }, { persistIfChanged: true, trustResultChanged: true });
+    if (noted?.changed) clearFileVisualProjectCache(projectId);
+  }
+
+  if (await captureChoiceChangedPresentations(projectId, operation) === null) return null;
 
   // Figma authoritative recovery pass for package-time scan.
   // Keeps local lsof/.fig heuristics as-is and supplements with cloud originals.
@@ -21653,7 +22177,8 @@ async function buildAuthoritativePackagePlan(
   entries,
   packageSettings,
   destinationFolderName,
-  presentationSuppression = { fingerprints: [], nameBases: [], occurrences: [] }
+  presentationSuppression = { fingerprints: [], nameBases: [], occurrences: [] },
+  onPresentationMedia = null
 ) {
   const layoutMode = normalizePackageOutputLayoutMode(packageSettings.outputLayoutMode);
   const outputAllocator = createAuthoritativePackageOutputAllocator(layoutMode);
@@ -21773,6 +22298,7 @@ async function buildAuthoritativePackagePlan(
     await extractEmbeddedMedia(files[entryIndex].path, null, files, {
       planOnly: true,
       failClosed: true,
+      ...(onPresentationMedia ? { onCandidate: candidate => onPresentationMedia(entryIndex, candidate.contentFingerprint) } : {}),
       dedupFingerprints,
       dedupNameBases,
       suppressedOccurrences,
@@ -21803,6 +22329,53 @@ async function buildAuthoritativePackagePlan(
     deterministicDerivedOutputs,
     diagnosticsMetadata,
   };
+}
+
+// A selected presentation with an individually chosen media row: if that media
+// changed while Crate was not capturing it, list the new media now (held for the
+// owner's choice). Other presentations are not read. Used by the pre-package scan
+// and before review planning, so a refusal always names rows the per-asset
+// control can act on. Returns null when the operation is no longer current.
+async function captureChoiceChangedPresentations(projectId, operation) {
+  try {
+    const latest = getProjects().find(item => item.id === projectId);
+    const membership = latest && hasWorkingSourceSelectionState(latest) ? getWorkingSourceMembership(latest) : null;
+    const excludedKeys = new Set(latest?.excludedAssetKeys || []);
+    const decks = (latest?.files || []).filter(file => ['.pptx', '.key'].includes(path.extname(file.path || '').toLowerCase()) &&
+      isWorkingSourceFile(file) && !(membership && (isUnretainedExcludedScanSource(membership, file) ||
+        membership.facts.get(getTrackedFileDedupKey(file))?.included === false)) &&
+      latest.files.some(row => row.presentationChoiceSuperseded === undefined && isPresentationMediaRowOf(latest, row, file.path) &&
+        hasIndividualAssetChoice(latest, row, excludedKeys)));
+    for (const deck of decks) {
+      if (!operation?.current()) return null;
+      await runScanOnSavePresentation(projectId, deck.path, null, operation, { choiceCapture: true });
+    }
+  } catch (_) { /* review planning fails closed on the same condition */ }
+  return true;
+}
+
+// The deck has an earlier media row with an individual choice whose bytes it no
+// longer contains, and the plan would write media that no row represents.
+// Bytes are identity (package content fingerprints); nothing else is.
+function getUnchosenChangedPresentationOutputs(project, files, plan, mediaByEntry) {
+  const names = [], entryIndexes = new Set(), excluded = new Set(project?.excludedAssetKeys || []);
+  for (const generator of plan?.deterministicDerivedOutputs || []) {
+    if (generator.materialization !== 'presentation-media' || !generator.expectedOutputs.length) continue;
+    const deck = files[generator.sourceEntryIndex], current = mediaByEntry.get(generator.sourceEntryIndex) || new Set();
+    const memo = {};
+    const lost = (project.files || []).some(row => {
+      // A row already superseded raised its hold; once that hold is resolved it is not lost again.
+      if (row.presentationChoiceSuperseded !== undefined) return false;
+      if (!isPresentationMediaRowOf(project, row, deck.path) || !hasIndividualAssetChoice(project, row, excluded, memo)) return false;
+      const known = getRecordedPresentationContentFingerprints(row);
+      try { known.push(getPackageContentFingerprint(fs.readFileSync(row.path))); } catch (_) { /* recorded fingerprints decide */ }
+      return !known.some(value => current.has(value));
+    });
+    if (!lost) continue;
+    entryIndexes.add(generator.sourceEntryIndex);
+    for (const output of generator.expectedOutputs) names.push(sanitizeRendererSourceName(output.outputName) || 'Media');
+  }
+  return { names, entryIndexes };
 }
 
 function getRelevantPackageReviewSettings() {
@@ -21951,6 +22524,16 @@ async function buildCanonicalPackageReviewManifest(projectId) {
         materializable: false,
       };
     }
+    // An asset whose earlier individual choice could not be carried to it.
+    if (membership.choiceReviewNames.length > 0) {
+      const held = new Set(files.filter(file => file.individualChoiceReview !== undefined).map(getTrackedFileDedupKey));
+      return {
+        project: currentProject, files, entries,
+        entryStatuses: entryStatuses.map((status, index) => held.has(getTrackedFileDedupKey(files[index])) ? 'unavailable' : status),
+        reviewedInputSignature, reviewedSettingsKey: packageSettingsKey, materializable: false,
+        packageMessage: getIndividualChoiceReviewMessage(membership.choiceReviewNames),
+      };
+    }
     const unavailableOutputs = getUnsatisfiedWorkingPsdOutputEntries(currentProject, membership, files, entries);
     if (unavailableOutputs.size > 0) return {
       project: currentProject, files, entries,
@@ -21967,13 +22550,18 @@ async function buildCanonicalPackageReviewManifest(projectId) {
       packageMessage: 'A working file requires an excluded asset. Restore the asset or exclude that working file.',
     };
     let plan;
+    const presentationMediaByEntry = new Map();
     try {
       plan = await buildAuthoritativePackagePlan(
         files,
         entries,
         packageSettings,
         getReviewedPackageFolderName(currentProject, packageSettings),
-        getSkippedExistingPresentationMediaSuppression(currentProject)
+        getSkippedExistingPresentationMediaSuppression(currentProject),
+        (entryIndex, fingerprint) => {
+          if (!presentationMediaByEntry.has(entryIndex)) presentationMediaByEntry.set(entryIndex, new Set());
+          presentationMediaByEntry.get(entryIndex).add(fingerprint);
+        }
       );
     } catch (error) {
       if (error instanceof PackageReviewChangedError) {
@@ -21988,6 +22576,15 @@ async function buildCanonicalPackageReviewManifest(projectId) {
       }
       throw error;
     }
+    // A presentation whose individually chosen media changed while Crate was
+    // not capturing it would write new media nobody chose for: fail closed.
+    const unchosenOutputs = getUnchosenChangedPresentationOutputs(currentProject, files, plan, presentationMediaByEntry);
+    if (unchosenOutputs.names.length) return {
+      project: currentProject, files, entries,
+      entryStatuses: entryStatuses.map((status, index) => unchosenOutputs.entryIndexes.has(index) ? 'unavailable' : status),
+      reviewedInputSignature, reviewedSettingsKey: packageSettingsKey, materializable: false,
+      packageMessage: 'A presentation changed while Crate was not capturing it, and Crate could not list its new media. Open Package Review again; Crate lists them so you can choose Include or Exclude for each.',
+    };
     const finalProject = getProjects().find(item => item && item.id === projectId);
     if (!finalProject || inputSignature !== getPackageSelectionInputSignature(finalProject)) continue;
     if (packageSettingsKey !== JSON.stringify(getRelevantPackageReviewSettings())) continue;
@@ -22122,7 +22719,7 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
   const diskCurrent = currentProject && diskInput === captureWorkingSourcePresentationDiskInput(manifest.files,
     getWorkingSourceMembership(currentProject, manifest.files)) && manifest.entries.every((entry, index) =>
       packageReviewFingerprintsMatch(entry.sourceFingerprint, getPackageReviewManifestEntry(manifest.files[index]).sourceFingerprint));
-  if (!isPackageReviewAuthorizationCurrent(accountAuthorization) || membership.blocked || !diskCurrent || !inputSignature || inputSignature !== getPackageSelectionInputSignature(currentProject, true) ||
+  if (!isPackageReviewAuthorizationCurrent(accountAuthorization) || membership.blocked || membership.choiceReviewNames.length > 0 || !diskCurrent || !inputSignature || inputSignature !== getPackageSelectionInputSignature(currentProject, true) ||
       settingsKey !== JSON.stringify(getRelevantPackageReviewSettings()) ||
       packageReviewSnapshots.get(token) !== snapshot || currentPackageReviewTokenByProject.get(projectId) !== token ||
       snapshot.expiresAt <= Date.now()) {
@@ -22266,6 +22863,13 @@ registerTrustedIpcHandler('projects:prepare-package-review', async (event, proje
   if (packageInFlight) return { error: 'package_in_flight' };
   const reviewStartedAt = Date.now();
   if (!isPackageReviewAuthorizationCurrent(accountAuthorization)) return { error: 'package_review_changed' };
+  // List media of a changed presentation whose earlier choice it lost, so the
+  // review names held rows (never media without a row).
+  const captureOperation = captureProjectOperation(projectId);
+  if (captureOperation) {
+    try { await captureChoiceChangedPresentations(projectId, captureOperation); } finally { captureOperation.close(); }
+  }
+  if (packageInFlight) return { error: 'package_in_flight' };
   const manifest = await buildCanonicalPackageReviewManifest(projectId);
   if (manifest.error) {
     if (['working_source_continuation_choice_required', 'working_file_choice_required'].includes(manifest.error)) {

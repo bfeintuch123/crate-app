@@ -3508,7 +3508,9 @@ test('PowerPoint scan-on-save extraction records media provenance without ledger
     let fresh = captured.result;
     const extracted = fresh.files.find(file => file.source === 'scan-on-save-presentation');
     assert.ok(extracted);
-    assert.deepEqual(Object.keys(extracted).sort(), ['addedAt', 'assetOrigin', 'ext', 'name', 'path', 'projectRole', 'source']);
+    // The presentation is recorded as the media's owner (excluded-source membership).
+    assert.deepEqual(Object.keys(extracted).sort(), ['addedAt', 'assetOrigin', 'dependencyOwners', 'ext', 'name', 'path', 'projectRole', 'source']);
+    assert.equal(extracted.dependencyOwners.length, 1); assert.match(extracted.dependencyOwners[0], /\.(pptx|key)$/);
     assert.equal(extracted.assetOrigin, 'added');
     assert.equal(extracted.projectRole, 'asset');
     assert.equal(extracted.name, 'Deck — image1.jpeg');
@@ -4649,6 +4651,7 @@ function expectedDormantWorkingSourceFacts(role) {
     selectionRevision: role === 'source' ? 0 : null,
     includedAsDependency: false,
     included: true,
+    excludedSourceOnly: false,
     effectiveRole: role,
     verificationStatus: 'unavailable',
     verificationRequired: false,
@@ -10201,7 +10204,9 @@ test('Keynote scan-on-save extraction records Data media provenance without ledg
     let fresh = captured.result;
     const extracted = fresh.files.find(file => file.source === 'scan-on-save-presentation');
     assert.ok(extracted);
-    assert.deepEqual(Object.keys(extracted).sort(), ['addedAt', 'assetOrigin', 'ext', 'name', 'path', 'projectRole', 'source']);
+    // The presentation is recorded as the media's owner (excluded-source membership).
+    assert.deepEqual(Object.keys(extracted).sort(), ['addedAt', 'assetOrigin', 'dependencyOwners', 'ext', 'name', 'path', 'projectRole', 'source']);
+    assert.equal(extracted.dependencyOwners.length, 1); assert.match(extracted.dependencyOwners[0], /\.(pptx|key)$/);
     assert.equal(extracted.assetOrigin, 'added');
     assert.equal(extracted.projectRole, 'asset');
     assert.equal(extracted.name, 'Deck — photo.jpeg');

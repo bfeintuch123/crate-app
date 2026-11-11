@@ -426,6 +426,25 @@ for (const origin of ['existing', 'added']) test(`${origin} required override ag
   assert.match(excludedRow.className, /is-excluded/);
 });
 
+test('an asset withheld with its excluded working file presents as Excluded with the Include action', () => {
+  const f = setup();
+  const asset = { name: 'Withheld.png', ext: '.png', visualIdentity: 'withheld', projectRole: 'asset', assetOrigin: 'existing',
+    excluded: false, included: false, includedAsDependency: false, excludedSourceOnly: true, requiredBy: [] };
+  f.workspace.files.push(asset); Object.assign(f.workspace.semanticCounts, { includedAssets: 0, excludedAssets: 1 });
+  f.renderer.renderAssetWorkspace(f.project, {}, f.workspace.files);
+  const list = f.elements['existing-assets-list'];
+  const filter = value => { f.renderer.selectedFilter = value; vm.runInContext('state.assetReviewFilter = selectedFilter', f.renderer); f.renderer.applyAssetReviewFilter(); };
+  filter('existing'); assert.equal(list.__assetReviewVirtualState.items.length, 0);
+  filter('excluded'); assert.equal(list.__assetReviewVirtualState.items.length, 1);
+  assert.equal(f.elements['filter-count-excluded'].textContent, '1');
+  const row = list.children.find(child => /Withheld.png/.test(getElementTreeText(child)));
+  assert.ok(row); assert.match(row.className, /is-excluded/);
+  assert.match(getElementTreeText(row), /Excluded/);
+  assert.equal(buttonFor(row, 'Required asset'), undefined);
+  const include = descendants(row).find(child => child.tagName === 'BUTTON' && child.title === 'Include Withheld.png');
+  assert.ok(include, 'the existing Include action is offered');
+});
+
 test('effective asset filters preserve excluded working-source intent and legacy fallback', () => {
   const f = setup({ sourceSelection: 'excluded', included: true, includedAsDependency: true, effectiveRole: 'asset' });
   const legacy = { name: 'Legacy.png', visualIdentity: 'legacy', assetOrigin: 'added', excluded: true };

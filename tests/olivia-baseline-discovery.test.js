@@ -37,10 +37,16 @@ replaceExactlyOnce('const fixture = structuredClone(currentPsdFixture);',
 replaceExactlyOnce('                  psd: fixture,',
   "                  psd: fixture || originalLoad.call(Module, 'ag-psd/dist/index.js', module).readPsd(fs.readFileSync(filePath), { skipLayerImageData: true, skipCompositeImageData: true }),\n" +
   "                  framing: fixture ? undefined : require('../parsers/add-files-psd-worker').inspectPsdLinkFraming(fs.readFileSync(filePath)),");
+// The main-process ag-psd boundary: a function fixture sees the bytes read; a
+// test can opt in to decoding the actual bytes for the PSD it wrote.
+replaceExactlyOnce("  readPsd: () => {\n    if (currentPsdFixture instanceof Error) throw currentPsdFixture;\n    if (typeof currentPsdFixture === 'function') return currentPsdFixture();",
+  "  readPsd: (buffer, options) => {\n    if (globalThis.__crateRealMainPsdBytes && currentPsdFixture === 'actual-source-buffer' && Buffer.isBuffer(buffer)) return originalLoad.call(Module, 'ag-psd/dist/index.js', module).readPsd(buffer, options);\n    if (currentPsdFixture instanceof Error) throw currentPsdFixture;\n    if (typeof currentPsdFixture === 'function') return currentPsdFixture(buffer);");
+// Locator refresh for proven renames, as in the working-file choice suite.
+replaceExactlyOnce('  captureProjectOperation,\n  runScanOnOpen', '  applyLiveAppEvidenceRefresh, refreshWorkingSourceLocators,\n  captureProjectOperation,\n  runScanOnOpen');
 const compiled = new Module(harnessPath, module);
 compiled.filename = harnessPath;
 compiled.paths = Module._nodeModulePaths(__dirname);
-compiled._compile(harness + '\n(' + baselineCases.toString() + ')();\n', harnessPath);
+compiled._compile(harness + '\n(' + baselineCases.toString() + ')();\n(' + excludedSourceMembershipCases.toString() + ')();\n', harnessPath);
 
 function baselineCases() {
   // V29 drives trusted account IPC into the real AccountSession.cancel and
@@ -2461,15 +2467,23 @@ function baselineCases() {
       assert.deepEqual(fs.readFileSync(f.paths[0].source), sourceBytes);
       assert.equal((await callIpcRaw('projects:package', f.project.id, TEST_HOME, previousReview.token)).error,
         'package_review_stale');
+      // The link was captured only as this excluded file's dependency and was
+      // admitted without owner intent (no flag, marker, Include or acceptance
+      // record), so it is withheld and nothing selected cannot issue.
+      const excludedProject = storeInstance.data.projects.find(p => p.id === f.project.id);
+      assertNoOwnerIntent(excludedProject, excludedProject.files.find(file => file.name === 'Link_0.png'));
       const assetOnly = await callIpcRaw('projects:prepare-package-review', f.project.id);
-      assert.equal(assetOnly.materializable, true);
-      assert.deepEqual(assetOnly.files.map(file => file.name), ['Link_0.png']);
+      assert.equal(assetOnly.materializable, false);
+      assert.deepEqual(assetOnly.files.map(file => file.name), []);
       assert.equal(assetOnly.semanticCounts.selectedWorkingSources, 0);
       assert.equal(assetOnly.semanticCounts.excludedWorkingSources, 1);
-      assert.equal(assetOnly.semanticCounts.includedAssets, 1);
+      assert.equal(assetOnly.semanticCounts.includedAssets, 0);
+      assert.equal(assetOnly.semanticCounts.excludedAssets, 1);
+      // Include All Existing while it is withheld keeps it for this exclusion.
       await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include');
       roundTripFakeStore();
       let current = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      assert.equal(current.files.find(file => file.name === 'Link_0.png').included, true);
       assert.equal(current.files.find(file => file.name === 'Design_0.ai').selectionReason, 'user-excluded');
       const stored = storeInstance.data.projects.find(p => p.id === f.project.id);
       const source = stored.files.find(file => file.path === f.paths[0].source);
@@ -2481,7 +2495,8 @@ function baselineCases() {
       const readmitted = current.files.find(file => file.name === 'Design_0.ai');
       assert.equal(readmitted.sourceSelection, 'excluded');
       assert.equal(readmitted.selectionReason, 'user-excluded');
-      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).files.length, 1);
+      // Re-admission of the same path keeps the same selection and exclusion.
+      assert.deepEqual((await callIpcRaw('projects:prepare-package-review', f.project.id)).files.map(file => file.name), ['Link_0.png']);
       const restored = await callIpcRaw('projects:set-working-source-selection', f.project.id, readmitted.visualIdentity,
         { action: 'restore', expectedRevision: readmitted.selectionRevision });
       assert.equal(restored.success, true);
@@ -3337,6 +3352,10 @@ function baselineCases() {
         assert.equal(f.current().workingSourceSelections?.[logicalKey], undefined);
         assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id,
           root.visualIdentity, { action: 'exclude', expectedRevision: 0 })).success, true);
+        // Accepted through production accept-pending, the child keeps owner
+        // intent although it reads only the explicitly excluded parent.
+        child = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(row => row.name === logical.name);
+        assert.equal(child.included, true); assert.equal(child.excludedSourceOnly, true);
         // Asset exclusion is independent of source intent. A hidden logical row
         // must not intercept the physical parent's Restore scan by shared path.
         await callIpcRaw('projects:remove-file', f.project.id, child.visualIdentity);
@@ -3438,6 +3457,374 @@ function baselineCases() {
         storeInstance.get = originalStoreGet;
         fs.rmSync(privateTmp, { recursive: true, force: true }); clearTrackedTimers(); },
     };
+  }
+
+  // A PSD with distinct embedded PNG outputs, a link shared with a kept .ai and
+  // a PSD-only link. Exclude must leave the PSD-only closure out of the package.
+  async function excludedPsdAssetsFixture(outputCount = 6) {
+    const zlib = require('zlib');
+    const chunk = (type, data) => { const body = Buffer.concat([Buffer.from(type), data]); const out = Buffer.alloc(8 + data.length + 4);
+      out.writeUInt32BE(data.length, 0); body.copy(out, 4); out.writeUInt32BE(zlib.crc32(body) >>> 0, 8 + data.length); return out; };
+    const png = value => Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+      chunk('IHDR', Buffer.from([0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0])),
+      chunk('IDAT', zlib.deflateSync(Buffer.from([0, value]))), chunk('IEND', Buffer.alloc(0))]);
+    const desk = name => path.join(TEST_HOME, 'Desktop', name);
+    const link = (id, name) => ({ id, name, childDocumentID: '', linkedFile: { fileSize: 1, name, fullPath: desk(name), originalPath: '', relativePath: '' } });
+    const outputNames = Array.from({ length: outputCount }, (_, i) => 'Layer-' + String(i).padStart(2, '0') + '.png');
+    const outputs = outputNames.map((name, i) => ({ id: '33333333-3333-4333-8333-' + String(i).padStart(12, '0'), name, data: png(i) }));
+    const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+    resetTestHomeWorkspace(); setChildProcessHandler(() => ({ stdout: '' }));
+    const created = await createProject('Excluded PSD assets'); clearTrackedTimers();
+    const current = () => storeInstance.data.projects.find(p => p.id === created.id);
+    for (const [name, value] of [['Shared.png', 201], ['PsdOnly.png', 202], ['AiOnly.png', 203]]) fs.writeFileSync(desk(name), png(value));
+    const psdPath = desk('Art.psd'), aiPath = desk('Poster.ai');
+    fs.writeFileSync(psdPath, actual.writePsdBuffer({ width: 1, height: 1, children: [], linkedFiles: [...outputs,
+      link('44444444-4444-4444-8444-444444444441', 'Shared.png'), link('44444444-4444-4444-8444-444444444442', 'PsdOnly.png')] }));
+    fs.writeFileSync(aiPath, '%PDF-1.7\n' + desk('Shared.png') + '\n' + desk('AiOnly.png') + '\n%%EOF\n');
+    const originalStoreGet = storeInstance.get;
+    storeInstance.get = function clonedStoreGet(...args) {
+      const value = originalStoreGet.apply(this, args);
+      return value === undefined ? value : JSON.parse(JSON.stringify(value));
+    };
+    const originalTmpdir = os.tmpdir;
+    const privateTmp = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'excluded-psd-assets-'));
+    os.tmpdir = () => privateTmp;
+    currentPsdFixture = 'actual-source-buffer';
+    const cleanup = () => { currentPsdFixture = { children: [], linkedFiles: [] }; os.tmpdir = originalTmpdir;
+      storeInstance.get = originalStoreGet; fs.rmSync(privateTmp, { recursive: true, force: true }); clearTrackedTimers(); };
+    try {
+      for (const filePath of [psdPath, aiPath]) {
+        manualDialogFor([filePath]); await callIpcRaw('projects:add-files', created.id);
+        if (current().assetBaseline.status === 'decision-required') await callIpcRaw('projects:set-existing-assets-decision', created.id, 'include');
+      }
+      for (let round = 0; round < 6; round++) {
+        const pending = (await callIpcRaw('projects:get-asset-workspace', created.id)).workingFileChoices?.choices || [];
+        if (!pending.length) break;
+        for (const entry of pending) {
+          assert.equal((await callIpcRaw('projects:resolve-working-file-choice', created.id,
+            { id: entry.id, revision: entry.revision, choice: 'keep-both', predecessorIdentity: null })).success, true);
+        }
+      }
+    } catch (error) { cleanup(); throw error; }
+    const workspace = () => callIpcRaw('projects:get-asset-workspace', created.id);
+    const row = async name => (await workspace()).files.find(file => file.name === name);
+    const setSelection = async (name, action) => {
+      const file = await row(name);
+      return callIpcRaw('projects:set-working-source-selection', created.id, file.visualIdentity, { action, expectedRevision: file.selectionRevision ?? 0 });
+    };
+    const out = desk('excluded-psd-out'); fs.mkdirSync(out, { recursive: true });
+    const review = () => callIpcRaw('projects:prepare-package-review', created.id, out);
+    const walk = dir => fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry =>
+      entry.isDirectory() ? walk(path.join(dir, entry.name)) : [path.join(dir, entry.name)]);
+    return { project: created, current, psdPath, aiPath, outputNames, workspace, row, setSelection, review, walk, out, cleanup,
+      toggle: async name => callIpcRaw('projects:remove-file', created.id, (await row(name)).visualIdentity),
+      stored: name => current().files.find(file => file.name === name) };
+  }
+  const sortedNames = files => files.map(file => file.name).sort();
+
+  baselineTest('excluded PSD leaves its embedded outputs and PSD-only link out of review and package', { timeout: 120000 }, async () => {
+    const f = await excludedPsdAssetsFixture();
+    try {
+      const before = await f.workspace();
+      for (const name of [...f.outputNames, 'PsdOnly.png', 'Shared.png', 'AiOnly.png']) {
+        assert.equal(before.files.find(file => file.name === name)?.included, true, name);
+      }
+      assert.equal(f.stored('Layer-00.png').source, 'psd-embedded');
+      assert.equal(f.stored('PsdOnly.png').source, 'psd-linked');
+      const excluded = await f.setSelection('Art.psd', 'exclude');
+      assert.equal(excluded.success, true);
+      const ws = await f.workspace();
+      for (const name of [...f.outputNames, 'PsdOnly.png']) {
+        const file = ws.files.find(item => item.name === name);
+        assert.equal(file.included, false, name); assert.equal(file.excludedSourceOnly, true, name);
+        assert.equal(file.excluded, false, name); assert.equal(file.includedAsDependency, false, name);
+      }
+      const shared = ws.files.find(file => file.name === 'Shared.png');
+      assert.equal(shared.included, true); assert.equal(shared.includedAsDependency, true);
+      assert.equal(shared.excludedSourceOnly, false); assert.deepEqual(shared.requiredBy, ['Poster.ai']);
+      assert.equal(ws.files.find(file => file.name === 'AiOnly.png').included, true);
+      assert.deepEqual(ws.semanticCounts, { selectedWorkingSources: 1, excludedWorkingSources: 1, invalidWorkingSources: 0,
+        includedAssets: 2, excludedAssets: f.outputNames.length + 1, unresolvedVerification: 0, missingRequiredReferences: 0, relationshipHolds: 0 });
+      assert.deepEqual(excluded.semanticCounts, ws.semanticCounts);
+      assert.deepEqual(f.current().excludedAssetKeys || [], [], 'withholding writes no asset exclusion intent');
+      const review = await f.review();
+      assert.equal(review.materializable, true, review.error || review.message);
+      assert.deepEqual(sortedNames(review.files), ['AiOnly.png', 'Poster.ai', 'Shared.png']);
+      assert.equal(review.totalFiles, 3);
+      const packaged = await callIpcRaw('projects:package', f.project.id, f.out, review.token);
+      assert.equal(packaged.success, true, packaged.error);
+      assert.equal(packaged.copiedCount, 3);
+      assert.deepEqual(packaged.errors || [], []);
+      assert.deepEqual(f.walk(packaged.folderPath).map(file => path.basename(file)).filter(name => name !== '.DS_Store').sort(),
+        ['AiOnly.png', 'Poster.ai', 'Shared.png']);
+    } finally { f.cleanup(); }
+  });
+
+  baselineTest('excluded PSD rescan stays skipped and Restore brings back its outputs', { timeout: 120000 }, async () => {
+    const f = await excludedPsdAssetsFixture();
+    try {
+      assert.equal((await f.setSelection('Art.psd', 'exclude')).success, true);
+      const counts = (await f.workspace()).semanticCounts;
+      const rows = JSON.stringify(f.current().files);
+      const rescan = await metadataTestHooks.runScanOnSave(f.project.id, f.psdPath);
+      assert.equal(rescan.success, true); assert.equal(rescan.skipped, 'source-excluded');
+      assert.deepEqual((await f.workspace()).semanticCounts, counts);
+      assert.equal(JSON.stringify(f.current().files), rows);
+      // Restore before any package: the restored PSD and its outputs return.
+      const restored = await f.setSelection('Art.psd', 'restore');
+      assert.equal(restored.success, true); assert.equal(restored.verificationStatus, 'scanned');
+      const ws = await f.workspace();
+      for (const name of [...f.outputNames, 'PsdOnly.png']) {
+        const file = ws.files.find(item => item.name === name);
+        assert.equal(file.included, true, name); assert.equal(file.excludedSourceOnly, false, name);
+        assert.equal(file.includedAsDependency, true, name);
+      }
+      assert.equal(ws.semanticCounts.excludedAssets, 0);
+      const review = await f.review();
+      assert.equal(review.materializable, true, review.error || review.message);
+      assert.deepEqual(sortedNames(review.files), ['AiOnly.png', 'Art.psd', ...f.outputNames, 'Poster.ai', 'PsdOnly.png', 'Shared.png'].sort());
+      const packaged = await callIpcRaw('projects:package', f.project.id, f.out, review.token);
+      assert.equal(packaged.success, true, packaged.error);
+      assert.equal(packaged.copiedCount, f.outputNames.length + 5);
+      assert.deepEqual(packaged.errors || [], []);
+    } finally { f.cleanup(); }
+  });
+
+  baselineTest('owner Include keeps a withheld PSD output; a second click explicitly excludes it', { timeout: 120000 }, async () => {
+    const f = await excludedPsdAssetsFixture();
+    try {
+      // Layer-01 is explicitly excluded first, then also withheld by Exclude.
+      await f.toggle('Layer-01.png');
+      assert.equal((f.current().excludedAssetKeys || []).length, 1);
+      assert.equal((await f.setSelection('Art.psd', 'exclude')).success, true);
+      assert.equal((await f.row('Layer-01.png')).excludedSourceOnly, true);
+      const keys = [...f.current().excludedAssetKeys];
+      await f.toggle('Layer-00.png');
+      assert.equal(f.stored('Layer-00.png').keptAfterSourceExclusion, true);
+      assert.deepEqual(f.current().excludedAssetKeys, keys, 'Include of a withheld row writes no exclusion key');
+      storeInstance.data.projects = JSON.parse(JSON.stringify(storeInstance.data.projects));
+      assert.equal(f.stored('Layer-00.png').keptAfterSourceExclusion, true, 'marker survives a store round trip');
+      let layer = await f.row('Layer-00.png');
+      assert.equal(layer.included, true); assert.equal(layer.excludedSourceOnly, true);
+      // One click includes a row that is both explicitly excluded and withheld.
+      await f.toggle('Layer-01.png');
+      assert.deepEqual(f.current().excludedAssetKeys, []);
+      assert.equal(f.stored('Layer-01.png').keptAfterSourceExclusion, true);
+      assert.equal((await f.row('Layer-01.png')).included, true);
+      // Restore reconciles the PSD outputs; the owner marker stays on the rows,
+      // so a second Exclude keeps them while their siblings leave again.
+      const restored = await f.setSelection('Art.psd', 'restore');
+      assert.equal(restored.success, true); assert.equal(restored.verificationStatus, 'scanned');
+      for (const name of ['Layer-00.png', 'Layer-01.png']) assert.equal(f.stored(name).keptAfterSourceExclusion, true, name);
+      assert.equal((await f.setSelection('Art.psd', 'exclude')).success, true);
+      for (const name of ['Layer-00.png', 'Layer-01.png']) assert.equal((await f.row(name)).included, true, name);
+      assert.equal((await f.row('Layer-02.png')).included, false);
+      let review = await f.review();
+      assert.equal(review.materializable, true, review.error || review.message);
+      assert.deepEqual(sortedNames(review.files), ['AiOnly.png', 'Layer-00.png', 'Layer-01.png', 'Poster.ai', 'Shared.png']);
+      await f.toggle('Layer-00.png');
+      assert.equal(Object.hasOwn(f.stored('Layer-00.png'), 'keptAfterSourceExclusion'), false);
+      assert.equal(f.current().excludedAssetKeys.length, 1);
+      layer = await f.row('Layer-00.png');
+      assert.equal(layer.included, false); assert.equal(layer.excluded, true);
+      review = await f.review();
+      assert.deepEqual(sortedNames(review.files), ['AiOnly.png', 'Layer-01.png', 'Poster.ai', 'Shared.png']);
+      const packaged = await callIpcRaw('projects:package', f.project.id, f.out, review.token);
+      assert.equal(packaged.success, true, packaged.error);
+      assert.equal(packaged.copiedCount, 4); assert.deepEqual(packaged.errors || [], []);
+      assert.deepEqual(f.walk(packaged.folderPath).map(file => path.basename(file)).filter(name => name !== '.DS_Store').sort(),
+        ['AiOnly.png', 'Layer-01.png', 'Poster.ai', 'Shared.png']);
+    } finally { f.cleanup(); }
+  });
+
+  function assertNoOwnerIntent(project, row) {
+    assert.ok(row);
+    for (const field of ['acceptedPending', 'keptAfterSourceExclusion', 'individualContentInclude', 'explicitUserAuthority']) {
+      assert.equal(row[field], undefined, `${row.name} ${field}`);
+    }
+    assert.ok(['ai-linked', 'indd-poll', 'indd-linked', 'ps-poll', 'psd-linked', 'psd-embedded', 'scan-on-open',
+      'scan-on-save-linked', 'scan-on-save-embedded', 'scan-on-save-presentation', 'embedded-media', 'figma-auto'].includes(row.source),
+    `${row.name} is dependency-captured (${row.source})`);
+    const records = (project.provenance?.observations || []).filter(item =>
+      ['projects:accept-pending', 'projects:set-existing-assets-decision'].includes(item?.observer?.method) &&
+      project.provenance.nodes[item.objectNodeId]?.path === row.path);
+    assert.deepEqual(records, [], `${row.name} has no owner acceptance record`);
+  }
+
+  // Accepted dependency assets of an excluded working file stay (owner
+  // decision). Pending rows use the live-capture shape; acceptance, scan,
+  // selection, review and packaging run through the real IPC routes.
+  async function acceptedLinkFixture(label, { acceptedOrigin = 'added', baselineStatus = 'legacy-included' } = {}) {
+    resetTestHomeWorkspace(); setChildProcessHandler(() => ({ stdout: '' }));
+    const created = await createProject('Accepted link ' + label);
+    await callIpcRaw('projects:pause', created.id); clearTrackedTimers();
+    const current = () => storeInstance.data.projects.find(p => p.id === created.id);
+    const desk = name => path.join(TEST_HOME, 'Desktop', name);
+    for (const name of ['A.psd', 'Accepted.png', 'Sibling.png']) fs.writeFileSync(desk(name), `synthetic ${name}`);
+    fs.writeFileSync(desk('Keep.ai'), '%PDF-1.7\n%%EOF\n');
+    const source = name => ({ fileId: name, path: desk(name), name, ext: path.extname(name), projectRole: 'source', source: 'user-added', addedAt: Date.now() });
+    const pendingRow = (name, assetOrigin) => ({ fileId: name, path: desk(name), name, ext: '.png', projectRole: 'asset', source: 'psd-linked', assetOrigin,
+      addedAt: Date.now() - 60000, captureState: 'needs-save', captureReason: 'linked-asset-observed',
+      captureEvidence: { schemaVersion: 1, source: 'psd-linked', appFamily: 'photoshop', relationshipSourcePath: desk('A.psd'), documentModified: true } });
+    current().files = [source('A.psd'), source('Keep.ai')];
+    current().pendingFiles = [pendingRow('Accepted.png', acceptedOrigin), pendingRow('Sibling.png', 'added')];
+    current().assetBaseline = { schemaVersion: 1, status: baselineStatus, decision: baselineStatus === 'legacy-included' ? 'include' : null, establishedAt: Date.now() };
+    roundTripFakeStore();
+    currentPsdFixture = { children: [], linkedFiles: ['Accepted.png', 'Sibling.png'].map(name => ({ name, linkedFile: { fullPath: desk(name) } })) };
+    const workspace = () => callIpcRaw('projects:get-asset-workspace', created.id);
+    const select = async action => {
+      const row = (await workspace()).files.find(file => file.name === 'A.psd');
+      const response = await callIpcRaw('projects:set-working-source-selection', created.id, row.visualIdentity,
+        { action, expectedRevision: row.selectionRevision });
+      assert.equal(response.success, true, JSON.stringify(response)); return response;
+    };
+    const methods = method => (current().provenance?.observations || []).filter(item => item?.observer?.method === method)
+      .map(item => current().provenance.nodes[item.objectNodeId]?.name).sort();
+    const out = desk('accepted-link-out'); fs.mkdirSync(out, { recursive: true });
+    return { project: created, current, desk, workspace, select, methods, out,
+      stored: name => current().files.find(file => file.name === name),
+      async scanThenExclude() {
+        await select('exclude');
+        assert.equal((await select('restore')).verificationStatus, 'scanned');
+        const record = metadataTestHooks.getWorkingSourceVerification(current(), current().files.find(file => file.name === 'A.psd'));
+        assert.deepEqual(record.requiredReferences.map(ref => path.basename(ref.path)).sort(), ['Accepted.png', 'Sibling.png'],
+          'the scan receipt lists both links only under A.psd');
+        for (const name of ['Accepted.png', 'Sibling.png']) assert.ok(current().files.some(file => file.name === name), name);
+        await select('exclude');
+      } };
+  }
+
+  baselineTest('an asset accepted through accept-pending stays in review and package after its only working file is excluded', { timeout: 120000 }, async () => {
+    const f = await acceptedLinkFixture('accept');
+    try {
+      assert.ok(await callIpcRaw('projects:accept-pending', f.project.id, f.desk('Accepted.png')));
+      const accepted = f.stored('Accepted.png');
+      assert.equal(accepted.acceptedPending, true);
+      assert.equal(accepted.captureEvidence, undefined, 'production acceptance strips capture evidence');
+      assert.deepEqual(f.methods('projects:accept-pending'), ['Accepted.png']);
+      await f.scanThenExclude();
+      // The scan admitted the sibling directly; nothing records owner intent on it.
+      const sibling = f.stored('Sibling.png');
+      for (const field of ['acceptedPending', 'keptAfterSourceExclusion', 'individualContentInclude', 'explicitUserAuthority']) {
+        assert.equal(sibling[field], undefined, field);
+      }
+      const ws = await f.workspace();
+      const fact = name => ws.files.find(file => file.name === name);
+      assert.equal(fact('Accepted.png').included, true); assert.equal(fact('Accepted.png').excludedSourceOnly, true);
+      assert.equal(fact('Accepted.png').excluded, false);
+      assert.equal(fact('Sibling.png').included, false); assert.equal(fact('Sibling.png').excludedSourceOnly, true);
+      assert.equal(fact('A.psd').sourceSelection, 'excluded');
+      assert.deepEqual(f.current().excludedAssetKeys || [], []);
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id, f.out);
+      assert.equal(review.materializable, true, review.error || review.message);
+      assert.deepEqual(review.files.map(file => file.name).sort(), ['Accepted.png', 'Keep.ai']);
+      const packaged = await callIpcRaw('projects:package', f.project.id, f.out, review.token);
+      assert.equal(packaged.success, true, packaged.error);
+      assert.equal(packaged.copiedCount, 2); assert.deepEqual(packaged.errors || [], []);
+      const written = fs.readdirSync(packaged.folderPath, { recursive: true }).map(name => path.basename(name)).filter(name => /\.(png|ai)$/.test(name)).sort();
+      assert.deepEqual(written, ['Accepted.png', 'Keep.ai']);
+      roundTripFakeStore();
+      assert.equal((await f.workspace()).files.find(file => file.name === 'Accepted.png').included, true, 'kept after reload');
+    } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+  });
+
+  baselineTest('existing assets included through the existing-assets decision before an exclusion are withheld after it', { timeout: 120000 }, async () => {
+    const f = await acceptedLinkFixture('existing', { acceptedOrigin: 'existing', baselineStatus: 'decision-required' });
+    try {
+      const decided = await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include');
+      assert.equal(decided.success, true);
+      assert.equal(f.stored('Accepted.png').acceptedPending, true);
+      assert.equal(f.stored('Accepted.png').captureEvidence, undefined);
+      assert.deepEqual(f.methods('projects:set-existing-assets-decision'), ['Accepted.png']);
+      const record = f.current().provenance.observations.find(item => item.observer.method === 'projects:set-existing-assets-decision');
+      assert.equal(record.observer.kind, 'manual_user_action'); assert.equal(record.payload.decision, 'include');
+      assert.deepEqual(f.methods('projects:accept-pending'), [], 'bulk Include writes no accept-pending record');
+      assert.ok(f.current().pendingFiles.some(file => file.name === 'Sibling.png'), 'an added-origin row is not an existing asset');
+      await f.scanThenExclude();
+      // A provably bulk Include made before the exclusion is not owner intent
+      // for it: the later exclusion wins (owner decision).
+      const ws = await f.workspace();
+      assert.equal(ws.files.find(file => file.name === 'Accepted.png').included, false);
+      assert.equal(ws.files.find(file => file.name === 'Accepted.png').excludedSourceOnly, true);
+      assert.equal(f.stored('Accepted.png').existingIncludeEpisode, undefined);
+      assert.equal(ws.files.find(file => file.name === 'Sibling.png').included, false);
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id, f.out);
+      assert.equal(review.materializable, true, review.error || review.message);
+      assert.deepEqual(review.files.map(file => file.name).sort(), ['Keep.ai']);
+      roundTripFakeStore();
+      assert.equal((await f.workspace()).files.find(file => file.name === 'Accepted.png').included, false, 'after reload');
+    } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+  });
+
+  // A byte-changing save replaces an output row at a new path. Owner intent on
+  // the predecessor travels as the keep marker; a same-bytes save retains it.
+  for (const intent of ['include', 'accept']) {
+    baselineTest(`replaced PSD output carries owner ${intent} intent across a changed-bytes save`, { timeout: 120000 }, async () => {
+      const kept = { id: psdId, name: 'Kept.png', data: embeddedPng };
+      const sibling = { id: '33333333-3333-4333-8333-333333333334', name: 'Sibling.png', data: Buffer.from('sibling bytes') };
+      const f = await workingPsdFixture([kept, sibling], [], false, intent === 'accept');
+      try {
+        const output = producerId => f.current().files.find(row => row.source === 'psd-embedded' && row.psdResource?.producerId === producerId);
+        const workspace = () => callIpcRaw('projects:get-asset-workspace', f.project.id);
+        const fact = async row => (await workspace()).files.find(file =>
+          file.visualIdentity === metadataTestHooks.createProjectFileVisualIdentity(f.project.id, row));
+        const select = async action => {
+          const row = (await workspace()).files.find(file => file.name === path.basename(f.filePath));
+          const response = await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity,
+            { action, expectedRevision: row.selectionRevision });
+          assert.equal(response.success, true, JSON.stringify(response)); return response;
+        };
+        const save = async objects => {
+          metadataTestHooks.clearPsdParseDebounce(f.filePath);
+          const result = await f.save(objects); assert.equal(result.skipped, undefined); return result;
+        };
+        if (intent === 'accept') {
+          const pending = f.current().pendingFiles.find(row => row.psdResource?.producerId === psdId);
+          assert.ok(pending, 'outputs are pending under forced pending admission');
+          assert.ok(await callIpcRaw('projects:accept-pending', f.project.id, pending.path));
+          assert.equal(output(psdId).acceptedPending, true);
+        }
+        await select('exclude');
+        const predecessor = output(psdId);
+        assert.equal((await fact(predecessor)).excludedSourceOnly, true);
+        if (intent === 'include') {
+          assert.equal((await fact(predecessor)).included, false);
+          assert.equal((await fact(output(sibling.id))).included, false);
+          await callIpcRaw('projects:remove-file', f.project.id, (await fact(predecessor)).visualIdentity);
+          assert.equal(output(psdId).keptAfterSourceExclusion, true);
+        }
+        assert.equal((await fact(output(psdId))).included, true);
+        assert.equal((await select('restore')).verificationStatus, 'scanned');
+        // Control: unchanged bytes retain the exact row and its intent.
+        const retained = { ...output(psdId) };
+        await save([kept, sibling]);
+        assert.equal(output(psdId).path, retained.path); assert.equal(output(psdId).fileId, retained.fileId);
+        assert.equal(output(psdId).keptAfterSourceExclusion, retained.keptAfterSourceExclusion);
+        assert.equal(output(psdId).acceptedPending, retained.acceptedPending);
+        // Changed bytes for that object: a new row at a new path replaces it.
+        await save([{ ...kept, data: Buffer.from('replacement bytes') }, sibling]);
+        const replacement = output(psdId);
+        assert.notEqual(replacement.path, retained.path);
+        assert.equal(f.current().files.some(row => row.path === retained.path), false, 'the predecessor row is retired');
+        assert.equal(replacement.fileId, retained.fileId);
+        assert.equal(replacement.keptAfterSourceExclusion, true, 'keep marker carried onto the replacement');
+        for (const field of ['acceptedPending', 'explicitUserAuthority', 'individualContentInclude']) {
+          assert.equal(Object.hasOwn(replacement, field), false, `${field} is not copied`);
+        }
+        await select('exclude');
+        const replacementFact = await fact(replacement);
+        assert.equal(replacementFact.included, true); assert.equal(replacementFact.excludedSourceOnly, true);
+        if (intent === 'include') {
+          const siblingRow = output(sibling.id);
+          assert.equal(siblingRow.keptAfterSourceExclusion, undefined);
+          assert.equal((await fact(siblingRow)).included, false, 'a sibling without intent is withheld');
+          assert.deepEqual((await metadataTestHooks.selectProjectFilesForPackaging(f.current())).map(row => row.name), [replacement.name]);
+        } else {
+          assert.ok(f.current().pendingFiles.some(row => row.psdResource?.producerId === sibling.id), 'the unaccepted sibling stays pending');
+          assert.deepEqual((await metadataTestHooks.selectProjectFilesForPackaging(f.current())).map(row => row.name), [replacement.name]);
+        }
+      } finally { f.cleanup(); }
+    });
   }
 
   baselineTest('cycle2: PSD identical saves reuse one output and removal/empty retire exact membership', async () => {
@@ -4723,6 +5110,9 @@ function baselineCases() {
       currentPsdFixture = () => f.actual.readPsd(fs.readFileSync(f.filePath), { skipLayerImageData: true, skipCompositeImageData: true });
       await metadataTestHooks.runScanOnSave(f.project.id, f.filePath);
       const logical = f.current().files.find(row => row.source === 'scan-on-save-embedded'); assert.ok(logical);
+      // Admitted directly by the save scan: no flag, marker, Include or owner
+      // acceptance record on its node, so the decided rule withholds it.
+      assertNoOwnerIntent(f.current(), logical);
       const safe = path.join(TEST_HOME, 'Desktop', 'Safe.txt'); fs.writeFileSync(safe, 'independent asset');
       f.current().files.push({ path: safe, name: 'Safe.txt', ext: '.txt', source: 'user-added', acceptedPending: true, projectRole: 'asset' });
       const q = path.join(TEST_HOME, 'Desktop', 'Unrelated.ai'); fs.writeFileSync(q, '%PDF-1.7\n%%EOF\n');
@@ -4732,6 +5122,9 @@ function baselineCases() {
       currentPsdFixture = 'actual-source-buffer'; await f.save([object]);
       const holds = JSON.parse(JSON.stringify(f.current().workingSourceRelationshipHolds)); assert.equal(holds.length, 1);
       await callIpcRaw('projects:set-working-source-selection', f.project.id, f.source.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      ws = await callIpcRaw('projects:get-asset-workspace', f.project.id); assert.equal(ws.semanticCounts.relationshipHolds, 0, 'logical asset withheld with its excluded parent leaves the hold dormant');
+      // Owner Include keeps the logical asset; it then reads the excluded parent.
+      await callIpcRaw('projects:remove-file', f.project.id, metadataTestHooks.createProjectFileVisualIdentity(f.project.id, logical));
       ws = await callIpcRaw('projects:get-asset-workspace', f.project.id); assert.equal(ws.semanticCounts.relationshipHolds, 1, 'included logical asset still reads parent');
       await callIpcRaw('projects:remove-file', f.project.id, metadataTestHooks.createProjectFileVisualIdentity(f.project.id, logical));
       ws = await callIpcRaw('projects:get-asset-workspace', f.project.id); assert.equal(ws.semanticCounts.relationshipHolds, 0);
@@ -5221,4 +5614,2235 @@ function baselineCases() {
     } finally { clearTrackedTimers(); }
   });
 
+}
+
+// Excluded working files across every supported format: owner records on the
+// routes that observe assets for a working file, Include All Existing for the
+// current exclusion only, and per-asset choices across a legacy PSD restage.
+// Complete main IPC/store routes on real files and written package folders;
+// app scripting, ps/lsof, Electron and the utility-process transport remain
+// modeled exactly as in the rest of this harness (no native-app acceptance).
+function excludedSourceMembershipCases() {
+  const zlib = require('zlib');
+  const chunk = (type, data) => { const body = Buffer.concat([Buffer.from(type), data]); const out = Buffer.alloc(8 + data.length + 4);
+    out.writeUInt32BE(data.length, 0); body.copy(out, 4); out.writeUInt32BE(zlib.crc32(body) >>> 0, 8 + data.length); return out; };
+  // Distinct PNGs over 500 bytes, so presentation media qualifies.
+  const png = seed => { const header = Buffer.alloc(13); header.writeUInt32BE(24); header.writeUInt32BE(24, 4); header[8] = 8; header[9] = 6;
+    const rows = Buffer.alloc(24 * (1 + 24 * 4)); let n = seed >>> 0; for (let y = 0; y < 24; y++) for (let x = 1; x < 97; x++) { n = (n * 1664525 + 1013904223) >>> 0; rows[y * 97 + x] = n >>> 24; }
+    return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', header), chunk('IDAT', zlib.deflateSync(rows)), chunk('IEND', Buffer.alloc(0))]); };
+  // InDesign is modeled as running with `inddDoc` open; its links are read from the document bytes.
+  let inddDoc = null, inddModified = false, idmlForm = 'file:', idmlExtra = [], extraMediaSeed = 0;
+  const inddSnapshot = () => { if (!inddDoc || !fs.existsSync(inddDoc)) return 'END\t0\t0\t0\t0\n';
+    const links = fs.readFileSync(inddDoc, 'utf8').split('\n').filter(line => line.startsWith('/'));
+    const name = path.basename(inddDoc);
+    return `DOC\t${inddDoc}\t${name}\t${inddModified}\ttrue\t${links.length}\n` + links.map(link => `LINK\t${inddDoc}\t${name}\t${link}\t${inddModified}\ttrue\n`).join('') +
+      `END\t1\t${links.length}\t${links.length}\t0\n`; };
+  const passthroughInner = ({ kind, command, args, options }) => {
+    if (inddDoc && String(command).includes('Adobe InDesign')) return { stdout: '/Applications/Adobe InDesign 2026/Adobe InDesign.app/Contents/MacOS/Adobe InDesign\n' };
+    if (inddDoc && kind === 'execFile' && command === '/bin/ps' && args[0] === 'axww') return { stdout: '  101 /Applications/Adobe InDesign 2026/Adobe InDesign.app/Contents/MacOS/Adobe InDesign\n', stderr: '' };
+    if (inddDoc && (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript') || isOsascriptInvocation({ kind, command, args }, 'crate-indd-poll.applescript'))) return { stdout: inddSnapshot() };
+    if (inddDoc && isOsascriptInvocation({ kind, command, args }, 'crate-indd-scan.applescript')) return { stdout: inddSnapshot().split('\n').filter(line => line.startsWith('LINK')).map(line => line.split('\t')[3]).join('\n') };
+    if (kind === 'execFile' && command === '/usr/bin/unzip') {
+      const binary = args[0] === '-p' && options && options.encoding === 'buffer';
+      const result = realSpawnSync(command, args, { encoding: binary ? null : 'utf8', maxBuffer: 64 * 1024 * 1024 });
+      if (result.status !== 0 && args[0] !== '-l') { const error = new Error('unzip failed ' + result.status); error.stderr = String(result.stderr || ''); throw error; }
+      return { stdout: result.stdout, stderr: '' };
+    }
+    return { stdout: '', stderr: '' };
+  };
+  const passthrough = () => setChildProcessHandler(passthroughInner);
+  const zipDir = (target, entries, store = false) => {
+    const stage = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'zipstage-'));
+    for (const [name, data] of Object.entries(entries)) { const file = path.join(stage, name); fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, data); }
+    fs.rmSync(target, { force: true });
+    assert.equal(realSpawnSync('/usr/bin/zip', ['-q', '-r', ...(store ? ['-0'] : []), target, '.'], { cwd: stage }).status, 0, 'zip');
+    fs.rmSync(stage, { recursive: true, force: true });
+  };
+  const desk = name => path.join(TEST_HOME, 'Desktop', name);
+  const matchName = (actual, name) => { actual = actual || ''; return actual === name || actual.endsWith(' — ' + name) ||
+    (/^(.*)_\d+(\.[a-z]+)$/.test(actual) && actual.replace(/_\d+(\.[a-z]+)$/, '$1').endsWith(name.replace(/\.[a-z]+$/, ''))); };
+  const actualPsd = () => originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+  const RN = 'http://schemas.openxmlformats.org/package/2006/relationships', ON = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  // A working file of `ext` that references `links` and, where the format
+  // embeds media, carries one embedded media object.
+  function writeWorking(ext, filePath, links, embeddedSeed = 900) {
+    const text = links.join('\n');
+    switch (ext) {
+      case '.ai': case '.pdf': fs.writeFileSync(filePath, `%PDF-1.7\n${text}\n%%EOF\n`); return null;
+      case '.xd': case '.fig': case '.ppt': case '.indd': fs.writeFileSync(filePath, `SYNTH${ext}\n${text}\n`); return null;
+      case '.idml': zipDir(filePath, { 'designmap.xml': '<Document>' + [...links.map(link => `<Link LinkResourceURI="${idmlForm}${link}"/>`),
+        ...idmlExtra.map(uri => `<Link LinkResourceURI="${uri}"/>`)].join('') + '</Document>' }); return null;
+      case '.sketch': zipDir(filePath, { 'document.json': JSON.stringify({ images: links }) }); return null;
+      case '.afdesign': case '.afphoto': case '.afpub': zipDir(filePath, { 'doc.xml': '<doc>' + links.map(link => `<r p="${link}"/>`).join('') + '</doc>' }); return null;
+      case '.pxd': zipDir(filePath, { 'doc.json': JSON.stringify({ links }) }); return null;
+      case '.key': zipDir(filePath, { 'Index/Document.iwa': text, 'Data/embedded-photo.png': png(embeddedSeed),
+        ...(extraMediaSeed ? { 'Data/second-photo.png': png(extraMediaSeed) } : {}) }, true); return 'embedded-photo.png';
+      case '.pptx': {
+        const rels = links.map((link, i) => `<Relationship Id="rIdL${i}" Type="${ON}/image" Target="${pathToFileURL(link).href}" TargetMode="External"/>`).join('');
+        zipDir(filePath, {
+          '[Content_Types].xml': '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/></Types>',
+          'ppt/slides/slide1.xml': `<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="${ON}"><p:spTree>${links.map((_, i) => `<a:blip r:link="rIdL${i}"/>`).join('')}<a:blip r:embed="rIdE"/></p:spTree></p:sld>`,
+          'ppt/slides/_rels/slide1.xml.rels': `<Relationships xmlns="${RN}">${rels}<Relationship Id="rIdE" Type="${ON}/image" Target="../media/image1.png"/></Relationships>`,
+          'ppt/media/image1.png': png(embeddedSeed),
+          ...(extraMediaSeed ? { 'ppt/media/image2.png': png(extraMediaSeed) } : {}),
+        });
+        return 'image1.png';
+      }
+      case '.psd': {
+        const linkObj = (i, link) => ({ id: '44444444-4444-4444-8444-44444444444' + i, name: path.basename(link), childDocumentID: '',
+          linkedFile: { fileSize: 1, name: path.basename(link), fullPath: link, originalPath: '', relativePath: '' } });
+        fs.writeFileSync(filePath, actualPsd().writePsdBuffer({ width: 1, height: 1, children: [],
+          linkedFiles: [{ id: '33333333-3333-4333-8333-' + String(embeddedSeed).padStart(12, '0'), name: 'Embedded-Layer.png', data: png(embeddedSeed) },
+            ...links.map((link, i) => linkObj(i, link))] }));
+        return 'Embedded-Layer.png';
+      }
+      default: throw new Error('no builder ' + ext);
+    }
+  }
+  const resolveChoices = async projectId => {
+    for (let round = 0; round < 6; round++) {
+      const pending = (await callIpcRaw('projects:get-asset-workspace', projectId)).workingFileChoices?.choices || [];
+      if (!pending.length) return;
+      for (const entry of pending) {
+        assert.equal((await callIpcRaw('projects:resolve-working-file-choice', projectId,
+          { id: entry.id, revision: entry.revision, choice: 'keep-both', predecessorIdentity: null })).success, true);
+      }
+    }
+  };
+  const walk = dir => fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => entry.isDirectory() ? walk(path.join(dir, entry.name)) : [path.join(dir, entry.name)]);
+  const normalizeCasePath = value => String(value || '').toLowerCase();
+  const FORMATS = ['.ai', '.pdf', '.xd', '.fig', '.ppt', '.psd', '.indd', '.idml', '.sketch', '.afdesign', '.afphoto', '.afpub', '.pxd', '.key', '.pptx'];
+  const originalTmpdir = os.tmpdir;
+  async function withEnv(work, { realTmp = false, realMainPsd = false } = {}) {
+    const privateTmp = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'matrix-tmp-'));
+    if (!realTmp) os.tmpdir = () => privateTmp;
+    currentPsdFixture = 'actual-source-buffer';
+    if (realMainPsd) globalThis.__crateRealMainPsdBytes = true;
+    const originalStoreGet = storeInstance.get;
+    storeInstance.get = function clonedStoreGet(...args) { const value = originalStoreGet.apply(this, args); return value === undefined ? value : JSON.parse(JSON.stringify(value)); };
+    try { return await work(); } finally {
+      inddDoc = null; inddModified = false; os.tmpdir = originalTmpdir; currentPsdFixture = { children: [], linkedFiles: [] }; storeInstance.get = originalStoreGet;
+      delete globalThis.__crateRealMainPsdBytes; passthrough(); fs.rmSync(privateTmp, { recursive: true, force: true }); clearTrackedTimers();
+    }
+  }
+  async function newProject(label, { scope, pause, before } = {}) {
+    resetTestHomeWorkspace(); passthrough(); clearTrackedTimers();
+    fs.mkdirSync(path.join(TEST_HOME, 'Desktop'), { recursive: true });
+    if (before) before();
+    const created = scope ? await callIpc('projects:create', label, 'branding', scope, null) : await createProject(label); clearTrackedTimers();
+    if (pause) await callIpcRaw('projects:pause', created.id);
+    return projectHandleFor(created.id, () => storeInstance.data.projects.find(project => project.id === created.id));
+  }
+  // Work-<t><ext> links Solo and Shared (and embeds E); Keep-<t>.ai links Shared and KeepSide.
+  async function formatProject(ext, opts = {}) {
+    const tag = ext.slice(1);
+    const names = { only: `Solo-${tag}${opts.onlyExt || '.png'}`, shared: `Shared-${tag}.png`, keepOnly: `KeepSide-${tag}.png`, newLink: `Fresh-${tag}.png` };
+    const W = desk('Work-' + tag + ext), K = desk('Keep-' + tag + '.ai');
+    let embeddedName = null;
+    const f = await newProject('Matrix ' + tag, { scope: opts.scope, before() {
+      fs.writeFileSync(desk(names.only), png(11)); fs.writeFileSync(desk(names.shared), png(12)); fs.writeFileSync(desk(names.keepOnly), png(13)); fs.writeFileSync(desk(names.newLink), png(14));
+      embeddedName = writeWorking(ext, W, [desk(names.only), desk(names.shared)]);
+      fs.writeFileSync(K, `%PDF-1.7\n${desk(names.shared)}\n${desk(names.keepOnly)}\n%%EOF\n`);
+      inddDoc = ext === '.indd' ? W : null;
+    } });
+    for (const filePath of opts.keepFirst ? [K, W] : [W, K]) await f.add(filePath);
+    return { ...f, names, W, K, tag, ext, embeddedName, keepNames: [`Keep-${tag}.ai`, names.keepOnly, names.shared].sort() };
+  }
+  // The same handle API over an existing project.
+  async function projectHandleFor(id, current) {
+    const workspace = () => callIpcRaw('projects:get-asset-workspace', id);
+    const add = async filePath => {
+      manualDialogFor([filePath]);
+      const result = await callIpcRaw('projects:add-files', id);
+      assert.notEqual(result?.success, false, JSON.stringify(result));
+      if (current().assetBaseline?.status === 'decision-required') {
+        assert.equal((await callIpcRaw('projects:set-existing-assets-decision', id, 'include')).success, true);
+      }
+      await resolveChoices(id);
+    };
+    const fact = async name => { const rows = (await workspace()).files.filter(file => matchName(file.name, name)); assert.equal(rows.length, 1, `one workspace row ${name}`); return rows[0]; };
+    const stored = name => { const rows = current().files.filter(file => matchName(file.name, name)); assert.equal(rows.length, 1, `one stored row ${name}`); return rows[0]; };
+    const anyRowAt = filePath => [...current().files, ...(current().pendingFiles || [])].filter(file => normalizeCasePath(file.path) === normalizeCasePath(filePath));
+    const select = async (filePath, action) => {
+      const row = (await workspace()).files.find(file => file.name === path.basename(filePath) && file.sourceSelection);
+      assert.ok(row, 'working row ' + path.basename(filePath));
+      const response = await callIpcRaw('projects:set-working-source-selection', id, row.visualIdentity, { action, expectedRevision: row.selectionRevision ?? 0 });
+      assert.equal(response.success, true, JSON.stringify(response));
+      return response;
+    };
+    const selectionOf = filePath => { const row = current().files.find(file => file.path === filePath);
+      const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(current(), row);
+      return { key, revision: current().workingSourceSelections?.[key]?.revision ?? 0 }; };
+    const out = desk('out-' + id.slice(-6)); fs.mkdirSync(out, { recursive: true });
+    const review = async () => { const result = await callIpcRaw('projects:prepare-package-review', id, out); assert.ok(result && !result.error, JSON.stringify(result?.error)); return result; };
+    const reviewNames = result => (result.files || []).map(file => file.name).sort();
+    const written = async result => {
+      assert.equal(result.materializable, true, JSON.stringify(result.semanticCounts));
+      const packaged = await callIpcRaw('projects:package', id, out, result.token);
+      assert.equal(packaged.success, true, packaged.error);
+      const names = walk(packaged.folderPath).map(file => path.basename(file)).filter(name => name !== '.DS_Store' && !/\.(json|txt|md)$/.test(name)).sort();
+      fs.rmSync(packaged.folderPath, { recursive: true, force: true });
+      return names;
+    };
+    const toggle = async name => { const response = await callIpcRaw('projects:remove-file', id, (await fact(name)).visualIdentity); assert.ok(Array.isArray(response)); };
+    const bulk = async decision => { const response = await callIpcRaw('projects:set-existing-assets-decision', id, decision); assert.equal(response.success, true, JSON.stringify(response)); return response; };
+    return { id, current, add, workspace, fact, stored, anyRowAt, select, selectionOf, review, reviewNames, written, toggle, bulk };
+  }
+  const withoutEmbedded = (list, embedded) => list.filter(name => !embedded || !matchName(name, embedded));
+
+  // ---- Format matrix: every supported working-file format.
+  for (const ext of FORMATS) {
+    baselineTest(`excluded working file ${ext}: only its own assets leave; Include All Existing keeps them for that exclusion only`, { timeout: 180000 }, () => withEnv(async () => {
+      const f = await formatProject(ext, { scope: ext === '.fig' ? 'entire-file' : undefined });
+      const { names, embeddedName: E } = f;
+      // A PSD packaged before Restore cannot be restored (pre-existing, identical on base); package it only at the end.
+      const packageBeforeRestore = ext !== '.psd';
+      for (const name of [names.only, names.shared, names.keepOnly, ...(E ? [E] : [])]) assert.equal((await f.fact(name)).included, true, name + ' before');
+      await f.select(f.W, 'exclude');
+      const assertWithheld = async name => { const row = await f.fact(name);
+        assert.deepEqual([row.included, row.excludedSourceOnly, row.excluded, row.includedAsDependency], [false, true, false, false], name); };
+      await assertWithheld(names.only);
+      if (E) await assertWithheld(E);
+      const shared = await f.fact(names.shared);
+      assert.deepEqual([shared.included, shared.includedAsDependency, shared.excludedSourceOnly], [true, true, false]);
+      assert.deepEqual(shared.requiredBy, [path.basename(f.K)]);
+      assert.equal((await f.fact(names.keepOnly)).included, true);
+      assert.deepEqual(f.current().excludedAssetKeys || [], [], 'withholding writes no exclusion intent');
+      assert.equal((await f.workspace()).semanticCounts.excludedAssets, E ? 2 : 1);
+      let review = await f.review();
+      assert.equal(review.materializable, true);
+      assert.deepEqual(f.reviewNames(review), f.keepNames);
+      if (packageBeforeRestore) {
+        assert.deepEqual(await f.written(review), f.keepNames, 'written package without the excluded file and its own assets');
+        review = await f.review();
+      }
+      // A rescan of the excluded file is skipped and changes nothing.
+      const rowsBefore = JSON.stringify(f.current().files);
+      assert.equal((await metadataTestHooks.runScanOnOpen(f.id, f.W))?.skipped, 'source-excluded');
+      assert.equal(JSON.stringify(f.current().files), rowsBefore);
+      // Pre-package scan while excluded admits nothing the excluded file links.
+      const originalBytes = fs.readFileSync(f.W);
+      writeWorking(ext, f.W, [desk(names.only), desk(names.shared), desk(names.newLink)]);
+      await callIpcRaw('projects:pre-package-scan', f.id);
+      assert.deepEqual(f.anyRowAt(desk(names.newLink)), [], 'no row or pending row for the new link');
+      assert.equal(f.current().files.some(row => ['psd-linked', 'psd-embedded', 'indd-linked'].includes(row.source) && /Fresh-/.test(row.name || '')), false);
+      fs.writeFileSync(f.W, originalBytes);
+      if (ext === '.indd') inddModified = false;
+      // Store reload changes nothing.
+      const factsBefore = JSON.stringify((await f.workspace()).files.map(row => [row.name, row.included, row.excludedSourceOnly]));
+      roundTripFakeStore();
+      assert.equal(JSON.stringify((await f.workspace()).files.map(row => [row.name, row.included, row.excludedSourceOnly])), factsBefore);
+      const staleToken = review.token;
+
+      // Include All Existing while withheld keeps them for this exclusion.
+      const wSelection = f.selectionOf(f.W);
+      await f.bulk('include');
+      for (const name of [names.only, ...(E ? [E] : [])]) {
+        const row = await f.fact(name);
+        assert.deepEqual([row.included, row.excludedSourceOnly, row.excluded], [true, true, false], name + ' after Include All Existing');
+        assert.deepEqual(f.stored(name).existingIncludeEpisode, { version: 1, owners: { [wSelection.key]: wSelection.revision } });
+        assert.equal(f.stored(name).keptAfterSourceExclusion, undefined);
+      }
+      assert.equal(f.stored(names.shared).existingIncludeEpisode, undefined, 'a required shared asset is not marked');
+      assert.equal((await callIpcRaw('projects:package', f.id, desk('stale-out'), staleToken)).error, 'package_review_stale', 'a token issued before the click is refused');
+      const bulkNames = [...f.keepNames, names.only, ...(E ? [E] : [])];
+      roundTripFakeStore();
+      review = await f.review();
+      assert.equal(f.reviewNames(review).length, bulkNames.length);
+      for (const name of bulkNames) assert.ok(f.reviewNames(review).some(actual => matchName(actual, name)), name + ' in review');
+      if (packageBeforeRestore) {
+        const out = await f.written(review);
+        for (const name of bulkNames) assert.ok(out.some(actual => matchName(actual, name)), name + ' written');
+      }
+
+      // Restore: its own assets return as dependencies.
+      const restored = await f.select(f.W, 'restore');
+      const assertDependency = async name => { const row = await f.fact(name);
+        assert.deepEqual([row.included, row.includedAsDependency, row.excludedSourceOnly], [true, true, false], name + ' after Restore'); };
+      if (ext === '.indd') {
+        // InDesign has the document open: Restore needs current bytes (pre-existing, identical on base).
+        assert.equal((await f.review()).materializable, false);
+      } else {
+        assert.equal(restored.verificationStatus, 'scanned');
+        await assertDependency(names.only);
+        review = await f.review();
+        assert.equal(review.materializable, true);
+        for (const name of [...bulkNames, path.basename(f.W)]) assert.ok(f.reviewNames(review).some(actual => matchName(actual, name)), name + ' after Restore');
+        // Written package at the Restore point (all formats except .indd, whose open-document Restore is not materializable).
+        const restoredWritten = await f.written(review);
+        assert.deepEqual(restoredWritten, f.reviewNames(review).slice().sort());
+        for (const name of [...bulkNames, path.basename(f.W)]) assert.ok(restoredWritten.some(actual => matchName(actual, name)), name + ' written after Restore');
+        review = await f.review();
+      }
+      // A later Exclude withholds them again: the earlier click belonged to the earlier exclusion.
+      await f.select(f.W, 'exclude');
+      roundTripFakeStore();
+      await assertWithheld(names.only);
+      if (E) await assertWithheld(E);
+      assert.ok(f.stored(names.only).existingIncludeEpisode.owners[wSelection.key] < f.selectionOf(f.W).revision);
+      assert.deepEqual(f.reviewNames(await f.review()), f.keepNames);
+      // A per-asset Include is durable and independent of the bulk state.
+      await f.toggle(names.only);
+      assert.equal(f.stored(names.only).keptAfterSourceExclusion, true);
+      assert.equal((await f.fact(names.only)).included, true);
+      // A second Include All Existing follows the current exclusion.
+      await f.bulk('include');
+      if (E) {
+        assert.equal((await f.fact(E)).included, true);
+        assert.deepEqual(f.stored(E).existingIncludeEpisode.owners, { [wSelection.key]: f.selectionOf(f.W).revision });
+      }
+      await f.select(f.W, 'restore');
+      await f.select(f.W, 'exclude');
+      roundTripFakeStore();
+      assert.equal((await f.fact(names.only)).included, true, 'per-asset Include survives Restore and a later Exclude');
+      if (E) await assertWithheld(E);
+      review = await f.review();
+      assert.equal(review.materializable, true);
+      const expected = [...f.keepNames, names.only].sort();
+      assert.deepEqual(f.reviewNames(review), expected);
+      assert.deepEqual(await f.written(review), expected);
+    }, { realTmp: ext === '.indd', realMainPsd: ext === '.psd' }));
+  }
+
+  // ---- Include All Existing for the current exclusion: several owners.
+  // X is linked by W1 and W2 only (existing); Keep.ai keeps the project packageable.
+  async function twoOwnerProject() {
+    const W1 = desk('W1.ai'), W2 = desk('W2.ai'), K = desk('Keep.ai'), X = desk('X.png'), side = desk('Side.png');
+    const f = await newProject('Two owners', { before() {
+      fs.writeFileSync(X, png(31)); fs.writeFileSync(side, png(32));
+      fs.writeFileSync(W1, `%PDF-1.7\n${X}\n%%EOF\n`); fs.writeFileSync(W2, `%PDF-1.7\n${X}\n%%EOF\n`);
+      fs.writeFileSync(K, `%PDF-1.7\n${side}\n%%EOF\n`);
+    } });
+    for (const filePath of [W1, W2, K]) await f.add(filePath);
+    assert.equal(f.stored('X.png').assetOrigin, 'existing');
+    const included = async () => (await f.fact('X.png')).included;
+    const state = async () => { const row = await f.fact('X.png'); return [row.included, row.includedAsDependency, row.excludedSourceOnly]; };
+    return { ...f, W1, W2, K, X, included, state };
+  }
+  const KEPT_BY_BULK = [true, false, true], WITHHELD = [false, false, true], DEPENDENCY = [true, true, false];
+  baselineTest('Include All Existing keeps an asset only while each excluded owner is in the exclusion current at the click (W1 first)', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await twoOwnerProject();
+    await f.select(f.W1, 'exclude');
+    assert.deepEqual(await f.state(), DEPENDENCY, 'an included owner keeps it');
+    await f.select(f.W2, 'exclude');
+    assert.deepEqual(await f.state(), WITHHELD);
+    await f.bulk('include');
+    const w1 = f.selectionOf(f.W1), w2 = f.selectionOf(f.W2);
+    assert.deepEqual(f.stored('X.png').existingIncludeEpisode, { version: 1, owners: { [w1.key]: w1.revision, [w2.key]: w2.revision } });
+    assert.deepEqual(await f.state(), KEPT_BY_BULK);
+    roundTripFakeStore(); assert.deepEqual(await f.state(), KEPT_BY_BULK, 'reload');
+    await f.select(f.W1, 'restore'); assert.deepEqual(await f.state(), DEPENDENCY, 'Restore W1');
+    await f.select(f.W1, 'exclude'); assert.deepEqual(await f.state(), WITHHELD, 'W1 is in a later exclusion');
+    roundTripFakeStore(); assert.deepEqual(await f.state(), WITHHELD, 'reload');
+    await f.select(f.W2, 'restore'); assert.deepEqual(await f.state(), DEPENDENCY, 'Restore W2');
+    await f.select(f.W2, 'exclude'); assert.deepEqual(await f.state(), WITHHELD, 'both in later exclusions');
+    await f.bulk('include'); assert.deepEqual(await f.state(), KEPT_BY_BULK, 'a second click honors the new exclusions');
+    const review = await f.review();
+    assert.deepEqual(f.reviewNames(review), ['Keep.ai', 'Side.png', 'X.png']);
+    assert.deepEqual(await f.written(review), ['Keep.ai', 'Side.png', 'X.png']);
+  }));
+  baselineTest('Include All Existing keeps an asset only while each excluded owner is in the exclusion current at the click (W2 cycles)', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await twoOwnerProject();
+    await f.select(f.W1, 'exclude'); await f.select(f.W2, 'exclude');
+    await f.bulk('include'); assert.deepEqual(await f.state(), KEPT_BY_BULK);
+    // W2 alone restored and excluded again: W1 is unchanged, W2 is not.
+    await f.select(f.W2, 'restore'); assert.deepEqual(await f.state(), DEPENDENCY);
+    await f.select(f.W2, 'exclude'); assert.deepEqual(await f.state(), WITHHELD);
+    await f.select(f.W1, 'restore'); assert.deepEqual(await f.state(), DEPENDENCY);
+    await f.select(f.W1, 'exclude'); assert.deepEqual(await f.state(), WITHHELD);
+    // An owner excluded only after the click: W1 alone at the click, W2 excluded later.
+    await f.select(f.W2, 'restore');
+    await f.bulk('include');
+    assert.deepEqual(await f.state(), DEPENDENCY, 'not withheld at the click: nothing recorded');
+    assert.equal(f.stored('X.png').existingIncludeEpisode.owners[f.selectionOf(f.W2).key] < f.selectionOf(f.W2).revision, true);
+    await f.select(f.W2, 'exclude');
+    assert.deepEqual(await f.state(), WITHHELD, 'a later exclusion of another owner withholds it');
+  }));
+
+  // Per-asset choices, explicit exclusions, Skip, shared assets and Add Files additions.
+  baselineTest('Include All Existing for the current exclusion leaves per-asset choices, shared assets and Add Files additions as they are', { timeout: 120000 }, () => withEnv(async () => {
+    const W = desk('Art.ai'), K = desk('Keep.ai');
+    const solo = desk('Solo.png'), toggled = desk('Toggled.png'), shared = desk('Shared.png'), manual = desk('Manual.png'), side = desk('Side.png');
+    const f = await newProject('Bulk choices', { before() {
+      for (const [file, seed] of [[solo, 41], [toggled, 42], [shared, 43], [manual, 44], [side, 45]]) fs.writeFileSync(file, png(seed));
+      fs.writeFileSync(W, `%PDF-1.7\n${solo}\n${toggled}\n${shared}\n${manual}\n%%EOF\n`);
+      fs.writeFileSync(K, `%PDF-1.7\n${shared}\n${side}\n%%EOF\n`);
+    } });
+    for (const filePath of [W, K]) await f.add(filePath);
+    // Manual.png is then added explicitly with Add Files.
+    manualDialogFor([manual]); await callIpcRaw('projects:add-files', f.id);
+    assert.equal(f.stored('Manual.png').assetOrigin === 'existing', false);
+    await f.select(W, 'exclude');
+    assert.equal((await f.fact('Solo.png')).included, false);
+    assert.equal((await f.fact('Manual.png')).included, true, 'Add Files addition stays');
+    assert.equal((await f.fact('Shared.png')).includedAsDependency, true);
+    // Per-asset Include before the click is durable and is not replaced by it.
+    await f.toggle('Toggled.png');
+    assert.equal(f.stored('Toggled.png').keptAfterSourceExclusion, true);
+    await f.bulk('include');
+    for (const name of ['Shared.png', 'Manual.png', 'Side.png', 'Toggled.png']) assert.equal(f.stored(name).existingIncludeEpisode, undefined, name);
+    assert.ok(f.stored('Solo.png').existingIncludeEpisode);
+    // Per-asset Exclude of a bulk-kept asset excludes it explicitly and ends the bulk keep.
+    await f.toggle('Solo.png');
+    let row = await f.fact('Solo.png');
+    assert.deepEqual([row.included, row.excluded], [false, true]);
+    assert.equal(f.stored('Solo.png').existingIncludeEpisode, undefined);
+    assert.ok(f.current().excludedAssetKeys.length >= 1);
+    // Include All Existing clears explicit exclusions of existing assets (unchanged behavior) and keeps it again.
+    await f.bulk('include');
+    row = await f.fact('Solo.png');
+    assert.deepEqual([row.included, row.excluded, row.excludedSourceOnly], [true, false, true]);
+    assert.ok(f.stored('Solo.png').existingIncludeEpisode);
+    // Skip All Existing afterwards is the later bulk choice: every existing asset is explicitly excluded and the keep ends.
+    await f.bulk('skip');
+    assert.equal(f.stored('Solo.png').existingIncludeEpisode, undefined);
+    for (const name of ['Solo.png', 'Toggled.png']) assert.equal((await f.fact(name)).included, false, name + ' after Skip');
+    assert.equal((await f.fact('Side.png')).includedAsDependency, true, 'required by the selected Keep.ai');
+    assert.equal((await f.fact('Manual.png')).included, true, 'an Add Files addition is not an existing asset');
+    // Restore and a later Exclude: the per-asset Include survives; Solo is withheld again after Include All.
+    await f.bulk('include');
+    await f.select(W, 'restore'); await f.select(W, 'exclude');
+    roundTripFakeStore();
+    assert.equal((await f.fact('Toggled.png')).included, true);
+    assert.equal((await f.fact('Solo.png')).included, false);
+    assert.equal((await f.fact('Manual.png')).included, true);
+    assert.equal((await f.fact('Shared.png')).included, true);
+  }));
+
+  // Include All Existing before any exclusion is not owner intent for a later exclusion.
+  async function pendingExistingFixture() {
+    const f = await newProject('Pending existing', { pause: true });
+    const A = desk('A.psd'), keep = desk('Keep.ai');
+    for (const name of ['A.psd', 'Accepted.png', 'Sibling.png']) fs.writeFileSync(desk(name), `synthetic ${name}`);
+    fs.writeFileSync(keep, '%PDF-1.7\n%%EOF\n');
+    const source = name => ({ fileId: name, path: desk(name), name, ext: path.extname(name), projectRole: 'source', source: 'user-added', addedAt: Date.now() });
+    const pendingRow = (name, assetOrigin) => ({ fileId: name, path: desk(name), name, ext: '.png', projectRole: 'asset', source: 'psd-linked', assetOrigin,
+      addedAt: Date.now() - 60000, captureState: 'needs-save', captureReason: 'linked-asset-observed',
+      captureEvidence: { schemaVersion: 1, source: 'psd-linked', appFamily: 'photoshop', relationshipSourcePath: A, documentModified: true } });
+    f.current().files = [source('A.psd'), source('Keep.ai')];
+    f.current().pendingFiles = [pendingRow('Accepted.png', 'existing'), pendingRow('Sibling.png', 'added')];
+    f.current().assetBaseline = { schemaVersion: 1, status: 'decision-required', decision: null, establishedAt: Date.now() };
+    roundTripFakeStore();
+    currentPsdFixture = { children: [], linkedFiles: ['Accepted.png', 'Sibling.png'].map(name => ({ name, linkedFile: { fullPath: desk(name) } })) };
+    const scanThenExclude = async () => {
+      await f.select(A, 'exclude');
+      assert.equal((await f.select(A, 'restore')).verificationStatus, 'scanned');
+      await f.select(A, 'exclude');
+    };
+    return { ...f, A, scanThenExclude };
+  }
+  baselineTest('pending existing assets promoted by Include All Existing during an exclusion are kept for that exclusion only', { timeout: 120000 }, async () => {
+    const f = await pendingExistingFixture();
+    try {
+      await f.scanThenExclude();
+      // An existing row still awaiting review while its working file is excluded.
+      const admitted = f.current().files.find(file => file.name === 'Accepted.png');
+      f.current().files = f.current().files.filter(file => file !== admitted);
+      f.current().pendingFiles.push({ ...admitted, assetOrigin: 'existing', captureState: 'needs-save', captureReason: 'linked-asset-observed',
+        captureEvidence: { schemaVersion: 1, source: 'psd-linked', appFamily: 'photoshop', relationshipSourcePath: f.A, documentModified: true } });
+      f.current().assetBaseline = { ...f.current().assetBaseline, status: 'decision-required', decision: null };
+      roundTripFakeStore();
+      const decided = await f.bulk('include');
+      assert.ok(decided.project.files.some(file => file.name === 'Accepted.png'), 'the IPC result carries the promoted row');
+      const row = await f.fact('Accepted.png');
+      assert.deepEqual([row.included, row.excludedSourceOnly], [true, true], 'the promoted row is included, as the click reported');
+      assert.deepEqual(f.reviewNames(await f.review()), ['Accepted.png', 'Keep.ai']);
+      await f.select(f.A, 'restore'); await f.select(f.A, 'exclude');
+      assert.equal((await f.fact('Accepted.png')).included, false, 'withheld after the next exclusion');
+    } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+  });
+
+  // ---- Selection or Include landing while a scan, a presentation save or a Start Watching snapshot is in flight.
+  const gateRead = (target, read = fs.promises.readFile) => {
+    let release, entered = false; const gate = new Promise(resolve => { release = resolve; });
+    fs.promises.readFile = async function gated(file, ...args) {
+      if (path.resolve(String(file)) === target && !entered) { entered = true; await gate; }
+      return read.call(fs.promises, file, ...args);
+    };
+    return { entered: () => entered, release, restore() { release(); fs.promises.readFile = read; } };
+  };
+  for (const landing of ['exclude', 'restore', 'include-all']) {
+    baselineTest(`pre-package scan in flight: ${landing} landing during the scan`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await formatProject('.ai');
+      if (landing !== 'exclude') await f.select(f.W, 'exclude');
+      writeWorking('.ai', f.W, [desk(f.names.only), desk(f.names.shared), desk(f.names.newLink)]);
+      const gate = gateRead(f.K);
+      try {
+        const scan = callIpcRaw('projects:pre-package-scan', f.id);
+        await waitForCondition(() => gate.entered(), 'scan did not reach the gated read', 20000);
+        if (landing === 'include-all') await f.bulk('include'); else await f.select(f.W, landing);
+        gate.release(); await scan;
+      } finally { gate.restore(); }
+      const fresh = f.anyRowAt(desk(f.names.newLink));
+      if (landing === 'exclude') {
+        // Admitted for W before the Exclude landed; its owner record withholds it.
+        assert.equal(fresh.length, 1); assert.deepEqual(fresh[0].dependencyOwners, [f.W]);
+        assert.equal((await f.fact(f.names.newLink)).included, false);
+        await f.select(f.W, 'restore');
+        assert.equal((await f.fact(f.names.newLink)).included, true);
+      } else if (landing === 'restore') {
+        // The scan skipped W; Restore's own scan admits the new link as a dependency.
+        assert.equal((await f.fact(f.names.newLink)).includedAsDependency, true);
+        assert.equal((await f.workspace()).semanticCounts.missingRequiredReferences, 0);
+      } else {
+        assert.deepEqual(fresh, [], 'the excluded file was not scanned');
+        assert.equal((await f.fact(f.names.only)).included, true, 'the merge keeps the click');
+        assert.ok(f.stored(f.names.only).existingIncludeEpisode);
+      }
+    }));
+  }
+  for (const landing of ['exclude', 'include-all']) {
+    baselineTest(`presentation save in flight: ${landing} landing during the save`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await formatProject('.pptx');
+      if (landing === 'include-all') await f.select(f.W, 'exclude');
+      extraMediaSeed = 557; try { writeWorking('.pptx', f.W, [desk(f.names.only), desk(f.names.shared)]); } finally { extraMediaSeed = 0; }
+      let release, entered = false; const gate = new Promise(resolve => { release = resolve; });
+      setChildProcessHandler(request => {
+        if (request.kind === 'execFile' && request.command === '/usr/bin/unzip' && request.args[0] === '-l' && !entered) {
+          entered = true; return gate.then(() => passthroughInner(request));
+        }
+        return passthroughInner(request);
+      });
+      const save = metadataTestHooks.runScanOnSavePresentation(f.id, f.W);
+      if (landing === 'include-all') {
+        // Excluded: the save does not start.
+        await save; assert.equal(entered, false);
+        await f.bulk('include');
+        assert.equal(f.current().files.some(row => /image2/.test(row.name || '')), false);
+        return;
+      }
+      await waitForCondition(() => entered, 'save did not reach the archive listing', 20000);
+      await f.select(f.W, 'exclude');
+      release(); await save;
+      const media = f.current().files.filter(row => /image2/.test(row.name || ''));
+      assert.equal(media.length, 1); assert.deepEqual(media[0].dependencyOwners, [f.W]);
+      assert.equal((await f.fact('image2.png')).included, false, 'withheld with its presentation');
+      await f.select(f.W, 'restore');
+      assert.equal((await f.fact('image2.png')).included, true);
+    }));
+  }
+  baselineTest('Start Watching snapshot: an Exclude landing before the snapshot commits is honored', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await formatProject('.ai');
+    await callIpcRaw('projects:pause', f.id); clearTrackedTimers();
+    writeWorking('.ai', f.W, [desk(f.names.only), desk(f.names.shared), desk(f.names.newLink)]);
+    let release, entered = false; const gate = new Promise(resolve => { release = resolve; });
+    setChildProcessHandler(request => {
+      if (request.kind === 'execFile' && request.command === '/bin/ps') return { stdout: '444 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
+      if (request.kind === 'execFile' && request.command === '/usr/sbin/lsof') {
+        const out = { stdout: `p444\nf14\ntREG\nn${f.W}\n` };
+        if (!entered) { entered = true; return gate.then(() => out); }
+        return out;
+      }
+      return passthroughInner(request);
+    });
+    const started = callIpcRaw('projects:start-watching', f.id);
+    await waitForCondition(() => entered, 'snapshot did not reach lsof', 20000);
+    await f.select(f.W, 'exclude');
+    release(); await started;
+    await metadataTestHooks.waitForWatcherIdle(f.id).catch(() => null);
+    await callIpcRaw('projects:pause', f.id); clearTrackedTimers(); passthrough();
+    assert.deepEqual(f.anyRowAt(desk(f.names.newLink)), [], 'the excluded file is not parsed for links');
+  }));
+
+  // ---- Owner records: every route that observes an asset for a working file.
+  const ROUTES = [['regex', '.ai'], ['doublecheck', '.sketch'], ['psdparse', '.psd'], ['snapshot', '.ai']];
+  for (const [route, ext] of ROUTES) for (const order of ['W-only', 'W-first', 'K-first']) {
+    baselineTest(`owner records ${route}: ${order}`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await formatProject(ext);
+      const X = desk('Shared2-' + f.tag + '.png'); fs.writeFileSync(X, png(88));
+      const K2 = desk('Keep2-' + f.tag + (route === 'psdparse' ? '.psd' : route === 'doublecheck' ? '.sketch' : '.ai'));
+      writeWorking(path.extname(K2), K2, [desk(f.names.keepOnly)], 901);
+      await f.add(K2);
+      const links = { W: false, K: false };
+      const linkIn = (file, withX) => {
+        if (route === 'psdparse') { links[file === f.W ? 'W' : 'K'] = withX; return; }
+        writeWorking(path.extname(file), file, file === f.W ? [desk(f.names.only), desk(f.names.shared), ...(withX ? [X] : [])]
+          : [desk(f.names.keepOnly), ...(withX ? [X] : [])], file === f.W ? 900 : 901);
+      };
+      const runRoute = async () => {
+        if (route === 'snapshot') {
+          await callIpcRaw('projects:pause', f.id); clearTrackedTimers();
+          const open = [f.W, K2].map((file, i) => `f${14 + i}\ntREG\nn${file}\n`).join('');
+          setChildProcessHandler(request => {
+            if (request.kind === 'execFile' && request.command === '/bin/ps') return { stdout: '444 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
+            if (request.kind === 'execFile' && request.command === '/usr/sbin/lsof') return { stdout: `p444\n${open}` };
+            return passthroughInner(request);
+          });
+          await callIpcRaw('projects:start-watching', f.id);
+          await metadataTestHooks.waitForWatcherIdle(f.id).catch(() => null);
+          await callIpcRaw('projects:pause', f.id); clearTrackedTimers(); passthrough();
+        } else if (route === 'psdparse') {
+          const wBytes = fs.readFileSync(f.W), kBytes = fs.readFileSync(K2);
+          currentPsdFixture = buffer => ({ children: buffer && ((links.W && buffer.equals(wBytes)) || (links.K && buffer.equals(kBytes)))
+            ? [{ name: 'L', linkedFile: { fullPath: X } }] : [], linkedFiles: [] });
+          try { await callIpcRaw('projects:pre-package-scan', f.id); } finally { currentPsdFixture = 'actual-source-buffer'; }
+        } else await callIpcRaw('projects:pre-package-scan', f.id);
+      };
+      if (order !== 'K-first') { linkIn(f.W, true); await runRoute(); }
+      if (order !== 'W-only') { linkIn(K2, true); await runRoute(); }
+      if (order === 'K-first') { linkIn(f.W, true); await runRoute(); }
+      const rows = f.anyRowAt(X);
+      assert.equal(rows.length, 1, 'one row for X');
+      const expectedOwners = order === 'W-only' ? [f.W] : order === 'W-first' ? [f.W, K2] : [K2, f.W];
+      assert.deepEqual(rows[0].dependencyOwners, expectedOwners);
+      await f.select(f.W, 'exclude');
+      const kept = order !== 'W-only';
+      assert.equal((await f.fact(path.basename(X))).included, kept);
+      roundTripFakeStore();
+      assert.equal((await f.fact(path.basename(X))).included, kept, 'after reload');
+      assert.deepEqual(f.anyRowAt(X)[0].dependencyOwners, expectedOwners);
+      if (!kept) {
+        assert.ok(!f.reviewNames(await f.review()).includes(path.basename(X)));
+        await f.select(f.W, 'restore');
+        assert.equal((await f.fact(path.basename(X))).included, true, 'Restore');
+      }
+    }, { realTmp: route === 'snapshot' }));
+  }
+  baselineTest('owner records: a late owner keeps the asset; an owner that is no longer a project file does not', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await formatProject('.ai');
+    const fresh = desk(f.names.newLink);
+    writeWorking('.ai', f.W, [desk(f.names.only), desk(f.names.shared), fresh]);
+    await callIpcRaw('projects:pre-package-scan', f.id);
+    assert.deepEqual(f.anyRowAt(fresh)[0].dependencyOwners, [f.W]);
+    await f.select(f.W, 'exclude');
+    assert.equal((await f.fact(f.names.newLink)).included, false);
+    // K gains the link while W is excluded: the next scan records K, which keeps it.
+    fs.writeFileSync(f.K, `%PDF-1.7\n${desk(f.names.shared)}\n${desk(f.names.keepOnly)}\n${fresh}\n%%EOF\n`);
+    await callIpcRaw('projects:pre-package-scan', f.id);
+    assert.deepEqual(f.anyRowAt(fresh)[0].dependencyOwners, [f.W, f.K]);
+    assert.equal((await f.fact(f.names.newLink)).included, true);
+    // An owner removed from the project no longer keeps it.
+    const owners = f.anyRowAt(fresh)[0].dependencyOwners;
+    f.current().files.find(row => row.path === fresh).dependencyOwners = [...owners.slice(0, 1), desk('Removed.ai')];
+    roundTripFakeStore();
+    assert.equal((await f.fact(f.names.newLink)).included, false, 'a recorded owner that is not a project file is ignored');
+  }));
+  baselineTest('owner records: the bound sets overflow and keeps; a token issued before an owner-only change is refused', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await formatProject('.ai');
+    const X = desk('Many-ai.png'); fs.writeFileSync(X, png(91));
+    writeWorking('.ai', f.W, [desk(f.names.only), desk(f.names.shared), X]);
+    await callIpcRaw('projects:pre-package-scan', f.id);
+    const review = await f.review();
+    fs.writeFileSync(f.K, `%PDF-1.7\n${desk(f.names.shared)}\n${desk(f.names.keepOnly)}\n${X}\n%%EOF\n`);
+    await callIpcRaw('projects:pre-package-scan', f.id);
+    assert.deepEqual(f.anyRowAt(X)[0].dependencyOwners, [f.W, f.K]);
+    assert.equal((await callIpcRaw('projects:package', f.id, desk('token-out'), review.token)).error, 'package_review_changed');
+    f.current().files.find(row => row.path === X).dependencyOwners = Array.from({ length: 8 }, (_, i) => desk(`Gone-${i}.ai`));
+    fs.writeFileSync(f.K, `%PDF-1.7\n${desk(f.names.shared)}\n${desk(f.names.keepOnly)}\n%%EOF\n`);
+    roundTripFakeStore();
+    await callIpcRaw('projects:pre-package-scan', f.id);
+    assert.equal(f.anyRowAt(X)[0].dependencyOwnersOverflow, true);
+    assert.equal(f.anyRowAt(X)[0].dependencyOwners.length, 8);
+    await f.select(f.W, 'exclude');
+    assert.equal((await f.fact('Many-ai.png')).included, true, 'overflow keeps');
+  }));
+  baselineTest('kept bridge: an excluded InDesign file places an Illustrator file; Including the placed file keeps what it links', { timeout: 120000 }, () => withEnv(async () => {
+    const W = desk('Chain.indd'), placed = desk('Placed.ai'), deep = desk('Deep.png'), keep = desk('KeepChain.ai');
+    const f = await newProject('Cross chain', { before() {
+      fs.writeFileSync(deep, png(61)); fs.writeFileSync(placed, `%PDF-1.7\n${deep}\n%%EOF\n`); fs.writeFileSync(W, `SYNTH.indd\n${placed}\n`);
+      fs.writeFileSync(keep, '%PDF-1.7\n%%EOF\n');
+    } });
+    inddDoc = W;
+    for (const filePath of [W, keep]) await f.add(filePath);
+    await callIpcRaw('projects:pre-package-scan', f.id);
+    assert.equal(f.anyRowAt(deep).length, 1, 'Deep.png admitted while the InDesign file is selected');
+    await f.select(W, 'exclude');
+    for (const name of ['Placed.ai', 'Deep.png']) assert.equal((await f.fact(name)).included, false, name);
+    await callIpcRaw('projects:pre-package-scan', f.id);
+    for (const name of ['Placed.ai', 'Deep.png']) assert.equal((await f.fact(name)).included, false, name + ' after a scan');
+    await f.toggle('Placed.ai');
+    assert.equal((await f.fact('Placed.ai')).included, true);
+    assert.equal((await f.fact('Deep.png')).included, true, 'kept by the included placed file');
+    assert.deepEqual(f.reviewNames(await f.review()), ['Deep.png', 'KeepChain.ai', 'Placed.ai']);
+  }, { realTmp: true }));
+  for (const variant of ['retained-as-dependency', 'never-engaged']) {
+    baselineTest(`scan guard does not skip: ${variant}`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await formatProject('.ai');
+      if (variant === 'retained-as-dependency') {
+        fs.writeFileSync(f.K, `%PDF-1.7\n${desk(f.names.shared)}\n${desk(f.names.keepOnly)}\n${f.W}\n%%EOF\n`);
+        await metadataTestHooks.runScanOnOpen(f.id, f.K, null, null, { verifySelectedSource: true });
+        await f.select(f.W, 'exclude');
+        assert.equal((await f.fact(path.basename(f.W))).includedAsDependency, true);
+      } else assert.equal(Object.hasOwn(f.current(), 'workingSourceSelections'), false);
+      writeWorking('.ai', f.W, [desk(f.names.only), desk(f.names.shared), desk(f.names.newLink)]);
+      await callIpcRaw('projects:pre-package-scan', f.id);
+      assert.equal(f.anyRowAt(desk(f.names.newLink)).length, 1, 'the link of a file still in the package is admitted');
+      assert.equal((await f.fact(f.names.newLink)).included, true);
+    }));
+  }
+
+  // ---- Presentation save while excluded, and while selected followed by Exclude.
+  for (const ext of ['.pptx', '.key']) for (const mode of ['excluded', 'selected-then-exclude']) {
+    baselineTest(`presentation save ${ext} ${mode}`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await formatProject(ext);
+      const second = ext === '.pptx' ? 'image2.png' : 'second-photo.png';
+      if (mode === 'excluded') await f.select(f.W, 'exclude');
+      const before = JSON.stringify([f.current().files, f.current().pendingFiles]);
+      extraMediaSeed = 557; try { writeWorking(ext, f.W, [desk(f.names.only), desk(f.names.shared)]); } finally { extraMediaSeed = 0; }
+      await metadataTestHooks.runScanOnSavePresentation(f.id, f.W);
+      if (mode === 'excluded') {
+        assert.equal(JSON.stringify([f.current().files, f.current().pendingFiles]), before, 'no row while excluded');
+        return;
+      }
+      const media = f.current().files.filter(row => matchName(row.name, second));
+      assert.equal(media.length, 1); assert.deepEqual(media[0].dependencyOwners, [f.W]);
+      await f.select(f.W, 'exclude');
+      assert.equal((await f.fact(second)).included, false);
+      const review = await f.review();
+      assert.deepEqual(f.reviewNames(review), f.keepNames);
+      assert.deepEqual(await f.written(review), f.keepNames, 'no package-time extraction from the excluded presentation');
+      await f.select(f.W, 'restore');
+      assert.equal((await f.fact(second)).included, true);
+    }));
+  }
+
+  // ---- Live link polls: Illustrator, Photoshop, InDesign (modeled scripting output).
+  const P_CASES = [['.ai', false], ['.ai', true], ['.psd', null], ['.indd', false], ['.indd', true]];
+  for (const [ext, modified] of P_CASES) for (const mode of ['excluded', 'selected-then-exclude']) {
+    baselineTest(`live poll ${ext} modified=${modified} ${mode}`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await formatProject(ext);
+      const fresh = desk(f.names.newLink);
+      if (mode === 'excluded') await f.select(f.W, 'exclude');
+      writeWorking(ext, f.W, [desk(f.names.only), desk(f.names.shared), fresh]);
+      if (ext === '.indd') inddModified = modified;
+      const appName = path.basename(f.W);
+      setChildProcessHandler(request => {
+        const { kind, command } = request;
+        if (ext === '.ai') {
+          if (isIllustratorPgrepCheck(request)) return { stdout: '432\n' };
+          if (isOsascriptInvocation(request, 'crate-ai-active-session.applescript')) return { stdout:
+            `DOC\t${f.W}\t${appName}\t${modified}\ttrue\nLINK\t${f.W}\t${appName}\t${fresh}\t${modified}\ttrue\nCOMPLETE\t1\t1\n` };
+        }
+        if (ext === '.psd') {
+          if (kind === 'exec' && String(command).includes("grep -i 'Adobe Photoshop'")) return { stdout: '123 /Applications/Adobe Photoshop.app/Contents/MacOS/Adobe Photoshop\n' };
+          if (isOsascriptInvocation(request, 'crate-ps-poll.applescript')) return { stdout: `${fresh}\n` };
+        }
+        return passthroughInner(request);
+      });
+      await metadataTestHooks.pollPsForProject(f.id, metadataTestHooks.getActiveWatchingActivationToken(f.id));
+      await metadataTestHooks.waitForWatcherIdle(f.id).catch(() => null);
+      clearTrackedTimers(); passthrough();
+      const savedInDesign = ext === '.indd' && modified === false;
+      const pending = (f.current().pendingFiles || []).filter(row => row.path === fresh);
+      if (savedInDesign && mode === 'selected-then-exclude') {
+        // A saved InDesign document admits its link directly; the owner record withholds it after Exclude.
+        assert.equal(f.current().files.filter(row => row.path === fresh).length, 1);
+        assert.deepEqual(f.current().files.find(row => row.path === fresh).dependencyOwners, [f.W]);
+        await f.select(f.W, 'exclude');
+        assert.equal((await f.fact(f.names.newLink)).included, false);
+        await f.select(f.W, 'restore');
+        assert.equal((await f.fact(f.names.newLink)).included, true);
+        return;
+      }
+      // Otherwise (including a saved InDesign document while excluded) the link waits for the owner.
+      assert.equal(pending.length, 1, 'pending');
+      assert.equal(f.current().files.some(row => row.path === fresh), false);
+      assert.ok(!f.reviewNames(await f.review()).includes(f.names.newLink));
+      assert.ok(await callIpcRaw('projects:accept-pending', f.id, metadataTestHooks.createProjectFileVisualIdentity(f.id, pending[0])));
+      if (mode === 'selected-then-exclude') await f.select(f.W, 'exclude');
+      assert.equal((await f.fact(f.names.newLink)).included, true, 'Add keeps it while excluded');
+      await f.select(f.W, 'restore'); await f.select(f.W, 'exclude');
+      assert.equal((await f.fact(f.names.newLink)).included, true, 'and after Restore and a later Exclude');
+    }, { realTmp: true }));
+  }
+
+  // ---- Links read whole since #324: .woff2 fonts and IDML declared-link forms.
+  for (const ext of ['.ai', '.idml', '.sketch', '.afdesign', '.pxd', '.key']) {
+    baselineTest(`woff2 font of an excluded ${ext} leaves and returns with it`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await formatProject(ext, { onlyExt: '.woff2' });
+      const font = f.stored(f.names.only);
+      assert.equal(font.path, desk(f.names.only));
+      await f.select(f.W, 'exclude');
+      assert.deepEqual([(await f.fact(f.names.only)).included, (await f.fact(f.names.only)).excludedSourceOnly], [false, true]);
+      assert.deepEqual(f.reviewNames(await f.review()), f.keepNames);
+      await f.select(f.W, 'restore');
+      const review = await f.review();
+      assert.ok((await f.written(review)).includes(f.names.only));
+    }));
+  }
+  for (const form of ['file://localhost', 'file://']) {
+    baselineTest(`IDML ${form} declared links leave and return with the excluded document`, { timeout: 120000 }, () => withEnv(async () => {
+      idmlForm = form;
+      try {
+        const f = await formatProject('.idml');
+        await f.select(f.W, 'exclude');
+        assert.equal((await f.fact(f.names.only)).included, false);
+        assert.deepEqual(f.reviewNames(await f.review()), f.keepNames);
+        await f.select(f.W, 'restore');
+        const review = await f.review();
+        assert.ok((await f.written(review)).includes(f.names.only));
+      } finally { idmlForm = 'file:'; }
+    }));
+  }
+
+  // ---- Legacy logical PSD rows: a per-asset choice follows identical embedded
+  // bytes of the same PSD across a rename or reorder restage (dormant project).
+  async function legacyPsdProject(label) {
+    const W = desk('Legacy.psd'), keep = desk('Keep.ai');
+    const f = await newProject('Legacy ' + label);
+    fs.writeFileSync(W, 'synthetic psd bytes'); fs.writeFileSync(keep, '%PDF-1.7\n%%EOF\n');
+    f.current().files = [
+      { fileId: 'w', path: W, name: 'Legacy.psd', ext: '.psd', projectRole: 'source', source: 'manual-browse', addedAt: Date.now() },
+      { fileId: 'keep', path: keep, name: 'Keep.ai', ext: '.ai', projectRole: 'source', source: 'manual-browse', addedAt: Date.now() }];
+    f.current().pendingFiles = [];
+    f.current().assetBaseline = { schemaVersion: 1, status: 'legacy-included', decision: 'include', establishedAt: Date.now() };
+    roundTripFakeStore();
+    const save = async linkedFiles => { currentPsdFixture = { children: [], linkedFiles }; await metadataTestHooks.runScanOnSave(f.id, W); };
+    const logical = () => f.current().files.filter(row => row.source === 'scan-on-save-embedded');
+    return { ...f, W, save, logical };
+  }
+  const objA = { name: 'Obj-A.png', data: png(41) }, objB = { name: 'Obj-B.png', data: png(42) };
+  for (const choice of ['exclude', 'exclude-include']) for (const restage of ['rename-reorder', 'unchanged']) {
+    baselineTest(`legacy PSD ${choice} survives a ${restage} save on identical embedded bytes`, { timeout: 120000 }, async () => {
+      const f = await legacyPsdProject(choice + restage);
+      try {
+        await f.save([objA, objB]);
+        assert.deepEqual(f.logical().map(row => row.name), ['Obj-A.png', 'Obj-B.png']);
+        await f.toggle('Obj-A.png');
+        if (choice === 'exclude-include') await f.toggle('Obj-A.png');
+        const fingerprint = f.stored('Obj-A.png')[choice === 'exclude' ? 'individualContentExclusion' : 'individualContentInclude'];
+        assert.match(fingerprint, /^\d+:[0-9a-f]{64}$/);
+        const renamed = restage === 'unchanged' ? 'Obj-A.png' : 'Obj-A-renamed.png';
+        await f.save(restage === 'unchanged' ? [objA, objB] : [objB, { name: renamed, data: objA.data }]);
+        const row = f.stored(renamed);
+        assert.equal(row[choice === 'exclude' ? 'individualContentExclusion' : 'individualContentInclude'], fingerprint);
+        assert.equal((await f.fact(renamed)).included, choice !== 'exclude');
+        assert.equal((await f.fact('Obj-B.png')).included, true, 'the other object is unaffected');
+        assert.equal(f.current().files.some(item => item.individualChoiceReview !== undefined), false, 'a proven carry raises no hold');
+        // Then the PSD is excluded: an Include stays, the untouched sibling leaves.
+        await f.select(f.W, 'exclude');
+        assert.equal((await f.fact(renamed)).included, choice !== 'exclude');
+        assert.equal((await f.fact('Obj-B.png')).included, false);
+      } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+    });
+  }
+  // ---- Choice guard, legacy logical PSD rows (older Photoshop save route).
+  const choiceReviewOf = f => f.current().files.filter(row => row.individualChoiceReview !== undefined).map(row => row.name).sort();
+  const assertHeld = async (f, names, reason, staleToken = null) => {
+    assert.deepEqual(choiceReviewOf(f), [...names].sort());
+    for (const name of names) assert.deepEqual(f.stored(name).individualChoiceReview, { version: 1, reason }, name);
+    const workspace = await f.workspace();
+    assert.equal(workspace.workingSourceSelectionBlocked, true, 'the workspace shows Package needs review');
+    const review = await f.review();
+    assert.equal(review.materializable, false); assert.equal(review.token, undefined);
+    for (const name of names) assert.ok(review.message.includes(`“${name}”`) || /and \d+ more/.test(review.message), review.message);
+    assert.match(review.message, /Choose Include or Exclude for each to continue packaging\./);
+    for (const file of review.files) {
+      if (names.some(name => matchName(file.name, name))) assert.equal(file.status, 'unavailable', file.name);
+    }
+    if (staleToken) assert.ok(['package_review_stale', 'package_review_changed'].includes((await callIpcRaw('projects:package', f.id, desk('held-out'), staleToken)).error));
+  };
+  const assertNotHeld = async f => {
+    assert.deepEqual(choiceReviewOf(f), []);
+    assert.equal((await f.workspace()).workingSourceSelectionBlocked, false);
+    assert.equal((await f.review()).materializable, true);
+  };
+  baselineTest('legacy PSD guard: an Exclude whose bytes changed in a restage holds the restaged rows until each is chosen', { timeout: 120000 }, async () => {
+    const f = await legacyPsdProject('guard-exclude');
+    try {
+      await f.save([objA, objB]);
+      await f.toggle('Obj-A.png');
+      const token = (await f.review()).token; assert.ok(token);
+      await f.save([objB, { name: 'A2.png', data: png(77) }]);
+      // Obj-B moved index but its recorded bytes prove it is the unchosen Obj-B;
+      // A2 has new bytes: nothing proves where the Exclude belongs.
+      await assertHeld(f, ['A2.png'], 'psd-embedded-restaged', token);
+      assert.equal(f.stored('A2.png').individualContentExclusion, undefined);
+      assert.equal((await f.fact('A2.png')).included, true, 'membership itself is unchanged; packaging is held');
+      roundTripFakeStore();
+      await assertHeld(f, ['A2.png'], 'psd-embedded-restaged');
+      // The unchanged save keeps the hold; nothing is restaged.
+      await f.save([objB, { name: 'A2.png', data: png(77) }]);
+      await assertHeld(f, ['A2.png'], 'psd-embedded-restaged');
+      // Resolution: one per-asset click records an explicit choice (here Exclude).
+      await f.toggle('A2.png');
+      assert.equal(f.stored('A2.png').individualChoiceReview, undefined);
+      assert.equal((await f.fact('A2.png')).included, false, 'A2 explicitly excluded');
+      await assertNotHeld(f);
+      const review = await f.review();
+      assert.deepEqual(f.reviewNames(review), ['Keep.ai', 'Legacy.psd', 'Obj-B.png']);
+      assert.deepEqual(await f.written(review), ['Keep.ai', 'Legacy.psd', 'Obj-B.png'], 'written folder matches review: A2 (Exclude) absent');
+    } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+  });
+  baselineTest('legacy PSD guard: conflicting choices on identical bytes and a second restage before resolution stay held', { timeout: 120000 }, async () => {
+    const f = await legacyPsdProject('guard-conflict');
+    try {
+      const twin = { name: 'Obj-C.png', data: objA.data };
+      await f.save([objA, objB, twin]);
+      await f.toggle('Obj-A.png');      // Exclude A; C (same bytes) follows by content
+      await f.toggle('Obj-C.png');      // Include C on its own
+      await f.save([{ name: 'A2.png', data: objA.data }, objB, { name: 'C2.png', data: objA.data }]);
+      // Obj-B kept its identity (same index and name): not restaged, not held.
+      await assertHeld(f, ['A2.png', 'C2.png'], 'psd-embedded-restaged');
+      for (const name of ['A2.png', 'C2.png']) {
+        assert.equal(f.stored(name).individualContentExclusion, undefined); assert.equal(f.stored(name).individualContentInclude, undefined);
+      }
+      // A second restage before resolution: the hold moves to the new rows.
+      await f.save([{ name: 'A3.png', data: objA.data }, objB, { name: 'C3.png', data: png(78) }]);
+      await assertHeld(f, ['A3.png', 'C3.png'], 'psd-embedded-restaged');
+      await f.toggle('A3.png'); await f.toggle('C3.png');
+      await assertNotHeld(f);
+    } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+  });
+  baselineTest('legacy PSD guard does not fire without a choice, for a proven carry, or when an object is only removed', { timeout: 120000 }, async () => {
+    const f = await legacyPsdProject('guard-none');
+    try {
+      await f.save([objA, objB]);
+      await f.save([objB, { name: 'A2.png', data: png(77) }]);
+      await assertNotHeld(f);
+      await f.toggle('A2.png');                                   // Exclude, bytes recorded
+      await f.save([{ name: 'A3.png', data: png(77) }, objB]);   // rename+reorder, same bytes: proven
+      assert.equal(f.stored('A3.png').individualContentExclusion !== undefined, true);
+      await assertNotHeld(f);
+      await f.save([objB]);                                       // the chosen object removed, no successor row
+      assert.deepEqual(f.logical().map(row => row.name), ['Obj-B.png']);
+      await assertNotHeld(f);
+    } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+  });
+  baselineTest('legacy PSD guard: the choice hold survives working-file Exclude, Restore and Exclude again and the per-asset control clears it; the separate association block remains', { timeout: 120000 }, async () => {
+    const f = await legacyPsdProject('guard-selection');
+    try {
+      await f.save([objA, objB]);
+      await f.toggle('Obj-A.png'); await f.toggle('Obj-A.png');   // Exclude then Include
+      await f.save([objB, { name: 'A2.png', data: png(77) }]);
+      await assertHeld(f, ['A2.png'], 'psd-embedded-restaged');
+      await f.select(f.W, 'exclude');
+      await assertHeld(f, ['A2.png'], 'psd-embedded-restaged');
+      assert.equal((await metadataTestHooks.runScanOnSave(f.id, f.W))?.skipped, 'source-excluded', 'saves while excluded are skipped');
+      await assertHeld(f, ['A2.png'], 'psd-embedded-restaged');
+      await f.select(f.W, 'restore');
+      assert.equal(f.stored('A2.png').individualChoiceReview?.reason, 'psd-embedded-restaged', 'Restore keeps the hold');
+      assert.equal((await f.workspace()).workingSourceSelectionBlocked, true);
+      await f.select(f.W, 'exclude');
+      await assertHeld(f, ['A2.png'], 'psd-embedded-restaged');
+      // Withheld with the excluded PSD, the held row is one click from an explicit Include.
+      await f.toggle('A2.png');
+      assert.equal(f.stored('A2.png').keptAfterSourceExclusion, true);
+      assert.equal((await f.fact('A2.png')).included, true);
+      // The choice hold is cleared by the per-asset control. After the engaged
+      // Restore of a legacy PSD the pre-existing, separate Photoshop association
+      // block remains (unchanged by this PR; identical on base).
+      assert.deepEqual(choiceReviewOf(f), []);
+      const settled = await f.review();
+      assert.equal(settled.materializable, false);
+      assert.equal(settled.message, 'Photoshop asset association is unresolved. Your files are preserved; this package is blocked.');
+      assert.equal(/Include or Exclude/.test(settled.message), false, 'not a choice-review refusal');
+    } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+  });
+
+  // ---- Choice guard, presentation media (presentation save route).
+  const mediaName = ext => ext === '.pptx' ? 'image1.png' : 'embedded-photo.png';
+  const changedName = ext => ext === '.pptx' ? 'image1_1.png' : 'embedded-photo_1.png';
+  // A save, then the selected deck's verification refresh (skipped while excluded).
+  const savePresentation = async (f, seed) => { writeWorking(f.ext, f.W, [desk(f.names.only), desk(f.names.shared)], seed);
+    await metadataTestHooks.runScanOnSavePresentation(f.id, f.W);
+    await metadataTestHooks.runScanOnOpen(f.id, f.W, null, null, { verifySelectedSource: true }); };
+  for (const ext of ['.pptx', '.key']) {
+    baselineTest(`presentation guard ${ext}: changed media after a per-asset Include holds the new row until chosen`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await formatProject(ext);
+      const old = `Work-${f.tag} — ${mediaName(ext)}`, fresh = `Work-${f.tag} — ${changedName(ext)}`;
+      await f.select(f.W, 'exclude');
+      await f.toggle(old);                                   // per-asset Include of the withheld media
+      await f.select(f.W, 'restore');
+      const token = (await f.review()).token; assert.ok(token);
+      await savePresentation(f, 777);                        // same member, different bytes
+      await assertHeld(f, [fresh], 'presentation-media-changed', token);
+      assert.deepEqual(f.stored(old).presentationChoiceSuperseded, { version: 1 });
+      assert.equal(f.stored(old).keptAfterSourceExclusion, true, 'the old row keeps its own choice');
+      roundTripFakeStore();
+      await assertHeld(f, [fresh], 'presentation-media-changed');
+      await savePresentation(f, 777);                        // unchanged save: no new row, no new hold
+      await assertHeld(f, [fresh], 'presentation-media-changed');
+      await f.select(f.W, 'exclude');
+      await assertHeld(f, [fresh], 'presentation-media-changed');
+      await savePresentation(f, 778);                        // saves while excluded are skipped
+      await assertHeld(f, [fresh], 'presentation-media-changed');
+      await f.select(f.W, 'restore');                        // Restore captures the 778 change: also held
+      const whileExcluded = `Work-${f.tag} — ${changedName(ext).replace('_1', '_2')}`;
+      await assertHeld(f, [fresh, whileExcluded], 'presentation-media-changed');
+      await f.toggle(whileExcluded);                         // Exclude it
+      await savePresentation(f, 777);
+      await assertHeld(f, [fresh], 'presentation-media-changed');
+      // Resolution: Include the new media (two clicks: Exclude, then Include).
+      await f.toggle(fresh);
+      assert.equal(f.stored(fresh).individualChoiceReview, undefined);
+      await f.toggle(fresh);
+      assert.equal((await f.fact(fresh)).included, true);
+      await assertNotHeld(f);
+      const review = await f.review();
+      // The old row is no longer in the presentation; it is still packaged by its own Include (from Crate's copy).
+      for (const name of [old, fresh]) assert.ok(f.reviewNames(review).includes(name), name);
+      assert.ok((await f.written(review)).includes(old));
+    }));
+    baselineTest(`presentation guard ${ext}: a second change before resolution, and a change after it, hold again`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await formatProject(ext);
+      const old = `Work-${f.tag} — ${mediaName(ext)}`;
+      await f.toggle(old);                                   // explicit Exclude while selected
+      await savePresentation(f, 777);
+      const first = f.current().files.filter(row => row.individualChoiceReview !== undefined).map(row => row.name);
+      assert.equal(first.length, 1);
+      await savePresentation(f, 779);                        // second change before resolution
+      const held = choiceReviewOf(f);
+      assert.equal(held.length, 2); assert.ok(held.includes(first[0]));
+      for (const name of held) await f.toggle(name);
+      await assertNotHeld(f);
+      // A later change of a row with an explicit choice raises the guard once more.
+      await savePresentation(f, 780);
+      assert.equal(choiceReviewOf(f).length, 1);
+      await f.toggle(choiceReviewOf(f)[0]);
+      await assertNotHeld(f);
+    }));
+    baselineTest(`presentation guard ${ext} does not fire without a choice or for bytes Crate already has`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await formatProject(ext);
+      await savePresentation(f, 777);                        // no individual choice anywhere
+      await assertNotHeld(f);
+      const old = `Work-${f.tag} — ${mediaName(ext)}`;
+      await f.toggle(old);                                   // Exclude the original media
+      fs.writeFileSync(desk('Same-bytes.png'), png(781));
+      await savePresentation(f, 777);                        // bytes Crate already has: no new row
+      await assertNotHeld(f);
+      // Bytes equal to another existing row are deduplicated: no successor, no hold.
+      await savePresentation(f, 900);                        // the original bytes return: re-armed, no new row
+      assert.equal(f.stored(old).presentationChoiceSuperseded, undefined);
+      await assertNotHeld(f);
+    }));
+  }
+  // .pptx/.key are outside Crate's proven-rename domain (LOCAL_ADOBE_CONTINUATION_EXTENSIONS):
+  // a renamed deck is not relocated. The hold is on the asset row, so it stays and stays clearable.
+  baselineTest('presentation guard: a held row stays held and clearable when the presentation is renamed on disk', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await formatProject('.pptx');
+    const old = 'Work-pptx — image1.png', fresh = 'Work-pptx — image1_1.png';
+    await f.toggle(old);
+    await savePresentation(f, 777);
+    await assertHeld(f, [fresh], 'presentation-media-changed');
+    await callIpcRaw('projects:pause', f.id); clearTrackedTimers();
+    await metadataTestHooks.refreshWorkingSourceLocators(f.id);
+    const destination = desk('Work-pptx-Moved.pptx');
+    fs.renameSync(f.W, destination);
+    await metadataTestHooks.refreshWorkingSourceLocators(f.id, [destination]);
+    roundTripFakeStore();
+    assert.equal(f.current().files.some(row => row.path === destination), false, 'not a proven rename for presentations (pre-existing)');
+    assert.deepEqual(choiceReviewOf(f), [fresh]);
+    assert.equal((await f.workspace()).workingSourceSelectionBlocked, true);
+    await f.toggle(fresh);
+    assert.deepEqual(choiceReviewOf(f), []);
+  }));
+
+  // The production renderer computes the Include All Existing button from the
+  // workspace facts alone (no renderer change): enabled while existing assets
+  // are withheld, disabled once the click includes them, enabled again after a
+  // later exclusion withholds them.
+  baselineTest('Include All Existing button state follows the workspace facts in the production renderer', { timeout: 120000 }, () => withEnv(async () => {
+    const { loadProjectedWorkspace } = require('./opus-renderer-helpers'), vm = require('node:vm');
+    const f = await formatProject('.ai');
+    const button = async () => {
+      const project = structuredClone(f.current()), workspace = await f.workspace();
+      const ui = loadProjectedWorkspace(project, workspace);
+      // Same inputs restoreAssetReviewBatchControls derives from the current workspace.
+      ui.renderer.testFiles = workspace.files;
+      vm.runInContext(`(() => { const existingAssets = testFiles.filter(file => file && file.assetOrigin === 'existing' && file.protectedSource !== true && file.projectRole !== 'source');
+        updateAssetReviewBatchControls(testProject, existingAssets, existingAssets.filter(file => (typeof file.included === 'boolean' ? file.included : file.excluded !== true)).length); })()`, ui.renderer);
+      const element = ui.elements['btn-include-all-existing'];
+      return [element.disabled, element.textContent];
+    };
+    assert.deepEqual(await button(), [true, 'All Existing Included']);
+    await f.select(f.W, 'exclude');
+    assert.deepEqual(await button(), [false, 'Include All Existing'], 'withheld existing assets enable the button');
+    await f.bulk('include');
+    assert.deepEqual(await button(), [true, 'All Existing Included'], 'the click included them');
+    await f.select(f.W, 'restore');
+    assert.deepEqual(await button(), [true, 'All Existing Included']);
+    await f.select(f.W, 'exclude');
+    assert.deepEqual(await button(), [false, 'Include All Existing'], 'a later exclusion withholds them again');
+  }));
+
+  // A presentation changed while excluded (its saves are skipped): Restore
+  // captures the current media through the save route, so the guard applies.
+  for (const ext of ['.pptx', '.key']) for (const choice of ['exclude', 'include']) {
+    baselineTest(`presentation guard ${ext}: media changed while excluded is held at Restore (${choice})`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await formatProject(ext);
+      const old = `Work-${f.tag} — ${mediaName(ext)}`, fresh = `Work-${f.tag} — ${changedName(ext)}`;
+      if (choice === 'exclude') { await f.toggle(old); await f.select(f.W, 'exclude'); }
+      else { await f.select(f.W, 'exclude'); await f.toggle(old); }
+      writeWorking(ext, f.W, [desk(f.names.only), desk(f.names.shared)], 777);
+      await metadataTestHooks.runScanOnSavePresentation(f.id, f.W);
+      assert.equal(f.current().files.some(row => row.name === fresh), false, 'no row while excluded');
+      await f.select(f.W, 'restore');
+      await assertHeld(f, [fresh], 'presentation-media-changed');
+      await f.toggle(fresh);
+      await assertNotHeld(f);
+    }));
+  }
+
+  // ---- Restore capture for presentations (deck changed or unchanged while excluded).
+  // Gate the capture's archive listing once the Restore verification has published.
+  const gateRestoreCapture = (f, deckPath) => {
+    let release, entered = false; const gate = new Promise(resolve => { release = resolve; });
+    setChildProcessHandler(request => {
+      if (!entered && request.kind === 'execFile' && request.command === '/usr/bin/unzip' && request.args[0] === '-l' && request.args[1] === deckPath) {
+        const row = f.current().files.find(file => file.path === deckPath);
+        const key = row && metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.current(), row);
+        if (f.current().workingSourceSelections?.[key]?.state === 'selected' && f.current().workingSourceVerification?.[key]?.status === 'scanned') {
+          entered = true; return gate.then(() => passthroughInner(request));
+        }
+      }
+      return passthroughInner(request);
+    });
+    return { entered: () => entered, release };
+  };
+  const restoreAsync = async (f, deckPath) => {
+    const row = (await f.workspace()).files.find(file => file.name === path.basename(deckPath));
+    return callIpcRaw('projects:set-working-source-selection', f.id, row.visualIdentity, { action: 'restore', expectedRevision: row.selectionRevision });
+  };
+  for (const ext of ['.pptx', '.key']) {
+    baselineTest(`Restore capture ${ext}: unchanged media keeps per-asset Include and Exclude exactly; no hold`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await formatProject(ext);
+      const second = `Work-${f.tag} — ${ext === '.pptx' ? 'image2.png' : 'second-photo.png'}`, first = `Work-${f.tag} — ${mediaName(ext)}`;
+      extraMediaSeed = 557; try { await savePresentation(f, 900); } finally { extraMediaSeed = 0; }
+      await f.toggle(first);                                  // per-asset Exclude while selected
+      await f.select(f.W, 'exclude');
+      await f.toggle(second);                                 // per-asset Include while excluded
+      const choices = () => [first, second].map(name => { const row = f.stored(name);
+        return [row.keptAfterSourceExclusion ?? null, row.individualContentExclusion ?? null, row.individualContentInclude ?? null,
+          (f.current().excludedAssetKeys || []).includes(row.fileId || row.path)]; });
+      const before = JSON.stringify(choices());
+      const token = (await f.review()).token; assert.ok(token);
+      await f.select(f.W, 'restore');
+      assert.equal(JSON.stringify(choices()), before, 'choices unchanged by the Restore capture');
+      await assertNotHeld(f);
+      assert.equal((await callIpcRaw('projects:package', f.id, desk('stale-out'), token)).error, 'package_review_stale');
+      roundTripFakeStore();
+      assert.equal(JSON.stringify(choices()), before);
+      await f.select(f.W, 'exclude');
+      assert.equal((await f.fact(second)).included, true, 'per-asset Include survives Restore and a later Exclude');
+      assert.equal((await f.fact(first)).included, false);
+      const review = await f.review();
+      assert.deepEqual(await f.written(review), [...f.keepNames, second].sort(), 'written folder: only the kept media, nothing extracted from the excluded deck');
+    }));
+    baselineTest(`Restore capture ${ext}: Include All Existing during the exclusion is not turned into a lasting keep`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await formatProject(ext);
+      const media = `Work-${f.tag} — ${mediaName(ext)}`;
+      await f.select(f.W, 'exclude');
+      await f.bulk('include');
+      const episode = JSON.stringify(f.stored(media).existingIncludeEpisode);
+      assert.ok(f.stored(media).existingIncludeEpisode);
+      await f.select(f.W, 'restore');
+      assert.equal(JSON.stringify(f.stored(media).existingIncludeEpisode), episode);
+      assert.equal(f.stored(media).keptAfterSourceExclusion, undefined);
+      await f.select(f.W, 'exclude');
+      assert.equal((await f.fact(media)).included, false, 'withheld again after a later Exclude');
+      assert.deepEqual(await f.written(await f.review()), f.keepNames);
+    }));
+    baselineTest(`Restore capture ${ext}: a review while the capture runs issues no token; holds survive reload`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await formatProject(ext);
+      const old = `Work-${f.tag} — ${mediaName(ext)}`, fresh = `Work-${f.tag} — ${changedName(ext)}`;
+      await f.select(f.W, 'exclude'); await f.toggle(old);
+      writeWorking(ext, f.W, [desk(f.names.only), desk(f.names.shared)], 777);
+      const gate = gateRestoreCapture(f, f.W);
+      const restoring = restoreAsync(f, f.W);
+      await waitForCondition(() => gate.entered(), 'Restore capture did not start', 20000);
+      const during = await f.review();
+      gate.release(); assert.equal((await restoring).success, true); passthrough();
+      // Before the capture lists the new media, review planning already refuses it.
+      assert.equal(during.materializable, false); assert.equal(during.token, undefined);
+      assert.match(during.message, /cannot carry your earlier Include or Exclude/);
+      await assertHeld(f, [fresh], 'presentation-media-changed');
+      roundTripFakeStore();
+      await assertHeld(f, [fresh], 'presentation-media-changed');
+      assert.equal(f.stored(old).keptAfterSourceExclusion, true, 'the earlier Include stays on its own row');
+      // No package path can write while held: review has no token and nothing is written.
+      assert.equal(fs.existsSync(path.join(desk('held-out'))), false);
+      await f.toggle(fresh); await f.toggle(fresh);          // Exclude, then Include: explicit Include
+      await assertNotHeld(f);
+      const review = await f.review();
+      const written = await f.written(review);
+      assert.deepEqual(written, f.reviewNames(review).filter(name => name !== path.basename(f.W)).concat(path.basename(f.W)).sort(), 'written folder matches review');
+      assert.ok(written.includes(fresh) && written.includes(old));
+    }));
+    baselineTest(`Restore capture ${ext}: an Exclude landing during the capture withholds what it admits`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await formatProject(ext);
+      await f.select(f.W, 'exclude');
+      extraMediaSeed = 559; try { writeWorking(ext, f.W, [desk(f.names.only), desk(f.names.shared)], 900); } finally { extraMediaSeed = 0; }
+      const gate = gateRestoreCapture(f, f.W);
+      const restoring = restoreAsync(f, f.W);
+      await waitForCondition(() => gate.entered(), 'Restore capture did not start', 20000);
+      const row = (await f.workspace()).files.find(file => file.name === path.basename(f.W));
+      const excluded = callIpcRaw('projects:set-working-source-selection', f.id, row.visualIdentity, { action: 'exclude', expectedRevision: row.selectionRevision });
+      gate.release(); await restoring; assert.equal((await excluded).success, true); passthrough();
+      const added = f.current().files.filter(file => /image2|second-photo/.test(file.name || ''));
+      assert.equal(added.length, 1); assert.deepEqual(added[0].dependencyOwners, [f.W]);
+      assert.equal((await f.fact(added[0].name)).included, false, 'withheld with the excluded deck');
+      assert.deepEqual(await f.written(await f.review()), f.keepNames);
+      // A Restore that does not apply (stale revision) captures nothing.
+      const before = JSON.stringify(f.current().files);
+      writeWorking(ext, f.W, [desk(f.names.only), desk(f.names.shared)], 901);
+      const stale = await callIpcRaw('projects:set-working-source-selection', f.id, row.visualIdentity, { action: 'restore', expectedRevision: row.selectionRevision });
+      assert.equal(stale.success, false);
+      assert.equal(JSON.stringify(f.current().files), before, 'no capture for a deck that is still excluded');
+    }));
+  }
+  // Two decks share media bytes. One is excluded and restored; the other stays,
+  // is excluded, or is restored, in both orders. An included deck always keeps it.
+  for (const order of ['W-restored-first', 'D2-restored-first']) {
+    baselineTest(`Restore capture: media shared by two decks (${order})`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await formatProject('.pptx');
+      const D2 = desk('Second.pptx');
+      writeWorking('.pptx', D2, [], 900);
+      await f.add(D2);
+      await metadataTestHooks.runScanOnSavePresentation(f.id, D2);
+      const original = 'Work-pptx — image1.png';
+      assert.ok((f.stored(original).dependencyOwners || []).includes(D2), 'the second deck is recorded for the shared media');
+      await f.select(f.W, 'exclude');
+      assert.equal((await f.fact(original)).included, true, 'the included deck keeps the shared media');
+      // New media added to both decks while W is excluded: D2's save sees it first, W's Restore second.
+      extraMediaSeed = 560;
+      try { writeWorking('.pptx', f.W, [desk(f.names.only), desk(f.names.shared)], 900); writeWorking('.pptx', D2, [], 900); } finally { extraMediaSeed = 0; }
+      await metadataTestHooks.runScanOnSavePresentation(f.id, D2);
+      const added = () => f.current().files.find(row => /image2/.test(row.name || ''));
+      assert.deepEqual(added().dependencyOwners, [D2]);
+      if (order === 'W-restored-first') {
+        await f.select(f.W, 'restore');
+        assert.deepEqual(added().dependencyOwners, [D2, f.W], 'the Restore capture records the restored deck');
+        await f.select(D2, 'exclude');
+        assert.equal((await f.fact(added().name)).included, true, 'kept by the restored deck');
+        await f.select(f.W, 'exclude');
+        assert.equal((await f.fact(added().name)).included, false, 'both decks excluded');
+        await f.select(D2, 'restore');
+        assert.equal((await f.fact(added().name)).included, true);
+      } else {
+        await f.select(D2, 'exclude');
+        assert.equal((await f.fact(added().name)).included, false, 'both excluded: withheld');
+        await f.select(D2, 'restore');
+        assert.equal((await f.fact(added().name)).included, true);
+        await f.select(f.W, 'restore');
+        assert.deepEqual(added().dependencyOwners, [D2, f.W]);
+        await f.select(D2, 'exclude');
+        assert.equal((await f.fact(added().name)).included, true, 'kept by the restored deck');
+      }
+      assert.deepEqual(choiceReviewOf(f), [], 'no individual choice: no hold');
+      const review = await f.review();
+      assert.deepEqual(await f.written(review), f.reviewNames(review).slice().sort());
+    }));
+  }
+
+  // ---- Paused project: a presentation changes while Crate is not capturing it.
+  // Review planning fails closed when an individually chosen media row lost its
+  // bytes and new media would be written; the pre-package scan then lists the
+  // new media (held) so the per-asset control resolves it.
+  const pausedDeck = async (ext, { decks = 1 } = {}) => {
+    const f = await formatProject(ext);
+    const D2 = desk('Second' + ext);
+    if (decks === 2) { writeWorking(ext, D2, [], 900); await f.add(D2); await metadataTestHooks.runScanOnSavePresentation(f.id, D2); }
+    return { ...f, D2, media: `Work-${f.tag} — ${mediaName(ext)}`, pause: async () => { await callIpcRaw('projects:pause', f.id); clearTrackedTimers(); },
+      change: seed => writeWorking(ext, f.W, [desk(f.names.only), desk(f.names.shared)], seed) };
+  };
+  const heldNow = f => f.current().files.filter(row => row.individualChoiceReview !== undefined).map(row => row.name).sort();
+  const assertClosedForChange = async (f, staleToken = null) => {
+    const review = await f.review();
+    assert.equal(review.materializable, false); assert.equal(review.token, undefined);
+    assert.match(review.message, /cannot carry your earlier Include or Exclude/);
+    // Without an existing hold, the changed deck itself is the unavailable entry.
+    if (!heldNow(f).length) assert.equal(review.files.find(file => file.name === path.basename(f.W)).status, 'unavailable');
+    if (staleToken) assert.ok(['package_review_stale', 'package_review_changed'].includes((await callIpcRaw('projects:package', f.id, desk('stale-out'), staleToken)).error));
+    return review;
+  };
+  const prePackage = f => callIpcRaw('projects:pre-package-scan', f.id);
+  // An engaged deck changed after its receipt is already refused (stale
+  // verification); re-verify it to reach the choice guard.
+  const staleThenReverify = async f => {
+    const stale = await f.review();
+    assert.equal(stale.materializable, false);
+    assert.equal(stale.message, 'Working-source verification is unresolved. Resolve it before packaging.');
+    await metadataTestHooks.runScanOnOpen(f.id, f.W, null, null, { verifySelectedSource: true });
+  };
+  for (const ext of ['.pptx', '.key']) {
+    baselineTest(`paused deck ${ext}: an explicit Exclude whose picture changed fails closed, is listed by the pre-package scan and resolves per asset`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await pausedDeck(ext);
+      await f.toggle(f.media);                                        // explicit Exclude, deck selected
+      await f.pause();
+      const token = (await f.review()).token; assert.ok(token);
+      f.change(777);
+      await assertClosedForChange(f, token);
+      roundTripFakeStore();
+      await assertClosedForChange(f);
+      await prePackage(f);
+      const held = heldNow(f); assert.equal(held.length, 1);
+      await assertHeld(f, held, 'presentation-media-changed');
+      roundTripFakeStore();
+      await assertHeld(f, held, 'presentation-media-changed');
+      await prePackage(f);                                            // no second row, no double hold
+      assert.deepEqual(heldNow(f), held);
+      assert.equal(f.current().files.filter(row => /image|photo/.test(row.name || '')).length, 2);
+      await f.toggle(held[0]);                                        // explicit Exclude of the new picture
+      await assertNotHeld(f);
+      const review = await f.review();
+      const written = await f.written(review);
+      assert.deepEqual(written, f.reviewNames(review));
+      assert.equal(written.some(name => /image|photo/.test(name) && name !== f.media), false, 'the newly excluded picture is not written by any route');
+    }));
+    baselineTest(`paused deck ${ext}: an Include made while excluded, restored then changed while paused, again before and after resolution`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await pausedDeck(ext);
+      await f.select(f.W, 'exclude'); await f.toggle(f.media);       // Include marker
+      await f.pause();
+      f.change(777);
+      assert.equal((await f.review()).materializable, true, 'an excluded deck is not packaged: nothing to guard');
+      await f.select(f.W, 'restore');                                 // paused: no Restore capture
+      await assertClosedForChange(f);
+      await prePackage(f);
+      const first = heldNow(f); assert.equal(first.length, 1);
+      f.change(778);                                                  // a second change before resolution
+      await staleThenReverify(f);
+      await assertClosedForChange(f);
+      await prePackage(f);
+      const both = heldNow(f); assert.equal(both.length, 2); assert.ok(both.includes(first[0]));
+      await f.select(f.W, 'exclude');                                 // Exclude/Restore keep the holds
+      await assertHeld(f, both, 'presentation-media-changed');
+      await f.select(f.W, 'restore');
+      await assertHeld(f, both, 'presentation-media-changed');
+      for (const name of both) { await f.toggle(name); await f.toggle(name); }   // Include both
+      await assertNotHeld(f);
+      f.change(779);                                                  // a further change after resolution
+      await staleThenReverify(f);
+      await assertClosedForChange(f);
+      await prePackage(f);
+      assert.equal(heldNow(f).length, 1);
+      await f.toggle(heldNow(f)[0]);
+      await assertNotHeld(f);
+      const review = await f.review();
+      assert.deepEqual(await f.written(review), f.reviewNames(review));
+      assert.ok(f.reviewNames(review).includes(f.media), 'the old row is packaged by its own Include (Crate copy)');
+    }));
+    baselineTest(`paused deck ${ext}: never fires without a choice or while chosen bytes remain; watching does not double-hold`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await pausedDeck(ext);
+      await f.pause();
+      f.change(777);                                                  // no choice anywhere
+      await prePackage(f);
+      assert.deepEqual(heldNow(f), []);
+      let review = await f.review(); assert.equal(review.materializable, true);
+      assert.deepEqual(await f.written(review), f.reviewNames(review));
+      assert.equal(f.current().files.some(row => /_1\.png$/.test(row.name || '')), false, 'nothing captured for a deck without choices');
+      // A chosen picture whose bytes are still in the deck: no trigger.
+      const g = await pausedDeck(ext);
+      await g.toggle(g.media);
+      await g.pause();
+      extraMediaSeed = 561; try { g.change(900); } finally { extraMediaSeed = 0; }
+      await prePackage(g);
+      assert.deepEqual(heldNow(g), []);
+      assert.equal((await g.review()).materializable, true);
+      // Watching: the save route holds once; the pre-package capture adds nothing.
+      const h = await pausedDeck(ext);
+      await h.toggle(h.media);
+      await savePresentation(h, 777);
+      const held = heldNow(h); assert.equal(held.length, 1);
+      await prePackage(h);
+      assert.deepEqual(heldNow(h), held);
+    }));
+  }
+  baselineTest('paused deck: media shared by two decks; the changed deck alone is guarded', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await pausedDeck('.pptx', { decks: 2 });
+    await f.toggle(f.media);                                          // explicit Exclude of the shared picture
+    await f.pause();
+    f.change(777);                                                    // W changes; Second.pptx still has the picture
+    const review = await assertClosedForChange(f);
+    assert.equal(review.files.find(file => file.name === 'Second.pptx').status, 'ready');
+    await prePackage(f);
+    const held = heldNow(f); assert.equal(held.length, 1);
+    assert.deepEqual(f.stored(held[0]).dependencyOwners, [f.W]);
+    await f.toggle(held[0]);
+    await assertNotHeld(f);
+    const settled = await f.review();
+    const written = await f.written(settled);
+    assert.deepEqual(written, f.reviewNames(settled).slice().sort());
+    assert.equal(written.includes(held[0]), false, 'the new picture was excluded explicitly');
+    assert.ok(written.includes('Second.pptx') && written.includes(path.basename(f.W)));
+  }));
+
+  // ---- Independent review regressions (frozen v1), kept as permanent tests.
+  // Accepted trade-off (owner decision, round five): a recorded owner counts for
+  // as long as it is a project file. If an included file stops linking an asset
+  // it once recorded, the asset is retained and written (possibly a stale extra
+  // file). No scan receipt retires the record.
+  baselineTest('stale recorded owner (accepted trade-off): a still-present owner that stops linking the asset keeps it, and it is written', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await formatProject('.ai'); const x = desk(f.names.newLink);
+    writeWorking('.ai', f.W, [desk(f.names.only), desk(f.names.shared), x]);
+    writeWorking('.ai', f.K, [desk(f.names.keepOnly), desk(f.names.shared), x]);
+    await callIpcRaw('projects:pre-package-scan', f.id);
+    assert.deepEqual(f.stored(f.names.newLink).dependencyOwners, [f.W, f.K]);
+    writeWorking('.ai', f.K, [desk(f.names.keepOnly), desk(f.names.shared)]);
+    await callIpcRaw('projects:pre-package-scan', f.id);
+    // Before K is re-verified its receipt is stale: K still counts (and packaging needs re-verification).
+    await metadataTestHooks.runScanOnOpen(f.id, f.K, null, null, { verifySelectedSource: true });
+    await f.select(f.W, 'exclude');
+    const fact = await f.fact(f.names.newLink);
+    assert.deepEqual([fact.included, fact.includedAsDependency, fact.excludedSourceOnly], [true, false, false], 'retained by the stale record, not required');
+    const review = await f.review();
+    assert.deepEqual(await f.written(review), [...f.keepNames, f.names.newLink].sort(), 'written folder: the stale extra file is written');
+  }));
+  baselineTest('review finding 1: live links accumulate both owners on an existing row and within one batch', { timeout: 120000 }, () => withEnv(async () => {
+    for (const batch of ['separate', 'same-batch']) {
+      const f = await newProject('Live legacy owners ' + batch);
+      const W = desk('LiveW.indd'), K = desk('LiveK.indd'), X = desk('LiveShared.png');
+      fs.writeFileSync(W, 'SYNTH W'); fs.writeFileSync(K, 'SYNTH K'); fs.writeFileSync(X, png(141));
+      f.current().files = [W, K].map(p => ({ path: p, name: path.basename(p), ext: '.indd', source: 'manual-browse', projectRole: 'source', addedAt: Date.now() }));
+      f.current().pendingFiles = []; f.current().assetBaseline = { schemaVersion: 1, status: 'legacy-included', decision: 'include', establishedAt: Date.now() }; roundTripFakeStore();
+      const evidence = owner => ({ filePath: X, source: 'indd-poll', appFamily: 'indesign', relationshipSourcePath: owner, savedEvidence: true, documentModified: false, allowDirect: true, forcePending: false });
+      if (batch === 'separate') { await metadataTestHooks.applyLiveAppEvidenceRefresh(f.id, [evidence(W)]); await metadataTestHooks.applyLiveAppEvidenceRefresh(f.id, [evidence(K)]); }
+      else await metadataTestHooks.applyLiveAppEvidenceRefresh(f.id, [evidence(W), evidence(K)]);
+      assert.deepEqual(f.stored('LiveShared.png').dependencyOwners, [W, K], batch);
+      await f.select(W, 'exclude');
+      assert.equal((await f.fact('LiveShared.png')).included, true, 'K still needs the shared link');
+      const review = await f.review();
+      assert.ok((await f.written(review)).includes('LiveShared.png'));
+    }
+  }, { realTmp: true }));
+  baselineTest('review finding 4: a missing cached copy does not erase the choice review of changed media', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await formatProject('.pptx'); const old = 'Work-pptx — image1.png';
+    await f.toggle(old); const oldPath = f.stored(old).path; fs.unlinkSync(oldPath);
+    await savePresentation(f, 777);
+    const review = await f.review();
+    assert.equal(review.materializable, false, 'changed chosen media with unavailable old bytes must be reviewed');
+    assert.equal(f.stored(old).path, oldPath, 'the old row keeps its own path');
+    const held = choiceReviewOf(f); assert.equal(held.length, 1);
+    assert.notEqual(f.current().files.find(row => row.name === held[0]).path, oldPath, 'the new media never reuses the old cache path');
+    await f.toggle(held[0]);
+    const after = await f.review();
+    assert.equal(after.materializable, true);
+    assert.equal((await f.written(after)).some(name => name === held[0]), false, 'the explicitly excluded new media is not written');
+  }));
+  baselineTest('review finding paused: a known paused presentation change is refused at review', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await formatProject('.pptx'); const old = 'Work-pptx — image1.png';
+    await f.toggle(old); await callIpcRaw('projects:pause', f.id); clearTrackedTimers();
+    writeWorking('.pptx', f.W, [desk(f.names.only), desk(f.names.shared)], 777);
+    const review = await f.review();
+    assert.equal(review.materializable, false, 'paused change with prior individual choice needs guard');
+  }));
+  baselineTest('review finding 2b: a live-owned placed file and what it links leave with the excluded file', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await newProject('Live chain'); const W = desk('ChainW.indd'), K = desk('ChainKeep.ai'), P = desk('ChainPlaced.ai'), X = desk('ChainDeep.png');
+    fs.writeFileSync(W, 'SYNTH'); writeWorking('.ai', K, []); writeWorking('.ai', P, [X]); fs.writeFileSync(X, png(142));
+    f.current().files = [W, K].map(p => ({ path: p, name: path.basename(p), ext: path.extname(p), source: 'manual-browse', projectRole: 'source', addedAt: Date.now() }));
+    f.current().pendingFiles = []; f.current().assetBaseline = { schemaVersion: 1, status: 'legacy-included', decision: 'include', establishedAt: Date.now() }; roundTripFakeStore();
+    await metadataTestHooks.applyLiveAppEvidenceRefresh(f.id, [{ filePath: P, source: 'indd-poll', appFamily: 'indesign', relationshipSourcePath: W, savedEvidence: true, documentModified: false, allowDirect: true, forcePending: false }]);
+    await callIpcRaw('projects:pre-package-scan', f.id);
+    await f.select(W, 'exclude');
+    assert.equal((await f.fact('ChainPlaced.ai')).included, false);
+    assert.equal((await f.fact('ChainDeep.png')).included, false, 'transitive descendant must leave');
+    const review = await f.review();
+    assert.deepEqual(await f.written(review), ['ChainKeep.ai']);
+    await f.select(W, 'restore');
+    for (const name of ['ChainPlaced.ai', 'ChainDeep.png']) assert.equal((await f.fact(name)).included, true, name + ' after Restore');
+  }, { realTmp: true }));
+  baselineTest('review finding 2a: a placed file kept by an included recorded owner keeps what it links', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await newProject('Legacy bridge'); const W = desk('BridgeW.indd'), K = desk('BridgeKeep.ai'), P = desk('BridgePlaced.ai'), X = desk('BridgeDeep.png');
+    fs.writeFileSync(W, `SYNTH\n${P}\n`); writeWorking('.ai', K, [P]); writeWorking('.ai', P, [X]); fs.writeFileSync(X, png(143));
+    inddDoc = W; await f.add(W);
+    f.current().files.push({ path: K, name: path.basename(K), ext: '.ai', source: 'manual-browse', projectRole: 'source', addedAt: Date.now() }); roundTripFakeStore();
+    await callIpcRaw('projects:pre-package-scan', f.id);
+    await f.select(W, 'exclude');
+    assert.equal((await f.fact('BridgePlaced.ai')).included, true);
+    assert.equal((await f.fact('BridgeDeep.png')).included, true, 'included bridge must keep what it needs');
+    const review = await f.review();
+    assert.deepEqual(await f.written(review), ['BridgeDeep.png', 'BridgeKeep.ai', 'BridgePlaced.ai']);
+  }, { realTmp: true }));
+  baselineTest('review finding 3: an excluded InDesign file retained as a dependency still admits its saved links', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await newProject('Retained live'); const W = desk('RetainedW.indd'), K = desk('RetainedK.ai'), X = desk('RetainedLink.png');
+    fs.writeFileSync(W, 'SYNTH'); writeWorking('.ai', K, [W]); fs.writeFileSync(X, png(144));
+    f.current().files = [W, K].map(p => ({ path: p, name: path.basename(p), ext: path.extname(p), source: 'manual-browse', projectRole: 'source', addedAt: Date.now() }));
+    f.current().pendingFiles = []; f.current().assetBaseline = { schemaVersion: 1, status: 'legacy-included', decision: 'include', establishedAt: Date.now() }; roundTripFakeStore();
+    await metadataTestHooks.runScanOnOpen(f.id, K, null, null, { verifySelectedSource: true });
+    await f.select(W, 'exclude'); assert.equal((await f.fact('RetainedW.indd')).includedAsDependency, true);
+    await metadataTestHooks.applyLiveAppEvidenceRefresh(f.id, [{ filePath: X, source: 'indd-poll', appFamily: 'indesign', relationshipSourcePath: W, savedEvidence: true, documentModified: false, allowDirect: true, forcePending: false }]);
+    const review = await f.review();
+    assert.ok(f.reviewNames(review).includes('RetainedLink.png'), 'retained owner still needs its saved link');
+    assert.ok((await f.written(review)).includes('RetainedLink.png'));
+  }, { realTmp: true }));
+  baselineTest('review finding 6: more than 64 excluded owners never turn Include All Existing into a lasting keep', { timeout: 180000 }, () => withEnv(async () => {
+    const f = await newProject('Many roots'); const X = desk('Shared65.png'); fs.writeFileSync(X, png(145));
+    const roots = Array.from({ length: 65 }, (_, i) => desk(`Root-${i}.ai`)); roots.forEach(p => writeWorking('.ai', p, [X]));
+    f.current().files = roots.map(p => ({ path: p, name: path.basename(p), ext: '.ai', source: 'manual-browse', projectRole: 'source', addedAt: Date.now() }));
+    f.current().pendingFiles = []; f.current().assetBaseline = { schemaVersion: 1, status: 'legacy-included', decision: 'include', establishedAt: Date.now() }; roundTripFakeStore();
+    for (const p of roots) await metadataTestHooks.runScanOnOpen(f.id, p, null, null, { verifySelectedSource: true });
+    for (const p of roots) await f.select(p, 'exclude');
+    assert.equal((await f.fact('Shared65.png')).included, false);
+    await f.bulk('include'); assert.equal((await f.fact('Shared65.png')).included, true, 'kept for the current exclusion');
+    const episode = f.stored('Shared65.png').existingIncludeEpisode;
+    assert.equal(episode.ownerCount, 65); assert.match(episode.ownersDigest, /^[a-f0-9]{64}$/); assert.equal(episode.owners, undefined);
+    assert.equal(f.stored('Shared65.png').keptAfterSourceExclusion, undefined, 'no lasting per-asset keep');
+    roundTripFakeStore(); assert.equal((await f.fact('Shared65.png')).included, true, 'after reload');
+    await f.select(roots[0], 'restore'); await f.select(roots[0], 'exclude');
+    assert.equal((await f.fact('Shared65.png')).included, false, 'a newer exclusion must end the bulk episode');
+    const keep = desk('Keep65w.ai'); writeWorking('.ai', keep, []);
+    f.current().files.push({ path: keep, name: 'Keep65w.ai', ext: '.ai', source: 'manual-browse', projectRole: 'source', addedAt: Date.now() }); roundTripFakeStore();
+    assert.deepEqual(await f.written(await f.review()), ['Keep65w.ai'], 'written folder: the asset is not packaged');
+  }));
+
+  // ---- Second review finding A: byte equality never makes a deck the owner of another asset.
+  for (const scope of [undefined, 'entire-file']) {
+    baselineTest(`presentation bytes equal to a Figma capture (${scope || 'current-page'}): the Figma row takes no deck owner`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await formatProject('.key', { scope });
+      const logo = desk('Logo.png'); fs.writeFileSync(logo, png(901));
+      f.current().files.push({ path: logo, name: 'Logo.png', ext: '.png', source: 'figma-auto', projectRole: 'asset', assetOrigin: 'added', addedAt: Date.now() });
+      roundTripFakeStore();
+      const before = (await f.fact('Logo.png')).included;            // Figma scope decides this, unchanged by the candidate
+      extraMediaSeed = 901; try { await savePresentation(f, 900); } finally { extraMediaSeed = 0; }
+      assert.equal(f.stored('Logo.png').dependencyOwners, undefined, 'no recorded owner on a Figma capture');
+      await f.select(f.W, 'exclude');
+      const logoFact = await f.fact('Logo.png');
+      assert.deepEqual([logoFact.included, logoFact.excludedSourceOnly], [before, false], 'excluding the deck does not change the Figma row');
+      const review = await f.review();
+      assert.equal(f.reviewNames(review).includes('Logo.png'), before);
+      assert.equal((await f.written(review)).includes('Logo.png'), before, 'written folder follows the Figma scope, not the deck');
+    }));
+  }
+  baselineTest('presentation bytes equal to a Photoshop link: the deck does not become its owner', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await formatProject('.psd');
+    const deck = desk('Deck.key'); writeWorking('.key', deck, [], 11);             // embeds the same bytes as Solo-psd.png
+    await f.add(deck);
+    await metadataTestHooks.runScanOnSavePresentation(f.id, deck);
+    assert.equal((f.stored(f.names.only).dependencyOwners || []).includes(deck), false, 'the deck is not recorded on the linked file');
+    await f.select(f.W, 'exclude');
+    assert.equal((await f.fact(f.names.only)).included, false, 'withheld with the only Photoshop file that links it');
+    const written = await f.written(await f.review());
+    assert.equal(written.includes(f.names.only), false, 'written folder: the excluded file\'s link is not packaged');
+    assert.ok(written.includes('Deck.key'));
+  }, { realMainPsd: true }));
+  baselineTest('pre-existing ownerless rows stay kept after their working file is excluded (keep on no knowledge)', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await formatProject('.ai');
+    const old = desk('OldLinked.png'); fs.writeFileSync(old, png(77));
+    f.current().files.push({ path: old, name: 'OldLinked.png', ext: '.png', source: 'linked-asset', projectRole: 'asset', assetOrigin: 'added', addedAt: Date.now() });
+    roundTripFakeStore();
+    writeWorking('.ai', f.W, [desk(f.names.only), desk(f.names.shared), old]);   // W links it, but W is now excluded and not rescanned
+    await f.select(f.W, 'exclude');
+    await callIpcRaw('projects:pre-package-scan', f.id);
+    assert.equal(f.stored('OldLinked.png').dependencyOwners, undefined, 'the excluded file is not scanned, so no owner is backfilled');
+    const fact = await f.fact('OldLinked.png');
+    assert.deepEqual([fact.included, fact.excludedSourceOnly], [true, false], 'no ownership knowledge: kept');
+  }));
+  baselineTest('legacy PSD guard: a hold resolved as Include is packaged and written as reviewed', { timeout: 120000 }, async () => {
+    const f = await legacyPsdProject('guard-include-written');
+    try {
+      await f.save([objA, objB]);
+      await f.toggle('Obj-A.png');                                  // Exclude
+      await f.save([objB, { name: 'A2.png', data: png(77) }]);
+      await assertHeld(f, ['A2.png'], 'psd-embedded-restaged');
+      await f.toggle('A2.png'); await f.toggle('A2.png');           // Exclude, then Include
+      assert.equal((await f.fact('A2.png')).included, true);
+      await assertNotHeld(f);
+      const review = await f.review();
+      assert.deepEqual(f.reviewNames(review), ['A2.png', 'Keep.ai', 'Legacy.psd', 'Obj-B.png']);
+      assert.deepEqual(await f.written(review), ['A2.png', 'Keep.ai', 'Legacy.psd', 'Obj-B.png'], 'written folder matches review: A2 (Include) written');
+    } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+  });
+
+  // ==== Round 4 (owner-approved bounded round) ====
+  // ---- Item 1: live InDesign admission is decided by the whole reported-owner set.
+  // Records come from the production parsers (parseInDesignActiveSessionOutput,
+  // createInDesignLiveEvidenceRecords) for saved, unmodified documents.
+  async function inddProject(label, names) {
+    const f = await newProject(label);
+    const docs = names.map(name => desk(name)), X = desk('Mixed.png');
+    for (const doc of docs) fs.writeFileSync(doc, 'SYNTH');
+    fs.writeFileSync(X, png(144));
+    f.current().files = docs.map(p => ({ path: p, name: path.basename(p), ext: path.extname(p), source: 'manual-browse', projectRole: 'source', addedAt: Date.now() }));
+    f.current().pendingFiles = []; f.current().assetBaseline = { schemaVersion: 1, status: 'legacy-included', decision: 'include', establishedAt: Date.now() };
+    roundTripFakeStore();
+    return { f, docs, X };
+  }
+  const inddSnapshotOf = docs => docs.map(doc => `DOC\t${doc.path}\t${path.basename(doc.path)}\tfalse\t${doc.current ? 'true' : 'false'}\t${doc.links.length}\n` +
+    doc.links.map(link => `LINK\t${doc.path}\t${path.basename(doc.path)}\t${link}\tfalse\t${doc.current ? 'true' : 'false'}`).join('\n')).join('\n') + '\n';
+  const refreshFromDocuments = async (f, docs) => {
+    const active = metadataTestHooks.parseInDesignActiveSessionOutput(inddSnapshotOf(docs));
+    const records = metadataTestHooks.createInDesignLiveEvidenceRecords(f.id, active, f.current());
+    assert.ok(records.some(record => record.source === 'indd-poll'), 'the parser produced link records');
+    await metadataTestHooks.applyLiveAppEvidenceRefresh(f.id, records);
+  };
+  const where = (f, filePath) => f.current().files.some(row => row.path === filePath) ? 'files'
+    : (f.current().pendingFiles || []).some(row => row.path === filePath) ? 'pending' : 'none';
+  for (const order of ['excluded-first', 'included-first']) {
+    baselineTest(`live InDesign mixed owners (${order}): an included reporter admits the shared link`, { timeout: 120000 }, () => withEnv(async () => {
+      const { f, docs: [W, K], X } = await inddProject('Mixed ' + order, ['MixedW.indd', 'MixedK.indd']);
+      await f.select(W, 'exclude');
+      const batch = [{ path: W, current: false, links: [X] }, { path: K, current: true, links: [X] }];
+      await refreshFromDocuments(f, order === 'excluded-first' ? batch : batch.slice().reverse());
+      assert.equal(where(f, X), 'files');
+      assert.deepEqual(f.stored('Mixed.png').dependencyOwners.slice().sort(), [W, K].sort(), 'every owner recorded');
+      await refreshFromDocuments(f, batch);                           // repeated batch (before packaging ends Watch)
+      assert.equal(f.current().files.filter(row => row.path === X).length, 1);
+      roundTripFakeStore();
+      const review = await f.review();
+      assert.deepEqual(await f.written(review), ['Mixed.png', 'MixedK.indd'], 'after reload');
+      await f.select(K, 'exclude');                                    // now every owner is excluded
+      assert.equal((await f.fact('Mixed.png')).included, false);
+    }, { realTmp: true }));
+  }
+  baselineTest('live InDesign mixed owners: both excluded stays pending; both included admits', { timeout: 120000 }, () => withEnv(async () => {
+    const a = await inddProject('Both excluded', ['MixedW.indd', 'MixedK.indd']);
+    await a.f.select(a.docs[0], 'exclude'); await a.f.select(a.docs[1], 'exclude');
+    await refreshFromDocuments(a.f, [{ path: a.docs[0], current: false, links: [a.X] }, { path: a.docs[1], current: true, links: [a.X] }]);
+    assert.equal(where(a.f, a.X), 'pending');
+    const refused = await a.f.review();
+    assert.equal(refused.materializable, false); assert.equal(refused.message, 'No files are selected for packaging.');
+    const b = await inddProject('Both included', ['MixedW.indd', 'MixedK.indd']);
+    await refreshFromDocuments(b.f, [{ path: b.docs[0], current: false, links: [b.X] }, { path: b.docs[1], current: true, links: [b.X] }]);
+    assert.equal(where(b.f, b.X), 'files');
+    assert.deepEqual(await b.f.written(await b.f.review()), ['Mixed.png', 'MixedK.indd', 'MixedW.indd']);
+  }, { realTmp: true }));
+  baselineTest('live InDesign mixed owners: an excluded reporter retained by an included file admits', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await newProject('Retained reporter'); const W = desk('RetainedW.indd'), K = desk('RetainedK.ai'), E2 = desk('OtherExcluded.indd'), X = desk('Mixed.png');
+    fs.writeFileSync(W, 'SYNTH'); fs.writeFileSync(E2, 'SYNTH'); writeWorking('.ai', K, [W]); fs.writeFileSync(X, png(144));
+    f.current().files = [W, K, E2].map(p => ({ path: p, name: path.basename(p), ext: path.extname(p), source: 'manual-browse', projectRole: 'source', addedAt: Date.now() }));
+    f.current().pendingFiles = []; f.current().assetBaseline = { schemaVersion: 1, status: 'legacy-included', decision: 'include', establishedAt: Date.now() }; roundTripFakeStore();
+    await metadataTestHooks.runScanOnOpen(f.id, K, null, null, { verifySelectedSource: true });
+    await f.select(W, 'exclude'); await f.select(E2, 'exclude');
+    assert.equal((await f.fact('RetainedW.indd')).includedAsDependency, true);
+    await refreshFromDocuments(f, [{ path: E2, current: false, links: [X] }, { path: W, current: true, links: [X] }]);
+    assert.equal(where(f, X), 'files');
+    const written = await f.written(await f.review());
+    assert.ok(written.includes('Mixed.png') && written.includes('RetainedW.indd') && written.includes('RetainedK.ai'));
+  }, { realTmp: true }));
+  baselineTest('live InDesign mixed owners: separate batches, three owners and an existing row', { timeout: 120000 }, () => withEnv(async () => {
+    // Separate batches: excluded-only stays pending; a later included-only batch promotes and writes it.
+    const s = await inddProject('Separate', ['MixedW.indd', 'MixedK.indd']);
+    await s.f.select(s.docs[0], 'exclude');
+    await refreshFromDocuments(s.f, [{ path: s.docs[0], current: true, links: [s.X] }]);
+    assert.equal(where(s.f, s.X), 'pending');
+    const pendingReview = await s.f.review();
+    assert.deepEqual(s.f.reviewNames(pendingReview), ['MixedK.indd'], 'a pending link is not in the package');
+    await refreshFromDocuments(s.f, [{ path: s.docs[0], current: true, links: [s.X] }]);    // repeated excluded-only batch
+    assert.equal(where(s.f, s.X), 'pending');
+    await refreshFromDocuments(s.f, [{ path: s.docs[1], current: true, links: [s.X] }]);
+    assert.equal(where(s.f, s.X), 'files');
+    assert.deepEqual(await s.f.written(await s.f.review()), ['Mixed.png', 'MixedK.indd']);
+    // Three owners: any order with an included reporter admits; all excluded stays pending.
+    // The included reporter is first, middle or last in the batch (T1, T2, T3 always reported in that order).
+    for (const [label, included, expected] of [['included first', 0, 'files'], ['included middle', 1, 'files'], ['included last', 2, 'files'], ['all excluded', -1, 'pending']]) {
+      const t = await inddProject('Three ' + label, ['T1.indd', 'T2.indd', 'T3.indd']);
+      for (const index of [0, 1, 2]) if (index !== included) await t.f.select(t.docs[index], 'exclude');
+      await refreshFromDocuments(t.f, [0, 1, 2].map(index => ({ path: t.docs[index], current: index === 2, links: [t.X] })));
+      assert.equal(where(t.f, t.X), expected, label);
+      assert.equal((t.f.current().files.find(row => row.path === t.X) || t.f.current().pendingFiles.find(row => row.path === t.X)).dependencyOwners.length, 3);
+      const review = await t.f.review();
+      if (expected === 'files') assert.deepEqual(await t.f.written(review), ['Mixed.png', path.basename(t.docs[included])], label);
+      else { assert.equal(review.materializable, false, label); assert.equal(review.message, 'No files are selected for packaging.'); }
+    }
+    // Existing row: X is already a row through K; an excluded W reports it later.
+    const e = await inddProject('Existing', ['MixedW.indd', 'MixedK.indd']);
+    assert.equal(where(e.f, e.X), 'none');
+    await refreshFromDocuments(e.f, [{ path: e.docs[1], current: true, links: [e.X] }]);
+    assert.equal(where(e.f, e.X), 'files');
+    await e.f.select(e.docs[0], 'exclude');
+    await refreshFromDocuments(e.f, [{ path: e.docs[0], current: true, links: [e.X] }]);
+    assert.deepEqual(e.f.stored('Mixed.png').dependencyOwners.slice().sort(), [e.docs[0], e.docs[1]].sort());
+    roundTripFakeStore();
+    assert.deepEqual(await e.f.written(await e.f.review()), ['Mixed.png', 'MixedK.indd']);
+  }, { realTmp: true }));
+
+  // ---- Item 2: a resolved presentation choice never leaves a block with no row.
+  const choiceNames = message => [...String(message || '').matchAll(/“([^”]+)”/g)].map(match => match[1]);
+  // Invariant for every choice-review refusal: each named asset is a row the per-asset
+  // toggle acts on, and acting on all of them clears the refusal.
+  const assertRefusalResolvable = async f => {
+    let review = await f.review();
+    for (let round = 0; round < 4 && !review.materializable && /Include or Exclude/.test(review.message || ''); round++) {
+      const names = choiceNames(review.message);
+      assert.ok(names.length > 0, 'a choice-review refusal names the assets to choose: ' + review.message);
+      for (const name of names) {
+        assert.equal(f.current().files.filter(row => row.name === name).length, 1, `“${name}” is a row the toggle can act on`);
+        await f.toggle(name);
+      }
+      review = await f.review();
+      for (const name of names) assert.ok(!choiceNames(review.message).includes(name), `${name} no longer refused`);
+    }
+    assert.equal(review.materializable, true, review.message);
+    return review;
+  };
+  for (const ext of ['.pptx', '.key']) for (const resolution of ['exclude', 'include']) {
+    baselineTest(`paused deck ${ext}: after the hold is resolved as ${resolution}, later new media is written with the deck`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await pausedDeck(ext);
+      const extra = ext === '.pptx' ? 'image2.png' : 'second-photo.png';
+      await f.toggle(f.media); await f.pause(); f.change(777);
+      await prePackage(f);
+      const held = heldNow(f); assert.equal(held.length, 1);
+      await f.toggle(held[0]); if (resolution === 'include') await f.toggle(held[0]);
+      await assertNotHeld(f);
+      extraMediaSeed = 888; try { f.change(777); } finally { extraMediaSeed = 0; }   // B unchanged, add C
+      await prePackage(f); await prePackage(f);
+      assert.deepEqual(heldNow(f), [], 'no hold: nothing chosen was lost');
+      let review = await f.review();
+      assert.equal(review.materializable, true, review.message);
+      let written = await f.written(review);
+      assert.ok(written.some(name => matchName(name, extra)), 'the new media is written with the deck');
+      assert.equal(written.includes(held[0]), resolution === 'include', 'B follows its explicit choice');
+      roundTripFakeStore();
+      assert.equal((await f.review()).materializable, true, 'after reload');
+      // A second later addition.
+      extraMediaSeed = 889; try { f.change(777); } finally { extraMediaSeed = 0; }   // C replaced by D: no chosen media lost
+      await prePackage(f);
+      assert.deepEqual(heldNow(f), []);
+      assert.equal((await f.review()).materializable, true);
+      // A later replacement of B itself holds again and is clearable. The same
+      // capture also lists the unrelated new media, and nothing proves which new
+      // media replaced B, so every new row of that capture is held.
+      extraMediaSeed = 889; try { f.change(779); } finally { extraMediaSeed = 0; }
+      await prePackage(f);
+      assert.ok(heldNow(f).length >= 1, 'replacing B raises a hold');
+      review = await assertRefusalResolvable(f);
+      written = await f.written(review);
+      assert.deepEqual(written, f.reviewNames(review).slice().sort());
+      // Excluding the deck omits the deck and its media, except an explicit per-asset Include (durable).
+      await f.select(f.W, 'exclude');
+      assert.deepEqual(await f.written(await f.review()), [...f.keepNames, ...(resolution === 'include' ? [held[0]] : [])].sort());
+    }));
+  }
+  for (const ext of ['.pptx', '.key']) {
+    baselineTest(`watching deck ${ext}: a later addition after a resolved hold is written (reviewers' V3 CONTROL)`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await pausedDeck(ext);
+      const fresh = `Work-${f.tag} — ${changedName(ext)}`, extra = ext === '.pptx' ? 'image2.png' : 'second-photo.png';
+      await f.toggle(f.media); await savePresentation(f, 777); await f.toggle(fresh); await f.pause();
+      extraMediaSeed = 888; try { f.change(777); } finally { extraMediaSeed = 0; }
+      await prePackage(f); await prePackage(f);
+      const review = await f.review();
+      assert.equal(review.materializable, true, 'all earlier changes resolved and currently chosen bytes remain; new unrelated media needs no hold');
+      assert.ok((await f.written(review)).some(name => matchName(name, extra)));
+    }));
+    baselineTest(`paused deck ${ext}: a deck with no individual choice and a second deck sharing media never refuse`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await pausedDeck(ext, { decks: 2 });
+      await f.pause();
+      extraMediaSeed = 888; try { f.change(777); } finally { extraMediaSeed = 0; }
+      await prePackage(f);
+      assert.deepEqual(heldNow(f), []);
+      const review = await f.review(); assert.equal(review.materializable, true);
+      const written = await f.written(review);
+      assert.ok(written.includes(path.basename(f.D2)) && written.includes(path.basename(f.W)));
+    }));
+  }
+  baselineTest('choice-review invariant: every refusal names rows the per-asset toggle clears', { timeout: 180000 }, () => withEnv(async () => {
+    for (const ext of ['.pptx', '.key']) {
+      // Paused change after an Exclude, reviewed without a pre-package scan.
+      const a = await pausedDeck(ext); await a.toggle(a.media); await a.pause(); a.change(777);
+      const refused = await a.review(); assert.equal(refused.materializable, false);
+      await assertRefusalResolvable(a);
+      // Watching save, missing cache, second change before resolution.
+      const b = await pausedDeck(ext); await b.toggle(b.media); fs.unlinkSync(b.stored(b.media).path);
+      await savePresentation(b, 777); await savePresentation(b, 778);
+      await assertRefusalResolvable(b);
+      // Paused, two changes, repeated pre-package and review.
+      const c = await pausedDeck(ext); await c.select(c.W, 'exclude'); await c.toggle(c.media); await c.pause(); await c.select(c.W, 'restore');
+      c.change(777); await prePackage(c); c.change(778); await metadataTestHooks.runScanOnOpen(c.id, c.W, null, null, { verifySelectedSource: true }); await prePackage(c);
+      await assertRefusalResolvable(c);
+    }
+  }));
+
+  // ---- Item 4a: a receipt never disproves an owner its reader cannot see.
+  baselineTest('receipt incompleteness: an IDML link seen only by the raw-bytes pass keeps its included owner', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await formatProject('.ai'); const X = desk(f.names.newLink);
+    const K2 = desk('Keep2.idml');
+    // Stored archive: the XML the IDML reader parses has no link; a non-XML entry names X.
+    zipDir(K2, { 'designmap.xml': '<Document></Document>', 'META-INF/notes.txt': X }, true);
+    writeWorking('.ai', f.W, [desk(f.names.only), desk(f.names.shared), X]);
+    await f.add(K2);
+    await prePackage(f);
+    assert.ok(f.stored(f.names.newLink).dependencyOwners.includes(K2), 'the raw-bytes pass records the Affinity file');
+    await metadataTestHooks.runScanOnOpen(f.id, K2, null, null, { verifySelectedSource: true });
+    const receipt = metadataTestHooks.getWorkingSourceVerification(f.current(), f.current().files.find(row => row.path === K2));
+    assert.equal(receipt.status, 'scanned');
+    assert.equal(receipt.requiredReferences.some(ref => ref.path === X), false, 'the ordinary IDML reader does not see it');
+    await f.select(f.W, 'exclude');
+    assert.equal((await f.fact(f.names.newLink)).included, true, 'kept: the receipt cannot disprove what its reader does not read');
+    assert.ok((await f.written(await f.review())).includes(f.names.newLink));
+  }));
+  // Round five: a recorded owner is never retired by a scan receipt, whatever
+  // route recorded it (accepted trade-off: possibly stale extra files are kept).
+  for (const route of ['live', 'regex']) {
+    baselineTest(`recorded owner never retired by a receipt: an owner recorded by the ${route} route keeps the asset its clean receipt omits`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await formatProject('.ai'); const X = desk(f.names.newLink);
+      writeWorking('.ai', f.W, [desk(f.names.only), desk(f.names.shared), X]);
+      await prePackage(f);
+      await metadataTestHooks.runScanOnOpen(f.id, f.K, null, null, { verifySelectedSource: true });
+      assert.equal(metadataTestHooks.getWorkingSourceVerification(f.current(), f.current().files.find(row => row.path === f.K)).status, 'scanned');
+      const row = f.current().files.find(item => item.path === X);
+      row.dependencyOwners = [f.W, f.K];
+      if (route === 'live') row.dependencyOwnerRoutes = { [f.W]: ['regex'], [f.K]: ['live'] };   // an older v4 field, now ignored
+      roundTripFakeStore();
+      await f.select(f.W, 'exclude');
+      assert.equal((await f.fact(f.names.newLink)).included, true);
+      assert.ok((await f.written(await f.review())).includes(f.names.newLink));
+    }));
+  }
+
+  // ---- Item 4b: the >64-owner episode follows a proven rename of an owner.
+  baselineTest('Include All Existing above 64 owners survives a proven owner rename and ends at the next exclusion', { timeout: 240000 }, () => withEnv(async () => {
+    const f = await newProject('Many roots rename'); const X = desk('Shared65.png'); fs.writeFileSync(X, png(145));
+    const keep = desk('Keep65.ai'); writeWorking('.ai', keep, []);
+    const roots = Array.from({ length: 65 }, (_, i) => desk(`Root-${i}.ai`)); roots.forEach(p => writeWorking('.ai', p, [X]));
+    f.current().files = [...roots, keep].map(p => ({ path: p, name: path.basename(p), ext: '.ai', source: 'manual-browse', projectRole: 'source', addedAt: Date.now() }));
+    f.current().pendingFiles = []; f.current().assetBaseline = { schemaVersion: 1, status: 'legacy-included', decision: 'include', establishedAt: Date.now() }; roundTripFakeStore();
+    for (const p of roots) await metadataTestHooks.runScanOnOpen(f.id, p, null, null, { verifySelectedSource: true });
+    for (const p of roots) await f.select(p, 'exclude');
+    await f.bulk('include');
+    assert.equal(f.stored('Shared65.png').existingIncludeEpisode.ownerCount, 65);
+    await callIpcRaw('projects:pause', f.id); clearTrackedTimers();
+    await metadataTestHooks.refreshWorkingSourceLocators(f.id);
+    const moved = desk('Root-7-Moved.ai'), inode = fs.statSync(roots[7]).ino;
+    fs.renameSync(roots[7], moved); assert.equal(fs.statSync(moved).ino, inode);
+    await metadataTestHooks.refreshWorkingSourceLocators(f.id, [moved]);
+    assert.ok(f.current().files.some(row => row.path === moved), 'proven rename');
+    assert.equal((await f.fact('Shared65.png')).included, true, 'the same exclusion is still current after the rename');
+    roundTripFakeStore();
+    assert.equal((await f.fact('Shared65.png')).included, true, 'after reload');
+    assert.deepEqual(await f.written(await f.review()), ['Keep65.ai', 'Shared65.png']);
+    await f.select(moved, 'restore'); await f.select(moved, 'exclude');
+    assert.equal((await f.fact('Shared65.png')).included, false, 'the next exclusion ends it');
+    assert.equal(f.stored('Shared65.png').keptAfterSourceExclusion, undefined);
+    assert.deepEqual(await f.written(await f.review()), ['Keep65.ai']);
+  }));
+
+  // ---- Item 3: counted cost of one membership call; owner work is linear.
+  baselineTest('membership cost: recorded-owner work adds linear, not assets-times-references, operations', { timeout: 300000 }, () => withEnv(async () => {
+    const measure = (project, stripOwners) => {
+      const p = structuredClone(project);
+      if (stripOwners) for (const row of p.files) { delete row.dependencyOwners; delete row.dependencyOwnerRoutes; }
+      let realpaths = 0, stats = 0, receiptLookups = 0;
+      const verification = p.workingSourceVerification || {};
+      p.workingSourceVerification = new Proxy(verification, { get(target, key, receiver) { if (typeof key === 'string' && /^[a-f0-9]{64}$/.test(key)) receiptLookups++; return Reflect.get(target, key, receiver); } });
+      const orig = fs.realpathSync.native, origStat = fs.statSync;
+      fs.realpathSync.native = function (...args) { realpaths++; return orig.apply(this, args); };
+      fs.statSync = function (...args) { stats++; return origStat.apply(this, args); };
+      let facts; try { facts = metadataTestHooks.getWorkingSourceMembership(p).facts; } finally { fs.realpathSync.native = orig; fs.statSync = origStat; }
+      return { realpaths, stats, receiptLookups, included: [...facts.values()].filter(fact => fact.included).length };
+    };
+    for (const count of [100, 200, 400]) {
+      const f = await newProject('cost ' + count), W = desk('Cost.ai'), K = desk('Excluded.ai');
+      const paths = Array.from({ length: count }, (_, i) => desk('Cost-' + i + '.png'));
+      paths.forEach(p => fs.writeFileSync(p, png(13))); writeWorking('.ai', W, paths); writeWorking('.ai', K, []);
+      f.current().files = [W, K].map(p => ({ path: p, name: path.basename(p), ext: '.ai', source: 'manual-browse', projectRole: 'source', addedAt: Date.now() }));
+      f.current().pendingFiles = []; f.current().assetBaseline = { schemaVersion: 1, status: 'legacy-included', decision: 'include', establishedAt: Date.now() }; roundTripFakeStore();
+      await metadataTestHooks.runScanOnOpen(f.id, W, null, null, { verifySelectedSource: true }); await prePackage(f); await f.select(K, 'exclude');
+      assert.ok(f.current().files.filter(row => paths.includes(row.path)).every(row => row.dependencyOwners?.includes(W)), 'every asset records its owner');
+      const withOwners = measure(f.current(), false), without = measure(f.current(), true);
+      assert.equal(withOwners.included, without.included, 'same membership result');
+      assert.ok(withOwners.realpaths - without.realpaths <= 5 * count + 16, JSON.stringify({ count, withOwners, without }));
+      assert.ok(withOwners.stats - without.stats <= 2, JSON.stringify({ count, withOwners, without }));
+      assert.ok(withOwners.receiptLookups - without.receiptLookups <= 2, JSON.stringify({ count, withOwners, without }));
+    }
+  }));
+
+  // ==== Round five: receipt-based owner retirement removed ====
+  const legacyRoots5 = (f, files) => {
+    f.current().files = files.map(p => ({ path: p, name: path.basename(p), ext: path.extname(p), source: 'manual-browse', projectRole: 'source', addedAt: Date.now() }));
+    f.current().pendingFiles = []; f.current().assetBaseline = { schemaVersion: 1, status: 'legacy-included', decision: 'include', establishedAt: Date.now() };
+    roundTripFakeStore();
+  };
+  const inddLink = async (f, doc, links, current = true) => {
+    const active = metadataTestHooks.parseInDesignActiveSessionOutput(`DOC\t${doc}\t${path.basename(doc)}\tfalse\t${current}\t${links.length}\n` +
+      links.map(link => `LINK\t${doc}\t${path.basename(doc)}\t${link}\tfalse\t${current}\n`).join('') + `END\t1\t${links.length}\t${links.length}\t0\n`);
+    await metadataTestHooks.applyLiveAppEvidenceRefresh(f.id, metadataTestHooks.createInDesignLiveEvidenceRecords(f.id, active, f.current()));
+  };
+
+  // ---- Reviewer regression 1 (first reviewer, round four): reader disagreement.
+  for (const ext of ['.ai', '.pdf', '.afdesign']) {
+    baselineTest(`round-five regression: a raw-route owner is not retired by a lazy ordinary receipt (${ext})`, { timeout: 120000 }, () => withEnv(async () => {
+      const f = await newProject('Raw reader ' + ext), W = desk('Excluded.ai'), K = desk('Included' + ext), X = desk('Picture.png.final.png'), short = desk('Picture.png');
+      fs.writeFileSync(X, png(901)); fs.writeFileSync(short, png(902));
+      writeWorking('.ai', W, [X]); if (ext === '.afdesign') zipDir(K, { 'doc.xml': '<r p="' + X + '"/>' }, true); else writeWorking(ext, K, [X]);
+      legacyRoots5(f, [W, K]);
+      await prePackage(f);
+      await metadataTestHooks.runScanOnOpen(f.id, K, null, null, { verifySelectedSource: true });
+      const receipt = metadataTestHooks.getWorkingSourceVerification(f.current(), f.current().files.find(r => r.path === K));
+      assert.equal(receipt.status, 'scanned'); assert.equal(receipt.unresolved.length, 0);
+      assert.ok(receipt.requiredReferences.some(r => r.path === short)); assert.ok(!receipt.requiredReferences.some(r => r.path === X));
+      await f.select(W, 'exclude');
+      assert.deepEqual(await f.written(await f.review()), ['Included' + ext, 'Picture.png', 'Picture.png.final.png'].sort(),
+        'included file still links the full filename found by the raw route');
+    }));
+  }
+  // ---- Reviewer regression 2 (first reviewer): an older untagged owner note observed again.
+  baselineTest('round-five regression: an older owner note observed again is not retired', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await formatProject('.ai'), X = desk(f.names.newLink);
+    writeWorking('.ai', f.W, [desk(f.names.only), desk(f.names.shared), X]);
+    writeWorking('.ai', f.K, [desk(f.names.keepOnly), desk(f.names.shared), X]);
+    await prePackage(f);
+    delete f.current().files.find(r => r.path === X).dependencyOwnerRoutes; roundTripFakeStore();   // as the reviewer did (no-op now)
+    await prePackage(f);                                                                             // observed again
+    assert.equal(f.stored(f.names.newLink).dependencyOwnerRoutes, undefined, 'no route field is written');
+    writeWorking('.ai', f.K, [desk(f.names.keepOnly), desk(f.names.shared)]);
+    await metadataTestHooks.runScanOnOpen(f.id, f.K, null, null, { verifySelectedSource: true });
+    await f.select(f.W, 'exclude');
+    assert.equal((await f.fact(f.names.newLink)).included, true);
+    assert.ok((await f.written(await f.review())).includes('Fresh-ai.png'));
+  }));
+  // ---- Reviewer regression 3 (second reviewer): Shot.png.copy.png with a live excluded owner.
+  async function shotProject(label, { keepExt = '.ai', excludedLive = true, route = 'regex' } = {}) {
+    const f = await newProject(label);
+    const short = desk('Shot.png'), long = desk('Shot.png.copy.png'), K = desk('KeepG' + keepExt), W = desk('WorkG.indd');
+    fs.writeFileSync(short, png(21)); fs.writeFileSync(long, png(22)); fs.writeFileSync(W, 'SYNTH');
+    if (keepExt === '.afdesign') zipDir(K, { 'doc.xml': `<doc><r p="${long}"/></doc>` }, true); else fs.writeFileSync(K, `%PDF-1.7\n${long}\n%%EOF\n`);
+    legacyRoots5(f, excludedLive ? [K, W] : [K]);
+    if (excludedLive) await f.select(W, 'exclude');
+    if (route === 'snapshot') {
+      setChildProcessHandler(request => {
+        if (request.kind === 'execFile' && request.command === '/bin/ps') return { stdout: '444 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
+        if (request.kind === 'execFile' && request.command === '/usr/sbin/lsof') return { stdout: `p444\nf14\ntREG\nn${K}\n` };
+        return passthroughInner(request);
+      });
+      await callIpcRaw('projects:pause', f.id); clearTrackedTimers();
+      await callIpcRaw('projects:start-watching', f.id);
+      await metadataTestHooks.waitForWatcherIdle(f.id).catch(() => null);
+      passthrough();
+    } else await prePackage(f);
+    assert.ok((f.anyRowAt(long)[0]?.dependencyOwners || []).includes(K), route + ' records the included owner');
+    await metadataTestHooks.runScanOnOpen(f.id, K, null, null, { verifySelectedSource: true });
+    if (excludedLive) await inddLink(f, W, [long]);
+    return { f, short, long, K, W };
+  }
+  for (const [keepExt, route] of [['.ai', 'regex'], ['.afdesign', 'regex'], ['.ai', 'snapshot']]) {
+    baselineTest(`round-five regression: an included ${keepExt} ${route} owner of Shot.png.copy.png is not retired when an excluded InDesign file reports it`, { timeout: 120000 }, () => withEnv(async () => {
+      const { f, long, K } = await shotProject('Shot ' + keepExt + ' ' + route, { keepExt, route });
+      const receipt = metadataTestHooks.getWorkingSourceVerification(f.current(), f.current().files.find(r => r.path === K));
+      assert.equal(receipt.status, 'scanned'); assert.ok(!receipt.requiredReferences.some(r => r.path === long));
+      if (route === 'snapshot') { await callIpcRaw('projects:pause', f.id); clearTrackedTimers(); }
+      const fact = await f.fact('Shot.png.copy.png');
+      assert.equal(fact.included, true); assert.equal(fact.excludedSourceOnly, false);
+      assert.deepEqual(await f.written(await f.review()), [path.basename(K), 'Shot.png', 'Shot.png.copy.png'].sort());
+    }, { realTmp: true }));
+  }
+  baselineTest('round-five bounding controls: included owner alone, an agreed path, a live-only owner, an IDML regex owner', { timeout: 180000 }, () => withEnv(async () => {
+    const solo = await shotProject('Shot solo', { excludedLive: false });
+    assert.deepEqual(await solo.f.written(await solo.f.review()), ['KeepG.ai', 'Shot.png', 'Shot.png.copy.png']);
+    // Agreed path both grammars name, shared with an excluded InDesign file.
+    const a = await newProject('Agreed'); const agreed = desk('Agreed.png'), KA = desk('KeepA.ai'), WA = desk('WorkA.indd');
+    fs.writeFileSync(agreed, png(23)); fs.writeFileSync(KA, `%PDF-1.7\n${agreed}\n%%EOF\n`); fs.writeFileSync(WA, 'SYNTH');
+    legacyRoots5(a, [KA, WA]); await a.select(WA, 'exclude'); await inddLink(a, WA, [agreed]); await prePackage(a);
+    await metadataTestHooks.runScanOnOpen(a.id, KA, null, null, { verifySelectedSource: true });
+    assert.deepEqual(await a.written(await a.review()), ['Agreed.png', 'KeepA.ai']);
+    // Live-only owner: kept while its document is included, withheld when it is excluded.
+    const l = await newProject('Live only'); const extra = desk('LiveOnly.png'), KL = desk('KeepL.ai'), side = desk('SideL.png');
+    fs.writeFileSync(extra, png(24)); fs.writeFileSync(side, png(25)); fs.writeFileSync(KL, `%PDF-1.7\n${side}\n%%EOF\n`);
+    legacyRoots5(l, [KL]);
+    await metadataTestHooks.applyLiveAppEvidenceRefresh(l.id, [{ filePath: extra, source: 'indd-poll', appFamily: 'indesign', relationshipSourcePath: KL, savedEvidence: true, documentModified: false, allowDirect: true, forcePending: false }]);
+    await metadataTestHooks.runScanOnOpen(l.id, KL, null, null, { verifySelectedSource: true });
+    assert.ok((await l.written(await l.review())).includes('LiveOnly.png'));
+  }, { realTmp: true }));
+
+  // ---- Trade-off verification (owner-accepted): stale recorded owners keep assets.
+  // a. Each owner-noting route: W and K recorded; K stops linking X; K is freshly verified; W is excluded.
+  async function staleOwner(route) {
+    if (route === 'regex' || route === 'snapshot') {
+      const f = await formatProject('.ai'); const X = desk(f.names.newLink);
+      writeWorking('.ai', f.W, [desk(f.names.only), desk(f.names.shared), X]); writeWorking('.ai', f.K, [desk(f.names.keepOnly), desk(f.names.shared), X]);
+      if (route === 'regex') await prePackage(f);
+      else {
+        await callIpcRaw('projects:pause', f.id); clearTrackedTimers();
+        setChildProcessHandler(request => {
+          if (request.kind === 'execFile' && request.command === '/bin/ps') return { stdout: '444 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
+          if (request.kind === 'execFile' && request.command === '/usr/sbin/lsof') return { stdout: `p444\nf14\ntREG\nn${f.W}\nf15\ntREG\nn${f.K}\n` };
+          return passthroughInner(request);
+        });
+        await callIpcRaw('projects:start-watching', f.id); await metadataTestHooks.waitForWatcherIdle(f.id).catch(() => null);
+        await callIpcRaw('projects:pause', f.id); clearTrackedTimers(); passthrough();
+      }
+      writeWorking('.ai', f.K, [desk(f.names.keepOnly), desk(f.names.shared)]);
+      await metadataTestHooks.runScanOnOpen(f.id, f.K, null, null, { verifySelectedSource: true });
+      await f.select(f.W, 'exclude');
+      return { f, name: f.names.newLink, W: f.W, K: f.K, expectOthers: f.keepNames };
+    }
+    if (route === 'doublecheck') {
+      const f = await formatProject('.sketch'); const X = desk(f.names.newLink), K2 = desk('Keep2.sketch');
+      writeWorking('.sketch', K2, [X]); await f.add(K2);                              // K2's Add Files scan admits X
+      writeWorking('.sketch', f.W, [desk(f.names.only), desk(f.names.shared), X]);
+      await prePackage(f);
+      assert.deepEqual(f.stored(f.names.newLink).dependencyOwners.slice().sort(), [f.W, K2].sort(), 'the double-check pass records both');
+      writeWorking('.sketch', K2, []);
+      await metadataTestHooks.runScanOnOpen(f.id, K2, null, null, { verifySelectedSource: true });
+      await f.select(f.W, 'exclude');
+      return { f, name: f.names.newLink, W: f.W, K: K2, expectOthers: [...f.keepNames, 'Keep2.sketch'] };
+    }
+    if (route === 'live') {
+      const f = await newProject('Stale live'); const W = desk('StaleW.indd'), K = desk('StaleK.indd'), X = desk('StaleLive.png');
+      fs.writeFileSync(W, 'SYNTH'); fs.writeFileSync(K, 'SYNTH'); fs.writeFileSync(X, png(146));
+      legacyRoots5(f, [W, K]);
+      await inddLink(f, W, [X]); await inddLink(f, K, [X]);
+      setChildProcessHandler(request => request.kind === 'execFile' && request.command === '/bin/ps' && request.args[0] === 'axww' ? { stdout: '  1 /sbin/launchd\n', stderr: '' } : passthroughInner(request));
+      await metadataTestHooks.runScanOnOpen(f.id, K, null, null, { verifySelectedSource: true });       // clean receipt, no X
+      passthrough();
+      await f.select(W, 'exclude');
+      return { f, name: 'StaleLive.png', W, K, expectOthers: ['StaleK.indd'] };
+    }
+    // presentation: both decks embed the same image; K's deck drops it.
+    const f = await formatProject('.pptx'); const K2 = desk('Second.pptx');
+    writeWorking('.pptx', K2, [], 900); await f.add(K2); await metadataTestHooks.runScanOnSavePresentation(f.id, K2);
+    const media = 'Work-pptx — image1.png';
+    assert.ok(f.stored(media).dependencyOwners.includes(K2));
+    writeWorking('.pptx', K2, [], 950);
+    await metadataTestHooks.runScanOnSavePresentation(f.id, K2);
+    await metadataTestHooks.runScanOnOpen(f.id, K2, null, null, { verifySelectedSource: true });
+    await f.select(f.W, 'exclude');
+    return { f, name: media, W: f.W, K: K2, expectOthers: null };
+  }
+  for (const route of ['regex', 'doublecheck', 'snapshot', 'live', 'presentation']) {
+    baselineTest(`accepted trade-off a (${route}): a stale recorded owner keeps the asset and it is written`, { timeout: 120000 }, () => withEnv(async () => {
+      const s = await staleOwner(route);
+      const fact = await s.f.fact(s.name);
+      assert.deepEqual([fact.included, fact.includedAsDependency, fact.excluded], [true, false, false]);
+      const written = await s.f.written(await s.f.review());
+      assert.ok(written.includes(s.name), JSON.stringify(written));
+      if (s.expectOthers) assert.deepEqual(written, [...s.expectOthers, s.name].sort());
+    }, { realTmp: route === 'snapshot' || route === 'live' }));
+  }
+  // b. The existing per-asset control removes the retained stale asset (variants: regex, double-check, snapshot, live, presentation).
+  const rendererButtonsFor = async (f, name) => {
+    const { loadProjectedWorkspace } = require('./opus-renderer-helpers');
+    const ui = loadProjectedWorkspace(structuredClone(f.current()), await f.workspace());
+    const labels = [];
+    const descend = element => { if (!element) return; const label = element.getAttribute?.('aria-label'); if (element.tagName === 'BUTTON' && label && label.includes(name)) labels.push(label); for (const child of element.children || []) descend(child); };
+    for (const id of ['existing-assets-list', 'added-assets-list', 'working-assets-list', 'project-file-list']) descend(ui.elements[id]);
+    return labels;
+  };
+  for (const route of ['regex', 'doublecheck', 'snapshot', 'live', 'presentation']) {
+    baselineTest(`accepted trade-off b (${route}): the per-asset Exclude removes the retained stale asset; Include brings it back`, { timeout: 120000 }, () => withEnv(async () => {
+      const s = await staleOwner(route);
+      const labels = await rendererButtonsFor(s.f, s.name);
+      assert.ok(labels.includes(`Exclude ${s.name} from this project`), 'the production renderer offers Exclude: ' + JSON.stringify(labels));
+      await s.f.toggle(s.name);
+      let fact = await s.f.fact(s.name);
+      assert.deepEqual([fact.included, fact.excluded], [false, true]);
+      let review = await s.f.review();
+      assert.equal(s.f.reviewNames(review).includes(s.name), false);
+      roundTripFakeStore();
+      review = await s.f.review();
+      assert.equal((await s.f.written(review)).includes(s.name), false, 'written folder: omitted after the per-asset Exclude, after reload');
+      await s.f.toggle(s.name);
+      fact = await s.f.fact(s.name);
+      assert.equal(fact.included, true);
+    }, { realTmp: route === 'snapshot' || route === 'live' }));
+  }
+  // c. Contrast: an authoritatively required asset (K's current receipt lists it). The pre-existing rule: per-asset Exclude is overridden.
+  baselineTest('pre-existing rule (unchanged): an asset the included file currently requires overrides a per-asset Exclude', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await formatProject('.ai'); const X = desk(f.names.newLink);
+    writeWorking('.ai', f.W, [desk(f.names.only), desk(f.names.shared), X]); writeWorking('.ai', f.K, [desk(f.names.keepOnly), desk(f.names.shared), X]);
+    await prePackage(f);
+    await metadataTestHooks.runScanOnOpen(f.id, f.K, null, null, { verifySelectedSource: true });     // K's receipt lists X
+    await f.select(f.W, 'exclude');
+    let fact = await f.fact(f.names.newLink);
+    assert.equal(fact.includedAsDependency, true);
+    const labels = await rendererButtonsFor(f, f.names.newLink);
+    assert.ok(labels.some(label => label.startsWith(`Why ${f.names.newLink} is required`)), 'the renderer shows Required asset, not Exclude: ' + JSON.stringify(labels));
+    assert.equal(labels.includes(`Exclude ${f.names.newLink} from this project`), false);
+    await f.toggle(f.names.newLink);                                                                  // the IPC still records an Exclude
+    fact = await f.fact(f.names.newLink);
+    assert.deepEqual([fact.excluded, fact.included, fact.includedAsDependency], [true, true, true]);
+    assert.ok((await f.written(await f.review())).includes(f.names.newLink), 'written: overridden by the required link (as on base)');
+  }));
+  // d. Extent: a stale-kept placed document (asset role, admitted by the Add Files
+  // scan) keeps what it links, and the pre-package passes read it as included.
+  baselineTest('accepted trade-off d: a stale-kept placed document keeps its own links and is scanned as an included document', { timeout: 120000 }, () => withEnv(async () => {
+    const W = desk('Work-d.ai'), K = desk('Keep-d.ai'), P = desk('Placed.ai'), Y = desk('Nested.png'), Z = desk('LaterNested.png'), side = desk('KeepSide-d.png');
+    const f = await newProject('Trade-off d', { before() {
+      fs.writeFileSync(Y, png(61)); fs.writeFileSync(Z, png(62)); fs.writeFileSync(side, png(63));
+      writeWorking('.ai', P, [Y]); writeWorking('.ai', W, [P]); writeWorking('.ai', K, [P, side]);
+    } });
+    for (const file of [W, K]) await f.add(file);
+    assert.equal(f.stored('Placed.ai').source, 'scan-on-open'); assert.equal(f.stored('Placed.ai').projectRole, 'asset');
+    await prePackage(f);                                       // the regex pass reads W, K and the placed P
+    assert.deepEqual(f.stored('Placed.ai').dependencyOwners.slice().sort(), [W, K].sort());
+    assert.deepEqual(f.stored('Nested.png').dependencyOwners, [P]);
+    writeWorking('.ai', K, [side]);                            // K stops placing P
+    await metadataTestHooks.runScanOnOpen(f.id, K, null, null, { verifySelectedSource: true });
+    await f.select(W, 'exclude');
+    for (const name of ['Placed.ai', 'Nested.png']) {
+      const fact = await f.fact(name);
+      assert.deepEqual([fact.included, fact.includedAsDependency], [true, false], name + ' retained, not required');
+    }
+    let written = await f.written(await f.review());
+    assert.deepEqual(written, ['Keep-d.ai', 'KeepSide-d.png', 'Nested.png', 'Placed.ai']);
+    writeWorking('.ai', P, [Y, Z]);
+    await prePackage(f);                                       // P is read as an included document: its new link is admitted
+    assert.deepEqual(f.stored('LaterNested.png').dependencyOwners, [P]);
+    written = await f.written(await f.review());
+    assert.deepEqual(written, ['Keep-d.ai', 'KeepSide-d.png', 'LaterNested.png', 'Nested.png', 'Placed.ai']);
+    // The per-asset Exclude removes the placed document; what it links stays until each is excluded.
+    const labels = await rendererButtonsFor(f, 'Placed.ai');
+    assert.ok(labels.includes('Exclude Placed.ai from this project'), JSON.stringify(labels));
+    await f.toggle('Placed.ai');
+    written = await f.written(await f.review());
+    assert.deepEqual(written, ['Keep-d.ai', 'KeepSide-d.png', 'LaterNested.png', 'Nested.png']);
+    for (const name of ['Nested.png', 'LaterNested.png']) {
+      assert.ok((await rendererButtonsFor(f, name)).includes(`Exclude ${name} from this project`), name);
+      await f.toggle(name);
+    }
+    assert.deepEqual(await f.written(await f.review()), ['Keep-d.ai', 'KeepSide-d.png'], 'each retained file is removable with its own Exclude control');
+    roundTripFakeStore();
+    assert.deepEqual(await f.written(await f.review()), ['Keep-d.ai', 'KeepSide-d.png'], 'after reload');
+  }));
+  // e. Owner removal, owner Exclude and Restore.
+  baselineTest('accepted trade-off e: a removed stale owner is ignored; owner Exclude and Restore follow selection', { timeout: 120000 }, () => withEnv(async () => {
+    const s = await staleOwner('regex');
+    await s.f.select(s.K, 'exclude'); roundTripFakeStore();
+    assert.equal((await s.f.fact(s.name)).included, false, 'both owners excluded');
+    await s.f.select(s.K, 'restore'); roundTripFakeStore();
+    assert.equal((await s.f.fact(s.name)).included, true, 'restored stale owner keeps it');
+    await s.f.select(s.W, 'restore'); roundTripFakeStore();
+    const viaW = await s.f.fact(s.name);
+    assert.deepEqual([viaW.included, viaW.includedAsDependency], [true, true], "W's dependency");
+    await s.f.select(s.W, 'exclude');
+    // Remove K from the project: the record is ignored.
+    const kRow = (await s.f.workspace()).files.find(row => row.name === path.basename(s.K));
+    s.f.current().files = s.f.current().files.filter(row => row.path !== s.K); roundTripFakeStore();
+    void kRow;
+    assert.equal((await s.f.fact(s.name)).included, false, 'an owner that is no longer a project file keeps nothing');
+    roundTripFakeStore();
+    assert.equal((await s.f.fact(s.name)).included, false);
+  }));
+  // f. Shared assets and individual choices are unaffected.
+  baselineTest('accepted trade-off f: shared assets, per-asset Include, Add Files and Add are kept through Exclude, Restore and Exclude', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await formatProject('.ai'); const added = desk('AddedByHand.png'), pending = desk(f.names.newLink);
+    fs.writeFileSync(added, png(70));
+    writeWorking('.ai', f.W, [desk(f.names.only), desk(f.names.shared), added, pending]);
+    manualDialogFor([added]); await callIpcRaw('projects:add-files', f.id);
+    await f.select(f.W, 'exclude');
+    await f.toggle(f.names.only);                                                                     // per-asset Include
+    setChildProcessHandler(request => {
+      if (isIllustratorPgrepCheck(request)) return { stdout: '432\n' };
+      if (isOsascriptInvocation(request, 'crate-ai-active-session.applescript')) return { stdout: `DOC\t${f.W}\tWork-ai.ai\ttrue\ttrue\nLINK\t${f.W}\tWork-ai.ai\t${pending}\ttrue\ttrue\nCOMPLETE\t1\t1\n` };
+      return passthroughInner(request);
+    });
+    await metadataTestHooks.pollPsForProject(f.id, metadataTestHooks.getActiveWatchingActivationToken(f.id));
+    await metadataTestHooks.waitForWatcherIdle(f.id).catch(() => null); clearTrackedTimers(); passthrough();
+    const row = f.current().pendingFiles.find(item => item.path === pending); assert.ok(row);
+    assert.ok(await callIpcRaw('projects:accept-pending', f.id, metadataTestHooks.createProjectFileVisualIdentity(f.id, row)));   // Add
+    await f.select(f.W, 'restore'); await f.select(f.W, 'exclude'); roundTripFakeStore();
+    const expected = [...f.keepNames, 'AddedByHand.png', f.names.only, f.names.newLink].sort();
+    assert.deepEqual(await f.written(await f.review()), expected);
+    assert.deepEqual((await f.fact(f.names.shared)).requiredBy, [path.basename(f.K)], 'shared asset stays required');
+  }, { realTmp: true }));
+
+  // ---- Presentation capture failure: once, and persistently.
+  baselineTest('presentation capture failure once: the unnamed refusal recovers on the next review to clearable rows', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await pausedDeck('.pptx'); await f.toggle(f.media); await f.pause(); f.change(777);
+    let listingFailed = false;
+    setChildProcessHandler(req => { if (!listingFailed && req.kind === 'execFile' && req.command === '/usr/bin/unzip' && req.args[0] === '-l' && req.args[1] === f.W) { listingFailed = true; throw new Error('synthetic listing failure'); } return passthroughInner(req); });
+    const failed = await f.review();
+    assert.equal(failed.materializable, false);
+    assert.equal(failed.message, 'A presentation changed while Crate was not capturing it, and Crate could not list its new media. Open Package Review again; Crate lists them so you can choose Include or Exclude for each.');
+    passthrough();
+    const retry = await f.review();
+    assert.match(retry.message, /cannot carry your earlier Include or Exclude/);
+    for (const name of heldNow(f)) await f.toggle(name);
+    assert.equal((await f.review()).materializable, true);
+  }));
+  baselineTest('presentation capture failure persistent: refusals stay clearable with existing controls', { timeout: 120000 }, () => withEnv(async () => {
+    // (1) The deck cannot be listed at all: planning also fails; the deck entry is unavailable.
+    const a = await pausedDeck('.pptx'); await a.toggle(a.media); await a.pause(); a.change(777);
+    setChildProcessHandler(req => { if (req.kind === 'execFile' && req.command === '/usr/bin/unzip' && req.args[1] === a.W) throw new Error('synthetic persistent read failure'); return passthroughInner(req); });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const refused = await a.review();
+      assert.equal(refused.materializable, false);
+      assert.equal(refused.message, 'Some files are unavailable. Resolve them before packaging.');
+    }
+    await a.select(a.W, 'exclude');                                                                   // existing control
+    assert.equal((await a.review()).materializable, true, 'excluding the unreadable deck clears it');
+    passthrough();
+    // (2) The deck is readable, but the capture's member extraction keeps failing
+    // (planning, which reads the same archive afterwards, succeeds).
+    const b = await pausedDeck('.pptx'); await b.toggle(b.media); await b.pause(); b.change(777);
+    let phase = 'plan', failing = true;
+    setChildProcessHandler(req => {
+      if (req.kind === 'execFile' && req.command === '/usr/bin/unzip' && req.args[1] === b.W) {
+        if (req.args[0] === '-l') phase = phase === 'capture' ? 'plan' : 'capture';
+        else if (failing && phase === 'capture') throw new Error('synthetic capture extraction failure');
+      }
+      return passthroughInner(req);
+    });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      phase = 'plan';
+      const refused = await b.review();
+      assert.equal(refused.materializable, false);
+      assert.equal(refused.message, 'A presentation changed while Crate was not capturing it, and Crate could not list its new media. Open Package Review again; Crate lists them so you can choose Include or Exclude for each.');
+      assert.deepEqual(heldNow(b), []);
+    }
+    await b.select(b.W, 'exclude');
+    assert.equal((await b.review()).materializable, true, 'excluding the deck clears the refusal');
+    await b.select(b.W, 'restore');
+    failing = false; passthrough();
+    const retry = await b.review();                                                                   // capture succeeds again
+    assert.match(retry.message || '', /cannot carry your earlier Include or Exclude/);
+    for (const name of heldNow(b)) await b.toggle(name);
+    assert.equal((await b.review()).materializable, true);
+  }));
+
+  // ---- Row kinds and the control that governs each (round five).
+  const rowKind = async (f, name) => {
+    const stored = f.stored(name), fact = await f.fact(name);
+    return { projectRole: stored.projectRole, source: stored.source, workingSource: !!fact.sourceSelection, protectedSource: fact.protectedSource === true,
+      included: fact.included, includedAsDependency: fact.includedAsDependency, excludedSourceOnly: fact.excludedSourceOnly, requiredBy: fact.requiredBy };
+  };
+  baselineTest('row kinds: a stale retained asset-role image and asset-role placed document use the per-asset control', { timeout: 120000 }, () => withEnv(async () => {
+    // Asset-role image (regex route).
+    const s = await staleOwner('regex');
+    assert.deepEqual(await rowKind(s.f, s.name), { projectRole: 'asset', source: 'linked-asset', workingSource: false, protectedSource: false,
+      included: true, includedAsDependency: false, excludedSourceOnly: false, requiredBy: [] });
+    // Asset-role placed document with its own link.
+    const W = desk('Work-k.ai'), K = desk('Keep-k.ai'), P = desk('PlacedK.ai'), Y = desk('NestedK.png'), side = desk('Side-k.png');
+    const f = await newProject('Row kinds', { before() { fs.writeFileSync(Y, png(64)); fs.writeFileSync(side, png(65)); writeWorking('.ai', P, [Y]); writeWorking('.ai', W, [P]); writeWorking('.ai', K, [P, side]); } });
+    for (const file of [W, K]) await f.add(file);
+    await prePackage(f); writeWorking('.ai', K, [side]);
+    await metadataTestHooks.runScanOnOpen(f.id, K, null, null, { verifySelectedSource: true });
+    await f.select(W, 'exclude');
+    assert.deepEqual(await rowKind(f, 'PlacedK.ai'), { projectRole: 'asset', source: 'scan-on-open', workingSource: false, protectedSource: false,
+      included: true, includedAsDependency: false, excludedSourceOnly: false, requiredBy: [] });
+    await f.toggle('PlacedK.ai');                                                  // control: per-asset Exclude (projects:remove-file)
+    assert.equal((await f.fact('PlacedK.ai')).excluded, true);
+    assert.equal((await f.fact('NestedK.png')).included, true, 'its nested asset stays until excluded itself');
+    assert.deepEqual(await f.written(await f.review()), ['Keep-k.ai', 'NestedK.png', 'Side-k.png']);
+    await f.toggle('NestedK.png');
+    assert.deepEqual(await f.written(await f.review()), ['Keep-k.ai', 'Side-k.png']);
+    await f.toggle('PlacedK.ai'); await f.toggle('NestedK.png');                  // Include again
+    roundTripFakeStore();
+    assert.deepEqual(await f.written(await f.review()), ['Keep-k.ai', 'NestedK.png', 'PlacedK.ai', 'Side-k.png']);
+  }));
+  // Working-role documents (existing working-file behavior, unchanged by this round):
+  // the per-asset toggle is not their control; working-file Exclude/Restore is.
+  baselineTest('row kinds: an independent working file is governed by working-file Exclude and Restore (existing behavior)', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await formatProject('.ai'); const P = desk('OtherWork.ai'), Y = desk('OtherWorkLink.png');
+    fs.writeFileSync(Y, png(66)); writeWorking('.ai', P, [Y]);
+    await f.add(P);
+    const kind = await rowKind(f, 'OtherWork.ai');
+    assert.deepEqual([kind.projectRole, kind.workingSource, kind.protectedSource], ['source', true, true]);
+    const before = JSON.stringify(f.current().files);
+    await callIpcRaw('projects:remove-file', f.id, (await f.fact('OtherWork.ai')).visualIdentity);
+    assert.equal(JSON.stringify(f.current().files), before, 'the per-asset call does not act on a working file');
+    await f.select(P, 'exclude');                                                    // control: working-file Exclude
+    assert.equal((await f.fact('OtherWorkLink.png')).included, false, 'its own asset leaves with it');
+    let written = await f.written(await f.review());
+    assert.equal(written.includes('OtherWork.ai') || written.includes('OtherWorkLink.png'), false);
+    await f.select(P, 'restore');                                                    // control: working-file Restore
+    written = await f.written(await f.review());
+    assert.ok(written.includes('OtherWork.ai') && written.includes('OtherWorkLink.png'));
+  }));
+  baselineTest('row kinds: a working file that an included file links stays as its required dependency when excluded (existing behavior)', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await formatProject('.ai'); const P = desk('PlacedWork.ai'), Y = desk('PlacedWorkLink.png');
+    fs.writeFileSync(Y, png(66)); writeWorking('.ai', P, [Y]);
+    writeWorking('.ai', f.W, [desk(f.names.only), desk(f.names.shared), P]);
+    await prePackage(f);                                                             // the regex pass admits P; an .ai is stored as a working file
+    const kind = await rowKind(f, 'PlacedWork.ai');
+    assert.deepEqual([kind.projectRole, kind.source, kind.workingSource, kind.protectedSource], ['source', 'linked-asset', true, true]);
+    await metadataTestHooks.runScanOnOpen(f.id, P, null, null, { verifySelectedSource: true });
+    await f.select(P, 'exclude');                                                    // control: working-file Exclude
+    const stale = await f.review();                                                  // W changed after its receipt: not packageable yet
+    assert.equal(stale.materializable, false); assert.equal(stale.message, 'Working-source verification is unresolved. Resolve it before packaging.');
+    await metadataTestHooks.runScanOnOpen(f.id, f.W, null, null, { verifySelectedSource: true });
+    const placed = await f.fact('PlacedWork.ai');
+    assert.deepEqual([placed.sourceSelection, placed.includedAsDependency, placed.included], ['excluded', true, true], 'retained as W\'s dependency');
+    assert.equal((await f.fact('PlacedWorkLink.png')).included, true);
+    const written = await f.written(await f.review());
+    assert.ok(written.includes('PlacedWork.ai') && written.includes('PlacedWorkLink.png'));
+  }));
+  baselineTest('presentation capture succeeds but lists nothing new: no refusal, a token is issued', { timeout: 120000 }, () => withEnv(async () => {
+    const f = await pausedDeck('.pptx'); await f.toggle(f.media); await f.pause();
+    writeWorking('.pptx', f.W, [desk(f.names.only), desk(f.names.shared)], 11);    // the deck now embeds bytes Crate already has (Solo-pptx.png)
+    const review = await f.review();
+    assert.equal(review.materializable, true, review.message); assert.ok(review.token);
+    assert.deepEqual(heldNow(f), []);
+    const written = await f.written(review);
+    assert.equal(written.includes(f.media), false, 'the explicitly excluded old picture stays out');
+  }));
 }
