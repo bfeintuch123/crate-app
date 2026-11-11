@@ -160,7 +160,7 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
   vm.runInContext('function toggleAssetForTest(project, removedFile) { let changed = false;\n' +
     between("    if (removedFile && inferProjectFileRole(removedFile) === 'asset') {",
       '    project.files = project.files.filter(file => (\n      !matchesProjectFileIdentity') + '  return changed; }', context);
-  api = vm.runInContext('({getWorkingSourceSelection, getWorkingSourceVerification, getWorkingSourceMembership, setWorkingSourceSelection, resolveWorkingFileChoice, getAssetBaselineSourceRecoveryRouteKey, selectProjectFilesForPackaging, beginWorkingSourceScan, collectWorkingSourceScanEvidence, publishWorkingSourceScan, failWorkingSourceScan, workingSourceScanLeases, workingSourceScanOperations, getWorkingSourceDiskIdentity, recordWorkingSourceContinuationCandidate, resolveWorkingSourceContinuation, getWorkingSourceContinuationPresentation, observeIllustratorWorkingSourceContinuation, refreshWorkingSourceLocators, retireInterruptedWorkingSourceScan: typeof retireInterruptedWorkingSourceScan === "function" ? retireInterruptedWorkingSourceScan : null, refreshWorkingSourceVerification, getWorkingFileVerificationReason, isUnretainedExcludedScanSource: typeof isUnretainedExcludedScanSource === "function" ? isUnretainedExcludedScanSource : null})', context);
+  api = vm.runInContext('({getWorkingSourceSelection, getWorkingSourceVerification, getWorkingSourceMembership, setWorkingSourceSelection, resolveWorkingFileChoice, getAssetBaselineSourceRecoveryRouteKey, selectProjectFilesForPackaging, beginWorkingSourceScan, collectWorkingSourceScanEvidence, publishWorkingSourceScan, failWorkingSourceScan, workingSourceScanLeases, workingSourceScanOperations, getWorkingSourceDiskIdentity, recordWorkingSourceContinuationCandidate, resolveWorkingSourceContinuation, getWorkingSourceContinuationPresentation, observeIllustratorWorkingSourceContinuation, refreshWorkingSourceLocators, retireInterruptedWorkingSourceScan: typeof retireInterruptedWorkingSourceScan === "function" ? retireInterruptedWorkingSourceScan : null, refreshWorkingSourceVerification, getWorkingFileVerificationReason, isUnretainedExcludedScanSource: typeof isUnretainedExcludedScanSource === "function" ? isUnretainedExcludedScanSource : null, isExclusionRuleActive: typeof isExclusionRuleActive === "function" ? isExclusionRuleActive : null})', context);
   const source = (name, fileId = name) => {
     const file = { path: `/Users/synthetic/${name}`, name, fileId, ext: path.extname(name), projectRole: 'source' };
     disk.set(file.path, Buffer.from('%PDF-1.7\n%%EOF\n'));
@@ -1939,6 +1939,30 @@ test('exclusion rule without a selection record: only an individually excluded d
   assert.equal(guarded(f, placed), false);
 });
 
+test('exclusion rule without a selection record: the excluded document\'s own receipt is an ownership tie', () => {
+  const f = fixture(), keep = f.source('Keep.ai');
+  const placed = dependencyAsset(f, 'Placed.ai'), linked = dependencyAsset(f, 'Linked.png');
+  f.project.files.push(keep, placed, linked);
+  f.project.excludedAssetKeys = [placed.path];
+  const receipt = requiredReferences => ({ status: 'scanned', attempt: 'synthetic', unresolved: [], requiredReferences,
+    sourceFingerprint: 'a'.repeat(64), sourceIdentity: { dev: 1, ino: 1, size: 1, mtimeMs: 0, ctimeMs: 0 }, selectionRevision: 0 });
+  const key = f.api.getAssetBaselineSourceRecoveryRouteKey(f.project, placed);
+  assert.equal(f.api.isExclusionRuleActive(f.snapshot()), false, 'no receipt');
+  assert.deepEqual(included(f, placed, linked), [false, true]);
+  f.project.workingSourceVerification = { [key]: receipt([]) };
+  assert.equal(f.api.isExclusionRuleActive(f.snapshot()), false, 'an empty receipt');
+  f.project.workingSourceVerification = { [key]: { ...receipt([]), requiredEmbeddedOutputs: [] } };
+  assert.equal(f.api.isExclusionRuleActive(f.snapshot()), false, 'no embedded outputs either');
+  f.project.workingSourceVerification = { [key]: receipt([{ path: linked.path }]) };
+  assert.equal(f.api.isExclusionRuleActive(f.snapshot()), true, 'a receipt-only tie');
+  assert.deepEqual(included(f, placed, linked), [false, false]);
+  assert.equal(Object.hasOwn(f.snapshot(), 'workingSourceSelections'), false);
+  f.project.workingSourceVerification = { [key]: { ...receipt([]), requiredEmbeddedOutputs: [{ path: linked.path, sourceDigest: 'a'.repeat(64), outputDigest: 'b'.repeat(64) }] } };
+  assert.equal(f.api.isExclusionRuleActive(f.snapshot()), true, 'an embedded-output-only tie');
+  f.project.excludedAssetKeys = [];
+  assert.equal(f.api.isExclusionRuleActive(f.snapshot()), false, 'nothing individually excluded');
+});
+
 test('exclusion rule: a Photoshop output follows the parent its extraction record names', () => {
   const f = fixture(), keep = f.source('Keep.ai');
   const placed = dependencyAsset(f, 'Placed.psd'), receipt = { version: 1, parentPath: placed.path, sourceDigest: 'b'.repeat(64),
@@ -1983,7 +2007,7 @@ function randomExclusionProject(f, rand) {
     else if (r < 0.5) project.workingSourceSelections[key(file)] = { state: 'excluded', reason: 'unknown', revision: 1 };
     else if (r < 0.75) project.workingSourceSelections[key(file)] = { state: 'selected', reason: null, revision: 1 + Math.floor(rand() * 3) };
   }
-  for (const file of sources) if (chance(0.6)) {
+  for (const file of [...sources, ...docs]) if (chance(sources.includes(file) ? 0.6 : 0.3)) {
     project.workingSourceVerification ||= {};
     project.workingSourceVerification[key(file)] = { status: 'scanned', attempt: 'synthetic', unresolved: [],
       requiredReferences: [...some([...docs, ...assets], 1.5), ...(chance(0.1) ? [pick(sources)] : [])].filter(ref => ref !== file).map(ref => ({ path: ref.path })),

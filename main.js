@@ -4154,26 +4154,36 @@ function isBulkSkippedOnlyAssetRow(project, file) {
   return project?.assetBaseline?.decision === 'skip' && file?.assetOrigin === 'existing' && !file.individualContentExclusion;
 }
 // The exclusion rule applies with a working-file selection record, or when an
-// asset-role row carries its own per-asset exclusion and another row names it
-// as an owner, producer or parent. This is a string test over stored fields
-// with no file-system access; the membership function confirms ownership on
-// normalized paths. A project without such a row does no added work.
+// asset-role row carries its own per-asset exclusion and owns something:
+// another row names it as an owner, producer or parent (a case-insensitive
+// string test over stored fields), or its own stored scan receipt lists a
+// reference or embedded output (one route key per such row, computed only
+// when the project stores receipts). The membership function confirms
+// ownership on normalized paths. A project without such a row does no added work.
 function isExclusionRuleActive(project) {
   if (hasWorkingSourceSelectionState(project)) return true;
   const keys = project?.excludedAssetKeys;
   if (!Array.isArray(keys) || !keys.length) return false;
-  const excluded = new Set(keys), documents = new Set();
+  const excluded = new Set(keys), documents = new Map();
   for (const file of project.files || []) {
     if (typeof file?.path !== 'string' || !excluded.has(getAssetReviewExclusionKey(file)) || isWorkingSourceFile(file) ||
         isBulkSkippedOnlyAssetRow(project, file)) continue;
-    documents.add(file.path.toLowerCase());
+    documents.set(file.path.toLowerCase(), file);
   }
   if (!documents.size) return false;
   const names = value => typeof value === 'string' && documents.has(value.toLowerCase());
-  return [...(project.files || []), ...(project.pendingFiles || [])].some(file => file && (
+  if ([...(project.files || []), ...(project.pendingFiles || [])].some(file => file && (
     (Array.isArray(file.dependencyOwners) && file.dependencyOwners.some(names)) || names(file.captureEvidence?.relationshipSourcePath) ||
     names(file.captureEvidence?.sourceDocumentPath) || names(file.assetBaselineSourcePath) || names(file.parentPsd) ||
-    names(file.psdResource?.parentPath) || names(file.psdExtractionReceipt?.parentPath)));
+    names(file.psdResource?.parentPath) || names(file.psdExtractionReceipt?.parentPath)))) return true;
+  const receipts = project.workingSourceVerification;
+  if (!receipts || typeof receipts !== 'object' || !Object.keys(receipts).length) return false;
+  for (const file of documents.values()) {
+    const record = receipts[getAssetBaselineSourceRecoveryRouteKey(project, file)];
+    if ((Array.isArray(record?.requiredReferences) && record.requiredReferences.length > 0) ||
+        (Array.isArray(record?.requiredEmbeddedOutputs) && record.requiredEmbeddedOutputs.length > 0)) return true;
+  }
+  return false;
 }
 // A Photoshop output's extraction record (written only by extractPsdAssets from
 // the parent's own bytes) under the validity conditions of

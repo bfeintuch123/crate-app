@@ -8162,6 +8162,27 @@ function excludedSourceMembershipCases() {
     assert.ok(f.current().files.some(row => row.path === Z), 'admitted on the first pass after Include');
     assert.deepEqual(await f.written(await f.review()), [...all, 'LaterS.png'].sort());
     neverEngaged(f);
+    // A link known only through the excluded document's own scan receipt. Work-r.ai's Add Files scan
+    // admits Placed-r.ai and Linked-r.png; Work-r.ai then drops the link, and the link's row carries no
+    // source field (as in an older store), so no other row names Placed-r.ai.
+    const WR = desk('Work-r2.ai'), PR = desk('Placed-r2.ai'), YR = desk('Linked-r2.png');
+    const g = await newProject('C2 receipt only', { before() { fs.writeFileSync(YR, png(505)); writeWorking('.ai', PR, [YR]); writeWorking('.ai', WR, [PR, YR]); } });
+    await g.add(WR);
+    await verifyScan(g, PR);
+    assert.ok(metadataTestHooks.getWorkingSourceVerification(g.current(), g.current().files.find(row => row.path === PR)).requiredReferences.some(ref => ref.path === YR));
+    writeWorking('.ai', WR, [PR]); await verifyScan(g, WR);
+    const linked = g.current().files.find(row => row.path === YR);
+    assert.equal(linked.source, 'scan-on-open');
+    delete linked.assetBaselineSourcePath; delete linked.dependencyOwners; if (linked.captureEvidence) { delete linked.captureEvidence.relationshipSourcePath; delete linked.captureEvidence.sourceDocumentPath; }
+    roundTripFakeStore();
+    assert.equal(g.current().files.some(row => [row.assetBaselineSourcePath, row.captureEvidence?.relationshipSourcePath, ...(row.dependencyOwners || [])].includes(PR)), false, 'no row names the document');
+    const withDocument = ['Linked-r2.png', 'Placed-r2.ai', 'Work-r2.ai'];
+    assert.deepEqual(await g.written(await g.review()), withDocument);
+    await g.toggle('Placed-r2.ai');
+    neverEngaged(g);
+    assert.deepEqual(await g.written(await g.review()), ['Work-r2.ai'], 'the receipt-only link leaves with its document');
+    await g.toggle('Placed-r2.ai');
+    assert.deepEqual(await g.written(await g.review()), withDocument, 'Include returns it');
   }));
   baselineTest('excluded documents without a selection record: Skip existing assets is not an Exclude of a document', { timeout: 180000 }, () => withEnv(async () => {
     const W = desk('Work-k.ai'), K = desk('Keep-k2.ai'), P = desk('PlacedH.ai'), Y = desk('NestedH.png'), side = desk('KeepSide-k2.png'), solo = desk('Solo-k.png'), Z = desk('NewInSkippedH.png');
