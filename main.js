@@ -20470,9 +20470,12 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   const operation = captureProjectOperation(projectId); if (!operation) return null;
   const operationCurrent = operation.current;
   const ordinaryPsdOutputBatches = [], ownerNotes = [];
-  const scanSkipper = scanProject => {
-    const membership = isExclusionRuleActive(scanProject) ? getWorkingSourceMembership(scanProject) : null;
-    return (file, options) => !!membership && isUnretainedExcludedScanSource(membership, file, options);
+  // The Photoshop parse keeps its merged guard: only with a selection record,
+  // and it goes on reading an individually excluded placed PSD.
+  const scanSkipper = (scanProject, { photoshopParse = false } = {}) => {
+    const active = photoshopParse ? hasWorkingSourceSelectionState(scanProject) : isExclusionRuleActive(scanProject);
+    const membership = active ? getWorkingSourceMembership(scanProject) : null;
+    return file => !!membership && isUnretainedExcludedScanSource(membership, file, { excludedAssetDocuments: !photoshopParse });
   };
   const stagePrePackageFile = (project, file, observation, stageIndex = null) => {
     if (!operationCurrent()) return null;
@@ -20905,9 +20908,9 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   // Works even when Photoshop is not running.
   try {
     const psdFiles = project.files.filter(f => f.ext === '.psd');
-    const skipPsd = scanSkipper(project);
+    const skipPsd = scanSkipper(project, { photoshopParse: true });
     for (const psdFile of psdFiles) {
-      if (skipPsd(psdFile, { excludedAssetDocuments: false })) continue;
+      if (skipPsd(psdFile)) continue;
       if (!fs.existsSync(psdFile.path)) continue;
       const psdAssets = await extractPsdAssets(psdFile.path, projectId, operationCurrent, {
         onOrdinaryPsdOutputs: outputs => ordinaryPsdOutputBatches.push(outputs),
