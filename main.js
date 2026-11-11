@@ -16292,9 +16292,12 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       // The same-parent chosen-output rule applies here too; this route keeps
       // its own naming otherwise (no other-file reservation).
       const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + projectId);
+      // The folder exists only if this run staged an output; a folder that
+      // cannot be listed holds no cached file, so every name is absent.
       let listing = null;
+      const listNames = () => { try { return new Set(fs.readdirSync(extractDir).map(entry => entry.toLowerCase())); } catch (_) { return new Set(); } };
       const { chosen } = getChosenMissingPsdOutputs(getProjects().find(project => project.id === projectId), psdFilePath, extractDir,
-        name => (listing ??= new Set(fs.readdirSync(extractDir).map(entry => entry.toLowerCase()))).has(name));
+        name => (listing ??= listNames()).has(name));
       return discoveredPaths.concat(workerResult.transaction.promote(chosen));
     }
 
