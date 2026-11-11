@@ -1939,6 +1939,26 @@ test('exclusion rule without a selection record: only an individually excluded d
   assert.equal(guarded(f, placed), false);
 });
 
+test('exclusion rule: a Photoshop output follows the parent its extraction record names', () => {
+  const f = fixture(), keep = f.source('Keep.ai');
+  const placed = dependencyAsset(f, 'Placed.psd'), receipt = { version: 1, parentPath: placed.path, sourceDigest: 'b'.repeat(64),
+    layerPath: null, linkedIndex: 0, originalName: 'Layer.png', outputDigest: 'c'.repeat(64) };
+  const output = dependencyAsset(f, 'Layer.png', { source: 'psd-embedded', psdExtractionReceipt: receipt });
+  const legacy = dependencyAsset(f, 'Legacy.png', { source: 'psd-embedded' });
+  f.project.files.push(keep, placed, output, legacy);
+  f.project.excludedAssetKeys = [placed.path];
+  assert.deepEqual(included(f, placed, output, legacy), [false, false, true], 'a legacy output without a record stays');
+  assert.equal(guarded(f, placed), true); assert.equal(guarded(f, placed, { excludedAssetDocuments: false }), false);
+  const row = () => f.project.files.find(item => item.path === output.path);
+  row().keptAfterSourceExclusion = true;
+  assert.deepEqual(included(f, output), [true], 'an Include stays on its row');
+  delete row().keptAfterSourceExclusion;
+  for (const changed of [{ current: false }, { outputDigest: 'short' }, { linkedIndex: -1 }, { layerPath: 'Group/Layer' }, { parentPath: '/Users/synthetic/Gone.psd' }]) {
+    row().psdExtractionReceipt = { ...receipt, ...changed };
+    assert.deepEqual(included(f, output), [true], 'ignored record keeps the row: ' + JSON.stringify(changed));
+  }
+});
+
 // Seeded random projects checked against an independent statement of the rule:
 // every row's expected inclusion is a least fixed point (seeds are rows written
 // for their own reasons; a withheld candidate is written once any written row
@@ -1984,6 +2004,12 @@ function randomExclusionProject(f, rand) {
       if (chance(0.08)) row.dependencyOwners.push('/Users/synthetic/Removed.ai');
       if (chance(0.05)) row.dependencyOwnersOverflow = true;
     }
+    if (assets.includes(row) && chance(0.15)) {
+      // A Photoshop output: its extraction record names its parent (valid, stale or not a project file).
+      row.source = 'psd-embedded'; delete row.dependencyOwners; delete row.dependencyOwnersOverflow;
+      row.psdExtractionReceipt = { version: 1, parentPath: chance(0.1) ? '/Users/synthetic/GoneParent.psd' : pick(docs).path, sourceDigest: 'b'.repeat(64),
+        layerPath: null, linkedIndex: 0, originalName: 'Embedded.png', outputDigest: 'c'.repeat(64), ...(chance(0.1) ? { current: false } : {}) };
+    }
     if (chance(0.08)) row.keptAfterSourceExclusion = true;
     if (chance(0.06)) row.acceptedPending = true;
     if (chance(0.35)) row.assetOrigin = 'existing';
@@ -2018,7 +2044,8 @@ function expectedExclusionInclusion(project, keyOf) {
     if (record.reason === 'user-excluded') return { state: 'excluded', userExcluded: true, revision: record.revision };
     return { state: 'invalid', revision: 0 };
   };
-  const eligible = row => row.source === 'scan-on-open' || row.source === 'linked-asset';
+  const dependencyCapture = row => row.source === 'scan-on-open' || row.source === 'psd-embedded';
+  const eligible = row => dependencyCapture(row) || row.source === 'linked-asset';
   const producerOf = row => lower(row.captureEvidence?.relationshipSourcePath || row.captureEvidence?.sourceDocumentPath || row.assetBaselineSourcePath);
   const ownersOf = row => eligible(row) && row.dependencyOwnersOverflow !== true && Array.isArray(row.dependencyOwners)
     ? row.dependencyOwners.map(lower).filter(owner => byKey.has(owner)) : [];
@@ -2030,6 +2057,10 @@ function expectedExclusionInclusion(project, keyOf) {
   }
   links.push(...requirementLinks);
   for (const row of rows) for (const owner of ownersOf(row)) links.push([owner, lower(row.path)]);
+  for (const row of rows) {
+    const receipt = row.source === 'psd-embedded' ? row.psdExtractionReceipt : null;
+    if (receipt && receipt.current !== false && byKey.has(lower(receipt.parentPath))) links.push([lower(receipt.parentPath), lower(row.path)]);
+  }
   const from = new Map();
   for (const [a, b] of links) if (a !== b) { if (!from.has(a)) from.set(a, new Set()); from.get(a).add(b); }
   const required = new Set();
@@ -2060,7 +2091,7 @@ function expectedExclusionInclusion(project, keyOf) {
   const reached = walk(excluded, () => false);
   const excludedish = k => excluded.has(k) || reached.has(k);
   const tied = row => {
-    const k = lower(row.path), dependency = row.source === 'scan-on-open', producer = producerOf(row), owners = ownersOf(row);
+    const k = lower(row.path), dependency = dependencyCapture(row), producer = producerOf(row), owners = ownersOf(row);
     if (dependency && producer && !excludedish(producer)) return false;
     if (eligible(row) && row.dependencyOwnersOverflow === true) return false;
     if (owners.length && !owners.every(excludedish)) return false;

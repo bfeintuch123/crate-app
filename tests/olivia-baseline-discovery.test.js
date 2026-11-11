@@ -8181,4 +8181,138 @@ function excludedSourceMembershipCases() {
     assert.ok(await readsOf(P, () => prePackage(f)) > 0, 'the skipped document is still read');
     assert.deepEqual(await f.written(await f.review()), [...first, 'NewInSkippedH.png'].sort());
   }));
+  // ---- Placed Photoshop files (part C): an output's extraction record ties it to its parent.
+  // Work-<t>.ai and Keep-<t>.ai place PlacedA-<t>.psd and PlacedB-<t>.psd; Keep then drops
+  // both links, so only old link records keep the placed files.
+  const psdPlaced = async (tag, { sameBytes = false } = {}) => {
+    const W = desk(`Work-${tag}.ai`), K = desk(`Keep-${tag}.ai`), A = desk(`PlacedA-${tag}.psd`), B = desk(`PlacedB-${tag}.psd`), side = desk(`KeepSide-${tag}.png`);
+    const f = await newProject('PSD ' + tag, { before() {
+      fs.writeFileSync(side, png(601)); writeWorking('.psd', A, [], 611); writeWorking('.psd', B, [], sameBytes ? 611 : 622);
+      writeWorking('.ai', W, [A, B]); writeWorking('.ai', K, [A, B, side]);
+    } });
+    for (const file of [W, K]) await f.add(file);
+    await prePackage(f);
+    writeWorking('.ai', K, [side]); await verifyScan(f, K);
+    const outputs = parent => f.current().files.filter(row => row.source === 'psd-embedded' && row.psdExtractionReceipt?.parentPath === parent);
+    const toggleRow = async row => assert.ok(Array.isArray(await callIpcRaw('projects:remove-file', f.id, metadataTestHooks.createProjectFileVisualIdentity(f.id, row))));
+    const factOfRow = async row => (await f.workspace()).files.find(item => item.visualIdentity === metadataTestHooks.createProjectFileVisualIdentity(f.id, row));
+    const keep = [`Keep-${tag}.ai`, `KeepSide-${tag}.png`];
+    assert.equal(outputs(A).length, 1); assert.equal(outputs(B).length, 1);
+    return { f, W, K, A, B, outputs, toggleRow, factOfRow, keep, name: row => path.basename(row.path) };
+  };
+  const noChoiceReview = f => assert.deepEqual(f.current().files.filter(row => row.individualChoiceReview !== undefined).map(row => row.name), []);
+  baselineTest('placed Photoshop files: excluding one withholds only its own output, for different and identical embedded bytes', { timeout: 240000 }, () => withEnv(async () => {
+    for (const sameBytes of [false, true]) {
+      const t = await psdPlaced(sameBytes ? 'p1b' : 'p1a', { sameBytes });
+      const [a] = t.outputs(t.A), [b] = t.outputs(t.B);
+      assert.notEqual(t.name(a), t.name(b));
+      await t.f.select(t.W, 'exclude');
+      assert.deepEqual(await t.f.written(await t.f.review()), [t.name(a), t.name(b), ...t.keep, path.basename(t.A), path.basename(t.B)].sort());
+      await t.f.toggle(path.basename(t.A));                                          // per-asset Exclude of PlacedA
+      const fact = await t.factOfRow(a);
+      assert.deepEqual([fact.included, fact.excludedSourceOnly], [false, true]);
+      assert.deepEqual(await t.f.written(await t.f.review()), [t.name(b), ...t.keep, path.basename(t.B)].sort(), sameBytes ? 'identical bytes' : 'different bytes');
+    }
+  }, { realMainPsd: true }));
+  baselineTest('placed Photoshop files: a parent saved again while included, then excluded, withholds both of its outputs', { timeout: 180000 }, () => withEnv(async () => {
+    const t = await psdPlaced('p2');
+    writeWorking('.psd', t.A, [], 633); await prePackage(t.f);
+    const aRows = t.outputs(t.A), [b] = t.outputs(t.B);
+    assert.equal(aRows.length, 2, 'the save adds a row; the earlier row stays');
+    await t.f.select(t.W, 'exclude');
+    assert.deepEqual(await t.f.written(await t.f.review()), [...aRows.map(t.name), t.name(b), ...t.keep, path.basename(t.A), path.basename(t.B)].sort());
+    await t.f.toggle(path.basename(t.A));
+    const expected = [t.name(b), ...t.keep, path.basename(t.B)].sort();
+    assert.deepEqual(await t.f.written(await t.f.review()), expected);
+    roundTripFakeStore();
+    assert.deepEqual(await t.f.written(await t.f.review()), expected, 'after reload');
+  }, { realMainPsd: true }));
+  // No choice is carried between rows: an Include stays on its own row; a row from a later save is new.
+  for (const variant of ['changed', 'identical']) {
+    baselineTest(`placed Photoshop files: an Include stays on its row; a later save's ${variant}-bytes output is not included`, { timeout: 240000 }, () => withEnv(async () => {
+      const t = await psdPlaced('p3' + variant[0]), extra = desk(`ExtraLink-p3${variant[0]}.png`);
+      fs.writeFileSync(extra, png(699));
+      await t.f.select(t.W, 'exclude');
+      await t.f.toggle(path.basename(t.A));                                          // Exclude the parent
+      const [a0] = t.outputs(t.A), [b] = t.outputs(t.B);
+      await t.toggleRow(a0);                                                         // Include its output
+      assert.equal(t.f.current().files.find(row => row.path === a0.path).keptAfterSourceExclusion, true);
+      roundTripFakeStore();
+      const keptOnly = [t.name(a0), t.name(b), ...t.keep, path.basename(t.B)].sort();
+      assert.deepEqual(await t.f.written(await t.f.review()), keptOnly);
+      // Saved again: different embedded bytes, or the same embedded bytes in a changed file.
+      if (variant === 'changed') writeWorking('.psd', t.A, [], 644); else writeWorking('.psd', t.A, [extra], 611);
+      assert.ok(await readsOf(t.A, () => prePackage(t.f)) > 0, 'the excluded placed Photoshop file is still read');
+      const aRows = t.outputs(t.A), a1 = aRows.find(row => row.path !== a0.path);
+      assert.equal(aRows.length, 2, 'the save adds a new row');
+      if (variant === 'identical') assert.equal(a1.psdExtractionReceipt.outputDigest, a0.psdExtractionReceipt.outputDigest);
+      else assert.notEqual(a1.psdExtractionReceipt.outputDigest, a0.psdExtractionReceipt.outputDigest);
+      const fact = await t.factOfRow(a1);
+      assert.deepEqual([fact.included, fact.excludedSourceOnly, fact.excluded], [false, true, false], 'the new row is withheld, not chosen');
+      assert.deepEqual(await t.f.written(await t.f.review()), keptOnly, 'the included row is written; the new row is not');
+      noChoiceReview(t.f);
+      await t.f.toggle(path.basename(t.A));                                          // Include the parent
+      const withParent = await t.f.written(await t.f.review());
+      assert.ok([t.name(a0), t.name(a1), path.basename(t.A)].every(name => withParent.includes(name)), JSON.stringify(withParent));
+      await t.f.toggle(path.basename(t.A));                                          // Exclude it again
+      assert.deepEqual(await t.f.written(await t.f.review()), keptOnly);
+      noChoiceReview(t.f);
+      await t.toggleRow(a1);                                                         // the new row has its own Include
+      assert.deepEqual(await t.f.written(await t.f.review()), [...keptOnly, t.name(a1)].sort());
+    }, { realMainPsd: true }));
+  }
+  baselineTest('placed Photoshop files: an individual Exclude of an output behaves as before across a save (changed and identical bytes)', { timeout: 240000 }, () => withEnv(async () => {
+    const results = {};
+    for (const variant of ['changed', 'identical']) {
+      const t = await psdPlaced('p4' + variant[0]), extra = desk(`ExtraLink-p4${variant[0]}.png`);
+      fs.writeFileSync(extra, png(698));
+      await t.f.select(t.W, 'exclude');
+      const [a0] = t.outputs(t.A);
+      await t.toggleRow(a0);                                                         // individual Exclude, parent included
+      if (variant === 'changed') writeWorking('.psd', t.A, [], 688); else writeWorking('.psd', t.A, [extra], 611);
+      await prePackage(t.f);
+      results[variant] = { written: await t.f.written(await t.f.review()), rows: t.outputs(t.A).map(row => t.name(row)),
+        excluded: t.f.current().excludedAssetKeys.length, review: t.f.current().files.filter(row => row.individualChoiceReview !== undefined).length };
+    }
+    // Pinned from merged v2.4.x (7ba7589b) on the same fixture.
+    assert.deepEqual(results, {
+      changed: { written: ['Embedded-Layer_1.png', 'Embedded-Layer_2.png', 'Keep-p4c.ai', 'KeepSide-p4c.png', 'PlacedA-p4c.psd', 'PlacedB-p4c.psd'],
+        rows: ['Embedded-Layer.png', 'Embedded-Layer_2.png'], excluded: 1, review: 0 },
+      identical: { written: ['Embedded-Layer_1.png', 'Keep-p4i.ai', 'KeepSide-p4i.png', 'PlacedA-p4i.psd', 'PlacedB-p4i.psd'],
+        rows: ['Embedded-Layer.png'], excluded: 1, review: 0 } });
+  }, { realMainPsd: true }));
+  baselineTest('placed Photoshop files: a kept output of an excluded parent is repaired after full cache loss', { timeout: 180000 }, () => withEnv(async () => {
+    const t = await psdPlaced('p5');
+    await t.f.select(t.W, 'exclude');
+    await t.f.toggle(path.basename(t.A));
+    const [a0] = t.outputs(t.A), [b] = t.outputs(t.B);
+    await t.toggleRow(a0);
+    const expected = [t.name(a0), t.name(b), ...t.keep, path.basename(t.B)].sort();
+    assert.deepEqual(await t.f.written(await t.f.review()), expected);
+    for (const dir of new Set([a0, b].map(row => path.dirname(row.path)))) for (const name of fs.readdirSync(dir)) fs.rmSync(path.join(dir, name), { force: true });
+    assert.equal((await t.f.review()).materializable, false, 'refused until repaired');
+    await prePackage(t.f);
+    assert.deepEqual(await t.f.written(await t.f.review()), expected, 'repaired from the excluded parent and written');
+  }, { realMainPsd: true }));
+  baselineTest('placed Photoshop files: a withheld parent\'s missing output does not lend its name to another file\'s new object', { timeout: 180000 }, () => withEnv(async () => {
+    const W = desk('Work-p6.ai'), K = desk('Keep-p6.ai'), A = desk('PlacedA-p6.psd'), B = desk('PlacedB-p6.psd'), side = desk('KeepSide-p6.png');
+    const f = await newProject('PSD p6', { before() {
+      fs.writeFileSync(side, png(601)); writeWorking('.psd', A, [], 611); writeWorking('.psd', B, [], 622); writeWorking('.ai', W, [A]); writeWorking('.ai', K, [B, side]);
+    } });
+    for (const file of [W, K]) await f.add(file);
+    await prePackage(f);
+    await f.select(W, 'exclude');                                                    // PlacedA is withheld with Work
+    const outputs = parent => f.current().files.filter(row => row.source === 'psd-embedded' && row.psdExtractionReceipt?.parentPath === parent);
+    const [a] = outputs(A), [b0] = outputs(B);
+    assert.deepEqual(await f.written(await f.review()), [path.basename(b0.path), 'Keep-p6.ai', 'KeepSide-p6.png', 'PlacedB-p6.psd']);
+    fs.rmSync(a.path, { force: true });                                              // the withheld parent's cached output is lost
+    writeWorking('.psd', B, [], 677); await verifyScan(f, K);
+    await prePackage(f);
+    const bRows = outputs(B), b1 = bRows.find(row => row.path !== b0.path);
+    assert.ok(b1, 'the new object gets its own row on the first pass');
+    assert.notEqual(path.basename(b1.path).toLowerCase(), path.basename(a.path).toLowerCase(), 'not at the withheld row\'s path');
+    assert.equal(fs.existsSync(a.path), false);
+    assert.deepEqual(await f.written(await f.review()), [path.basename(b0.path), path.basename(b1.path), 'Keep-p6.ai', 'KeepSide-p6.png', 'PlacedB-p6.psd'].sort(),
+      'written in the first package; the missing withheld output does not block');
+  }, { realMainPsd: true }));
 }

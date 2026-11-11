@@ -4173,7 +4173,18 @@ function isExclusionRuleActive(project) {
   return [...(project.files || []), ...(project.pendingFiles || [])].some(file => file && (
     (Array.isArray(file.dependencyOwners) && file.dependencyOwners.some(names)) || names(file.captureEvidence?.relationshipSourcePath) ||
     names(file.captureEvidence?.sourceDocumentPath) || names(file.assetBaselineSourcePath) || names(file.parentPsd) ||
-    names(file.psdResource?.parentPath)));
+    names(file.psdResource?.parentPath) || names(file.psdExtractionReceipt?.parentPath)));
+}
+// A Photoshop output's extraction record (written only by extractPsdAssets from
+// the parent's own bytes) under the validity conditions of
+// getPsdExtractionResourceIdentity, without its parent identity read.
+function getValidPsdExtractionReceiptParent(row) {
+  const receipt = row?.source === 'psd-embedded' ? row.psdExtractionReceipt : null;
+  if (receipt?.version !== 1 || receipt.current === false || receipt.layerPath !== null ||
+      typeof receipt.parentPath !== 'string' || !path.isAbsolute(receipt.parentPath) ||
+      !/^[a-f0-9]{64}$/.test(receipt.sourceDigest) || !/^[a-f0-9]{64}$/.test(receipt.outputDigest) ||
+      !Number.isInteger(receipt.linkedIndex) || receipt.linkedIndex < 0 || typeof receipt.originalName !== 'string') return null;
+  return receipt.parentPath;
 }
 
 function getWorkingSourceMembership(project, packageFiles = null) {
@@ -4277,6 +4288,15 @@ function getWorkingSourceMembership(project, packageFiles = null) {
       if (file.source === 'psd-embedded' && resource?.version === 1 && resource.current !== false &&
           typeof resource.parentPath === 'string' && path.isAbsolute(resource.parentPath)) link(resource.parentPath, file.path);
     }
+  }
+  // An extraction record names the placed Photoshop file an output came from
+  // while that file is a project file: an ownership link for support and
+  // withholding only, never a requirement, count or verification input.
+  if (exclusionActive) for (const file of physicalFiles) {
+    const parentKey = normalizeTrackedFilePath(getValidPsdExtractionReceiptParent(file));
+    const key = parentKey && projectPhysicalPaths.has(parentKey) && normalizeTrackedFilePath(file.path);
+    if (!key || key === parentKey) continue;
+    const links = ownershipEdges.get(parentKey) || new Map(); links.set(key, file.path); ownershipEdges.set(parentKey, links);
   }
   if (exclusionActive) for (const file of physicalFiles) {
     for (const ownerKey of recordedOwnerKeys(file)) {
@@ -16230,6 +16250,16 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       const project = getProjects().find(project => project.id === projectId);
       const priorEmbeddedRows = [...(project?.files || []), ...(project?.pendingFiles || [])]
         .filter(row => row.source === 'psd-embedded');
+      // An output name that belongs to another file's row is never handed to
+      // this file, even when that row's cached file is missing: the row keeps
+      // its own parent's record. Reuse within the same parent is unchanged.
+      const psdKey = normalizeTrackedFilePath(psdFilePath);
+      for (const row of priorEmbeddedRows) {
+        const parentPath = row.psdExtractionReceipt?.parentPath ?? row.psdResource?.parentPath;
+        if (typeof parentPath === 'string' && normalizeTrackedFilePath(parentPath) !== psdKey && isDirectCacheChild(extractDir, row.path)) {
+          usedEmbeddedNames.add(path.basename(row.path).toLowerCase());
+        }
+      }
       const embeddedRecords = [];
       for (const [embeddedIndex, lf] of linkedFiles.entries()) {
         if (!lf.data) continue;
