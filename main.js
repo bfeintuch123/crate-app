@@ -4137,17 +4137,24 @@ function noteDependencyOwnerOnRows(rows, assetPath, ownerPath) {
   for (const row of rows || []) if (normalizeTrackedFilePath(row?.path) === key) changed = noteDependencyOwner(row, ownerPath) || changed;
   return changed;
 }
-// Guard for scans run on a working file's behalf (G1/G3/G4).
-function isUnretainedExcludedScanSource(membership, file) {
+// Guard for scans run on a working file's behalf (G1/G3/G4). Nothing is read or
+// admitted on behalf of an excluded document or of a row withheld with one. The
+// Photoshop parse passes `excludedAssetDocuments: false`: it keeps reading an
+// individually excluded placed PSD so a kept output's cached file can be repaired.
+function isUnretainedExcludedScanSource(membership, file, { excludedAssetDocuments = true } = {}) {
   const fact = file && membership?.facts.get(getTrackedFileDedupKey(file));
   return !!fact && !fact.included &&
-    ((fact.sourceSelection === 'excluded' && fact.selectionReason === 'user-excluded') || fact.excludedSourceOnly === true);
+    ((fact.sourceSelection === 'excluded' && fact.selectionReason === 'user-excluded') || fact.excludedSourceOnly === true ||
+      (excludedAssetDocuments && membership.excludedAssetDocumentKeys?.has(getTrackedFileDedupKey(file)) === true));
 }
 
 function getWorkingSourceMembership(project, packageFiles = null) {
   const scopedProject = getIllustratorScopedProjectView(project);
   const files = deduplicateFiles(scopedProject?.files || []);
   const engaged = hasWorkingSourceSelectionState(project);
+  // Whether the exclusion rule below applies to this project. Kept separate
+  // from `engaged`, which also gates verification and required-asset roles.
+  const exclusionActive = engaged;
   const recoveryGuardKeys = getWorkingSourceRecoveryGuardKeys(project);
   const recoveryGuardPaths = new Set();
   let recoveryGuardInvalid = recoveryGuardKeys === null;
@@ -4208,10 +4215,6 @@ function getWorkingSourceMembership(project, packageFiles = null) {
       }
     }
   }
-  // Assets reachable only from working files the owner explicitly excluded.
-  // Each working file governs its own closure; Replace history, invalid roots
-  // and excluded roots retained as dependencies contribute nothing here.
-  const unretainedExcludedRoots = new Map(), excludedOnlyPaths = new Set(), keptBridgePaths = new Set(), bridgeMemo = {};
   const sourcePaths = new Set(sources.map(file => normalizeTrackedFilePath(file.path)));
   // Owners recorded on a row count only while they are still project files:
   // a removed file cannot need an asset in the package.
@@ -4228,43 +4231,85 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     recordedOwnerMemo.set(file, keys);
     return keys;
   };
-  // Recorded owners join receipt and row-evidence edges for retention and the
-  // excluded-only walk only; never for requirements, counts or verification.
+  // Recorded owners join receipt and row-evidence edges as ownership links for
+  // the exclusion rule only; never for requirements, counts or verification.
   const ownershipEdges = new Map();
   for (const [source, links] of edges) ownershipEdges.set(source, new Map(links));
-  if (engaged) for (const file of physicalFiles) {
+  if (exclusionActive) for (const file of physicalFiles) {
     for (const ownerKey of recordedOwnerKeys(file)) {
       const links = ownershipEdges.get(ownerKey) || new Map(); links.set(normalizeTrackedFilePath(file.path), file.path); ownershipEdges.set(ownerKey, links);
     }
   }
-  // Everything an included working file reaches through that relation stays.
-  const retainedPaths = new Set();
-  if (engaged) {
-    const queue = sources.filter(file => getWorkingSourceSelection(project, file).state !== 'excluded').map(file => normalizeTrackedFilePath(file.path));
-    for (const key of queue) retainedPaths.add(key);
-    for (let index = 0; index < queue.length; index++) {
-      for (const [target] of ownershipEdges.get(queue[index]) || []) if (!retainedPaths.has(target)) { retainedPaths.add(target); queue.push(target); }
+  for (const key of recoveryGuardKeys || []) {
+    const matches = (project.files || []).filter(file=>getAssetBaselineSourceRecoveryRouteKey(project,file)===key);
+    if (matches.length !== 1 || !isWorkingSourceFile(matches[0])) { recoveryGuardInvalid = true; continue; }
+    const root = matches[0], rootPath = normalizeTrackedFilePath(root.path);
+    if (getWorkingSourceSelection(project,root).state === 'excluded' && !requiredByPath.has(rootPath)) continue;
+    const queue = [rootPath];
+    for (let index=0; index<queue.length; index++) {
+      const current = queue[index]; if (recoveryGuardPaths.has(current)) continue;
+      recoveryGuardPaths.add(current);
+      const canonical = (project.files || []).filter(file=>!isScanOnSaveEmbeddedPsdFile(file)&&normalizeTrackedFilePath(file.path)===current);
+      if (canonical.length !== 1 || !byPath.has(current)) { recoveryGuardInvalid = true; continue; }
+      const row = canonical[0], verification = getWorkingSourceVerification(project,row);
+      if (isWorkingSourceFile(row) && (!verification || !['scanned','no-extractor'].includes(verification.status) ||
+          (path.extname(row.path||'').toLowerCase()==='.psd' && verification.provider==='psd-ordinary' && verification.status==='scanned'))) recoveryGuardInvalid = true;
+      for (const [target] of edges.get(current) || []) queue.push(target);
+      for (const output of verification?.requiredEmbeddedOutputs || []) { edge(row.path,output.path); queue.push(normalizeTrackedFilePath(output.path)); }
     }
   }
-  // Assets kept by an existing-assets Include for the exclusion current at the
-  // click act as kept bridges too, settled below in at most one pass per row.
-  const episodeBridges = new Set(), rootClosures = new Map();
-  const walkExcludedOnly = (roots, visited, bridges) => {
+  // Exclusion rule. An excluded document is a row the owner excluded directly
+  // and that nothing requires: a working file excluded with the working-file
+  // control, or an asset-role row that owns something and carries its own
+  // per-asset exclusion. The bulk "Skip existing assets" decision alone is not
+  // an action on a document, and Replace history, invalid selections and
+  // required documents never count.
+  // An excluded document keeps nothing and admits nothing; whatever is written
+  // keeps what it links, whatever the reason it is written. A row is withheld
+  // only when an excluded document reaches it along ownership links, its own
+  // evidence ties it only to excluded documents and rows they reach, and
+  // nothing that is written links it.
+  const keptAsRequired = key => requiredByPath.has(key) && (engaged || recoveryGuardPaths.has(key));
+  const reviewExcludedMemo = new Map();
+  const isReviewExcluded = file => {
+    if (!reviewExcludedMemo.has(file)) reviewExcludedMemo.set(file, isAssetReviewFileExcluded(project, file));
+    return reviewExcludedMemo.get(file);
+  };
+  const unretainedExcludedRoots = new Map(), excludedDocuments = new Map(), excludedAssetDocumentKeys = new Set();
+  if (exclusionActive) {
+    if (engaged) for (const root of sources) {
+      const selection = getWorkingSourceSelection(project, root), rootKey = normalizeTrackedFilePath(root.path);
+      if (selection.state === 'excluded' && selection.reason === 'user-excluded' && rootKey && !requiredByPath.has(rootKey)) {
+        unretainedExcludedRoots.set(rootKey, root); excludedDocuments.set(rootKey, root);
+      }
+    }
+    const individuallyExcluded = new Set(project?.excludedAssetKeys || []);
+    if (individuallyExcluded.size) for (const [key, file] of byPath) {
+      if (!ownershipEdges.has(key) || isWorkingSourceFile(file) || keptAsRequired(key) || !individuallyExcluded.has(getAssetReviewExclusionKey(file)) ||
+          (project.assetBaseline?.decision === 'skip' && file.assetOrigin === 'existing' && !file.individualContentExclusion)) continue;
+      excludedDocuments.set(key, file); excludedAssetDocumentKeys.add(getTrackedFileDedupKey(file));
+    }
+  }
+  // Working files follow their own selection and required rows are written,
+  // so no walk enters either.
+  const walkFromExcluded = (roots, visited, stopAtDocuments) => {
     const queue = [...roots];
     for (let index = 0; index < queue.length; index++) {
       for (const [target] of ownershipEdges.get(queue[index]) || []) {
-        if (sourcePaths.has(target) || requiredByPath.has(target) || retainedPaths.has(target) || visited.has(target)) continue;
-        visited.add(target);
-        // An asset the owner kept keeps what it needs: do not walk past it.
-        const targetRow = byPath.get(target);
-        if (targetRow && (episodeBridges.has(target) || isOwnerKeptAfterSourceExclusion(project, targetRow, bridgeMemo))) { bridges?.add(target); continue; }
-        queue.push(target);
+        if (visited.has(target) || sourcePaths.has(target) || keptAsRequired(target) ||
+            (stopAtDocuments && excludedDocuments.has(target))) continue;
+        visited.add(target); queue.push(target);
       }
     }
     return visited;
   };
+  const excludedOnlyPaths = excludedDocuments.size ? walkFromExcluded(excludedDocuments.keys(), new Set(), false) : new Set();
+  // "Include All Existing" keeps an existing asset for the working-file
+  // exclusion current at the click. Each excluded working file's closure stops
+  // at an excluded asset-role document: what that document links stays with it.
+  const rootClosures = new Map();
   const closureOf = rootKey => {
-    if (!rootClosures.has(rootKey)) rootClosures.set(rootKey, walkExcludedOnly([rootKey], new Set(), null));
+    if (!rootClosures.has(rootKey)) rootClosures.set(rootKey, walkFromExcluded([rootKey], new Set(), true));
     return rootClosures.get(rootKey);
   };
   const ownerCandidateKeys = file => {
@@ -4297,43 +4342,67 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     if (overflow) return current.length === overflow.ownerCount && getExistingIncludeEpisodeDigest(currentOwners) === overflow.ownersDigest;
     return current.length > 0 && current.every(([key, revision]) => recorded[key] === revision);
   };
-  if (engaged) {
-    for (const root of sources) {
-      const selection = getWorkingSourceSelection(project, root), rootKey = normalizeTrackedFilePath(root.path);
-      if (selection.state === 'excluded' && selection.reason === 'user-excluded' && rootKey && !requiredByPath.has(rootKey)) {
-        unretainedExcludedRoots.set(rootKey, root);
+  // The per-row evidence test: the row's own ties (producer, parent, recorded
+  // owners) all lead to excluded documents or rows they reach. Returns those
+  // ties, or null when the row is not tied that way (no evidence, an
+  // overflowed owner list, or any tie to anything else keeps the row).
+  const ownerExcluded = key => excludedDocuments.has(key) || excludedOnlyPaths.has(key);
+  const excludedOnlyTies = (file, rowKey) => {
+    const captureSource = getFileCaptureSource(file), logicalEmbedded = isScanOnSaveEmbeddedPsdFile(file);
+    const ties = [];
+    let owned = false;
+    if (DEPENDENCY_CAPTURE_SOURCES.has(captureSource)) {
+      const evidence = file.captureEvidence || {};
+      const producerKey = normalizeTrackedFilePath(evidence.relationshipSourcePath || evidence.sourceDocumentPath || file.assetBaselineSourcePath);
+      const ownerKey = logicalEmbedded ? normalizeTrackedFilePath(file.parentPsd || file.path) : rowKey;
+      owned = !!ownerKey && (excludedOnlyPaths.has(ownerKey) || (logicalEmbedded && excludedDocuments.has(ownerKey)));
+      if (producerKey) { if (!ownerExcluded(producerKey)) return null; ties.push(producerKey); }
+      if (logicalEmbedded && ownerKey) ties.push(ownerKey);
+    }
+    if (!logicalEmbedded && OWNER_RECORD_ELIGIBLE_SOURCES.has(captureSource)) {
+      const recorded = recordedOwnerKeys(file);
+      if (excludedOnlyPaths.has(rowKey) && recorded.length) owned = true;
+      if (file.dependencyOwnersOverflow === true) return null;
+      if (recorded.length) { if (!recorded.every(ownerExcluded)) return null; owned = true; ties.push(...recorded); }
+    }
+    return owned ? ties : null;
+  };
+  // Support: seeds are rows written for their own reasons (an included or
+  // required file, the owner's Include or acceptance, a current existing-assets
+  // Include, or no excluded-only tie). Support flows from written rows along
+  // ownership links and the rows' own ties, never into an excluded document,
+  // and a supported row that is written passes it on.
+  const ownerIntentMemo = {}, evidenceRows = new Set(), withholdable = new Map(), supportedPaths = new Set(), writtenPaths = new Set();
+  if (excludedDocuments.size) {
+    const tiesFrom = new Map();
+    for (const [key, file] of byPath) {
+      if (isWorkingSourceFile(file)) {
+        if (!excludedDocuments.has(key) && (getWorkingSourceSelection(project, file).state === 'selected' || keptAsRequired(key))) writtenPaths.add(key);
+        continue;
       }
+      if (keptAsRequired(key)) { writtenPaths.add(key); continue; }
+      const ties = excludedOnlyPaths.has(key) ? excludedOnlyTies(file, key) : null;
+      if (ties) {
+        evidenceRows.add(key);
+        for (const tie of ties) { const rows = tiesFrom.get(tie) || []; rows.push(key); tiesFrom.set(tie, rows); }
+      }
+      if (excludedDocuments.has(key)) continue;
+      if (ties && !isOwnerKeptAfterSourceExclusion(project, file, ownerIntentMemo) && !isExistingIncludeEpisodeCurrent(file)) withholdable.set(key, file);
+      else if (!isReviewExcluded(file)) writtenPaths.add(key);
     }
-    walkExcludedOnly(unretainedExcludedRoots.keys(), excludedOnlyPaths, keptBridgePaths);
-    const episodeRows = unretainedExcludedRoots.size ? physicalFiles.filter(hasExistingIncludeEpisode) : [];
-    for (let pass = 0; pass < episodeRows.length; pass++) {
-      const added = episodeRows.map(file => normalizeTrackedFilePath(file.path)).filter((key, index) =>
-        excludedOnlyPaths.has(key) && !keptBridgePaths.has(key) && isExistingIncludeEpisodeCurrent(episodeRows[index]));
-      if (!added.length) break;
-      for (const key of added) episodeBridges.add(key);
-      excludedOnlyPaths.clear(); keptBridgePaths.clear(); rootClosures.clear(); rootsByPath = null;
-      walkExcludedOnly(unretainedExcludedRoots.keys(), excludedOnlyPaths, keptBridgePaths);
-    }
-  }
-  for (const key of recoveryGuardKeys || []) {
-    const matches = (project.files || []).filter(file=>getAssetBaselineSourceRecoveryRouteKey(project,file)===key);
-    if (matches.length !== 1 || !isWorkingSourceFile(matches[0])) { recoveryGuardInvalid = true; continue; }
-    const root = matches[0], rootPath = normalizeTrackedFilePath(root.path);
-    if (getWorkingSourceSelection(project,root).state === 'excluded' && !requiredByPath.has(rootPath)) continue;
-    const queue = [rootPath];
-    for (let index=0; index<queue.length; index++) {
-      const current = queue[index]; if (recoveryGuardPaths.has(current)) continue;
-      recoveryGuardPaths.add(current);
-      const canonical = (project.files || []).filter(file=>!isScanOnSaveEmbeddedPsdFile(file)&&normalizeTrackedFilePath(file.path)===current);
-      if (canonical.length !== 1 || !byPath.has(current)) { recoveryGuardInvalid = true; continue; }
-      const row = canonical[0], verification = getWorkingSourceVerification(project,row);
-      if (isWorkingSourceFile(row) && (!verification || !['scanned','no-extractor'].includes(verification.status) ||
-          (path.extname(row.path||'').toLowerCase()==='.psd' && verification.provider==='psd-ordinary' && verification.status==='scanned'))) recoveryGuardInvalid = true;
-      for (const [target] of edges.get(current) || []) queue.push(target);
-      for (const output of verification?.requiredEmbeddedOutputs || []) { edge(row.path,output.path); queue.push(normalizeTrackedFilePath(output.path)); }
+    const queue = [...writtenPaths];
+    const reach = target => {
+      if (supportedPaths.has(target)) return;
+      supportedPaths.add(target);
+      const row = withholdable.get(target);
+      if (row && !isReviewExcluded(row)) { writtenPaths.add(target); queue.push(target); }
+    };
+    for (let index = 0; index < queue.length; index++) {
+      for (const [target] of ownershipEdges.get(queue[index]) || []) reach(target);
+      for (const target of tiesFrom.get(queue[index]) || []) reach(target);
     }
   }
-  const facts = new Map(), ownerIntentMemo = bridgeMemo;
+  const facts = new Map();
   const counts = { selectedWorkingSources: 0, excludedWorkingSources: 0, invalidWorkingSources: 0, includedAssets: 0,
     excludedAssets: 0, unresolvedVerification: 0, missingRequiredReferences: 0, relationshipHolds: 0 };
   for (const file of files) {
@@ -4343,32 +4412,25 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     const selectedSource = source && selection.state === 'selected';
     const recoveryGuarded = recoveryGuardPaths.has(normalizeTrackedFilePath(file.path));
     const includedAsDependency = (engaged || recoveryGuarded) && requiredBy.length > 0;
-    // Withhold a dependency-captured asset only when its own evidence ties it to
-    // an explicitly excluded working file and nothing ties it to another file.
-    let excludedSourceOnly = false;
-    if (engaged && !source && !includedAsDependency && !retainedPaths.has(normalizeTrackedFilePath(file.path))) {
-      const ownerExcluded = key => unretainedExcludedRoots.has(key) || (excludedOnlyPaths.has(key) && !keptBridgePaths.has(key));
-      const captureSource = getFileCaptureSource(file), logicalEmbedded = isScanOnSaveEmbeddedPsdFile(file);
-      let owned = false, contradicted = false;
-      if (DEPENDENCY_CAPTURE_SOURCES.has(captureSource)) {
-        const evidence = file.captureEvidence || {};
-        const producerKey = normalizeTrackedFilePath(evidence.relationshipSourcePath || evidence.sourceDocumentPath || file.assetBaselineSourcePath);
-        const ownerKey = normalizeTrackedFilePath(logicalEmbedded ? file.parentPsd || file.path : file.path);
-        owned = !!ownerKey && (excludedOnlyPaths.has(ownerKey) || (logicalEmbedded && unretainedExcludedRoots.has(ownerKey)));
-        contradicted = !!producerKey && !ownerExcluded(producerKey);
+    // Withhold a row only under the exclusion rule above: an excluded document
+    // reaches it, its own evidence ties it only to excluded documents and rows
+    // they reach, nothing written links it, and the owner did not keep it.
+    let excludedSourceOnly = false, withheld = false;
+    if (excludedDocuments.size && !source && !includedAsDependency) {
+      if (isScanOnSaveEmbeddedPsdFile(file)) {
+        // A logical resource reads its parent's bytes: it is supported while
+        // its parent or producer is written.
+        const ties = excludedOnlyTies(file, null);
+        excludedSourceOnly = !!ties && !ties.some(key => writtenPaths.has(key));
+        withheld = excludedSourceOnly && !isOwnerKeptAfterSourceExclusion(project, file, ownerIntentMemo) && !isExistingIncludeEpisodeCurrent(file);
+      } else {
+        const key = normalizeTrackedFilePath(file.path);
+        excludedSourceOnly = evidenceRows.has(key) && !supportedPaths.has(key);
+        withheld = withholdable.has(key) && !supportedPaths.has(key);
       }
-      if (!logicalEmbedded && OWNER_RECORD_ELIGIBLE_SOURCES.has(captureSource)) {
-        const recorded = recordedOwnerKeys(file);
-        if (excludedOnlyPaths.has(normalizeTrackedFilePath(file.path)) && recorded.length) owned = true;
-        if (file.dependencyOwnersOverflow === true) contradicted = true;
-        else if (recorded.length) { if (recorded.every(ownerExcluded)) owned = true; else contradicted = true; }
-      }
-      excludedSourceOnly = owned && !contradicted;
     }
-    const withheld = excludedSourceOnly && !isOwnerKeptAfterSourceExclusion(project, file, ownerIntentMemo) &&
-      !isExistingIncludeEpisodeCurrent(file);
     const eligible = source ? (selectedSource || includedAsDependency)
-      : ((!isAssetReviewFileExcluded(project, file) && !withheld) || includedAsDependency);
+      : ((!isReviewExcluded(file) && !withheld) || includedAsDependency);
     const included = eligible && (!packageKeys || packageKeys.has(getTrackedFileDedupKey(file)));
     const verification = getWorkingSourceVerification(project, file);
     const persistedVerification = Object.hasOwn(project.workingSourceVerification || {}, getAssetBaselineSourceRecoveryRouteKey(project, file));
@@ -4452,7 +4514,7 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     !/^[a-f0-9]{64}$/.test(key) || !isValidWorkingSourceSelectionRecord(project, key, record)));
   const choiceReviewNames = files.filter(file => file.individualChoiceReview !== undefined)
     .map(file => sanitizeRendererSourceName(file.name || path.basename(file.path || '')) || 'Asset');
-  const membership = { facts, counts, requiredByPath, getExcludedOwnerSelections, choiceReviewNames, blocked: recoveryGuardInvalid || hasWorkingSourceRecoveryHold(project) || selectionInvalid || counts.relationshipHolds > 0 ||
+  const membership = { facts, counts, requiredByPath, getExcludedOwnerSelections, excludedAssetDocumentKeys, choiceReviewNames, blocked: recoveryGuardInvalid || hasWorkingSourceRecoveryHold(project) || selectionInvalid || counts.relationshipHolds > 0 ||
     (engaged && (counts.unresolvedVerification > 0 || counts.missingRequiredReferences > 0)) ||
     [...recoveryGuardPaths].some(key=>{ const row=byPath.get(key), fact=row&&facts.get(getTrackedFileDedupKey(row));
       return !row || !fs.existsSync(row.path) || (packagePaths&&!packagePaths.has(key)) || (isWorkingSourceFile(row)&&
@@ -20364,7 +20426,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   const ordinaryPsdOutputBatches = [], ownerNotes = [];
   const scanSkipper = scanProject => {
     const membership = hasWorkingSourceSelectionState(scanProject) ? getWorkingSourceMembership(scanProject) : null;
-    return file => !!membership && isUnretainedExcludedScanSource(membership, file);
+    return (file, options) => !!membership && isUnretainedExcludedScanSource(membership, file, options);
   };
   const stagePrePackageFile = (project, file, observation, stageIndex = null) => {
     if (!operationCurrent()) return null;
@@ -20799,7 +20861,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     const psdFiles = project.files.filter(f => f.ext === '.psd');
     const skipPsd = scanSkipper(project);
     for (const psdFile of psdFiles) {
-      if (skipPsd(psdFile)) continue;
+      if (skipPsd(psdFile, { excludedAssetDocuments: false })) continue;
       if (!fs.existsSync(psdFile.path)) continue;
       const psdAssets = await extractPsdAssets(psdFile.path, projectId, operationCurrent, {
         onOrdinaryPsdOutputs: outputs => ordinaryPsdOutputBatches.push(outputs),

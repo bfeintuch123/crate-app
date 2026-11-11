@@ -7633,8 +7633,9 @@ function excludedSourceMembershipCases() {
     assert.ok((await f.written(await f.review())).includes(f.names.newLink), 'written: overridden by the required link (as on base)');
   }));
   // d. Extent: a stale-kept placed document (asset role, admitted by the Add Files
-  // scan) keeps what it links, and the pre-package passes read it as included.
-  baselineTest('accepted trade-off d: a stale-kept placed document keeps its own links and is scanned as an included document', { timeout: 120000 }, () => withEnv(async () => {
+  // scan) keeps what it links while it is included, and the pre-package passes
+  // read it as included. Its own per-asset Exclude withholds what only it links.
+  baselineTest('accepted trade-off d: a stale-kept placed document keeps its links while included; its per-asset Exclude withholds what only it links', { timeout: 120000 }, () => withEnv(async () => {
     const W = desk('Work-d.ai'), K = desk('Keep-d.ai'), P = desk('Placed.ai'), Y = desk('Nested.png'), Z = desk('LaterNested.png'), side = desk('KeepSide-d.png');
     const f = await newProject('Trade-off d', { before() {
       fs.writeFileSync(Y, png(61)); fs.writeFileSync(Z, png(62)); fs.writeFileSync(side, png(63));
@@ -7659,19 +7660,19 @@ function excludedSourceMembershipCases() {
     assert.deepEqual(f.stored('LaterNested.png').dependencyOwners, [P]);
     written = await f.written(await f.review());
     assert.deepEqual(written, ['Keep-d.ai', 'KeepSide-d.png', 'LaterNested.png', 'Nested.png', 'Placed.ai']);
-    // The per-asset Exclude removes the placed document; what it links stays until each is excluded.
+    // The per-asset Exclude removes the placed document and what only it links.
     const labels = await rendererButtonsFor(f, 'Placed.ai');
     assert.ok(labels.includes('Exclude Placed.ai from this project'), JSON.stringify(labels));
     await f.toggle('Placed.ai');
-    written = await f.written(await f.review());
-    assert.deepEqual(written, ['Keep-d.ai', 'KeepSide-d.png', 'LaterNested.png', 'Nested.png']);
     for (const name of ['Nested.png', 'LaterNested.png']) {
-      assert.ok((await rendererButtonsFor(f, name)).includes(`Exclude ${name} from this project`), name);
-      await f.toggle(name);
+      const fact = await f.fact(name);
+      assert.deepEqual([fact.included, fact.excludedSourceOnly], [false, true], name + ' withheld with its excluded document');
     }
-    assert.deepEqual(await f.written(await f.review()), ['Keep-d.ai', 'KeepSide-d.png'], 'each retained file is removable with its own Exclude control');
+    assert.deepEqual(await f.written(await f.review()), ['Keep-d.ai', 'KeepSide-d.png']);
     roundTripFakeStore();
     assert.deepEqual(await f.written(await f.review()), ['Keep-d.ai', 'KeepSide-d.png'], 'after reload');
+    await f.toggle('Placed.ai');                                // Include brings the document and its links back
+    assert.deepEqual(await f.written(await f.review()), ['Keep-d.ai', 'KeepSide-d.png', 'LaterNested.png', 'Nested.png', 'Placed.ai']);
   }));
   // e. Owner removal, owner Exclude and Restore.
   baselineTest('accepted trade-off e: a removed stale owner is ignored; owner Exclude and Restore follow selection', { timeout: 120000 }, () => withEnv(async () => {
@@ -7775,7 +7776,7 @@ function excludedSourceMembershipCases() {
     return { projectRole: stored.projectRole, source: stored.source, workingSource: !!fact.sourceSelection, protectedSource: fact.protectedSource === true,
       included: fact.included, includedAsDependency: fact.includedAsDependency, excludedSourceOnly: fact.excludedSourceOnly, requiredBy: fact.requiredBy };
   };
-  baselineTest('row kinds: a stale retained asset-role image and asset-role placed document use the per-asset control', { timeout: 120000 }, () => withEnv(async () => {
+  baselineTest('row kinds: a stale retained asset-role image and asset-role placed document use the per-asset control; the placed document takes what only it links', { timeout: 120000 }, () => withEnv(async () => {
     // Asset-role image (regex route).
     const s = await staleOwner('regex');
     assert.deepEqual(await rowKind(s.f, s.name), { projectRole: 'asset', source: 'linked-asset', workingSource: false, protectedSource: false,
@@ -7791,11 +7792,12 @@ function excludedSourceMembershipCases() {
       included: true, includedAsDependency: false, excludedSourceOnly: false, requiredBy: [] });
     await f.toggle('PlacedK.ai');                                                  // control: per-asset Exclude (projects:remove-file)
     assert.equal((await f.fact('PlacedK.ai')).excluded, true);
-    assert.equal((await f.fact('NestedK.png')).included, true, 'its nested asset stays until excluded itself');
-    assert.deepEqual(await f.written(await f.review()), ['Keep-k.ai', 'NestedK.png', 'Side-k.png']);
-    await f.toggle('NestedK.png');
+    const nested = await f.fact('NestedK.png');
+    assert.deepEqual([nested.included, nested.excludedSourceOnly], [false, true], 'its nested asset leaves with it');
     assert.deepEqual(await f.written(await f.review()), ['Keep-k.ai', 'Side-k.png']);
-    await f.toggle('PlacedK.ai'); await f.toggle('NestedK.png');                  // Include again
+    await f.toggle('NestedK.png');                                                 // per-asset Include keeps the nested asset alone
+    assert.deepEqual(await f.written(await f.review()), ['Keep-k.ai', 'NestedK.png', 'Side-k.png']);
+    await f.toggle('PlacedK.ai');                                                  // Include again
     roundTripFakeStore();
     assert.deepEqual(await f.written(await f.review()), ['Keep-k.ai', 'NestedK.png', 'PlacedK.ai', 'Side-k.png']);
   }));
@@ -7844,5 +7846,249 @@ function excludedSourceMembershipCases() {
     assert.deepEqual(heldNow(f), []);
     const written = await f.written(review);
     assert.equal(written.includes(f.media), false, 'the explicitly excluded old picture stays out');
+  }));
+
+  // ==== Excluded documents: whatever is written keeps what it links (P), and a
+  // document the owner excluded directly keeps nothing and admits nothing (Q). ====
+  // Work-g.ai places Logo-g.ai and Icon-g.ai; Logo-g.ai places Icon-g.ai and links
+  // Badge-g.png; Icon-g.ai links Texture-g.png and Shared-g.png, which the
+  // unrelated included Keep-g.ai also links.
+  baselineTest('excluded documents: a document the owner includes keeps what its placed documents link (Texture regression)', { timeout: 180000 }, () => withEnv(async () => {
+    const W = desk('Work-g.ai'), K = desk('Keep-g.ai'), L = desk('Logo-g.ai'), I = desk('Icon-g.ai');
+    const T = desk('Texture-g.png'), B = desk('Badge-g.png'), S = desk('Shared-g.png'), side = desk('KeepSide-g.png');
+    const f = await newProject('Diamond', { before() {
+      [[T, 411], [B, 412], [S, 413], [side, 414]].forEach(([file, seed]) => fs.writeFileSync(file, png(seed)));
+      writeWorking('.ai', I, [T, S]); writeWorking('.ai', L, [I, B]); writeWorking('.ai', W, [L, I]); writeWorking('.ai', K, [side, S]);
+    } });
+    for (const file of [W, K]) await f.add(file);
+    await prePackage(f); await prePackage(f);
+    for (const name of ['Logo-g.ai', 'Icon-g.ai', 'Texture-g.png', 'Badge-g.png']) assert.equal(f.stored(name).projectRole, 'asset', name);
+    assert.deepEqual(f.stored('Icon-g.ai').dependencyOwners.slice().sort(), [I, L, W].filter(p => p !== I).sort());
+    const all = ['Badge-g.png', 'Icon-g.ai', 'Keep-g.ai', 'KeepSide-g.png', 'Logo-g.ai', 'Shared-g.png', 'Texture-g.png', 'Work-g.ai'];
+    const keepOnly = ['Keep-g.ai', 'KeepSide-g.png', 'Shared-g.png'];
+    const placed = ['Badge-g.png', 'Icon-g.ai', 'Logo-g.ai', 'Texture-g.png'];
+    assert.deepEqual(await f.written(await f.review()), all);
+    await f.select(W, 'exclude');                                                    // 1. working-file Exclude
+    assert.deepEqual(await f.written(await f.review()), keepOnly);
+    await f.toggle('Logo-g.ai');                                                     // 2. per-asset Include on Logo
+    assert.equal(f.stored('Logo-g.ai').keptAfterSourceExclusion, true);
+    assert.deepEqual(await f.written(await f.review()), [...keepOnly, ...placed].sort(), 'Logo keeps Icon, and Icon keeps Texture');
+    roundTripFakeStore();
+    assert.deepEqual(await f.written(await f.review()), [...keepOnly, ...placed].sort(), 'after reload');
+    await f.toggle('Logo-g.ai');                                                     // 3. per-asset Exclude on Logo again
+    assert.deepEqual(await f.written(await f.review()), keepOnly);
+    await f.select(W, 'restore');                                                    // 4. Restore
+    assert.deepEqual(await f.written(await f.review()), all);
+    // Include All Existing after the Exclude keeps all placed files for that exclusion.
+    await f.select(W, 'exclude');
+    assert.deepEqual(await f.written(await f.review()), keepOnly);
+    await f.bulk('include');
+    assert.deepEqual(await f.written(await f.review()), [...keepOnly, ...placed].sort(), 'Include All Existing');
+    roundTripFakeStore();
+    assert.deepEqual(await f.written(await f.review()), [...keepOnly, ...placed].sort(), 'Include All Existing after reload');
+  }));
+  // Counts reads of one file by the main process while `work` runs.
+  const readsOf = async (target, work) => {
+    const key = target.toLowerCase(); let count = 0;
+    const wrap = (owner, name) => { const original = owner[name];
+      owner[name] = function (file, ...rest) { if (typeof file === 'string' && file.toLowerCase() === key) count++; return original.call(this, file, ...rest); };
+      return () => { owner[name] = original; }; };
+    const restore = [wrap(fs, 'readFileSync'), wrap(fs, 'readFile'), wrap(fs, 'openSync'), wrap(fs, 'open'), wrap(fs, 'createReadStream'),
+      wrap(fs.promises, 'readFile'), wrap(fs.promises, 'open')];
+    try { await work(); } finally { restore.forEach(undo => undo()); }
+    return count;
+  };
+  const verifyScan = (f, filePath) => metadataTestHooks.runScanOnOpen(f.id, filePath, null, null, { verifySelectedSource: true });
+  baselineTest('excluded documents N1/N2: a placed document\'s per-asset Exclude withholds what only it links, and it is not read until Include', { timeout: 180000 }, () => withEnv(async () => {
+    const W = desk('Work-n.ai'), K = desk('Keep-n.ai'), P = desk('Placed-n.ai'), Y = desk('Nested-n.png'), Z = desk('LaterNested-n.png'), A = desk('AfterExclude-n.png'), side = desk('KeepSide-n.png');
+    const f = await newProject('N1 N2', { before() {
+      [[Y, 421], [Z, 422], [A, 423], [side, 424]].forEach(([file, seed]) => fs.writeFileSync(file, png(seed)));
+      writeWorking('.ai', P, [Y]); writeWorking('.ai', W, [P]); writeWorking('.ai', K, [P, side]);
+    } });
+    for (const file of [W, K]) await f.add(file);
+    await prePackage(f);
+    writeWorking('.ai', K, [side]); await verifyScan(f, K);                        // Keep-n.ai holds only an old link record for Placed-n.ai
+    await f.select(W, 'exclude');
+    writeWorking('.ai', P, [Y, Z]); await prePackage(f);
+    const all = ['Keep-n.ai', 'KeepSide-n.png', 'LaterNested-n.png', 'Nested-n.png', 'Placed-n.ai'], keep = ['Keep-n.ai', 'KeepSide-n.png'];
+    assert.deepEqual(await f.written(await f.review()), all, 'kept by the old record, with its links');
+    for (let cycle = 0; cycle < 3; cycle++) {
+      await f.toggle('Placed-n.ai');                                               // per-asset Exclude
+      for (const name of ['Nested-n.png', 'LaterNested-n.png']) {
+        const fact = await f.fact(name);
+        assert.deepEqual([fact.included, fact.excludedSourceOnly, fact.excluded], [false, true, false], `${name} cycle ${cycle}`);
+      }
+      assert.deepEqual(await f.written(await f.review()), keep, `Exclude, cycle ${cycle}`);
+      if (cycle === 1) { roundTripFakeStore(); assert.deepEqual(await f.written(await f.review()), keep, 'after reload'); }
+      await f.toggle('Placed-n.ai');                                               // per-asset Include
+      assert.deepEqual(await f.written(await f.review()), all, `Include, cycle ${cycle}`);
+    }
+    // N2: the excluded document gains a link; the pre-package passes neither read it nor admit the link.
+    await f.toggle('Placed-n.ai');
+    writeWorking('.ai', P, [Y, Z, A]);
+    assert.equal(await readsOf(P, () => prePackage(f)), 0, 'the excluded document is not read');
+    assert.deepEqual(f.anyRowAt(A), [], 'no row or pending row for its new link');
+    assert.deepEqual(await f.written(await f.review()), keep);
+    roundTripFakeStore();
+    assert.deepEqual(await f.written(await f.review()), keep, 'after reload');
+    await f.toggle('Placed-n.ai');
+    assert.ok(await readsOf(P, () => prePackage(f)) > 0, 'read again once included');
+    assert.ok(f.current().files.some(row => row.path === A), 'the link is admitted on the first pass after Include');
+    assert.deepEqual(await f.written(await f.review()), [...all, 'AfterExclude-n.png'].sort());
+  }));
+  baselineTest('excluded documents N3-i: a working-role placed document kept only by an old record takes its own link when excluded', { timeout: 180000 }, () => withEnv(async () => {
+    const f = await formatProject('.ai'); const P = desk('PlacedWork-i.ai'), Y = desk('PlacedWorkLink-i.png');
+    fs.writeFileSync(Y, png(431)); writeWorking('.ai', P, [Y]);
+    writeWorking('.ai', f.W, [desk(f.names.only), desk(f.names.shared), P]);
+    writeWorking('.ai', f.K, [desk(f.names.keepOnly), desk(f.names.shared), P]);
+    await prePackage(f);
+    assert.equal(f.stored('PlacedWork-i.ai').projectRole, 'source');
+    writeWorking('.ai', f.K, [desk(f.names.keepOnly), desk(f.names.shared)]); await verifyScan(f, f.K);
+    await f.select(f.W, 'exclude');
+    const withPlaced = [...f.keepNames, 'PlacedWork-i.ai', 'PlacedWorkLink-i.png'].sort();
+    assert.deepEqual(await f.written(await f.review()), withPlaced);
+    await f.select(P, 'exclude');                                                  // working-file Exclude of the placed document
+    const link = await f.fact('PlacedWorkLink-i.png');
+    assert.deepEqual([link.included, link.excludedSourceOnly, link.excluded], [false, true, false]);
+    assert.deepEqual(await f.written(await f.review()), f.keepNames);
+    roundTripFakeStore();
+    assert.deepEqual(await f.written(await f.review()), f.keepNames, 'after reload');
+    await f.select(P, 'restore');
+    assert.deepEqual(await f.written(await f.review()), withPlaced, 'Restore returns the document and its link');
+    await f.select(P, 'exclude'); roundTripFakeStore();
+    assert.deepEqual(await f.written(await f.review()), f.keepNames, 'Exclude again, after reload');
+  }));
+  baselineTest('excluded documents: shared, old-record, individually included, accepted and added links of an excluded placed document stay', { timeout: 180000 }, () => withEnv(async () => {
+    const W = desk('Work-m.ai'), K = desk('Keep-m.ai'), P = desk('PlacedM.ai'), side = desk('KeepSide-m.png');
+    const shared = desk('SharedN-m.png'), stale = desk('StaleN-m.png'), only = desk('OnlyN-m.png'), added = desk('AddedN-m.png'), pend = desk('PendingN-m.png');
+    const f = await newProject('Mixed owners', { before() {
+      [[side, 441], [shared, 442], [stale, 443], [only, 444], [added, 445], [pend, 446]].forEach(([file, seed]) => fs.writeFileSync(file, png(seed)));
+      writeWorking('.ai', P, [shared, stale, only, added]); writeWorking('.ai', W, [P]); writeWorking('.ai', K, [P, side, shared, stale]);
+    } });
+    for (const file of [W, K]) await f.add(file);
+    manualDialogFor([added]); await callIpcRaw('projects:add-files', f.id);      // explicitly added by the owner
+    await prePackage(f);
+    writeWorking('.ai', K, [side, shared]); await verifyScan(f, K);                 // Keep-m.ai: current link to SharedN, old records for PlacedM and StaleN
+    await f.select(W, 'exclude');
+    // A link Illustrator reports for the placed document while it is unsaved waits as pending; the owner adds it.
+    setChildProcessHandler(request => {
+      if (isIllustratorPgrepCheck(request)) return { stdout: '432\n' };
+      if (isOsascriptInvocation(request, 'crate-ai-active-session.applescript')) return { stdout: `DOC\t${P}\tPlacedM.ai\ttrue\ttrue\nLINK\t${P}\tPlacedM.ai\t${pend}\ttrue\ttrue\nCOMPLETE\t1\t1\n` };
+      return passthroughInner(request);
+    });
+    await metadataTestHooks.pollPsForProject(f.id, metadataTestHooks.getActiveWatchingActivationToken(f.id));
+    await metadataTestHooks.waitForWatcherIdle(f.id).catch(() => null); clearTrackedTimers(); passthrough();
+    const row = f.current().pendingFiles.find(item => item.path === pend); assert.ok(row, 'pending row for the live link');
+    assert.ok(await callIpcRaw('projects:accept-pending', f.id, metadataTestHooks.createProjectFileVisualIdentity(f.id, row)));
+    const all = ['AddedN-m.png', 'Keep-m.ai', 'KeepSide-m.png', 'OnlyN-m.png', 'PendingN-m.png', 'PlacedM.ai', 'SharedN-m.png', 'StaleN-m.png'];
+    const stays = all.filter(name => !['OnlyN-m.png', 'PlacedM.ai'].includes(name));
+    assert.deepEqual(await f.written(await f.review()), all);
+    await f.toggle('PlacedM.ai');                                                  // per-asset Exclude of the placed document
+    assert.deepEqual(await f.written(await f.review()), stays, 'only the link nothing else keeps leaves');
+    await f.toggle('OnlyN-m.png');                                                 // per-asset Include on the withheld link
+    assert.deepEqual(await f.written(await f.review()), [...stays, 'OnlyN-m.png'].sort());
+    await f.toggle('PlacedM.ai'); await f.toggle('PlacedM.ai'); roundTripFakeStore();
+    assert.deepEqual(await f.written(await f.review()), [...stays, 'OnlyN-m.png'].sort(), 'the Include survives Include/Exclude of its document and reload');
+    await f.toggle('OnlyN-m.png');                                                 // a second click excludes it
+    assert.deepEqual(await f.written(await f.review()), stays);
+  }, { realTmp: true }));
+  baselineTest('excluded documents: a document an included file requires stays whole with its links (N3-ii, C1a)', { timeout: 180000 }, () => withEnv(async () => {
+    // Asset-role placed document listed by Keep-c.ai's current receipt, per-asset Exclude.
+    const W = desk('Work-c.ai'), K = desk('Keep-c.ai'), P = desk('PlacedC.ai'), Y = desk('NestedC.png'), side = desk('KeepSide-c.png'), solo = desk('Solo-c.png');
+    const c = await newProject('Required asset doc', { before() {
+      [[Y, 451], [side, 452], [solo, 453]].forEach(([file, seed]) => fs.writeFileSync(file, png(seed)));
+      writeWorking('.ai', P, [Y]); writeWorking('.ai', K, [P, side]); writeWorking('.ai', W, [solo]);
+    } });
+    for (const file of [W, K]) await c.add(file);
+    await prePackage(c); await verifyScan(c, K); await verifyScan(c, W);
+    await c.select(W, 'exclude');
+    const required = ['Keep-c.ai', 'KeepSide-c.png', 'NestedC.png', 'PlacedC.ai'];
+    assert.deepEqual(await c.written(await c.review()), required);
+    await c.toggle('PlacedC.ai');
+    const placed = await c.fact('PlacedC.ai');
+    assert.deepEqual([placed.excluded, placed.included, placed.includedAsDependency], [true, true, true]);
+    assert.deepEqual(await c.written(await c.review()), required, 'the required document keeps its link');
+    roundTripFakeStore();
+    assert.deepEqual(await c.written(await c.review()), required, 'after reload');
+    // Working-role placed document that the included working file currently links, working-file Exclude.
+    const f = await formatProject('.ai'); const PW = desk('PlacedWork-r.ai'), YW = desk('PlacedWorkLink-r.png');
+    fs.writeFileSync(YW, png(454)); writeWorking('.ai', PW, [YW]);
+    writeWorking('.ai', f.W, [desk(f.names.only), desk(f.names.shared), PW]);
+    await prePackage(f); await verifyScan(f, PW);
+    await f.select(PW, 'exclude'); await verifyScan(f, f.W);
+    assert.equal((await f.fact('PlacedWork-r.ai')).includedAsDependency, true);
+    assert.deepEqual(await f.written(await f.review()),
+      [...f.keepNames, f.names.only, 'PlacedWork-r.ai', 'PlacedWorkLink-r.png', 'Work-ai.ai'].sort());
+  }));
+  baselineTest('excluded documents: a reader disagreement keeps the long name an included file recorded (before and after the Exclude and a rescan)', { timeout: 180000 }, () => withEnv(async () => {
+    const W = desk('Work-r.ai'), K = desk('Keep-r.ai'), P = desk('PlacedR.ai'), long = desk('Picture.png.final.png'), short = desk('Picture.png'), side = desk('KeepSide-r.png');
+    const f = await newProject('Reader disagreement', { before() {
+      [[long, 461], [short, 462], [side, 463]].forEach(([file, seed]) => fs.writeFileSync(file, png(seed)));
+      writeWorking('.ai', P, [long]); writeWorking('.ai', W, [P]); writeWorking('.ai', K, [P, side, long]);
+    } });
+    for (const file of [W, K]) await f.add(file);
+    await prePackage(f);
+    writeWorking('.ai', K, [side, long]); await verifyScan(f, K);
+    const receipt = metadataTestHooks.getWorkingSourceVerification(f.current(), f.current().files.find(row => row.path === K));
+    assert.ok(receipt.requiredReferences.some(ref => ref.path === short) && !receipt.requiredReferences.some(ref => ref.path === long), 'the clean scan lists only the short name');
+    assert.ok(f.stored('Picture.png.final.png').dependencyOwners.includes(K));
+    await f.select(W, 'exclude');
+    const before = await f.written(await f.review());
+    assert.ok(before.includes('Picture.png.final.png'), JSON.stringify(before));
+    await f.toggle('PlacedR.ai');                                                  // Exclude the placed document that also links it
+    const after = await f.written(await f.review());
+    assert.deepEqual(after, before.filter(name => name !== 'PlacedR.ai'));
+    await verifyScan(f, K); await prePackage(f);
+    assert.deepEqual(await f.written(await f.review()), after, 'after a rescan and another pre-package pass');
+  }));
+  baselineTest('excluded documents: a document with no owner evidence stays, and so does what it links', { timeout: 180000 }, () => withEnv(async () => {
+    const W = desk('Work-o.ai'), K = desk('Keep-o.ai'), U = desk('Unowned-o.ai'), C = desk('UnownedChild-o.png'), side = desk('KeepSide-o.png');
+    const f = await newProject('No owner evidence', { before() {
+      [[C, 471], [side, 472]].forEach(([file, seed]) => fs.writeFileSync(file, png(seed)));
+      writeWorking('.ai', U, [C]); writeWorking('.ai', W, [U, C]); writeWorking('.ai', K, [side]);
+    } });
+    for (const file of [W, K]) await f.add(file);
+    await prePackage(f);
+    assert.equal(f.stored('Unowned-o.ai').projectRole, 'asset');
+    assert.ok(f.stored('UnownedChild-o.png').dependencyOwners.includes(U));
+    // W stops placing the document and is rescanned; the document's row loses its owner
+    // evidence, as in a store written before owner recording.
+    writeWorking('.ai', W, [C]); await verifyScan(f, W);
+    const stored = f.current().files.find(row => row.path === U);
+    delete stored.dependencyOwners; delete stored.assetBaselineSourcePath;
+    if (stored.captureEvidence) { delete stored.captureEvidence.relationshipSourcePath; delete stored.captureEvidence.sourceDocumentPath; }
+    roundTripFakeStore();
+    await f.select(W, 'exclude');
+    assert.deepEqual(await f.written(await f.review()), ['Keep-o.ai', 'KeepSide-o.png', 'Unowned-o.ai', 'UnownedChild-o.png']);
+  }));
+  baselineTest('membership cost: an excluded document that owns 400 rows adds linear work', { timeout: 300000 }, () => withEnv(async () => {
+    const count = 400, W = desk('CostWork.ai'), K = desk('CostKeep.ai'), P = desk('CostPlaced.ai');
+    const paths = Array.from({ length: count }, (_, i) => desk('Owned-' + i + '.png'));
+    const f = await newProject('Excluded document cost', { before() {
+      paths.forEach((file, i) => fs.writeFileSync(file, png(5000 + i))); writeWorking('.ai', P, paths); writeWorking('.ai', W, [P]); writeWorking('.ai', K, [P]);
+    } });
+    for (const file of [W, K]) await f.add(file);
+    await prePackage(f);
+    assert.ok(f.current().files.filter(row => paths.includes(row.path)).every(row => row.dependencyOwners?.includes(P)), 'every row records the document');
+    writeWorking('.ai', K, []); await verifyScan(f, K);                            // the document stays by K's old record
+    await f.select(W, 'exclude');
+    const measure = () => {
+      const p = structuredClone(f.current());
+      let realpaths = 0, stats = 0, receiptLookups = 0;
+      p.workingSourceVerification = new Proxy(p.workingSourceVerification || {}, { get(target, key, receiver) { if (typeof key === 'string' && /^[a-f0-9]{64}$/.test(key)) receiptLookups++; return Reflect.get(target, key, receiver); } });
+      const orig = fs.realpathSync.native, origStat = fs.statSync;
+      fs.realpathSync.native = function (...args) { realpaths++; return orig.apply(this, args); };
+      fs.statSync = function (...args) { stats++; return origStat.apply(this, args); };
+      let facts; try { facts = metadataTestHooks.getWorkingSourceMembership(p).facts; } finally { fs.realpathSync.native = orig; fs.statSync = origStat; }
+      return { realpaths, stats, receiptLookups, included: [...facts.values()].filter(fact => fact.included).length };
+    };
+    const included = measure();
+    await f.toggle('CostPlaced.ai');
+    const excluded = measure();
+    console.log('# EXCLUDED_DOCUMENT_COST ' + JSON.stringify({ count, included, excluded }));
+    assert.deepEqual([included.included, excluded.included], [count + 2, 1], 'the document and every row it alone links leave');
+    assert.ok(excluded.realpaths - included.realpaths <= 5 * count + 16, JSON.stringify({ included, excluded }));
+    assert.ok(excluded.stats - included.stats <= 2, JSON.stringify({ included, excluded }));
+    assert.ok(excluded.receiptLookups - included.receiptLookups <= 2, JSON.stringify({ included, excluded }));
   }));
 }
