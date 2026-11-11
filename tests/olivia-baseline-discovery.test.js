@@ -8336,4 +8336,42 @@ function excludedSourceMembershipCases() {
     assert.deepEqual(await f.written(await f.review()), [path.basename(b0.path), path.basename(b1.path), 'Keep-p6.ai', 'KeepSide-p6.png', 'PlacedB-p6.psd'].sort(),
       'written in the first package; the missing withheld output does not block');
   }, { realMainPsd: true }));
+  // A lost cached output whose row carries an individual choice is refilled by a later
+  // save only with the bytes that choice was made on; otherwise the save gets its own row.
+  // Rows without a choice keep the ordinary same-parent refill.
+  baselineTest('placed Photoshop files: after cache loss a later save never refills a chosen output with other bytes', { timeout: 300000 }, () => withEnv(async () => {
+    const results = {};
+    for (const [variant, choice, save] of [['kc', 'keep', 'changed'], ['ki', 'keep', 'identical'], ['ic', 'include', 'changed'],
+      ['ec', 'exclude', 'changed'], ['nc', 'none', 'changed']]) {
+      const t = await psdPlaced('p7' + variant), extra = desk(`ExtraLink-p7${variant}.png`);
+      fs.writeFileSync(extra, png(696));
+      if (choice === 'keep') { await t.f.select(t.W, 'exclude'); await t.f.toggle(path.basename(t.A)); }
+      const [a0] = t.outputs(t.A), [b] = t.outputs(t.B), at = row => t.outputs(t.A).find(item => item.path === row.path);
+      if (choice !== 'none') await t.toggleRow(a0);                                   // Include (excluded parent) or Exclude
+      if (choice === 'include') await t.toggleRow(at(a0));                            // Exclude, then Include again
+      roundTripFakeStore();
+      fs.rmSync(a0.path, { force: true });                                            // the cached output is lost
+      if (save === 'changed') writeWorking('.psd', t.A, [], 645); else writeWorking('.psd', t.A, [extra], 611);
+      await prePackage(t.f);
+      const rows = t.outputs(t.A), a1 = rows.find(row => row.path !== a0.path);
+      const cached = fs.existsSync(a0.path) ? require('crypto').createHash('sha256').update(fs.readFileSync(a0.path)).digest('hex') : null;
+      const review = await t.f.review();
+      results[variant] = { rows: rows.map(t.name).sort(), oldRowBytes: cached === null ? 'missing' : cached === a0.psdExtractionReceipt.outputDigest ? 'chosen' : 'other',
+        materializable: review.materializable };
+      if (review.materializable) results[variant].written = (await t.f.written(review)).filter(name => name.startsWith('Embedded-Layer'));
+      if (variant === 'kc' && a1) {                                                       // the owner resolves the lost row, then the new one
+        await t.toggleRow(at(a0));
+        assert.deepEqual((await t.f.written(await t.f.review())).filter(name => name.startsWith('Embedded-Layer')), [t.name(b)]);
+        await t.toggleRow(a1);
+        assert.deepEqual((await t.f.written(await t.f.review())).filter(name => name.startsWith('Embedded-Layer')), [t.name(b), t.name(a1)].sort());
+      }
+    }
+    assert.deepEqual(results, {
+      kc: { rows: ['Embedded-Layer.png', 'Embedded-Layer_2.png'], oldRowBytes: 'missing', materializable: false },
+      ki: { rows: ['Embedded-Layer.png'], oldRowBytes: 'chosen', materializable: true, written: ['Embedded-Layer.png', 'Embedded-Layer_1.png'] },
+      ic: { rows: ['Embedded-Layer.png', 'Embedded-Layer_2.png'], oldRowBytes: 'missing', materializable: false },
+      ec: { rows: ['Embedded-Layer.png', 'Embedded-Layer_2.png'], oldRowBytes: 'missing', materializable: true, written: ['Embedded-Layer_1.png', 'Embedded-Layer_2.png'] },
+      nc: { rows: ['Embedded-Layer.png'], oldRowBytes: 'other', materializable: true, written: ['Embedded-Layer.png', 'Embedded-Layer_1.png'] },
+    });
+  }, { realMainPsd: true }));
 }

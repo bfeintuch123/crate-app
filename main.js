@@ -16262,17 +16262,28 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         .filter(row => row.source === 'psd-embedded');
       // An output name that belongs to another file's row is never handed to
       // this file, even when that row's cached file is missing: the row keeps
-      // its own parent's record. Reuse within the same parent is unchanged.
+      // its own parent's record. Within the same parent, on this ordinary
+      // route, a missing output whose row carries an individual choice is
+      // refilled by a later save only with the bytes that choice was made on;
+      // other bytes get their own row. Rows without a choice, and the owned
+      // baseline route, keep the ordinary same-parent refill.
       // The comparison is made per row, only for a row that names a parent.
-      let psdKey = null;
+      let psdKey = null, choiceKeys = null;
+      const chosenMissing = new Map();
       for (const row of priorEmbeddedRows) {
         const parentPath = row.psdExtractionReceipt?.parentPath ?? row.psdResource?.parentPath;
         if (typeof parentPath !== 'string') continue;
         psdKey ??= normalizeTrackedFilePath(psdFilePath);
-        if (normalizeTrackedFilePath(parentPath) !== psdKey && isDirectCacheChild(extractDir, row.path)) {
-          usedEmbeddedNames.add(path.basename(row.path).toLowerCase());
+        if (!isDirectCacheChild(extractDir, row.path)) continue;
+        const name = path.basename(row.path).toLowerCase();
+        if (normalizeTrackedFilePath(parentPath) !== psdKey) usedEmbeddedNames.add(name);
+        else if (!options.onOwnedPsdOutputs && !usedEmbeddedNames.has(name) &&
+            hasIndividualAssetChoice(project, row, choiceKeys ??= new Set(project.excludedAssetKeys || []))) {
+          const receipt = row.psdExtractionReceipt || row.psdResource;
+          chosenMissing.set(name, { name: path.basename(row.path), outputDigest: receipt?.outputDigest, originalName: receipt?.originalName });
         }
       }
+      for (const name of chosenMissing.keys()) usedEmbeddedNames.add(name);
       const embeddedRecords = [];
       for (const [embeddedIndex, lf] of linkedFiles.entries()) {
         if (!lf.data) continue;
@@ -16294,7 +16305,13 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         for (const row of matches) if (isDirectCacheChild(extractDir, row.path)) {
           usedEmbeddedNames.add(path.basename(row.path).toLowerCase());
         }
-        embeddedRecords.push({ lf, embeddedIndex, outputDigest, matches });
+        // A chosen missing output is refilled only with the bytes it was chosen on.
+        let chosenName = null;
+        if (!options.onOwnedPsdOutputs && !matches.length) for (const [name, chosen] of chosenMissing) {
+          if (chosen.outputDigest !== outputDigest || chosen.originalName !== (lf.name || '')) continue;
+          chosenMissing.delete(name); chosenName = chosen.name; break;
+        }
+        embeddedRecords.push({ lf, embeddedIndex, outputDigest, matches, chosenName });
       }
       let repairSource = null;
       const assertRepairSource = () => {
@@ -16303,7 +16320,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         assertPsdBaselineSnapshot(repairSource);
       };
       let baselineEmbeddedOrdinal = 0;
-      for (const { lf, embeddedIndex, outputDigest, matches } of embeddedRecords) {
+      for (const { lf, embeddedIndex, outputDigest, matches, chosenName } of embeddedRecords) {
         if (!isCurrent()) return [];
         const data = Buffer.from(lf.data);
         const psdExtractionReceipt = { version: 1, parentPath: psdFilePath, sourceDigest,
@@ -16351,7 +16368,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
             }
           }
         }
-        const extractPath = restoreTargets ? restoreTargets[0].path : path.join(extractDir, reserveUniqueName(lf.name, usedEmbeddedNames));
+        const extractPath = restoreTargets ? restoreTargets[0].path : path.join(extractDir, chosenName || reserveUniqueName(lf.name, usedEmbeddedNames));
         const stagedPath = safeCacheTempPath(extractPath);
         const staged = {
           stagedPath,
