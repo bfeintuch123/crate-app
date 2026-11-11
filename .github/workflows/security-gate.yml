@@ -17,7 +17,7 @@ jobs:
   source-security:
     name: Source security and regression suite
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       CI: 'true'
       NODE_OPTIONS: ''
