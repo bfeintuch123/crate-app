@@ -1497,4 +1497,52 @@ function cases() {
       assert.equal((await f.resolve(current)).success,true);
     } finally {held=false;release();unpause();global.setTimeout=timer;await pause(50);}
   });
+  // Include All Existing for an exclusion is bound to the excluded file's
+  // selection record; a proven rename moves that record and the binding together.
+  choiceTest('Include All Existing for an exclusion follows a proven rename of the excluded working file', async () => {
+    resetTestHomeWorkspace(); setPresentationUnzipFixture([]); currentPsdFixture = { children: [], linkedFiles: [] };
+    const project = await createProject('Bulk include rename');
+    await callIpcRaw('projects:pause', project.id); clearTrackedTimers();
+    const stored = () => storeInstance.data.projects.find(item => item.id === project.id);
+    const workspace = () => callIpcRaw('projects:get-asset-workspace', project.id);
+    const desk = name => path.join(TEST_HOME, 'Desktop', name);
+    const x = desk('X.png'), a = desk('A.ai'), c = desk('C.ai');
+    fs.writeFileSync(x, Buffer.alloc(600, 7)); fs.writeFileSync(a, '%PDF-1.7\n' + x + '\n%%EOF\n'); fs.writeFileSync(c, '%PDF-1.7\n%%EOF\n');
+    for (const target of [a, c]) {
+      manualDialogFor([target]); await callIpcRaw('projects:add-files', project.id);
+      if (stored().assetBaseline?.status === 'decision-required') assert.equal((await callIpcRaw('projects:set-existing-assets-decision', project.id, 'include')).success, true);
+    }
+    for (const entry of (await workspace()).workingFileChoices.choices) {
+      assert.equal((await callIpcRaw('projects:resolve-working-file-choice', project.id, { id: entry.id, revision: entry.revision, choice: 'keep-both', predecessorIdentity: null })).success, true);
+    }
+    await metadataTestHooks.refreshWorkingSourceLocators(project.id);
+    const select = async (name, action) => {
+      const row = (await workspace()).files.find(item => item.name === name);
+      const response = await callIpcRaw('projects:set-working-source-selection', project.id, row.visualIdentity, { action, expectedRevision: row.selectionRevision });
+      assert.equal(response.success, true, JSON.stringify(response));
+    };
+    const xRow = async () => (await workspace()).files.find(item => item.name === 'X.png');
+    const key = row => metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(stored(), row);
+    assert.equal(stored().files.find(item => item.path === x).assetOrigin, 'existing');
+    await select('A.ai', 'exclude');
+    assert.equal((await xRow()).included, false);
+    assert.equal((await callIpcRaw('projects:set-existing-assets-decision', project.id, 'include')).success, true);
+    const oldKey = key(stored().files.find(item => item.path === a)), revision = stored().workingSourceSelections[oldKey].revision;
+    assert.deepEqual(stored().files.find(item => item.path === x).existingIncludeEpisode, { version: 1, owners: { [oldKey]: revision } });
+    assert.equal((await xRow()).included, true);
+    const destination = desk('A-Moved.ai'), inode = fs.statSync(a).ino;
+    fs.renameSync(a, destination); assert.equal(fs.statSync(destination).ino, inode);
+    await metadataTestHooks.refreshWorkingSourceLocators(project.id, [destination]);
+    roundTripFakeStore();
+    const moved = stored().files.find(item => item.path === destination);
+    assert.ok(moved, 'the rename was recognized');
+    const newKey = key(moved);
+    assert.notEqual(newKey, oldKey);
+    assert.equal(stored().workingSourceSelections[newKey].revision, revision);
+    assert.deepEqual(stored().files.find(item => item.path === x).existingIncludeEpisode, { version: 1, owners: { [newKey]: revision } });
+    assert.equal((await xRow()).included, true, 'still kept for the same exclusion');
+    await select('A-Moved.ai', 'restore');
+    await select('A-Moved.ai', 'exclude');
+    assert.equal((await xRow()).included, false, 'a later exclusion withholds it again');
+  });
 }

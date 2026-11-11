@@ -160,7 +160,7 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
   vm.runInContext('function toggleAssetForTest(project, removedFile) { let changed = false;\n' +
     between("    if (removedFile && inferProjectFileRole(removedFile) === 'asset') {",
       '    project.files = project.files.filter(file => (\n      !matchesProjectFileIdentity') + '  return changed; }', context);
-  api = vm.runInContext('({getWorkingSourceSelection, getWorkingSourceVerification, getWorkingSourceMembership, setWorkingSourceSelection, resolveWorkingFileChoice, getAssetBaselineSourceRecoveryRouteKey, selectProjectFilesForPackaging, beginWorkingSourceScan, collectWorkingSourceScanEvidence, publishWorkingSourceScan, failWorkingSourceScan, workingSourceScanLeases, workingSourceScanOperations, getWorkingSourceDiskIdentity, recordWorkingSourceContinuationCandidate, resolveWorkingSourceContinuation, getWorkingSourceContinuationPresentation, observeIllustratorWorkingSourceContinuation, refreshWorkingSourceLocators, retireInterruptedWorkingSourceScan: typeof retireInterruptedWorkingSourceScan === "function" ? retireInterruptedWorkingSourceScan : null, refreshWorkingSourceVerification, getWorkingFileVerificationReason})', context);
+  api = vm.runInContext('({getWorkingSourceSelection, getWorkingSourceVerification, getWorkingSourceMembership, setWorkingSourceSelection, resolveWorkingFileChoice, getAssetBaselineSourceRecoveryRouteKey, selectProjectFilesForPackaging, beginWorkingSourceScan, collectWorkingSourceScanEvidence, publishWorkingSourceScan, failWorkingSourceScan, workingSourceScanLeases, workingSourceScanOperations, getWorkingSourceDiskIdentity, recordWorkingSourceContinuationCandidate, resolveWorkingSourceContinuation, getWorkingSourceContinuationPresentation, observeIllustratorWorkingSourceContinuation, refreshWorkingSourceLocators, retireInterruptedWorkingSourceScan: typeof retireInterruptedWorkingSourceScan === "function" ? retireInterruptedWorkingSourceScan : null, refreshWorkingSourceVerification, getWorkingFileVerificationReason, isUnretainedExcludedScanSource: typeof isUnretainedExcludedScanSource === "function" ? isUnretainedExcludedScanSource : null})', context);
   const source = (name, fileId = name) => {
     const file = { path: `/Users/synthetic/${name}`, name, fileId, ext: path.extname(name), projectRole: 'source' };
     disk.set(file.path, Buffer.from('%PDF-1.7\n%%EOF\n'));
@@ -1546,7 +1546,7 @@ function ownerRecord(project, file, method, payload, kind = OBSERVER_KINDS.MANUA
 }
 const ACCEPT = 'projects:accept-pending', BULK = 'projects:set-existing-assets-decision';
 
-test('owner intent matrix: every acceptance signal keeps the asset; absent or other records do not', async () => {
+test('owner intent matrix: individual acceptance keeps the asset; a provably bulk Include Existing, absent or other records do not', async () => {
   const f = fixture(), root = f.source('Art.ai');
   const rows = {
     never: dependencyAsset(f, 'Never.png'),
@@ -1571,7 +1571,9 @@ test('owner intent matrix: every acceptance signal keeps the asset; absent or ot
   ownerRecord(f.project, rows.parserAccept, ACCEPT, undefined, OBSERVER_KINDS.PARSER);
   await scanWorkingFile(f, root, Object.values(rows));
   await f.command(root, 'exclude');
-  const kept = ['flagAndAccept', 'flagAndBulk', 'flagOnly', 'acceptOnly', 'bulkOnly', 'individualInclude', 'marked'];
+  // The flag with only a bulk record is provably the bulk Include Existing;
+  // a flag with no record cannot be told apart from an Add, so it keeps.
+  const kept = ['flagAndAccept', 'flagOnly', 'acceptOnly', 'individualInclude', 'marked'];
   for (const [label, file] of Object.entries(rows)) {
     const fact = factOf(f, file);
     assert.equal(fact.excludedSourceOnly, true, `${label} ownership fact is unchanged`);
@@ -1613,7 +1615,7 @@ test('the asset toggle shares the owner predicate: every click flips accepted an
   await f.command(root, 'exclude');
   const stored = file => f.snapshot().files.find(row => row.path === file.path);
   for (const file of [flagged, recorded, bulk, never]) {
-    let expected = file !== never;
+    let expected = file !== never && file !== bulk;
     assert.equal(factOf(f, file).included, expected, `${file.name} initial`);
     for (let click = 0; click < 4; click++) {
       f.toggleAsset(file);
@@ -1662,7 +1664,21 @@ test('owner-intent records are read lazily and in one bounded pass', async () =>
   reads = 0;
   const flaggedFacts = f.api.getWorkingSourceMembership(project).facts;
   assert.ok(flagged.every(file => flaggedFacts.get(file.path.toLowerCase()).included));
-  assert.equal(reads, 0, 'row signals short-circuit record lookup');
+  // The accept flag alone cannot tell an Add from the bulk Include Existing:
+  // flagged candidates share one record pass; other row signals read none.
+  assert.equal(reads, 1, 'flagged candidates read the records once');
+  const marked = Array.from({ length: 50 }, (_, i) => dependencyAsset(f, `Marked-${i}.png`, { keptAfterSourceExclusion: true }));
+  project.files = project.files.filter(file => !flagged.includes(file));
+  project.files.push(...marked);
+  await f.command(root, 'restore');
+  await scanWorkingFile(f, root, marked);
+  await f.command(root, 'exclude');
+  reads = 0;
+  const markedFacts = f.api.getWorkingSourceMembership(project).facts;
+  assert.ok(marked.every(file => markedFacts.get(file.path.toLowerCase()).included));
+  assert.equal(reads, 0, 'row markers short-circuit record lookup');
+  project.files = project.files.filter(file => !marked.includes(file));
+  project.files.push(...flagged);
   // Many unresolved candidates and a large record log cost one pass in total.
   const candidates = Array.from({ length: 200 }, (_, i) => dependencyAsset(f, `Candidate-${i}.png`));
   project.files.push(...candidates);
@@ -1677,4 +1693,93 @@ test('owner-intent records are read lazily and in one bounded pass', async () =>
   assert.equal(indexReads, observations.length, 'each record is visited once');
   assert.equal(facts.get(candidates[7].path.toLowerCase()).included, true);
   assert.equal(candidates.filter(file => facts.get(file.path.toLowerCase()).included).length, 1);
+});
+
+// A legacy logical PSD row shares its parent's path. The parent's own accept
+// record is not the child's; only the child's own flag or a record naming a
+// logical child keeps it once the parent is excluded.
+test('legacy logical children ignore the parent PSD accept record', async () => {
+  const f = fixture(), psd = f.source('Design.psd');
+  // The VM dedup model keys by path (see the logical-children test above).
+  const logical = (name, index, extra = {}) => ({ path: psd.path + '#' + name, name, fileId: 'logical-' + index, ext: '.png', projectRole: 'asset',
+    source: 'scan-on-save-embedded', embedded: true, parentPsd: psd.path, embeddedIndex: index, ...extra });
+  const plainChild = logical('Plain.png', 0), flaggedChild = logical('Flagged.png', 1, { acceptedPending: true });
+  f.project.files.push(psd, plainChild, flaggedChild);
+  ownerRecord(f.project, psd, ACCEPT, { source: 'lsof' });
+  await f.command(psd, 'exclude');
+  const fact = file => factOf(f, file);
+  assert.equal(fact(plainChild).excludedSourceOnly, true);
+  assert.equal(fact(plainChild).included, false, 'the parent record does not keep the child');
+  assert.equal(fact(flaggedChild).included, true, 'the child flag keeps it');
+  ownerRecord(f.project, psd, ACCEPT, { source: 'scan-on-save-embedded' });
+  assert.equal(fact(plainChild).included, true, 'a record naming a logical child keeps it');
+});
+
+// Recorded owners count only while they are still project files.
+test('recorded owners that are no longer project files are ignored', async () => {
+  const f = fixture(), root = f.source('Art.ai'), kept = f.source('Poster.ai');
+  const asset = dependencyAsset(f, 'Linked.png', { source: 'linked-asset', dependencyOwners: [root.path, kept.path] });
+  f.project.files.push(root, kept, asset);
+  await f.command(root, 'exclude');
+  assert.equal(factOf(f, asset).included, true, 'a selected recorded owner keeps it');
+  f.project.files = f.project.files.filter(file => file !== kept);
+  assert.equal(factOf(f, asset).excludedSourceOnly, true);
+  assert.equal(factOf(f, asset).included, false, 'a removed owner keeps nothing');
+  asset.dependencyOwnersOverflow = true;
+  assert.equal(factOf(f, asset).included, true, 'overflow keeps');
+});
+
+// Include All Existing for the current exclusion: the stored episode keeps the
+// row only while every excluded owner still has the recorded revision.
+test('an Include All Existing episode keeps only while every excluded owner has its recorded revision', async () => {
+  const f = fixture(), first = f.source('First.ai'), second = f.source('Second.ai');
+  const asset = dependencyAsset(f, 'Both.png', { source: 'linked-asset', dependencyOwners: [first.path, second.path] });
+  f.project.files.push(first, second, asset);
+  await f.command(first, 'exclude'); await f.command(second, 'exclude');
+  const key = file => f.api.getAssetBaselineSourceRecoveryRouteKey(f.project, file);
+  const revision = file => f.api.getWorkingSourceSelection(f.project, file).revision;
+  const episode = owners => { asset.existingIncludeEpisode = { version: 1, owners }; return factOf(f, asset).included; };
+  assert.equal(factOf(f, asset).included, false);
+  assert.equal(episode({ [key(first)]: revision(first), [key(second)]: revision(second) }), true);
+  assert.equal(episode({ [key(first)]: revision(first) }), false, 'every excluded owner must be covered');
+  assert.equal(episode({ [key(first)]: revision(first), [key(second)]: revision(second) - 1 }), false, 'an earlier exclusion does not count');
+  for (const malformed of [{ version: 2, owners: { [key(first)]: 1 } }, { version: 1, owners: [] }, { version: 1, owners: { short: 1 } },
+    { version: 1, owners: { [key(first)]: 0 } }, { version: 1, owners: {} }, null, 'episode']) {
+    asset.existingIncludeEpisode = malformed;
+    assert.equal(factOf(f, asset).included, false, JSON.stringify(malformed));
+  }
+  asset.existingIncludeEpisode = { version: 1, owners: { [key(first)]: revision(first), [key(second)]: revision(second) } };
+  f.reload();
+  assert.equal(factOf(f, asset).included, true, 'after reload');
+  // A per-asset Exclude ends the bulk keep; the next click is a durable Include.
+  f.toggleAsset(asset);
+  let stored = f.snapshot().files.find(row => row.path === asset.path);
+  assert.equal(stored.existingIncludeEpisode, undefined);
+  assert.equal(factOf(f, asset).included, false);
+  f.toggleAsset(asset);
+  stored = f.snapshot().files.find(row => row.path === asset.path);
+  assert.equal(stored.keptAfterSourceExclusion, true);
+  await f.command(first, 'restore'); await f.command(first, 'exclude');
+  assert.equal(factOf(f, asset).included, true, 'the durable Include survives a later exclusion');
+});
+
+// The scan guard (pre-package passes, presentation save, Start Watching
+// snapshot, live InDesign refresh) skips only an explicitly excluded working
+// file that nothing included retains. Replace history and invalid selections
+// are not skipped (their assets keep today's behavior).
+test('scan guard predicate: Replace history, invalid and retained selections are not skipped', async () => {
+  const f = continuationFixture();
+  assert.equal((await f.api.resolveWorkingSourceContinuation(f.project.id, continuationRequest(f))).success, true);
+  assert.equal(f.api.getWorkingSourceSelection(f.project, f.a).reason, 'continuation-replaced');
+  assert.equal(f.api.isUnretainedExcludedScanSource(f.api.getWorkingSourceMembership(f.project), f.a), false, 'Replace history');
+  const g = fixture(), root = g.source('Art.ai'), other = g.source('Other.ai'), kept = g.source('Poster.ai');
+  g.project.files.push(root, other, kept);
+  await g.command(other, 'exclude');
+  assert.equal(g.api.isUnretainedExcludedScanSource(g.api.getWorkingSourceMembership(g.project), other), true, 'explicitly excluded');
+  g.project.workingSourceSelections[g.api.getAssetBaselineSourceRecoveryRouteKey(g.project, root)] = { state: 'excluded', reason: 'unknown', revision: 1 };
+  assert.equal(g.api.getWorkingSourceSelection(g.project, root).state, 'invalid');
+  assert.equal(g.api.isUnretainedExcludedScanSource(g.api.getWorkingSourceMembership(g.project), root), false, 'invalid selection');
+  await scanWorkingFile(g, kept, [other]);
+  assert.equal(factOf(g, other).includedAsDependency, true);
+  assert.equal(g.api.isUnretainedExcludedScanSource(g.api.getWorkingSourceMembership(g.project), other), false, 'retained as a dependency');
 });
