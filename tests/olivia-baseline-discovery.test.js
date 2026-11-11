@@ -8335,6 +8335,53 @@ function excludedSourceMembershipCases() {
     assert.equal(fs.existsSync(a.path), false);
     assert.deepEqual(await f.written(await f.review()), [path.basename(b0.path), path.basename(b1.path), 'Keep-p6.ai', 'KeepSide-p6.png', 'PlacedB-p6.psd'].sort(),
       'written in the first package; the missing withheld output does not block');
+    await callIpcRaw('projects:delete', f.id);
+    // The same rule when the two documents are added with Add Files (worker route). Document A's
+    // output, with or without a choice, loses its cached file; document B, whose embedded object has
+    // the same name, is added. Harness note: the review and package below are the harness's direct
+    // calls of the app's review and package handlers; packaging only happens after the last Add Files.
+    const sha = data => require('crypto').createHash('sha256').update(data).digest('hex');
+    const onDisk = file => fs.existsSync(file) ? sha(fs.readFileSync(file)) : 'missing';
+    const tieOf = row => row.psdExtractionReceipt || row.psdResource || {};
+    for (const [tag, choice, sameBytes, unfinished] of [['n', null, false], ['i', 'include', false], ['e', 'exclude', false], ['a', 'accept', false],
+      ['s', null, true], ['u', 'include', false, true]]) {
+      const DA = desk(`DocA-q${tag}.psd`), DB = desk(`DocB-q${tag}.psd`), bad = desk(`BadDoc-q${tag}.psd`);
+      const g = await newProject('Two documents ' + tag, { before() {
+        writeWorking('.psd', DA, [], 611); writeWorking('.psd', DB, [], sameBytes ? 611 : 622); if (unfinished) fs.writeFileSync(bad, Buffer.from('not a Photoshop file'));
+      } });
+      if (unfinished) { manualDialogFor([DA, bad]); assert.equal((await callIpcRaw('projects:add-files', g.id)).error, 'add_files_partial_scan_failure'); }
+      else await g.add(DA);
+      const rowsOf = parent => [...g.current().files, ...(g.current().pendingFiles || [])].filter(row => row.source === 'psd-embedded' && tieOf(row).parentPath === parent);
+      const [a0] = rowsOf(DA), aBytes = sha(png(611)), bBytes = sha(png(sameBytes ? 611 : 622));
+      const toggle = async () => assert.ok(Array.isArray(await callIpcRaw('projects:remove-file', g.id,
+        metadataTestHooks.createProjectFileVisualIdentity(g.id, g.current().files.find(row => row.path === a0.path)))));
+      if (choice === 'include') { await toggle(); await toggle(); }
+      if (choice === 'exclude') await toggle();
+      if (choice === 'accept') g.current().files.find(row => row.path === a0.path).acceptedPending = true;
+      roundTripFakeStore();
+      fs.rmSync(a0.path, { force: true });                                             // A's cached output is lost
+      if (unfinished) { manualDialogFor([DB]); await callIpcRaw('projects:add-files', g.id); } else await g.add(DB);
+      const [a1, ...aExtra] = rowsOf(DA), bRows = rowsOf(DB);
+      assert.deepEqual(aExtra, [], `${tag}: one row for document A`);
+      assert.equal(a1.path, a0.path, `${tag}: A's row keeps its file name`);
+      assert.equal(tieOf(a1).outputDigest, aBytes, `${tag}: A's row keeps A's record`);
+      assert.equal(onDisk(a1.path), 'missing', `${tag}: A's file is not written from B; it stays missing until A is read again`);
+      assert.equal(bRows.length, 1, `${tag}: B has its own row at once`);
+      assert.notEqual(bRows[0].path, a0.path, `${tag}: not at A's file name`);
+      assert.deepEqual([tieOf(bRows[0]).outputDigest, onDisk(bRows[0].path)], [bBytes, bBytes], `${tag}: B's row holds B's bytes`);
+      if (choice === 'include') assert.ok(a1.individualContentInclude, `${tag}: A's choice stays on A's row`);
+      if (choice === 'accept') assert.equal(a1.acceptedPending, true);
+      if (choice === 'exclude') assert.ok(a1.individualContentExclusion);
+      if (!unfinished) {
+        const before = await g.review();
+        assert.equal(before.materializable, choice === 'exclude', `${tag}: without the pre-package pass A's missing row stops packaging unless excluded`);
+        await prePackage(g);
+        assert.equal(onDisk(a0.path), aBytes, `${tag}: the pre-package pass repairs A's file from A`);
+        const written = (await g.written(await g.review())).filter(name => name.startsWith('Embedded-Layer'));
+        assert.deepEqual(written, (choice === 'exclude' ? [bRows[0].path] : [a0.path, bRows[0].path]).map(file => path.basename(file)).sort(), tag);
+      }
+      await callIpcRaw('projects:delete', g.id);
+    }
   }, { realMainPsd: true }));
   // A lost cached output whose row carries an individual choice is refilled by a later
   // save only with the bytes that choice was made on; otherwise the save gets its own row.

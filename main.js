@@ -15726,14 +15726,16 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
       pendingIO = consume(message);
       return pendingIO;
     },
-    promote(chosenMissing = null) {
+    promote(chosenMissing = null, otherFileNames = null) {
       check();
-      // A missing output of this file whose row carries an individual choice
-      // keeps its name: only a stage with that row's bytes and original name
-      // takes it, and any other stage that was given the name is renamed before
-      // it is linked. Output digests are known only now, after every record.
-      if (chosenMissing?.size && stages.length) {
-        const reserved = new Set(chosenMissing.keys()), available = new Map(chosenMissing);
+      // Another file's output name is never taken by this file, whether or not
+      // its cached file exists. A missing output of this file whose row carries
+      // an individual choice keeps its name: only a stage with that row's bytes
+      // and original name takes it. Any other stage given a reserved name is
+      // renamed before it is linked; output digests are known only now.
+      if ((chosenMissing?.size || otherFileNames?.size) && stages.length) {
+        const reserved = new Set([...(chosenMissing ? chosenMissing.keys() : []), ...(otherFileNames || [])]);
+        const available = new Map([...(chosenMissing || [])].filter(([name]) => !otherFileNames?.has(name)));
         for (const name of reserved) usedNames.add(name);
         for (const stage of stages) {
           let target = null;
@@ -16289,16 +16291,17 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
 
     if (workerResult) {
       if (!isCurrent()) return [];
-      // The same-parent chosen-output rule applies here too; this route keeps
-      // its own naming otherwise (no other-file reservation).
+      // The same rules as the extraction below: another file's output name is
+      // never taken, and a same-parent chosen output is refilled only with its
+      // own bytes. The other-file names come from rows, not from the folder.
       const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + projectId);
       // The folder exists only if this run staged an output; a folder that
       // cannot be listed holds no cached file, so every name is absent.
       let listing = null;
       const listNames = () => { try { return new Set(fs.readdirSync(extractDir).map(entry => entry.toLowerCase())); } catch (_) { return new Set(); } };
-      const { chosen } = getChosenMissingPsdOutputs(getProjects().find(project => project.id === projectId), psdFilePath, extractDir,
+      const { chosen, otherParentNames } = getChosenMissingPsdOutputs(getProjects().find(project => project.id === projectId), psdFilePath, extractDir,
         name => (listing ??= listNames()).has(name));
-      return discoveredPaths.concat(workerResult.transaction.promote(chosen));
+      return discoveredPaths.concat(workerResult.transaction.promote(chosen, otherParentNames));
     }
 
     // Extract embedded files from psd.linkedFiles
