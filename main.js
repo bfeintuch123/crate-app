@@ -4148,13 +4148,41 @@ function isUnretainedExcludedScanSource(membership, file, { excludedAssetDocumen
       (excludedAssetDocuments && membership.excludedAssetDocumentKeys?.has(getTrackedFileDedupKey(file)) === true));
 }
 
+// A row excluded only by the bulk "Skip existing assets" decision: not an
+// action on that row (mirrors getIndividualAssetContentExclusions).
+function isBulkSkippedOnlyAssetRow(project, file) {
+  return project?.assetBaseline?.decision === 'skip' && file?.assetOrigin === 'existing' && !file.individualContentExclusion;
+}
+// The exclusion rule applies with a working-file selection record, or when an
+// asset-role row carries its own per-asset exclusion and another row names it
+// as an owner, producer or parent. This is a string test over stored fields
+// with no file-system access; the membership function confirms ownership on
+// normalized paths. A project without such a row does no added work.
+function isExclusionRuleActive(project) {
+  if (hasWorkingSourceSelectionState(project)) return true;
+  const keys = project?.excludedAssetKeys;
+  if (!Array.isArray(keys) || !keys.length) return false;
+  const excluded = new Set(keys), documents = new Set();
+  for (const file of project.files || []) {
+    if (typeof file?.path !== 'string' || !excluded.has(getAssetReviewExclusionKey(file)) || isWorkingSourceFile(file) ||
+        isBulkSkippedOnlyAssetRow(project, file)) continue;
+    documents.add(file.path.toLowerCase());
+  }
+  if (!documents.size) return false;
+  const names = value => typeof value === 'string' && documents.has(value.toLowerCase());
+  return [...(project.files || []), ...(project.pendingFiles || [])].some(file => file && (
+    (Array.isArray(file.dependencyOwners) && file.dependencyOwners.some(names)) || names(file.captureEvidence?.relationshipSourcePath) ||
+    names(file.captureEvidence?.sourceDocumentPath) || names(file.assetBaselineSourcePath) || names(file.parentPsd) ||
+    names(file.psdResource?.parentPath)));
+}
+
 function getWorkingSourceMembership(project, packageFiles = null) {
   const scopedProject = getIllustratorScopedProjectView(project);
   const files = deduplicateFiles(scopedProject?.files || []);
   const engaged = hasWorkingSourceSelectionState(project);
   // Whether the exclusion rule below applies to this project. Kept separate
   // from `engaged`, which also gates verification and required-asset roles.
-  const exclusionActive = engaged;
+  const exclusionActive = isExclusionRuleActive(project);
   const recoveryGuardKeys = getWorkingSourceRecoveryGuardKeys(project);
   const recoveryGuardPaths = new Set();
   let recoveryGuardInvalid = recoveryGuardKeys === null;
@@ -4235,6 +4263,21 @@ function getWorkingSourceMembership(project, packageFiles = null) {
   // the exclusion rule only; never for requirements, counts or verification.
   const ownershipEdges = new Map();
   for (const [source, links] of edges) ownershipEdges.set(source, new Map(links));
+  // Without a selection record the requirement graph omits embedded-output and
+  // resource edges; they join the ownership links here, for support only.
+  if (exclusionActive && !engaged) {
+    const link = (sourcePath, targetPath) => {
+      const source = normalizeTrackedFilePath(sourcePath), target = normalizeTrackedFilePath(targetPath);
+      if (!source || !target || source === target) return;
+      const links = ownershipEdges.get(source) || new Map(); links.set(target, targetPath); ownershipEdges.set(source, links);
+    };
+    for (const file of files) for (const output of getWorkingSourceVerification(project, file)?.requiredEmbeddedOutputs || []) link(file.path, output.path);
+    for (const file of [...files, ...(scopedProject?.pendingFiles || [])]) {
+      const resource = file.psdResource;
+      if (file.source === 'psd-embedded' && resource?.version === 1 && resource.current !== false &&
+          typeof resource.parentPath === 'string' && path.isAbsolute(resource.parentPath)) link(resource.parentPath, file.path);
+    }
+  }
   if (exclusionActive) for (const file of physicalFiles) {
     for (const ownerKey of recordedOwnerKeys(file)) {
       const links = ownershipEdges.get(ownerKey) || new Map(); links.set(normalizeTrackedFilePath(file.path), file.path); ownershipEdges.set(ownerKey, links);
@@ -4286,7 +4329,7 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     const individuallyExcluded = new Set(project?.excludedAssetKeys || []);
     if (individuallyExcluded.size) for (const [key, file] of byPath) {
       if (!ownershipEdges.has(key) || isWorkingSourceFile(file) || keptAsRequired(key) || !individuallyExcluded.has(getAssetReviewExclusionKey(file)) ||
-          (project.assetBaseline?.decision === 'skip' && file.assetOrigin === 'existing' && !file.individualContentExclusion)) continue;
+          isBulkSkippedOnlyAssetRow(project, file)) continue;
       excludedDocuments.set(key, file); excludedAssetDocumentKeys.add(getTrackedFileDedupKey(file));
     }
   }
@@ -17536,10 +17579,13 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   const inDesignSourceIdentity = ext === '.indd' ? getExplicitWorkingFileIdentity(currentProject, sourceRow) : null;
   const verificationScan = hasWorkingSourceSelectionState(currentProject) || !!options.workingSourceAttempt || options.verifySelectedSource === true;
   const previousVerification = sourceRow && getWorkingSourceVerification(currentProject, sourceRow);
-  const sourceFact = sourceRow && getWorkingSourceMembership(currentProject).facts.get(getTrackedFileDedupKey(sourceRow));
+  const sourceMembership = sourceRow && getWorkingSourceMembership(currentProject);
+  const sourceFact = sourceMembership && sourceMembership.facts.get(getTrackedFileDedupKey(sourceRow));
   const excludedPreparation = typeof options.excludedWorkingSourcePreparation === 'function' ? options.excludedWorkingSourcePreparation : null;
-  if (hasWorkingSourceSelectionState(currentProject) && sourceFact && !sourceFact.included &&
-      !(excludedPreparation && excludedPreparation(currentProject, sourceRow) === true)) {
+  // Without a selection record, skip only an excluded document or a row withheld with one.
+  const sourceSkipped = hasWorkingSourceSelectionState(currentProject) ? !!sourceFact && !sourceFact.included
+    : !!sourceRow && isUnretainedExcludedScanSource(sourceMembership, sourceRow);
+  if (sourceSkipped && !(excludedPreparation && excludedPreparation(currentProject, sourceRow) === true)) {
     if (ownsOperation) operation?.close();
     return { success: true, skipped: 'source-excluded' };
   }
@@ -18300,7 +18346,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
     const base = path.basename(presentationPath, ext);
     const currentProject = getProjects().find(p => p.id === projectId);
     if (!currentProject || !isAcceptedProjectFilePath(currentProject, presentationPath)) return;
-    if (hasWorkingSourceSelectionState(currentProject) && isUnretainedExcludedScanSource(getWorkingSourceMembership(currentProject),
+    if (isExclusionRuleActive(currentProject) && isUnretainedExcludedScanSource(getWorkingSourceMembership(currentProject),
       currentProject.files.find(file => normalizeTrackedFilePath(file.path) === normalizeTrackedFilePath(presentationPath)))) return;
 
     // Ensure temp dir exists: ~/.crate/presentation-assets/{projectId}/
@@ -19199,7 +19245,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
           let currentType = null;
           const LINKABLE_EXTS_SNAPSHOT = new Set(['.ai', '.indd', '.idml', '.psd', '.pdf', '.afdesign', '.afpub', '.afphoto']);
           const linkableForParse = [];
-          const snapshotMembership = hasWorkingSourceSelectionState(project) ? getWorkingSourceMembership(project) : null;
+          const snapshotMembership = isExclusionRuleActive(project) ? getWorkingSourceMembership(project) : null;
 
           for (const line of lsofOut.trim().split('\n')) {
             if (line.length === 0) continue;
@@ -20048,7 +20094,7 @@ registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileI
         const fingerprint = getAssetReviewContentFingerprint(removedFile);
         // An asset withheld with its explicitly excluded working file presents
         // as Excluded; Include records the owner's choice on the row itself.
-        const fact = hasWorkingSourceSelectionState(project)
+        const fact = isExclusionRuleActive(project)
           ? getWorkingSourceMembership(project).facts.get(getTrackedFileDedupKey(removedFile)) : null;
         const withheld = fact?.excludedSourceOnly === true && fact.included !== true;
         const reviewExcluded = isAssetReviewFileExcluded(project, removedFile);
@@ -20425,7 +20471,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   const operationCurrent = operation.current;
   const ordinaryPsdOutputBatches = [], ownerNotes = [];
   const scanSkipper = scanProject => {
-    const membership = hasWorkingSourceSelectionState(scanProject) ? getWorkingSourceMembership(scanProject) : null;
+    const membership = isExclusionRuleActive(scanProject) ? getWorkingSourceMembership(scanProject) : null;
     return (file, options) => !!membership && isUnretainedExcludedScanSource(membership, file, options);
   };
   const stagePrePackageFile = (project, file, observation, stageIndex = null) => {

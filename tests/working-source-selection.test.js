@@ -1915,6 +1915,30 @@ test('exclusion rule: a document an included file requires is not an excluded do
   assert.equal(guarded(f, placed), false);
 });
 
+test('exclusion rule without a selection record: only an individually excluded document that owns something applies it', () => {
+  const f = fixture(), keep = f.source('Keep.ai');
+  const placed = dependencyAsset(f, 'Placed.ai'), nested = linkedRow(f, 'Nested.png', [placed]), shared = linkedRow(f, 'Shared.png', [placed, keep]);
+  f.project.files.push(keep, placed, nested, shared);
+  assert.deepEqual(included(f, placed, nested, shared), [true, true, true]);
+  f.project.excludedAssetKeys = [nested.path];                           // a leaf: the rule stays inactive
+  assert.deepEqual(included(f, placed, nested, shared), [true, false, true]);
+  assert.equal(f.api.getWorkingSourceMembership(f.snapshot()).excludedAssetDocumentKeys.size, 0);
+  f.project.excludedAssetKeys = [placed.path];
+  assert.deepEqual(included(f, placed, nested, shared), [false, false, true]);
+  assert.deepEqual([factOf(f, nested).excludedSourceOnly, guarded(f, placed)], [true, true]);
+  f.toggleAsset(nested);                                                 // Include on the withheld row
+  assert.deepEqual(included(f, placed, nested, shared), [false, true, true]);
+  assert.equal(f.snapshot().files.find(row => row.path === nested.path).keptAfterSourceExclusion, true);
+  assert.equal(Object.hasOwn(f.snapshot(), 'workingSourceSelections'), false);
+  f.toggleAsset(nested);
+  // Bulk Skip alone is not an Exclude of the document.
+  Object.assign(f.project.files.find(row => row.path === placed.path), { assetOrigin: 'existing' });
+  f.project.assetBaseline = { decision: 'skip' };
+  f.project.excludedAssetKeys = [placed.path];
+  assert.deepEqual(included(f, placed, nested, shared), [false, true, true]);
+  assert.equal(guarded(f, placed), false);
+});
+
 // Seeded random projects checked against an independent statement of the rule:
 // every row's expected inclusion is a least fixed point (seeds are rows written
 // for their own reasons; a withheld candidate is written once any written row
@@ -1927,7 +1951,7 @@ function randomExclusionProject(f, rand) {
   const chance = p => rand() < p, pick = list => list[Math.floor(rand() * list.length)];
   const some = (list, max) => { const out = list.filter(() => chance(max / Math.max(1, list.length))); return out; };
   const project = { id: 'project-a', status: 'paused', files: [], excludedAssetKeys: [] };
-  if (chance(0.85)) project.workingSourceSelections = {};
+  if (chance(0.7)) project.workingSourceSelections = {};
   const sources = Array.from({ length: 2 + Math.floor(rand() * 3) }, (_, i) => f.source(`S${i}.ai`));
   const docs = Array.from({ length: 1 + Math.floor(rand() * 4) }, (_, i) => Object.assign(f.asset(`D${i}.ai`), { source: 'scan-on-open' }));
   const assets = Array.from({ length: 2 + Math.floor(rand() * 6) }, (_, i) => Object.assign(f.asset(`A${i}.png`), { source: 'scan-on-open' }));
@@ -1964,7 +1988,7 @@ function randomExclusionProject(f, rand) {
     if (chance(0.06)) row.acceptedPending = true;
     if (chance(0.35)) row.assetOrigin = 'existing';
     if (project.assetBaseline && row.assetOrigin === 'existing' && chance(0.5)) project.excludedAssetKeys.push(row.path);
-    if (chance(0.18)) {
+    if (chance(project.workingSourceSelections ? 0.18 : 0.3)) {
       if (!project.excludedAssetKeys.includes(row.path)) project.excludedAssetKeys.push(row.path);
       row.individualContentExclusion = 'e'.repeat(64);
     }
@@ -2004,9 +2028,8 @@ function expectedExclusionInclusion(project, keyOf) {
     if (receipt && receipt.selectionRevision === selection(row).revision) for (const ref of receipt.requiredReferences) requirementLinks.push([lower(row.path), lower(ref.path)]);
     if (producerOf(row)) requirementLinks.push([producerOf(row), lower(row.path)]);
   }
-  const active = engaged;
   links.push(...requirementLinks);
-  if (active) for (const row of rows) for (const owner of ownersOf(row)) links.push([owner, lower(row.path)]);
+  for (const row of rows) for (const owner of ownersOf(row)) links.push([owner, lower(row.path)]);
   const from = new Map();
   for (const [a, b] of links) if (a !== b) { if (!from.has(a)) from.set(a, new Set()); from.get(a).add(b); }
   const required = new Set();
@@ -2015,13 +2038,16 @@ function expectedExclusionInclusion(project, keyOf) {
     while (queue.length) { const at = queue.shift(); for (const [a, b] of requirementLinks) if (a === at && a !== b) { if (b !== lower(root.path)) required.add(b); if (!seen.has(b)) { seen.add(b); queue.push(b); } } }
   }
   const keptAsRequired = k => engaged && required.has(k);
+  // The rule is active with a selection record, or when an individually
+  // excluded asset-role row owns something (no selection record).
   const excluded = new Set(), workingRoots = [];
-  if (active) for (const row of rows) {
+  for (const row of rows) {
     const k = lower(row.path);
-    if (isSource(row)) { if (selection(row).userExcluded && !required.has(k)) { excluded.add(k); workingRoots.push(row); } continue; }
+    if (isSource(row)) { if (engaged && selection(row).userExcluded && !required.has(k)) { excluded.add(k); workingRoots.push(row); } continue; }
     if (from.has(k) && project.excludedAssetKeys.includes(row.path) && !keptAsRequired(k) &&
         !(project.assetBaseline?.decision === 'skip' && row.assetOrigin === 'existing' && !row.individualContentExclusion)) excluded.add(k);
   }
+  const active = engaged || excluded.size > 0;
   const walk = (roots, stop) => {
     const seen = new Set(), queue = [...roots];
     while (queue.length) for (const next of from.get(queue.shift()) || []) {
@@ -2071,7 +2097,7 @@ function expectedExclusionInclusion(project, keyOf) {
 test('exclusion rule: seeded random projects match an independent fixed point of the rule', () => {
   const f = fixture(), rand = seededRandom(0x5eed2611);
   const mismatch = { omitted: 0, extra: 0, projects: 0, excludedDocuments: 0 }, examples = [];
-  let rows = 0, withheld = 0, supported = 0, withExcludedDocuments = 0;
+  let rows = 0, withheld = 0, supported = 0, withExcludedDocuments = 0, withoutRecord = 0, withheldWithoutRecord = 0;
   const PROJECTS = 2500;
   for (let index = 0; index < PROJECTS; index++) {
     const project = randomExclusionProject(f, rand);
@@ -2080,6 +2106,7 @@ test('exclusion rule: seeded random projects match an independent fixed point of
     let bad = false;
     if (expected.excludedAssets.size) withExcludedDocuments++;
     withheld += expected.withheld; supported += expected.supported;
+    if (!Object.hasOwn(project, 'workingSourceSelections')) { withoutRecord++; withheldWithoutRecord += expected.withheld; }
     for (const row of project.files) {
       rows++;
       const actual = membership.facts.get(row.path.toLowerCase()).included, want = expected.written.has(row.path.toLowerCase());
@@ -2091,6 +2118,6 @@ test('exclusion rule: seeded random projects match an independent fixed point of
     if (JSON.stringify(actualDocuments) !== JSON.stringify(wantDocuments)) mismatch.excludedDocuments++;
     if (bad) mismatch.projects++;
   }
-  console.log('# EXCLUSION_PROPERTY ' + JSON.stringify({ generated: PROJECTS, rows, withheld, supported, withExcludedDocuments, mismatch }));
+  console.log('# EXCLUSION_PROPERTY ' + JSON.stringify({ generated: PROJECTS, rows, withheld, supported, withExcludedDocuments, withoutRecord, withheldWithoutRecord, mismatch }));
   assert.deepEqual(mismatch, { omitted: 0, extra: 0, projects: 0, excludedDocuments: 0 }, JSON.stringify(examples));
 });
