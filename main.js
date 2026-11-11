@@ -16262,11 +16262,11 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         .filter(row => row.source === 'psd-embedded');
       // An output name that belongs to another file's row is never handed to
       // this file, even when that row's cached file is missing: the row keeps
-      // its own parent's record. Within the same parent, on this ordinary
-      // route, a missing output whose row carries an individual choice is
-      // refilled by a later save only with the bytes that choice was made on;
-      // other bytes get their own row. Rows without a choice, and the owned
-      // baseline route, keep the ordinary same-parent refill.
+      // its own parent's record. Within the same parent, on every route
+      // (including the owned baseline scan of an unfinished first scan), a
+      // missing output whose row carries an individual choice is refilled by
+      // a later save only with the bytes that choice was made on; other bytes
+      // get their own row. Rows without a choice keep the ordinary refill.
       // The comparison is made per row, only for a row that names a parent.
       let psdKey = null, choiceKeys = null;
       const chosenMissing = new Map();
@@ -16277,7 +16277,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         if (!isDirectCacheChild(extractDir, row.path)) continue;
         const name = path.basename(row.path).toLowerCase();
         if (normalizeTrackedFilePath(parentPath) !== psdKey) usedEmbeddedNames.add(name);
-        else if (!options.onOwnedPsdOutputs && !usedEmbeddedNames.has(name) &&
+        else if (!usedEmbeddedNames.has(name) &&
             hasIndividualAssetChoice(project, row, choiceKeys ??= new Set(project.excludedAssetKeys || []))) {
           const receipt = row.psdExtractionReceipt || row.psdResource;
           chosenMissing.set(name, { name: path.basename(row.path), outputDigest: receipt?.outputDigest, originalName: receipt?.originalName });
@@ -16307,7 +16307,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         }
         // A chosen missing output is refilled only with the bytes it was chosen on.
         let chosenName = null;
-        if (!options.onOwnedPsdOutputs && !matches.length) for (const [name, chosen] of chosenMissing) {
+        if (!matches.length) for (const [name, chosen] of chosenMissing) {
           if (chosen.outputDigest !== outputDigest || chosen.originalName !== (lf.name || '')) continue;
           chosenMissing.delete(name); chosenName = chosen.name; break;
         }

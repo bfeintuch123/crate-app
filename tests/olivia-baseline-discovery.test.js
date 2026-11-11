@@ -8374,4 +8374,41 @@ function excludedSourceMembershipCases() {
       nc: { rows: ['Embedded-Layer.png'], oldRowBytes: 'other', materializable: true, written: ['Embedded-Layer.png', 'Embedded-Layer_1.png'] },
     });
   }, { realMainPsd: true }));
+  // The same rule while a project's first existing-assets scan is unfinished, where scans
+  // run the owned baseline extraction (Add Files with one unreadable Photoshop file holds it).
+  baselineTest('Photoshop outputs: during an unfinished first scan a later save never refills a chosen output with other bytes', { timeout: 300000 }, () => withEnv(async () => {
+    const results = {};
+    const digest = file => fs.existsSync(file) ? require('crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex') : null;
+    for (const [variant, choose, save] of [['hc', true, 'changed'], ['hi', true, 'identical'], ['nc', false, 'changed']]) {
+      const A = desk(`Held-${variant}.psd`), bad = desk(`Unreadable-${variant}.psd`), extra = desk(`ExtraLink-${variant}.png`);
+      const f = await newProject('Held first scan ' + variant, { before() {
+        writeWorking('.psd', A, [], 611); fs.writeFileSync(bad, Buffer.from('not a Photoshop file')); fs.writeFileSync(extra, png(697));
+      } });
+      manualDialogFor([A, bad]);
+      assert.equal((await callIpcRaw('projects:add-files', f.id)).error, 'add_files_partial_scan_failure');
+      assert.equal(f.current().assetBaseline.status, 'awaiting-first-scan');
+      const outputs = () => f.current().files.filter(row => row.source === 'psd-embedded');
+      const [a0] = outputs(), chosenDigest = digest(a0.path);
+      const toggle = async row => assert.ok(Array.isArray(await callIpcRaw('projects:remove-file', f.id,
+        metadataTestHooks.createProjectFileVisualIdentity(f.id, f.current().files.find(item => item.path === row.path)))));
+      if (choose) { await toggle(a0); await toggle(a0); }                               // Exclude, then Include again
+      roundTripFakeStore();
+      fs.rmSync(a0.path, { force: true });                                              // the cached output is lost
+      metadataTestHooks.clearPsdParseDebounce(A);
+      if (save === 'changed') writeWorking('.psd', A, [], 645); else writeWorking('.psd', A, [extra], 611);
+      assert.equal((await metadataTestHooks.runScanOnOpen(f.id, A, null, null)).success, true);
+      assert.equal(f.current().assetBaseline.status, 'awaiting-first-scan');
+      const rows = outputs(), a1 = rows.find(row => row.path !== a0.path);
+      const oldBytes = digest(a0.path);
+      results[variant] = { rows: rows.map(row => path.basename(row.path)).sort(),
+        oldRowBytes: oldBytes === null ? 'missing' : oldBytes === chosenDigest ? 'chosen' : 'other',
+        newRowBytes: a1 ? (digest(a1.path) === chosenDigest ? 'chosen' : 'other') : null,
+        newRowChoice: a1 ? !!(a1.individualContentInclude || a1.keptAfterSourceExclusion || a1.acceptedPending) : null };
+    }
+    assert.deepEqual(results, {
+      hc: { rows: ['Embedded-Layer.png', 'Embedded-Layer_1.png'], oldRowBytes: 'missing', newRowBytes: 'other', newRowChoice: false },
+      hi: { rows: ['Embedded-Layer.png'], oldRowBytes: 'chosen', newRowBytes: null, newRowChoice: null },
+      nc: { rows: ['Embedded-Layer.png'], oldRowBytes: 'other', newRowBytes: null, newRowChoice: null },
+    });
+  }, { realMainPsd: true }));
 }
