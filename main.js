@@ -11274,6 +11274,32 @@ function reserveUniqueName(name, usedNames) {
 
 // Concurrent PSDs may reserve the same name while their bytes are staged.
 // Only an exclusive link claims the destination; never replace a sibling.
+// Extracted outputs of this Photoshop file whose cached file is missing and
+// whose row carries an individual choice: name -> the bytes and original name
+// that choice was made on. Only an output with exactly those may refill the
+// name; any other output gets its own row. Also returns the names of other
+// files' outputs in the same folder. Parents are compared per row, and only
+// for a row that names one.
+function getChosenMissingPsdOutputs(project, psdFilePath, extractDir, isNamePresent) {
+  const chosen = new Map(), otherParentNames = new Set();
+  let psdKey = null, choiceKeys = null;
+  for (const row of [...(project?.files || []), ...(project?.pendingFiles || [])]) {
+    if (row.source !== 'psd-embedded') continue;
+    const parentPath = row.psdExtractionReceipt?.parentPath ?? row.psdResource?.parentPath;
+    if (typeof parentPath !== 'string') continue;
+    psdKey ??= normalizeTrackedFilePath(psdFilePath);
+    if (!isDirectCacheChild(extractDir, row.path)) continue;
+    const name = path.basename(row.path).toLowerCase();
+    if (normalizeTrackedFilePath(parentPath) !== psdKey) otherParentNames.add(name);
+    else if (!isNamePresent(name) &&
+        hasIndividualAssetChoice(project, row, choiceKeys ??= new Set(project.excludedAssetKeys || []))) {
+      const receipt = row.psdExtractionReceipt || row.psdResource;
+      chosen.set(name, { name: path.basename(row.path), outputDigest: receipt?.outputDigest, originalName: receipt?.originalName });
+    }
+  }
+  return { chosen, otherParentNames };
+}
+
 function promoteEmbeddedPsdStage(stage, extractDir, usedNames, assertCurrentAndOwned) {
   for (let attempt = 0; attempt < 1024; attempt++) {
     assertCurrentAndOwned();
@@ -15700,8 +15726,27 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
       pendingIO = consume(message);
       return pendingIO;
     },
-    promote() {
+    promote(chosenMissing = null) {
       check();
+      // A missing output of this file whose row carries an individual choice
+      // keeps its name: only a stage with that row's bytes and original name
+      // takes it, and any other stage that was given the name is renamed before
+      // it is linked. Output digests are known only now, after every record.
+      if (chosenMissing?.size && stages.length) {
+        const reserved = new Set(chosenMissing.keys()), available = new Map(chosenMissing);
+        for (const name of reserved) usedNames.add(name);
+        for (const stage of stages) {
+          let target = null;
+          for (const [name, chosen] of available) {
+            if (chosen.outputDigest !== stage.outputDigest || chosen.originalName !== stage.embeddedOriginalName) continue;
+            available.delete(name); target = chosen.name; break;
+          }
+          if (target) stage.extractPath = path.join(extractDir, target);
+          else if (reserved.has(path.basename(stage.extractPath).toLowerCase())) {
+            stage.extractPath = path.join(extractDir, reserveUniqueName(stage.embeddedOriginalName, usedNames));
+          }
+        }
+      }
       for (const stage of stages) {
         promoteEmbeddedPsdStage(stage, extractDir, usedNames, () => {
           check();
@@ -16244,7 +16289,13 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
 
     if (workerResult) {
       if (!isCurrent()) return [];
-      return discoveredPaths.concat(workerResult.transaction.promote());
+      // The same-parent chosen-output rule applies here too; this route keeps
+      // its own naming otherwise (no other-file reservation).
+      const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + projectId);
+      let listing = null;
+      const { chosen } = getChosenMissingPsdOutputs(getProjects().find(project => project.id === projectId), psdFilePath, extractDir,
+        name => (listing ??= new Set(fs.readdirSync(extractDir).map(entry => entry.toLowerCase()))).has(name));
+      return discoveredPaths.concat(workerResult.transaction.promote(chosen));
     }
 
     // Extract embedded files from psd.linkedFiles
@@ -16262,27 +16313,15 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         .filter(row => row.source === 'psd-embedded');
       // An output name that belongs to another file's row is never handed to
       // this file, even when that row's cached file is missing: the row keeps
-      // its own parent's record. Within the same parent, on every route
-      // (including the owned baseline scan of an unfinished first scan), a
-      // missing output whose row carries an individual choice is refilled by
-      // a later save only with the bytes that choice was made on; other bytes
-      // get their own row. Rows without a choice keep the ordinary refill.
-      // The comparison is made per row, only for a row that names a parent.
-      let psdKey = null, choiceKeys = null;
-      const chosenMissing = new Map();
-      for (const row of priorEmbeddedRows) {
-        const parentPath = row.psdExtractionReceipt?.parentPath ?? row.psdResource?.parentPath;
-        if (typeof parentPath !== 'string') continue;
-        psdKey ??= normalizeTrackedFilePath(psdFilePath);
-        if (!isDirectCacheChild(extractDir, row.path)) continue;
-        const name = path.basename(row.path).toLowerCase();
-        if (normalizeTrackedFilePath(parentPath) !== psdKey) usedEmbeddedNames.add(name);
-        else if (!usedEmbeddedNames.has(name) &&
-            hasIndividualAssetChoice(project, row, choiceKeys ??= new Set(project.excludedAssetKeys || []))) {
-          const receipt = row.psdExtractionReceipt || row.psdResource;
-          chosenMissing.set(name, { name: path.basename(row.path), outputDigest: receipt?.outputDigest, originalName: receipt?.originalName });
-        }
-      }
+      // its own parent's record. Within the same parent, on every extraction
+      // route (including the owned baseline scan of an unfinished first scan
+      // and, in promote(), the Add Files worker route), a missing output whose
+      // row carries an individual choice is refilled by a later save only with
+      // the bytes that choice was made on; other bytes get their own row. Rows
+      // without a choice keep the ordinary refill.
+      const reservation = getChosenMissingPsdOutputs(project, psdFilePath, extractDir, name => usedEmbeddedNames.has(name));
+      const chosenMissing = reservation.chosen;
+      for (const name of reservation.otherParentNames) usedEmbeddedNames.add(name);
       for (const name of chosenMissing.keys()) usedEmbeddedNames.add(name);
       const embeddedRecords = [];
       for (const [embeddedIndex, lf] of linkedFiles.entries()) {

@@ -8374,12 +8374,14 @@ function excludedSourceMembershipCases() {
       nc: { rows: ['Embedded-Layer.png'], oldRowBytes: 'other', materializable: true, written: ['Embedded-Layer.png', 'Embedded-Layer_1.png'] },
     });
   }, { realMainPsd: true }));
-  // The same rule while a project's first existing-assets scan is unfinished, where scans
-  // run the owned baseline extraction (Add Files with one unreadable Photoshop file holds it).
+  // The same rule while a project's first existing-assets scan is unfinished (Add Files with one
+  // unreadable Photoshop file holds it), through both of its entry points: a scan, which runs the
+  // owned baseline extraction, and adding the same file again, which runs the Add Files worker.
   baselineTest('Photoshop outputs: during an unfinished first scan a later save never refills a chosen output with other bytes', { timeout: 300000 }, () => withEnv(async () => {
     const results = {};
     const digest = file => fs.existsSync(file) ? require('crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex') : null;
-    for (const [variant, choose, save] of [['hc', true, 'changed'], ['hi', true, 'identical'], ['nc', false, 'changed']]) {
+    for (const [variant, choose, save, route] of [['hc', 'include', 'changed', 'scan'], ['hi', 'include', 'identical', 'scan'], ['nc', null, 'changed', 'scan'],
+      ['wc', 'include', 'changed', 'add'], ['wa', 'accept', 'changed', 'add'], ['wi', 'include', 'identical', 'add'], ['wn', null, 'changed', 'add']]) {
       const A = desk(`Held-${variant}.psd`), bad = desk(`Unreadable-${variant}.psd`), extra = desk(`ExtraLink-${variant}.png`);
       const f = await newProject('Held first scan ' + variant, { before() {
         writeWorking('.psd', A, [], 611); fs.writeFileSync(bad, Buffer.from('not a Photoshop file')); fs.writeFileSync(extra, png(697));
@@ -8391,12 +8393,14 @@ function excludedSourceMembershipCases() {
       const [a0] = outputs(), chosenDigest = digest(a0.path);
       const toggle = async row => assert.ok(Array.isArray(await callIpcRaw('projects:remove-file', f.id,
         metadataTestHooks.createProjectFileVisualIdentity(f.id, f.current().files.find(item => item.path === row.path)))));
-      if (choose) { await toggle(a0); await toggle(a0); }                               // Exclude, then Include again
+      if (choose === 'include') { await toggle(a0); await toggle(a0); }                  // Exclude, then Include again
+      if (choose === 'accept') f.current().files.find(row => row.path === a0.path).acceptedPending = true;
       roundTripFakeStore();
       fs.rmSync(a0.path, { force: true });                                              // the cached output is lost
       metadataTestHooks.clearPsdParseDebounce(A);
       if (save === 'changed') writeWorking('.psd', A, [], 645); else writeWorking('.psd', A, [extra], 611);
-      assert.equal((await metadataTestHooks.runScanOnOpen(f.id, A, null, null)).success, true);
+      if (route === 'scan') assert.equal((await metadataTestHooks.runScanOnOpen(f.id, A, null, null)).success, true);
+      else { manualDialogFor([A]); await callIpcRaw('projects:add-files', f.id); }     // the same file added again
       assert.equal(f.current().assetBaseline.status, 'awaiting-first-scan');
       const rows = outputs(), a1 = rows.find(row => row.path !== a0.path);
       const oldBytes = digest(a0.path);
@@ -8409,6 +8413,10 @@ function excludedSourceMembershipCases() {
       hc: { rows: ['Embedded-Layer.png', 'Embedded-Layer_1.png'], oldRowBytes: 'missing', newRowBytes: 'other', newRowChoice: false },
       hi: { rows: ['Embedded-Layer.png'], oldRowBytes: 'chosen', newRowBytes: null, newRowChoice: null },
       nc: { rows: ['Embedded-Layer.png'], oldRowBytes: 'other', newRowBytes: null, newRowChoice: null },
+      wc: { rows: ['Embedded-Layer.png', 'Embedded-Layer_1.png'], oldRowBytes: 'missing', newRowBytes: 'other', newRowChoice: false },
+      wa: { rows: ['Embedded-Layer.png', 'Embedded-Layer_1.png'], oldRowBytes: 'missing', newRowBytes: 'other', newRowChoice: false },
+      wi: { rows: ['Embedded-Layer.png'], oldRowBytes: 'chosen', newRowBytes: null, newRowChoice: null },
+      wn: { rows: ['Embedded-Layer.png'], oldRowBytes: 'other', newRowBytes: null, newRowChoice: null },
     });
   }, { realMainPsd: true }));
 }
