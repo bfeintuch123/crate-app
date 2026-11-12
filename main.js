@@ -22140,10 +22140,24 @@ const fontFactsCache = new Map();
 const installedFontCopyOffers = new Map();
 const pendingFontFilePickers = new Set();
 
+// Any name that decides what is written counts: the source path, the row's
+// extension, the package output (display) name and an embedded original name.
+function getFontRelevantNames(file) {
+  const names = [file.ext ? `x${file.ext}` : null, getPackageFileDisplayName(file), file.name, file.embeddedOriginalName];
+  if (!isScanOnSaveEmbeddedPsdFile(file)) names.push(file.path);
+  return names.filter(name => typeof name === 'string' && name);
+}
+
+// Every font-named row is diverted from the ordinary output path; the font
+// gate alone decides whether anything is written for it.
 function isGatedFontFile(file) {
-  if (!file || typeof file !== 'object' || isScanOnSaveEmbeddedPsdFile(file)) return false;
-  const ext = `${file.ext || path.extname(typeof file.path === 'string' ? file.path : '')}`.toLowerCase();
-  return fontHandoff.GATED_FONT_EXTENSIONS.has(ext);
+  if (!file || typeof file !== 'object') return false;
+  return getFontRelevantNames(file).some(name => fontHandoff.GATED_FONT_EXTENSIONS.has(path.extname(name).toLowerCase()));
+}
+
+// A font-named resource inside a Photoshop file has no file of its own.
+function isEmbeddedFontResource(file) {
+  return isGatedFontFile(file) && isScanOnSaveEmbeddedPsdFile(file);
 }
 
 function isGatedFontPath(filePath) {
@@ -22286,6 +22300,16 @@ function collectFontCandidates(project, files) {
     if (extra.postscriptName) group.requested.add(extra.postscriptName);
   };
   (files || []).forEach(file => {
+    if (isEmbeddedFontResource(file)) {
+      const parent = normalizeTrackedFilePath(file.parentPsd || file.path) || '';
+      const identity = `${parent}\0${Number.isInteger(file.embeddedIndex) ? file.embeddedIndex : ''}\0${file.embeddedOriginalName || ''}\0${getPackageFileDisplayName(file) || ''}`;
+      const key = crypto.createHash('sha256').update(`crate-font-embedded:v1:${identity}`).digest('hex').slice(0, 32);
+      if (!groups.has(key)) {
+        groups.set(key, { key, sourcePath: null, embedded: true, origins: new Set(['found']), requested: new Set(),
+          displayName: getPackageFileDisplayName(file) || 'Font file', addedAt: Number.isFinite(file.addedAt) ? file.addedAt : Infinity });
+      }
+      return;
+    }
     if (isGatedFontFile(file) && typeof file.path === 'string') {
       add(file.path, isExplicitUserCapturedFile(file) ? 'project-file' : 'found', { addedAt: file.addedAt });
     }
@@ -22303,6 +22327,7 @@ function getFontRowOrigin(group) {
 
 function getFontGateInput(group, inspected, handoff, homeDir) {
   return {
+    embedded: group.embedded === true,
     file: { state: inspected.fingerprint.state },
     readError: inspected.readError,
     faces: inspected.parsed?.faces || [],
@@ -22323,7 +22348,9 @@ function evaluateFontHandoff(project, files) {
   if (!groups.length) return null;
   const homeDir = os.homedir();
   const rows = groups.map(group => {
-    const inspected = inspectFontFile(group.sourcePath);
+    const inspected = group.embedded
+      ? { sourcePath: null, fingerprint: { state: 'virtual' }, realPath: null, sha256: null, parsed: null, readError: null }
+      : inspectFontFile(group.sourcePath);
     const gateInput = getFontGateInput(group, inspected, handoff, homeDir);
     return { group, inspected, gateInput, gate: fontHandoff.evaluateFontGate({ ...gateInput, conflict: false }) };
   });
@@ -22616,16 +22643,46 @@ function rememberInstalledFontCopyOffer(projectId, offer) {
   return id;
 }
 
-function storeInstalledFontSelection(projectId, selection) {
-  const key = getFontRowKey(selection.path);
+class FontOperationStaleError extends Error {
+  constructor() {
+    super('font_operation_stale');
+    this.name = 'FontOperationStaleError';
+    this.code = 'font_operation_stale';
+  }
+}
+
+// Authorization and project-operation fence for font actions that await. It
+// runs after every await and inside the mutation, before anything is written.
+function createFontOperationFence(projectId) {
+  const assertAccountCurrent = captureAccountAuthorization();
+  assertAccountCurrent();
+  const operation = captureProjectOperation(projectId);
+  if (!operation) return null;
+  return {
+    assert() {
+      assertAccountCurrent();
+      if (!operation.current() || packageInFlight) throw new FontOperationStaleError();
+    },
+    close() { operation.close(); },
+  };
+}
+
+// All selections from one request are written together, or none are.
+function storeInstalledFontSelections(projectId, selections, fence) {
   return mutateProject(projectId, project => {
+    fence.assert();
     const handoff = readProjectFontHandoff(project);
-    handoff.installed = handoff.installed.filter(item => item.postscriptName !== selection.postscriptName);
-    if (handoff.installed.length >= MAX_FONT_HANDOFF_SELECTIONS) return { error: 'font_limit_reached' };
-    handoff.installed.push({ ...selection, addedAt: Date.now() });
-    if (key && handoff.choices[key] === 'remove') delete handoff.choices[key];
+    let stored = 0;
+    for (const selection of selections) {
+      handoff.installed = handoff.installed.filter(item => item.postscriptName !== selection.postscriptName);
+      if (handoff.installed.length >= MAX_FONT_HANDOFF_SELECTIONS) break;
+      handoff.installed.push({ ...selection, addedAt: Date.now() });
+      const key = getFontRowKey(selection.path);
+      if (key && handoff.choices[key] === 'remove') delete handoff.choices[key];
+      stored++;
+    }
     writeProjectFontHandoff(project, handoff);
-    return { success: true };
+    return { success: true, stored };
   });
 }
 
@@ -22643,12 +22700,13 @@ function confirmInstalledFontCandidate(postscriptName, candidate) {
   };
 }
 
-async function addInstalledFontFamilies(projectId, request) {
+async function addInstalledFontFamilies(projectId, request, fence) {
   const families = Array.isArray(request?.families)
     ? [...new Set(request.families.filter(family => isStoredFontText(family)))].slice(0, MAX_FONT_REGISTRY_FAMILIES_PER_ADD) : [];
   if (!families.length) return { error: 'font_request_invalid' };
   let registered;
   try { registered = await listRegisteredFonts(); } catch (_) { return { error: 'font_registry_unavailable' }; }
+  fence.assert();
   const wanted = new Set(families);
   const faces = new Map();
   const refused = [];
@@ -22663,8 +22721,9 @@ async function addInstalledFontFamilies(projectId, request) {
   }
   let resolved;
   try { resolved = await resolveInstalledPostScriptNames([...faces.keys()]); } catch (_) { return { error: 'font_registry_unavailable' }; }
+  fence.assert();
   if (!getProjects().some(project => project.id === projectId)) return { error: 'not_found' };
-  let added = 0;
+  const selections = [];
   const unconfirmedFaces = [];
   const storedRealPaths = new Set(); // variable files only
   const choices = [];
@@ -22677,13 +22736,8 @@ async function addInstalledFontFamilies(projectId, request) {
     if (confirmed.length === 0) {
       unconfirmedFaces.push(face);
     } else if (confirmed.length === 1) {
-      const stored = storeInstalledFontSelection(projectId, {
-        postscriptName, family: face.family, style: face.style, path: confirmed[0].path,
-      });
-      if (stored?.success) {
-        added++;
-        if (confirmed[0].variable) storedRealPaths.add(normalizeTrackedFilePath(confirmed[0].path));
-      }
+      selections.push({ postscriptName, family: face.family, style: face.style, path: confirmed[0].path });
+      if (confirmed[0].variable) storedRealPaths.add(normalizeTrackedFilePath(confirmed[0].path));
     } else {
       choices.push({
         label: formatFontFaceLabel(face),
@@ -22701,6 +22755,9 @@ async function addInstalledFontFamilies(projectId, request) {
   // the file (for example "Skia-Regular_Bold"). Such a name is never confirmed,
   // but when the registry places it in a variable file already added through a
   // confirmed face, that whole file is already in the package.
+  const stored = selections.length ? storeInstalledFontSelections(projectId, selections, fence) : { success: true, stored: 0 };
+  if (!stored) return { error: 'not_found' };
+  const added = stored.stored;
   const unconfirmed = unconfirmedFaces
     .filter(face => !storedRealPaths.has(normalizeTrackedFilePath(face.path)))
     .map(face => ({ label: formatFontFaceLabel(face), reasonText: fontHandoff.FONT_REASON_TEXT.unconfirmed }));
@@ -22708,7 +22765,7 @@ async function addInstalledFontFamilies(projectId, request) {
   return { success: true, added, refused, unconfirmed, choices };
 }
 
-function chooseInstalledFontCopy(projectId, offerId) {
+function chooseInstalledFontCopy(projectId, offerId, fence) {
   const offer = typeof offerId === 'string' ? installedFontCopyOffers.get(offerId) : null;
   if (!offer || offer.projectId !== projectId || offer.expiresAt <= Date.now()) return { error: 'font_choice_expired' };
   const verified = confirmInstalledFontCandidate(offer.postscriptName, { path: offer.path });
@@ -22716,12 +22773,12 @@ function chooseInstalledFontCopy(projectId, offerId) {
   for (const [id, item] of installedFontCopyOffers) {
     if (item.projectId === projectId && item.postscriptName === offer.postscriptName) installedFontCopyOffers.delete(id);
   }
-  const stored = storeInstalledFontSelection(projectId, {
+  const stored = storeInstalledFontSelections(projectId, [{
     postscriptName: offer.postscriptName, family: offer.family, style: offer.style, path: offer.path,
-  });
+  }], fence);
   if (!stored) return { error: 'not_found' };
   invalidatePackageReviewForProject(projectId);
-  return stored;
+  return stored.stored ? { success: true } : { error: 'font_limit_reached' };
 }
 
 function getProjectFontCandidateGroup(project, rowKey) {
@@ -22766,6 +22823,7 @@ function setFontLicenceConfirmation(projectId, rowKey, request) {
   const result = mutateProject(projectId, project => {
     const group = getProjectFontCandidateGroup(project, rowKey);
     if (!group) return { error: 'font_not_found' };
+    if (group.embedded) return { error: 'font_not_eligible' };
     const handoff = readProjectFontHandoff(project);
     if (!request.confirmed) {
       delete handoff.confirmations[rowKey];
@@ -23660,43 +23718,56 @@ registerTrustedIpcHandler('fonts:list-installed', async (event, projectId) => {
   }
 });
 
-registerTrustedIpcHandler('fonts:add-installed', async (event, projectId, request) => {
-  const assertAccountCurrent = captureAccountAuthorization();
-  assertAccountCurrent();
+async function runFencedFontOperation(projectId, action) {
   if (packageInFlight) return { error: 'package_in_flight' };
-  const result = await addInstalledFontFamilies(projectId, request);
-  assertAccountCurrent();
-  return result;
-});
+  const fence = createFontOperationFence(projectId);
+  if (!fence) return { error: 'not_found' };
+  try {
+    return await action(fence);
+  } catch (error) {
+    if (error instanceof FontOperationStaleError) return { error: error.code };
+    throw error;
+  } finally {
+    fence.close();
+  }
+}
 
-registerTrustedIpcHandler('fonts:choose-installed-copy', async (event, projectId, offerId) => {
-  captureAccountAuthorization()();
-  if (packageInFlight) return { error: 'package_in_flight' };
-  return chooseInstalledFontCopy(projectId, offerId);
-});
+registerTrustedIpcHandler('fonts:add-installed', async (event, projectId, request) => (
+  runFencedFontOperation(projectId, fence => addInstalledFontFamilies(projectId, request, fence))
+));
+
+registerTrustedIpcHandler('fonts:choose-installed-copy', async (event, projectId, offerId) => (
+  runFencedFontOperation(projectId, fence => chooseInstalledFontCopy(projectId, offerId, fence))
+));
 
 registerTrustedIpcHandler('fonts:add-files', async (event, projectId) => {
   const assertAccountCurrent = captureAccountAuthorization();
   assertAccountCurrent();
   if (packageInFlight) return { error: 'package_in_flight' };
-  if (!getProjects().some(project => project.id === projectId)) return { error: 'not_found' };
   if (pendingFontFilePickers.has(projectId)) return { error: 'font_picker_open' };
+  const operation = captureProjectOperation(projectId);
+  if (!operation) return { error: 'not_found' };
   pendingFontFilePickers.add(projectId);
-  let dialogResult;
   try {
-    dialogResult = await dialog.showOpenDialog({
-      properties: ['openFile', 'multiSelections'],
-      title: 'Add Font Files',
-      filters: [{ name: 'Font Files', extensions: ['otf', 'ttf', 'ttc', 'otc'] }],
-    });
+    let dialogResult;
+    try {
+      dialogResult = await dialog.showOpenDialog({
+        properties: ['openFile', 'multiSelections'],
+        title: 'Add Font Files',
+        filters: [{ name: 'Font Files', extensions: ['otf', 'ttf', 'ttc', 'otc'] }],
+      });
+    } finally {
+      pendingFontFilePickers.delete(projectId);
+    }
+    showTrayWindow();
+    if (!dialogResult || dialogResult.canceled) return { success: true, added: 0, canceled: true };
+    assertAccountCurrent();
+    if (packageInFlight) return { error: 'package_in_flight' };
+    if (!operation.current()) return { error: 'font_operation_stale' };
+    return addFontFilePaths(projectId, Array.isArray(dialogResult.filePaths) ? dialogResult.filePaths.slice(0, MAX_FONT_HANDOFF_SELECTIONS) : []);
   } finally {
-    pendingFontFilePickers.delete(projectId);
+    operation.close();
   }
-  showTrayWindow();
-  if (!dialogResult || dialogResult.canceled) return { success: true, added: 0, canceled: true };
-  assertAccountCurrent();
-  if (packageInFlight) return { error: 'package_in_flight' };
-  return addFontFilePaths(projectId, Array.isArray(dialogResult.filePaths) ? dialogResult.filePaths.slice(0, MAX_FONT_HANDOFF_SELECTIONS) : []);
 });
 
 registerTrustedIpcHandler('fonts:set-row-choice', async (event, projectId, rowKey, choice) => {

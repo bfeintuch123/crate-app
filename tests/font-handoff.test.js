@@ -302,3 +302,38 @@ test('fonts note is deterministic and the bundled OFL text is the full licence',
     assert.equal(typeof FONT_REASON_TEXT[reason], 'string', reason);
   }
 });
+
+function tableRecord(bytes, tag) {
+  for (let index = 0; index < bytes.readUInt16BE(4); index++) {
+    const base = 12 + index * 16;
+    if (bytes.toString('latin1', base, base + 4) === tag) return base;
+  }
+  throw new Error(`no ${tag}`);
+}
+
+test('name records and strings must lie inside the declared name table', () => {
+  const ofl = englishNames({ licence: OFL_STATEMENT });
+  const truncated = buildFont({ names: ofl });
+  truncated.writeUInt32BE(6, tableRecord(truncated, 'name') + 12);
+  assert.throws(() => readFontFaces(truncated), error => error instanceof FontReadError && error.code === 'malformed');
+
+  // Records inside the table but string storage pointing past its end.
+  const shortStorage = buildFont({ names: ofl });
+  const nameRecordBase = tableRecord(shortStorage, 'name');
+  const declared = shortStorage.readUInt32BE(nameRecordBase + 12);
+  shortStorage.writeUInt32BE(declared - 40, nameRecordBase + 12);
+  assert.throws(() => readFontFaces(shortStorage), error => error instanceof FontReadError && error.code === 'malformed');
+});
+
+test('fvar axes and instances must lie inside the declared fvar table', () => {
+  const names = [...englishNames({ family: 'Flex', postscriptName: 'Flex-Regular' }), nameRecord(256, 'Bold')];
+  const font = buildFont({ names, fvar: { instances: [{ subfamilyNameId: 256 }] } });
+  font.writeUInt32BE(16, tableRecord(font, 'fvar') + 12);
+  assert.throws(() => readFontFaces(font), error => error instanceof FontReadError && error.code === 'malformed');
+});
+
+test('a font stored inside another file is excluded whatever the choice or confirmation', () => {
+  const unlock = { choice: 'include', confirmation: { sha256: SHA_A, wordingVersion: FONT_CONFIRMATION_WORDING_VERSION } };
+  assert.deepEqual(evaluateFontGate(gateInput({ ...unlock, embedded: true, faces: [] })), { outcome: 'excluded', reason: 'embedded', basis: null });
+  assert.equal(typeof FONT_REASON_TEXT.embedded, 'string');
+});

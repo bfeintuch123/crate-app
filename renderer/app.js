@@ -5283,6 +5283,8 @@ const FONT_ACTION_ERRORS = {
   font_choice_expired: 'That choice expired. Add the font again.',
   font_limit_reached: 'Too many fonts are added to this project.',
   font_picker_open: 'A font file picker is already open.',
+  font_operation_stale: 'The project changed while Crate was checking fonts. Try again.',
+  package_in_flight: 'Packaging is in progress. Try again when it finishes.',
 };
 let packageReviewFontState = { projectId: null, families: [], selected: new Set(), choices: [] };
 

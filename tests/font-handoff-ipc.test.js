@@ -486,6 +486,51 @@ function cases() {
     assert.ok(!JSON.stringify(result.fontsNotIncluded).includes(f.dir), 'no path in the font report');
   });
 
+  fontTest('an expired sign-in during installed-font lookup leaves the project unchanged', async () => {
+    const f = await fixture('Expiry');
+    const font = path.join(fontsDir(), 'BrandSans-Regular.otf');
+    writeFont(font, brand('Regular', { licence: OFL_STATEMENT }));
+    registerInstalled(font, 'Regular');
+    const previousNow = testAccountSession.now;
+    registryResolveOverride = name => {
+      testAccountSession.now = () => testAccountSession.accessExpiresAt;
+      return [[name, 'Brand Sans', 'Regular', font]];
+    };
+    try {
+      await assert.rejects(callIpcRaw('fonts:add-installed', f.project.id, { families: ['Brand Sans'] }), /Sign in/);
+    } finally {
+      testAccountSession.now = previousNow;
+    }
+    const stored = storeInstance.data.projects.find(item => item.id === f.project.id);
+    assert.equal(stored.fontHandoff, undefined, 'no selection persisted by an unauthorized request');
+  });
+
+  fontTest('a font stored inside a Photoshop file is never packaged and is reported', async () => {
+    const f = await fixture('Embedded');
+    const parentPsd = path.join(f.dir, 'Parent.psd');
+    fs.writeFileSync(parentPsd, Buffer.from('PSD container bytes'));
+    currentPsdFixture = { children: [], linkedFiles: [{ name: 'Restricted.otf', data: buildFont({ fsType: 2 }) }] };
+    await setProjectFiles(f.project.id, { files: [
+      { path: f.image, name: 'Logo.png', ext: '.png', addedAt: Date.now(), source: 'manual-browse' },
+      { path: parentPsd, parentPsd, name: 'Restricted.otf', ext: '.otf', source: 'scan-on-save-embedded', embedded: true,
+        embeddedOriginalName: 'Restricted.otf', embeddedIndex: 0, fileId: 'synthetic-font-resource' },
+    ] });
+    const reviewResult = await review(f);
+    assert.ok(!reviewResult.files.some(file => file.name === 'Restricted.otf'), 'not an ordinary output');
+    const embedded = row(reviewResult, 'Restricted.otf');
+    assert.equal(embedded.outcome, 'excluded');
+    assert.equal(embedded.reason, 'embedded');
+    assert.equal(embedded.canConfirm, false);
+    assert.equal(embedded.canInclude, false);
+    await callIpcRaw('fonts:set-row-choice', f.project.id, embedded.key, 'include');
+    assert.equal(row(await review(f), 'Restricted.otf').outcome, 'excluded');
+    const { result } = await packageNow(f);
+    assert.equal(result.success, true, JSON.stringify(result));
+    const tree = listTree(result.folderPath);
+    assert.ok(!tree.some(file => /\.(otf|ttf|ttc|otc)$/i.test(file)), tree.join(', '));
+    assert.match(fs.readFileSync(path.join(result.folderPath, 'Fonts', 'Fonts in this package.txt'), 'utf8'), /Restricted\.otf: Stored inside a Photoshop file/);
+  });
+
   fontTest('registry failure reports unavailable and leaves packaging untouched', async () => {
     const f = await fixture();
     registryFailure = true;

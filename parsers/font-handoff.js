@@ -71,6 +71,13 @@ function need(buffer, offset, length) {
   }
 }
 
+// Every read inside a table must stay inside that table's declared span, so a
+// malformed file cannot borrow names or licence text from elsewhere.
+function needIn(buffer, table, offset, length) {
+  need(buffer, offset, length);
+  if (offset < table.offset || offset + length > table.offset + table.length) throw new FontReadError('malformed');
+}
+
 // English only: Windows US English, then Macintosh Roman English, then Unicode.
 // Other-language Windows records are never used, even when listed first.
 function nameRecordScore(platform, encoding, language) {
@@ -82,11 +89,11 @@ function nameRecordScore(platform, encoding, language) {
 
 function readNameTable(buffer, table) {
   if (!table) return new Map();
-  need(buffer, table.offset, 6);
+  needIn(buffer, table, table.offset, 6);
   const count = buffer.readUInt16BE(table.offset + 2);
   const storage = table.offset + buffer.readUInt16BE(table.offset + 4);
   if (count > MAX_NAME_RECORDS) throw new FontReadError('malformed');
-  need(buffer, table.offset + 6, count * 12);
+  needIn(buffer, table, table.offset + 6, count * 12);
   const best = new Map();
   for (let index = 0; index < count; index++) {
     const base = table.offset + 6 + index * 12;
@@ -97,8 +104,8 @@ function readNameTable(buffer, table) {
     const length = buffer.readUInt16BE(base + 8);
     const offset = storage + buffer.readUInt16BE(base + 10);
     const score = nameRecordScore(platform, encoding, language);
+    needIn(buffer, table, offset, length);
     if (!score || (best.get(nameId)?.score || 0) >= score) continue;
-    need(buffer, offset, length);
     const raw = buffer.subarray(offset, offset + length);
     best.set(nameId, { score, text: platform === 1 ? decodeMacRoman(raw) : decodeUtf16be(raw) });
   }
@@ -107,15 +114,16 @@ function readNameTable(buffer, table) {
 
 function readFvar(buffer, table, names) {
   if (!table) return null;
-  need(buffer, table.offset, 16);
+  needIn(buffer, table, table.offset, 16);
   const axesOffset = buffer.readUInt16BE(table.offset + 4);
   const axisCount = buffer.readUInt16BE(table.offset + 8);
   const axisSize = buffer.readUInt16BE(table.offset + 10);
   const instanceCount = buffer.readUInt16BE(table.offset + 12);
   const instanceSize = buffer.readUInt16BE(table.offset + 14);
   if (instanceCount > MAX_FVAR_INSTANCES || instanceSize < axisCount * 4 + 4) throw new FontReadError('malformed');
+  needIn(buffer, table, table.offset + axesOffset, axisCount * axisSize);
   const start = table.offset + axesOffset + axisCount * axisSize;
-  need(buffer, start, instanceCount * instanceSize);
+  needIn(buffer, table, start, instanceCount * instanceSize);
   const instances = [];
   for (let index = 0; index < instanceCount; index++) {
     const base = start + index * instanceSize;
@@ -266,6 +274,9 @@ function gateResult(outcome, reason = null, basis = null) {
 // The gate. Order matters: availability, then every exclusion (no control can
 // pass these), then the user's own choices, then permission.
 function evaluateFontGate(input) {
+  // A font inside another file (for example a Photoshop resource) has no
+  // reviewed file of its own to check, so it is never packaged.
+  if (input?.embedded === true) return gateResult('excluded', 'embedded');
   const state = input?.file?.state;
   if (state === 'missing') return gateResult('unavailable', 'missing');
   if (state === 'symlink') return gateResult('excluded', 'symlink');
@@ -307,6 +318,7 @@ const FONT_REASON_TEXT = Object.freeze({
   conflict: 'Another font file here has the same font name with different contents. Remove one of them.',
   'licence-unknown': 'Crate can\'t tell whether this font\'s licence allows sharing it. Confirm below to include it.',
   duplicate: 'Same file as another font in this package. It is copied once.',
+  embedded: 'Stored inside a Photoshop file. Crate can\'t check it, so it isn\'t packaged.',
 });
 
 // The fonts note is read by the people receiving the package, so reasons that
@@ -321,6 +333,7 @@ const FONT_NOTE_REASON_TEXT = Object.freeze({
   missing: 'The font file was no longer available on the sender\'s Mac.',
   unreadable: 'Crate couldn\'t open this font file on the sender\'s Mac.',
   'adobe-fonts': 'Activated through Adobe Fonts. It can\'t be packaged. Activate it with your own Adobe account.',
+  embedded: 'Stored inside a Photoshop file on the sender\'s Mac. Crate couldn\'t check it, so it was not packaged.',
 });
 
 const FONT_ORIGIN_TEXT = Object.freeze({
