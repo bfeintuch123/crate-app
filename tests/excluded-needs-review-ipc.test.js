@@ -288,4 +288,101 @@ function excludedCases() {
     for (const index of [0, 499, 1000]) assert.ok(included.has(rows[index].path));
     assert.equal((await f.workspace()).excludedPendingFiles.length, count + 1 - 3);
   });
+
+  // --- End-to-end choice, scan and + Add Files paths (real IPC) ---
+  const resolveChoice = (f, entry, choice, predecessorIdentity = null) => callIpcRaw('projects:resolve-working-file-choice', f.id,
+    { id: entry.id, revision: entry.revision, choice, predecessorIdentity });
+  async function addThroughPicker(f, name) {
+    if (!fs.existsSync(desk(name))) fs.writeFileSync(desk(name), name.endsWith('.ai') ? '%PDF-1.7\n%%EOF\n' : `synthetic ${name}`);
+    manualDialogFor([desk(name)]);
+    const result = await callIpcRaw('projects:add-files', f.id);
+    assert.ok(getAddFilesResultFiles(result).some(row => row.path === desk(name)), JSON.stringify(result));
+    clearTrackedTimers();
+  }
+  // Two selected working files (A, C) added through the real picker, their own choice answered.
+  async function selectedSourcesFixture(label) {
+    const f = await fixture(label, { sources: [] });
+    await addThroughPicker(f, 'A.ai');
+    await addThroughPicker(f, 'C.ai');
+    const initial = (await f.workspace()).workingFileChoices.choices[0];
+    assert.ok(initial?.ready, JSON.stringify(initial));
+    assert.equal((await resolveChoice(f, initial, 'keep-both')).success, true);
+    const row = pendingRow('B.ai');
+    if (!fs.existsSync(row.path)) fs.writeFileSync(row.path, '%PDF-1.7\n%%EOF\n');
+    metadataTestHooks.mutateProjectForTest(f.id, project => { project.pendingFiles = [{ ...structuredClone(row), addedAt: Date.now() }]; return {}; });
+    const target = (await f.workspace()).pendingFiles.find(file => file.name === 'B.ai')?.visualIdentity;
+    assert.ok(target, 'B.ai is in Needs Review');
+    return { f, target };
+  }
+  const choiceSummary = entry => entry && ({ route: entry.route, ready: entry.ready, source: entry.source?.name,
+    predecessors: (entry.predecessors || []).map(item => item.name).sort() });
+
+  for (const choice of ['replace', 'keep-both']) {
+    excludedTest(`Include from Excluded raises the same Replace/Keep both choice as a direct accept, and ${choice} resolves it`, { timeout: 60000 }, async () => {
+      const summaries = {};
+      for (const route of ['direct', 'excluded']) {
+        const { f, target } = await selectedSourcesFixture(`choice-${choice}-${route}`);
+        if (route === 'excluded') {
+          assert.ok(Array.isArray(await f.reject(target)));
+          const before = await f.workspace();
+          assert.equal(before.workingFileChoices.choices.length, 0, 'excluding raises no choice');
+          assert.deepEqual(before.excludedPendingFiles.map(file => file.name), ['B.ai']);
+        }
+        assert.ok(await f.accept(target), `${route} include`);
+        const ws = await f.workspace();
+        const entry = ws.workingFileChoices.choices.find(item => item.source?.name === 'B.ai');
+        assert.ok(entry, `${route}: choice raised`);
+        assert.equal(entry.route, 'accepted-pending');
+        summaries[route] = choiceSummary(entry);
+        const record = f.current().files.find(file => file.name === 'B.ai');
+        assert.equal(metadataTestHooks.getWorkingSourceVerificationForTest(f.current(), record)?.status, 'scanned', `${route}: scan ran`);
+        assert.equal(entry.ready, true, JSON.stringify(entry));
+        const predecessor = entry.predecessors.find(item => item.name === 'A.ai');
+        const response = await resolveChoice(f, entry, choice, choice === 'replace' ? predecessor.visualIdentity : null);
+        assert.equal(response.success, true, JSON.stringify(response));
+        const after = await f.workspace();
+        const selection = name => after.files.find(row => row.name === name)?.sourceSelection;
+        assert.deepEqual(['A.ai', 'B.ai', 'C.ai'].map(selection),
+          choice === 'replace' ? ['excluded', 'selected', 'selected'] : ['selected', 'selected', 'selected'], `${route} ${choice} membership`);
+        assert.equal(after.workingFileChoices.choices.length, 0);
+        assert.equal(after.excludedPendingFiles.length, 0);
+        assert.equal(f.current().excludedAssetKeys.includes(desk('B.ai')), false);
+      }
+      assert.deepEqual(summaries.excluded, summaries.direct, 'identical choice record for both paths');
+    });
+  }
+
+  excludedTest('Include from Excluded with no other selected working file raises no choice and still scans', { timeout: 30000 }, async () => {
+    const row = pendingRow('Solo.ai');
+    const f = await fixture('solo-design', { sources: [], pending: [row] });
+    const target = (await f.workspace()).pendingFiles[0].visualIdentity;
+    assert.ok(Array.isArray(await f.reject(target)));
+    assert.ok(await f.accept(target));
+    const ws = await f.workspace();
+    assert.equal(ws.workingFileChoices.choices.length, 0);
+    const solo = ws.files.find(file => file.name === 'Solo.ai');
+    assert.deepEqual([solo.protectedSource, solo.sourceSelection], [true, 'selected']);
+    assert.equal(metadataTestHooks.getWorkingSourceVerificationForTest(f.current(), f.current().files.find(file => file.name === 'Solo.ai'))?.status, 'scanned');
+  });
+
+  excludedTest('+ Add Files of a remembered file includes it and prunes only its record; other records and legacy keys are untouched', { timeout: 30000 }, async () => {
+    const rows = [pendingRow('Readd.png'), pendingRow('Other.png')];
+    const f = await fixture('add-files-prune', { pending: rows });
+    f.current().excludedAssetKeys = [desk('Legacy.png')];
+    roundTripFakeStore();
+    for (const row of rows) assert.ok(Array.isArray(await f.reject(row.path)));
+    assert.deepEqual(f.current().excludedPendingFiles.map(record => record.name), ['Readd.png', 'Other.png']);
+
+    await addThroughPicker(f, 'Readd.png');
+
+    assert.deepEqual(f.current().excludedPendingFiles.map(record => record.name), ['Other.png'], 'only the re-added file is pruned');
+    assert.deepEqual([...f.current().excludedAssetKeys].sort(), [desk('Legacy.png'), desk('Other.png')].sort(),
+      '+ Add Files clears only its own exclusion; the other record and the legacy key keep theirs');
+    const ws = await f.workspace();
+    assert.deepEqual(ws.excludedPendingFiles.map(file => file.name), ['Other.png']);
+    const readded = ws.files.find(file => file.name === 'Readd.png');
+    assert.deepEqual([readded.excluded, readded.included], [false, true], 'the explicitly added file is Included');
+    assert.ok((await metadataTestHooks.selectProjectFilesForPackagingForTest(f.id)).some(file => file.path === desk('Readd.png')));
+    assert.equal((await metadataTestHooks.selectProjectFilesForPackagingForTest(f.id)).some(file => file.path === desk('Other.png')), false);
+  });
 }

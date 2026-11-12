@@ -1424,3 +1424,17 @@ for (const surface of ['working-assets-list', 'project-file-list']) {
     });
   }
 }
+
+test('recovery Include says "Including the working-file role…", sends the unchanged restore action and refuses a second press', async () => {
+  const f = await recoverySetup();
+  const row = f.recoveryRow(), include = buttonFor(row, 'Include'), gate = deferred();
+  assert.match(include.getAttribute('aria-label'), /^Include Original\.ai as a working file$/);
+  f.crate.setWorkingSourceSelection = async (...args) => { f.calls.push(args); return gate.promise; };
+  const pending = f.activate('Include');
+  assert.match(getElementTreeText(row), /Including the working-file role…/);
+  assert.equal(include.disabled, true);
+  assert.equal(await f.activate('Include'), false, 'a second press is ignored');
+  assert.equal(f.calls.length, 1);
+  assert.deepEqual(clone(f.calls[0]), [f.project.id, 'owned-source', { action: 'restore', expectedRevision: 3 }]);
+  gate.resolve({ success: false, error: 'working_source_selection_stale' }); await pending;
+});

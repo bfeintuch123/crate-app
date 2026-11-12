@@ -9341,3 +9341,111 @@ test('a file excluded from Needs Review shows as Excluded with one [+], counts o
   assert.equal(elements['filter-count-added'].textContent, '1');
   assert.equal(document.activeElement.dataset.rowAction, 'exclude', 'focus moves to the same row\'s new [x]');
 });
+
+test('every changed message is exact: Existing batch toasts, batch reasons, and row failure messages that re-enable their button', async () => {
+  // Existing assets batch: "Existing assets excluded" / "Existing assets included" through the cohort IPC.
+  {
+    const { document, elements } = createInteractiveRendererDom();
+    const existing = { name: 'Existing.png', path: '/synthetic/Existing.png', ext: '.png', assetOrigin: 'existing', projectRole: 'asset' };
+    const project = { id: 'existing-toasts', files: [{ name: 'Workspace.ai', path: '/synthetic/Workspace.ai', ext: '.ai', assetOrigin: 'added', projectRole: 'source' }, existing],
+      pendingFiles: [], excludedAssetKeys: [], assetBaseline: { status: 'included', decision: 'include' } };
+    let current = cloneTestValue(project);
+    const decisions = [];
+    const renderer = loadRendererHelpers(document, { crate: {
+      setExistingAssetsDecision: async (projectId, decision) => {
+        decisions.push(decision);
+        current = { ...current, excludedAssetKeys: decision === 'skip' ? [existing.path] : [],
+          assetBaseline: decision === 'skip' ? { status: 'skipped', decision: 'skip' } : { status: 'included', decision: 'include' } };
+        return { success: true, project: current };
+      },
+      getProjects: async () => [cloneTestValue(current)],
+    } });
+    renderer.testProject = project;
+    vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+    await renderer.ensureProjectAssetWorkspace(project);
+    assert.equal(elements['btn-skip-all-existing'].textContent, 'Exclude All Existing');
+    assert.equal(elements['btn-skip-all-existing'].getAttribute('aria-label'), 'Exclude all existing assets');
+    assert.equal(await renderer.submitExistingAssetsBatchDecision('skip'), true);
+    assert.equal(elements['toast-message'].textContent, 'Existing assets excluded');
+    vm.runInContext('state.projects = [' + JSON.stringify(current) + '];', renderer);
+    await renderer.ensureProjectAssetWorkspace(vm.runInContext('state.projects[0]', renderer));
+    assert.equal(await renderer.submitExistingAssetsBatchDecision('include'), true);
+    assert.equal(elements['toast-message'].textContent, 'Existing assets included');
+    assert.deepEqual(decisions, ['skip', 'include']);
+  }
+
+  // Batch reasons, full text.
+  {
+    const mixed = createPendingBatchProject('reason-mixed');
+    mixed.pendingFiles[3].captureState = 'needs-save';
+    const f = await loadPendingBatchFixture({ project: mixed });
+    assert.equal(f.elements['asset-review-batch-reason'].textContent,
+      'Include All and Exclude All apply only to eligible review items. Other items stay unchanged.');
+    const unidentified = createPendingBatchProject('reason-unidentified');
+    unidentified.pendingFiles = [{ name: 'Unidentified.png', captureState: 'pending' }];
+    const g = await loadPendingBatchFixture({ project: unidentified });
+    assert.equal(g.elements['asset-review-batch-reason'].textContent,
+      'Crate cannot identify which files to update. Include All and Exclude All are unavailable.');
+  }
+
+  // A row decision that throws: exact message; the row stays and its buttons are usable again.
+  {
+    const f = await loadPendingBatchFixture({ id: 'row-throws' });
+    f.renderer.window.crate.rejectPending = async () => { throw new Error('synthetic reject failure'); };
+    const row = pendingRowNamed(f, 'Needs_1.png');
+    pendingRowButtons(row).exclude.click();
+    await settleRendererActions(f.renderer);
+    assert.equal(f.elements['toast-message'].textContent, 'Crate could not exclude Needs_1.png. Try again.');
+    const again = pendingRowButtons(pendingRowNamed(f, 'Needs_1.png'));
+    assert.equal(again.exclude.disabled, false);
+    assert.equal(again.include.disabled, false);
+    assert.equal(vm.runInContext('rendererActionsInFlight.size', f.renderer), 0);
+  }
+
+  // Asset row [x]: an unconfirmed toggle and a thrown toggle, each re-enabling the button.
+  for (const mode of ['unconfirmed', 'throws']) {
+    const { document, elements } = createInteractiveRendererDom();
+    const added = { name: 'Texture.png', ext: '.png', assetOrigin: 'added', projectRole: 'asset', protectedSource: false,
+      excluded: false, visualIdentity: 'texture-identity', visualRevision: 'texture-revision' };
+    const project = { id: `asset-row-${mode}`, name: 'Asset row', type: 'branding', status: 'watching', files: [added], pendingFiles: [],
+      excludedAssetKeys: [], assetBaseline: { status: 'included', decision: 'include' } };
+    const renderer = loadRendererHelpers(document, { crate: {
+      removeFile: async () => { if (mode === 'throws') throw new Error('synthetic toggle failure'); },
+      getProjects: async () => [cloneTestValue(project)],
+      getAssetWorkspace: async () => ({ projectId: project.id, files: [added], pendingFiles: [] }),
+    } });
+    renderer.testProject = project;
+    vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+    renderer.renderAssetWorkspace(project, {}, project.files);
+    const button = elements['added-assets-list'].children[0].children.find(child => child.tagName === 'BUTTON');
+    button.click();
+    await settleRendererActions(renderer);
+    assert.equal(elements['toast-message'].textContent, mode === 'throws'
+      ? 'Crate could not exclude that asset. Try again.'
+      : 'Crate could not confirm that change. Review the asset list.');
+    const current = elements['added-assets-list'].children[0].children.find(child => child.tagName === 'BUTTON');
+    assert.equal(current.disabled, false);
+  }
+
+  // Remembered exclusion [+]: accept refused, exact message, still Excluded with a usable [+].
+  {
+    const { document, elements } = createInteractiveRendererDom();
+    const remembered = { name: 'Texture.png', ext: '.png', assetOrigin: 'added', projectRole: 'asset', protectedSource: false,
+      included: false, excluded: true, excludedPending: true, visualIdentity: 'remembered-identity', visualRevision: null };
+    const project = { id: 'remembered-refused', name: 'Remembered', type: 'branding', status: 'watching', files: [], pendingFiles: [],
+      excludedAssetKeys: ['/synthetic/Texture.png'], assetBaseline: { status: 'included', decision: 'include' } };
+    const renderer = loadRendererHelpers(document, { crate: {
+      getProjects: async () => [cloneTestValue(project)],
+      getAssetWorkspace: async projectId => ({ projectId, files: [], pendingFiles: [], excludedPendingFiles: [remembered] }),
+      acceptPending: async () => null,
+    } });
+    renderer.testProject = project;
+    vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id; state.assetReviewOpen = true;', renderer);
+    await renderer.renderFiles();
+    elements['added-assets-list'].children[0].children.find(child => child.tagName === 'BUTTON').click();
+    await settleRendererActions(renderer);
+    assert.equal(elements['toast-message'].textContent, 'Crate could not include Texture.png. Try again.');
+    const plus = elements['added-assets-list'].children[0].children.find(child => child.tagName === 'BUTTON');
+    assert.deepEqual([plus.dataset.rowAction, plus.disabled], ['include', false]);
+  }
+});

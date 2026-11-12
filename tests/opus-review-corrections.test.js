@@ -73,3 +73,11 @@ test('standalone section counts only standalone rows and empty filters explain t
   f.filter('existing');assert.equal(f.elements['asset-review-empty'].textContent,'No existing assets.');
   f.filter('missing');assert.equal(f.elements['asset-review-empty'].textContent,'No files need review.');
 });
+test('dashboard summary for an "Include or Exclude" row uses the same row text, with and without a known app',()=>{
+  const withApp=fixture({pending:[{name:'Texture.png',ext:'.png',captureState:'pending',captureEvidence:{appFamily:'indesign'}}]});
+  assert.equal(withApp.elements['project-review-detail'].textContent,'Found in InDesign. Crate isn’t sure it belongs · Not in the package');
+  assert.equal(withApp.elements['project-review-eyebrow'].textContent,'1 file needs review');
+  const noApp=fixture({pending:[{name:'Texture.png',ext:'.png',captureState:'pending'}]});
+  assert.equal(noApp.elements['project-review-detail'].textContent,'Crate isn’t sure it belongs · Not in the package');
+  assert.doesNotMatch(noApp.elements['project-review-detail'].textContent,/Needs review before packaging|Add|Skip/);
+});

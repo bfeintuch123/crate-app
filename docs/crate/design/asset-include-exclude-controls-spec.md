@@ -94,4 +94,4 @@ Working-file-type Needs Review rows. A row marked "Include or Exclude" can be a 
 
 Storage. Each remembered row keeps only the row's own identity fields, never its capture details. There is no new limit on how many rows can be remembered; the list grows only when the designer excludes a row.
 
-Known limits: files excluded from Needs Review before this change were remembered only by their exclusion, so they cannot appear in the Excluded tab. A remembered row is no longer shown once the same file is added to the project again, for example with + Add Files; it then appears as that project file and keeps its exclusion until the designer includes it. Remembered rows show the file type instead of a thumbnail.
+Known limits: files excluded from Needs Review before this change were remembered only by their exclusion, so they cannot appear in the Excluded tab. A remembered row is no longer shown once the same file is added to the project again with + Add Files; adding it that way includes it, as + Add Files always has. Remembered rows show the file type instead of a thumbnail.
