@@ -67,6 +67,7 @@ const {
   truncatePackageComponent,
   createPackageNameAllocator,
   getPackageOutputRelativePath,
+  getPackageGroupedOutputRelativePath,
   normalizePackageOutputLayoutMode,
   ensureSafePackageDirectory,
   resolveUniquePackagePath: resolveSafeUniquePackagePath,
@@ -75,6 +76,7 @@ const {
   writeFileIntoPackageExact,
 } = require('./parsers/package-safety');
 const { summarizeDiagnosticPackageErrors } = require('./diagnostic-summary');
+const fontHandoff = require('./parsers/font-handoff');
 const { redactUrlAndCredentialText, redactPrivatePathText } = require('./parsers/figma-redaction');
 const {
   FIGMA_NETWORK_LIMITS,
@@ -22117,6 +22119,694 @@ function getSkippedExistingPresentationMediaSuppression(project) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Font handoff. Font files (.otf/.ttf/.ttc/.otc) never use the ordinary asset
+// output path: every one passes the font gate in this process at review and
+// again at packaging from the reviewed bytes. A font that is excluded,
+// undecided or unavailable is skipped and reported; it never blocks the rest.
+// Paths stay in main; the renderer sees opaque row keys and file names.
+const FONT_HANDOFF_SCHEMA_VERSION = 1;
+const MAX_FONT_HANDOFF_SELECTIONS = 200;
+const MAX_FONT_REGISTRY_REQUEST_NAMES = 2000;
+const MAX_FONT_REGISTRY_RECORDS = 20000;
+const MAX_FONT_REGISTRY_FAMILIES_PER_ADD = 50;
+const FONT_REGISTRY_TIMEOUT_MS = 10000;
+const FONT_REGISTRY_MAX_BUFFER = 16 * 1024 * 1024;
+const FONT_COPY_OFFER_TTL_MS = 10 * 60 * 1000;
+const MAX_FONT_FACTS_CACHE_ENTRIES = 256;
+const FONT_ROW_KEY_PATTERN = /^[a-f0-9]{32}$/;
+const FONT_ORIGIN_PRIORITY = ['installed', 'added-file', 'project-file', 'found'];
+const fontFactsCache = new Map();
+const installedFontCopyOffers = new Map();
+const pendingFontFilePickers = new Set();
+
+function isGatedFontFile(file) {
+  if (!file || typeof file !== 'object' || isScanOnSaveEmbeddedPsdFile(file)) return false;
+  const ext = `${file.ext || path.extname(typeof file.path === 'string' ? file.path : '')}`.toLowerCase();
+  return fontHandoff.GATED_FONT_EXTENSIONS.has(ext);
+}
+
+function isGatedFontPath(filePath) {
+  return typeof filePath === 'string' && fontHandoff.GATED_FONT_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+}
+
+function getFontRowKey(filePath) {
+  const folded = normalizeTrackedFilePath(filePath);
+  return folded
+    ? crypto.createHash('sha256').update(`crate-font-row:v1:${folded.normalize('NFC')}`).digest('hex').slice(0, 32)
+    : null;
+}
+
+function isStoredFontText(value, limit = 255) {
+  return typeof value === 'string' && value.length > 0 && value.length <= limit && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function isStoredFontPath(value) {
+  return typeof value === 'string' && value.length <= 4096 && path.isAbsolute(value) && !value.includes('\0');
+}
+
+// Tolerant read of persisted state: anything malformed is dropped, never
+// reinterpreted as a wider permission.
+function readProjectFontHandoff(project) {
+  const raw = isRecord(project?.fontHandoff) ? project.fontHandoff : {};
+  const installed = (Array.isArray(raw.installed) ? raw.installed : []).filter(item => isRecord(item) &&
+    isStoredFontText(item.postscriptName) && isStoredFontPath(item.path) && isGatedFontPath(item.path))
+    .slice(0, MAX_FONT_HANDOFF_SELECTIONS)
+    .map(item => ({
+      postscriptName: item.postscriptName,
+      family: isStoredFontText(item.family) ? item.family : null,
+      style: isStoredFontText(item.style) ? item.style : null,
+      path: item.path,
+      addedAt: Number.isFinite(item.addedAt) ? item.addedAt : 0,
+    }));
+  const files = (Array.isArray(raw.files) ? raw.files : []).filter(item => isRecord(item) &&
+    isStoredFontPath(item.path) && isGatedFontPath(item.path))
+    .slice(0, MAX_FONT_HANDOFF_SELECTIONS)
+    .map(item => ({ path: item.path, addedAt: Number.isFinite(item.addedAt) ? item.addedAt : 0 }));
+  const choices = Object.create(null);
+  for (const [key, value] of Object.entries(isRecord(raw.choices) ? raw.choices : {})) {
+    if (FONT_ROW_KEY_PATTERN.test(key) && (value === 'include' || value === 'remove')) choices[key] = value;
+  }
+  const confirmations = Object.create(null);
+  for (const [key, value] of Object.entries(isRecord(raw.confirmations) ? raw.confirmations : {})) {
+    if (!FONT_ROW_KEY_PATTERN.test(key) || !isRecord(value) || !/^[a-f0-9]{64}$/.test(value.sha256 || '') ||
+        !isStoredFontText(value.wordingVersion, 64) || !/^\d{4}-\d{2}-\d{2}$/.test(value.confirmedOn || '')) continue;
+    confirmations[key] = {
+      sha256: value.sha256,
+      wordingVersion: value.wordingVersion,
+      confirmedOn: value.confirmedOn,
+      postscriptNames: (Array.isArray(value.postscriptNames) ? value.postscriptNames : [])
+        .filter(name => isStoredFontText(name)).slice(0, 256),
+    };
+  }
+  return { installed, files, choices, confirmations };
+}
+
+function writeProjectFontHandoff(project, handoff) {
+  const hasState = handoff.installed.length || handoff.files.length ||
+    Object.keys(handoff.choices).length || Object.keys(handoff.confirmations).length;
+  if (!hasState) {
+    delete project.fontHandoff;
+    return;
+  }
+  project.fontHandoff = {
+    version: FONT_HANDOFF_SCHEMA_VERSION,
+    installed: handoff.installed,
+    files: handoff.files,
+    choices: { ...handoff.choices },
+    confirmations: { ...handoff.confirmations },
+  };
+}
+
+function rememberFontFacts(cacheKey, facts) {
+  fontFactsCache.delete(cacheKey);
+  while (fontFactsCache.size >= MAX_FONT_FACTS_CACHE_ENTRIES) {
+    const oldest = fontFactsCache.keys().next().value;
+    if (oldest === undefined) break;
+    fontFactsCache.delete(oldest);
+  }
+  fontFactsCache.set(cacheKey, facts);
+}
+
+function getFontFactsFromBuffer(buffer) {
+  const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
+  try {
+    return { sha256, parsed: fontHandoff.readFontFaces(buffer), readError: null };
+  } catch (error) {
+    return { sha256, parsed: null, readError: error instanceof fontHandoff.FontReadError ? error.code : 'malformed' };
+  }
+}
+
+// Reads only a regular, non-symlinked file through the reviewed-source
+// fingerprint. Facts are cached by the full fingerprint (device, inode, size,
+// times), so a changed file is always read again.
+function inspectFontFile(sourcePath) {
+  const fingerprint = getPackageReviewSourceFingerprint(sourcePath);
+  let realPath = null;
+  try { realPath = realpathSync(sourcePath); } catch (_) {}
+  const result = { sourcePath, fingerprint, realPath, sha256: null, parsed: null, readError: null };
+  if (fingerprint.state !== 'present') return result;
+  if (Number(fingerprint.source.size) > fontHandoff.MAX_FONT_FILE_BYTES) return { ...result, readError: 'too-large' };
+  const cacheKey = JSON.stringify(fingerprint);
+  const cached = fontFactsCache.get(cacheKey);
+  if (cached) return { ...result, ...cached };
+  let buffer;
+  try {
+    buffer = readStablePackageReviewBuffer(sourcePath, fingerprint);
+  } catch (_) {
+    return { ...result, fingerprint: { ...fingerprint, state: 'unavailable' } };
+  }
+  const facts = getFontFactsFromBuffer(buffer);
+  rememberFontFacts(cacheKey, facts);
+  return { ...result, ...facts };
+}
+
+function getFontFacePostscriptNames(faces) {
+  const names = new Set();
+  for (const face of faces || []) {
+    if (face.postscriptName) names.add(face.postscriptName);
+    for (const instance of face.namedInstances || []) if (instance.postscriptName) names.add(instance.postscriptName);
+  }
+  return [...names];
+}
+
+function collectFontCandidates(project, files) {
+  const handoff = readProjectFontHandoff(project);
+  const groups = new Map();
+  const add = (sourcePath, origin, extra = {}) => {
+    const key = getFontRowKey(sourcePath);
+    if (!key) return;
+    let group = groups.get(key);
+    if (!group) {
+      group = { key, sourcePath, origins: new Set(), requested: new Set(), displayName: path.basename(sourcePath), addedAt: Infinity };
+      groups.set(key, group);
+    }
+    group.origins.add(origin);
+    if (Number.isFinite(extra.addedAt)) group.addedAt = Math.min(group.addedAt, extra.addedAt);
+    if (extra.postscriptName) group.requested.add(extra.postscriptName);
+  };
+  (files || []).forEach(file => {
+    if (isGatedFontFile(file) && typeof file.path === 'string') {
+      add(file.path, isExplicitUserCapturedFile(file) ? 'project-file' : 'found', { addedAt: file.addedAt });
+    }
+  });
+  for (const selection of handoff.installed) {
+    add(selection.path, 'installed', { postscriptName: selection.postscriptName, addedAt: selection.addedAt });
+  }
+  for (const selection of handoff.files) add(selection.path, 'added-file', { addedAt: selection.addedAt });
+  return { handoff, groups: [...groups.values()] };
+}
+
+function getFontRowOrigin(group) {
+  return FONT_ORIGIN_PRIORITY.find(origin => group.origins.has(origin)) || 'found';
+}
+
+function getFontGateInput(group, inspected, handoff, homeDir) {
+  return {
+    file: { state: inspected.fingerprint.state },
+    readError: inspected.readError,
+    faces: inspected.parsed?.faces || [],
+    location: fontHandoff.classifyFontLocation(inspected.realPath || group.sourcePath, homeDir),
+    identityConfirmed: group.requested.size
+      ? [...group.requested].every(name => !!fontHandoff.findFace(inspected.parsed, name)) : undefined,
+    intent: [...group.origins].some(origin => origin !== 'found') ? 'explicit' : 'found',
+    choice: handoff.choices[group.key] || null,
+    sha256: inspected.sha256,
+    confirmation: handoff.confirmations[group.key] || null,
+  };
+}
+
+// One row per physical font file. Two different files claiming one font name
+// are never both offered, and identical bytes are copied once.
+function evaluateFontHandoff(project, files) {
+  const { handoff, groups } = collectFontCandidates(project, files);
+  if (!groups.length) return null;
+  const homeDir = os.homedir();
+  const rows = groups.map(group => {
+    const inspected = inspectFontFile(group.sourcePath);
+    const gateInput = getFontGateInput(group, inspected, handoff, homeDir);
+    return { group, inspected, gateInput, gate: fontHandoff.evaluateFontGate({ ...gateInput, conflict: false }) };
+  });
+  const live = rows.filter(row => row.gate.outcome === 'included' || row.gate.outcome === 'needs-confirmation');
+  const shasByName = new Map();
+  for (const row of live) {
+    for (const name of getFontFacePostscriptNames(row.gateInput.faces)) {
+      if (!shasByName.has(name)) shasByName.set(name, new Set());
+      shasByName.get(name).add(row.inspected.sha256);
+    }
+  }
+  for (const row of live) {
+    const conflict = getFontFacePostscriptNames(row.gateInput.faces).some(name => shasByName.get(name).size > 1);
+    if (conflict) row.gate = fontHandoff.evaluateFontGate({ ...row.gateInput, conflict: true });
+  }
+  const keptSha = new Set();
+  const ordered = rows.filter(row => row.gate.outcome === 'included').sort((left, right) =>
+    FONT_ORIGIN_PRIORITY.indexOf(getFontRowOrigin(left.group)) - FONT_ORIGIN_PRIORITY.indexOf(getFontRowOrigin(right.group)) ||
+    (left.group.addedAt === right.group.addedAt ? 0 : left.group.addedAt < right.group.addedAt ? -1 : 1) ||
+    (left.group.key < right.group.key ? -1 : left.group.key > right.group.key ? 1 : 0));
+  for (const row of ordered) {
+    if (keptSha.has(row.inspected.sha256)) row.gate = { outcome: 'not-included', reason: 'duplicate', basis: null };
+    else keptSha.add(row.inspected.sha256);
+  }
+  rows.sort((left, right) => (left.group.key < right.group.key ? -1 : left.group.key > right.group.key ? 1 : 0));
+  return { rows, handoff };
+}
+
+function getFontRowLabel(row) {
+  const faces = row.gateInput.faces;
+  if (!faces.length) return sanitizeRendererSourceName(row.group.displayName) || 'Font file';
+  return faces.map(face => [face.family, face.style].filter(Boolean).join(' ') || face.postscriptName || 'Unnamed font')
+    .join(', ');
+}
+
+function getFontNoteModel(fontReview, inputs, oflTextFileName) {
+  const byKey = new Map(fontReview.rows.map(row => [row.group.key, row]));
+  return {
+    included: inputs.map(input => {
+      const row = byKey.get(input.rowKey);
+      return {
+        fileName: path.posix.basename(input.relativePath),
+        sha256: input.sha256,
+        origin: input.origin,
+        basis: input.basis,
+        confirmedOn: input.confirmation?.confirmedOn || null,
+        faces: row.gateInput.faces,
+      };
+    }),
+    notIncluded: fontReview.rows.filter(row => row.gate.outcome !== 'included' && row.gate.reason !== 'duplicate')
+      .map(row => {
+        const faces = row.gateInput.faces;
+        const label = faces.length ? fontHandoff.describeFontFaces(faces) : sanitizeRendererSourceName(row.group.displayName) || 'Font file';
+        return { label, reason: row.gate.reason || 'licence-unknown' };
+      }),
+    oflTextFileName,
+  };
+}
+
+// Plans font outputs after every ordinary and derived output so a package with
+// no font candidates keeps the base plan exactly.
+function planFontOutputs(fontReview, layoutMode, outputAllocator) {
+  if (!fontReview) return null;
+  const inputs = [];
+  for (const row of fontReview.rows) {
+    if (row.gate.outcome !== 'included') continue;
+    const outputName = outputAllocator.reserveOutputName(row.group.displayName);
+    inputs.push({
+      rowKey: row.group.key,
+      sourcePath: row.group.sourcePath,
+      sourceFingerprint: row.inspected.fingerprint,
+      sha256: row.inspected.sha256,
+      basis: row.gate.basis,
+      origin: getFontRowOrigin(row.group),
+      gate: {
+        intent: row.gateInput.intent,
+        choice: row.gateInput.choice,
+        requested: [...row.group.requested].sort(),
+        confirmation: row.gateInput.confirmation,
+      },
+      rawName: row.group.displayName,
+      outputName,
+      relativePath: outputAllocator.getOutputRelativePath(outputName),
+    });
+  }
+  const oflNeeded = inputs.some(input => input.basis === 'open-licence');
+  const oflOutputName = oflNeeded ? outputAllocator.reserveGroupedOutputName(fontHandoff.OFL_TEXT_FILENAME, 'fonts') : null;
+  const noteOutputName = outputAllocator.reserveGroupedOutputName(fontHandoff.FONTS_NOTE_FILENAME, 'fonts');
+  const text = fontHandoff.buildFontsNote(getFontNoteModel(fontReview, inputs, oflOutputName));
+  return {
+    schemaVersion: 1,
+    inputs,
+    oflText: oflOutputName ? { outputName: oflOutputName, relativePath: outputAllocator.getOutputRelativePath(oflOutputName) } : null,
+    note: { outputName: noteOutputName, relativePath: outputAllocator.getOutputRelativePath(noteOutputName), text },
+  };
+}
+
+// Packaging-time gate: the reviewed bytes are read again, hashed, parsed and
+// gated with the reviewed decisions. Anything different is a changed review.
+function readGatedFontForPackaging(input, layoutMode) {
+  let buffer;
+  try {
+    buffer = readStablePackageReviewBuffer(input.sourcePath, input.sourceFingerprint);
+  } catch (_) {
+    throw new PackageReviewChangedError();
+  }
+  const facts = getFontFactsFromBuffer(buffer);
+  if (facts.sha256 !== input.sha256 || !facts.parsed) throw new PackageReviewChangedError();
+  let realPath;
+  try { realPath = realpathSync(input.sourcePath); } catch (_) { throw new PackageReviewChangedError(); }
+  const gate = fontHandoff.evaluateFontGate({
+    file: { state: 'present' },
+    readError: null,
+    faces: facts.parsed.faces,
+    location: fontHandoff.classifyFontLocation(realPath, os.homedir()),
+    identityConfirmed: input.gate.requested.length
+      ? input.gate.requested.every(name => !!fontHandoff.findFace(facts.parsed, name)) : undefined,
+    intent: input.gate.intent,
+    choice: input.gate.choice,
+    sha256: facts.sha256,
+    confirmation: input.gate.confirmation,
+    conflict: false,
+  });
+  if (gate.outcome !== 'included' || gate.basis !== input.basis) throw new PackageReviewChangedError();
+  if (getPackageOutputRelativePath(input.outputName, layoutMode) !== input.relativePath) throw new PackageReviewChangedError();
+  const mode = Number(BigInt(input.sourceFingerprint.source.mode) & 0o777n) || OWNER_ONLY_FILE_MODE;
+  return { buffer, mode };
+}
+
+function getFontFolderLabel(plan) {
+  return plan.layoutMode === PACKAGE_OUTPUT_LAYOUT_MODES.FLAT ? 'Package root' : 'Fonts';
+}
+
+function presentFontReview(fontReview, plan) {
+  if (!fontReview) return null;
+  const inputKeys = new Set((plan?.fonts?.inputs || []).map(input => input.rowKey));
+  const rows = fontReview.rows.map(row => {
+    const faces = row.gateInput.faces;
+    const fileName = sanitizeRendererSourceName(row.group.displayName) || 'Font file';
+    const { outcome, reason, basis } = row.gate;
+    const excluded = outcome === 'excluded' || outcome === 'unavailable';
+    const needsStatement = outcome === 'needs-confirmation' || basis === 'confirmed' ||
+      (reason === 'found' && !fontHandoff.detectOpenLicence(faces) && faces.length > 0 && !excluded);
+    return {
+      key: row.group.key,
+      fileName,
+      label: getFontRowLabel(row),
+      faces: faces.map(face => ({
+        family: face.family, style: face.style, postscriptName: face.postscriptName, version: face.version,
+        variable: face.variable === true, instanceCount: (face.namedInstances || []).length,
+      })),
+      contents: faces.length ? fontHandoff.describeFontFaces(faces) : '',
+      collection: row.inspected.parsed?.collection === true,
+      variable: faces.some(face => face.variable === true),
+      origin: getFontRowOrigin(row.group),
+      outcome,
+      reason,
+      reasonText: reason ? fontHandoff.FONT_REASON_TEXT[reason] || '' : '',
+      basis,
+      sha256: excluded ? null : row.inspected.sha256,
+      statement: needsStatement && row.inspected.sha256
+        ? fontHandoff.getFontConfirmationStatement(faces, fileName) : null,
+      statementVersion: fontHandoff.FONT_CONFIRMATION_WORDING_VERSION,
+      confirmed: fontHandoff.isCurrentConfirmation(row.gateInput.confirmation, row.inspected.sha256),
+      canConfirm: !excluded && reason !== 'removed' && reason !== 'conflict' && basis !== 'open-licence' && faces.length > 0,
+      canRemove: row.gateInput.choice !== 'remove',
+      canInclude: reason === 'found' || reason === 'removed',
+      packageFolder: inputKeys.has(row.group.key) ? getFontFolderLabel(plan) : null,
+    };
+  });
+  rows.sort((left, right) => left.label.localeCompare(right.label) || left.fileName.localeCompare(right.fileName) ||
+    (left.key < right.key ? -1 : left.key > right.key ? 1 : 0));
+  return {
+    rows,
+    includedCount: inputKeys.size,
+    notIncludedCount: rows.filter(row => row.outcome !== 'included' && row.reason !== 'duplicate').length,
+    needsConfirmationCount: rows.filter(row => row.outcome === 'needs-confirmation').length,
+  };
+}
+
+function buildFontRegistryScript(requestPath) {
+  // Names arrive in a private data file, never in script text. No descriptor
+  // asks for a download; only registered (active) fonts are enumerated.
+  return `ObjC.import('AppKit');
+ObjC.import('CoreText');
+function attr(d, k) { var v = $.CTFontDescriptorCopyAttribute(d, $(k)); if (!v || (v.isNil && v.isNil())) return null; var u = ObjC.unwrap(v); return typeof u === 'string' ? u : null; }
+function fileOf(d) { var u = $.CTFontDescriptorCopyAttribute(d, $('NSCTFontFileURLAttribute')); if (!u || (u.isNil && u.isNil()) || !u.isFileURL) return null; return ObjC.unwrap(u.path); }
+function row(d) { return [attr(d, 'NSFontNameAttribute'), attr(d, 'NSFontFamilyAttribute'), attr(d, 'NSFontFaceAttribute'), fileOf(d)]; }
+function run() {
+  var request = JSON.parse(ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(${JSON.stringify(requestPath)}, $.NSUTF8StringEncoding, null)));
+  if (request.mode === 'list') {
+    var all = $.NSFontCollection.fontCollectionWithAllAvailableDescriptors.matchingDescriptors;
+    var rows = [];
+    for (var i = 0; i < Number(all.count); i++) rows.push(row(all.objectAtIndex(i)));
+    return JSON.stringify({ mode: 'list', rows: rows });
+  }
+  var mandatory = $.NSSet.setWithObject($('NSFontNameAttribute'));
+  var results = {};
+  for (var j = 0; j < request.names.length; j++) {
+    var name = String(request.names[j]);
+    var descriptor = $.CTFontDescriptorCreateWithAttributes($.NSDictionary.dictionaryWithObjectForKey($(name), $('NSFontNameAttribute')));
+    var matches = $.CTFontDescriptorCreateMatchingFontDescriptors(descriptor, mandatory);
+    var list = [];
+    if (matches && !(matches.isNil && matches.isNil())) {
+      matches = ObjC.castRefToObject(matches);
+      for (var k = 0; k < Number(matches.count); k++) list.push(row(matches.objectAtIndex(k)));
+    }
+    results[name] = list;
+  }
+  return JSON.stringify({ mode: 'resolve', results: results });
+}`;
+}
+
+function parseFontRegistryRow(value) {
+  if (!Array.isArray(value) || value.length !== 4) return null;
+  const [postscriptName, family, style, filePath] = value;
+  if (!isStoredFontText(postscriptName) || !isStoredFontPath(filePath)) return null;
+  return {
+    postscriptName,
+    family: isStoredFontText(family) ? family : null,
+    style: isStoredFontText(style) ? style : null,
+    path: filePath,
+  };
+}
+
+async function runFontRegistry(request) {
+  if (process.platform !== 'darwin') throw new Error('font_registry_unavailable');
+  const { stdout } = await runOsascriptInPrivateTemp(({ resolveScriptPath }) => ({
+    'crate-font-registry-request.json': JSON.stringify(request),
+    'crate-font-registry.js': buildFontRegistryScript(resolveScriptPath('crate-font-registry-request.json')),
+  }), 'crate-font-registry.js', {
+    language: 'JavaScript',
+    timeout: FONT_REGISTRY_TIMEOUT_MS,
+    maxBuffer: FONT_REGISTRY_MAX_BUFFER,
+    killSignal: 'SIGKILL',
+  });
+  const parsed = JSON.parse(`${stdout || ''}`.trim());
+  if (!parsed || parsed.mode !== request.mode) throw new Error('font_registry_invalid');
+  return parsed;
+}
+
+async function listRegisteredFonts() {
+  const parsed = await runFontRegistry({ mode: 'list' });
+  if (!Array.isArray(parsed.rows) || parsed.rows.length > MAX_FONT_REGISTRY_RECORDS) throw new Error('font_registry_invalid');
+  return parsed.rows.map(parseFontRegistryRow).filter(Boolean);
+}
+
+// Exact PostScript identity: Core Text is asked with the name as a mandatory
+// key, and only results whose own name equals the request exactly are kept.
+// Core Text matches loosely ("Helvetica Bold" -> Helvetica-Bold), so this
+// equality check is Crate's, not the system's.
+async function resolveInstalledPostScriptNames(names) {
+  const requested = [...new Set((names || []).filter(name => isStoredFontText(name)))].slice(0, MAX_FONT_REGISTRY_REQUEST_NAMES);
+  const resolved = new Map(requested.map(name => [name, []]));
+  if (!requested.length) return resolved;
+  const parsed = await runFontRegistry({ mode: 'resolve', names: requested });
+  if (!isRecord(parsed.results)) throw new Error('font_registry_invalid');
+  for (const name of requested) {
+    const rows = Array.isArray(parsed.results[name]) ? parsed.results[name].slice(0, 64) : [];
+    const exact = rows.map(parseFontRegistryRow).filter(row => row && row.postscriptName === name);
+    const byPath = new Map(exact.map(row => [row.path, row]));
+    resolved.set(name, [...byPath.values()]);
+  }
+  return resolved;
+}
+
+function getFontLocationExclusion(filePath, postscriptName) {
+  if (typeof postscriptName === 'string' && postscriptName.startsWith('.')) return 'system';
+  let realPath = filePath;
+  try { realPath = realpathSync(filePath); } catch (_) {}
+  return fontHandoff.classifyFontLocation(realPath, os.homedir()).excludedReason;
+}
+
+function formatFontFaceLabel(face) {
+  return [face.family, face.style].filter(Boolean).join(' ') || face.postscriptName;
+}
+
+function getInstalledFontLocationLabel(filePath) {
+  let realPath = filePath;
+  try { realPath = realpathSync(filePath); } catch (_) {}
+  const kind = fontHandoff.classifyFontLocation(realPath, os.homedir()).kind;
+  return kind === 'installed' ? 'Fonts folder' : 'Another folder';
+}
+
+function rememberInstalledFontCopyOffer(projectId, offer) {
+  const now = Date.now();
+  for (const [id, item] of installedFontCopyOffers) if (item.expiresAt <= now) installedFontCopyOffers.delete(id);
+  const id = crypto.randomBytes(16).toString('hex');
+  installedFontCopyOffers.set(id, { ...offer, projectId, expiresAt: now + FONT_COPY_OFFER_TTL_MS });
+  return id;
+}
+
+function storeInstalledFontSelection(projectId, selection) {
+  const key = getFontRowKey(selection.path);
+  return mutateProject(projectId, project => {
+    const handoff = readProjectFontHandoff(project);
+    handoff.installed = handoff.installed.filter(item => item.postscriptName !== selection.postscriptName);
+    if (handoff.installed.length >= MAX_FONT_HANDOFF_SELECTIONS) return { error: 'font_limit_reached' };
+    handoff.installed.push({ ...selection, addedAt: Date.now() });
+    if (key && handoff.choices[key] === 'remove') delete handoff.choices[key];
+    writeProjectFontHandoff(project, handoff);
+    return { success: true };
+  });
+}
+
+function confirmInstalledFontCandidate(postscriptName, candidate) {
+  if (getFontLocationExclusion(candidate.path, postscriptName)) return null;
+  const inspected = inspectFontFile(candidate.path);
+  if (inspected.fingerprint.state !== 'present' || !inspected.parsed || !fontHandoff.findFace(inspected.parsed, postscriptName)) return null;
+  if (getFontLocationExclusion(inspected.realPath || candidate.path, postscriptName)) return null;
+  const face = inspected.parsed.faces.find(item => item.postscriptName === postscriptName) || inspected.parsed.faces[0];
+  return {
+    ...candidate,
+    sha256: inspected.sha256,
+    version: face?.version || null,
+    variable: inspected.parsed.faces.some(item => item.variable === true),
+  };
+}
+
+async function addInstalledFontFamilies(projectId, request) {
+  const families = Array.isArray(request?.families)
+    ? [...new Set(request.families.filter(family => isStoredFontText(family)))].slice(0, MAX_FONT_REGISTRY_FAMILIES_PER_ADD) : [];
+  if (!families.length) return { error: 'font_request_invalid' };
+  let registered;
+  try { registered = await listRegisteredFonts(); } catch (_) { return { error: 'font_registry_unavailable' }; }
+  const wanted = new Set(families);
+  const faces = new Map();
+  const refused = [];
+  for (const row of registered) {
+    if (!wanted.has(row.family)) continue;
+    const exclusion = getFontLocationExclusion(row.path, row.postscriptName);
+    if (exclusion) {
+      refused.push({ label: formatFontFaceLabel(row), reasonText: fontHandoff.FONT_REASON_TEXT[exclusion] });
+      continue;
+    }
+    if (!faces.has(row.postscriptName)) faces.set(row.postscriptName, row);
+  }
+  let resolved;
+  try { resolved = await resolveInstalledPostScriptNames([...faces.keys()]); } catch (_) { return { error: 'font_registry_unavailable' }; }
+  if (!getProjects().some(project => project.id === projectId)) return { error: 'not_found' };
+  let added = 0;
+  const unconfirmedFaces = [];
+  const storedRealPaths = new Set(); // variable files only
+  const choices = [];
+  for (const [postscriptName, face] of faces) {
+    const confirmed = [];
+    for (const candidate of resolved.get(postscriptName) || []) {
+      const verified = confirmInstalledFontCandidate(postscriptName, candidate);
+      if (verified && !confirmed.some(item => item.sha256 === verified.sha256)) confirmed.push(verified);
+    }
+    if (confirmed.length === 0) {
+      unconfirmedFaces.push(face);
+    } else if (confirmed.length === 1) {
+      const stored = storeInstalledFontSelection(projectId, {
+        postscriptName, family: face.family, style: face.style, path: confirmed[0].path,
+      });
+      if (stored?.success) {
+        added++;
+        if (confirmed[0].variable) storedRealPaths.add(normalizeTrackedFilePath(confirmed[0].path));
+      }
+    } else {
+      choices.push({
+        label: formatFontFaceLabel(face),
+        postscriptName,
+        options: confirmed.map(item => ({
+          id: rememberInstalledFontCopyOffer(projectId, { postscriptName, family: face.family, style: face.style, path: item.path, sha256: item.sha256 }),
+          fileName: sanitizeRendererSourceName(path.basename(item.path)) || 'Font file',
+          version: item.version,
+          location: getInstalledFontLocationLabel(item.path),
+        })),
+      });
+    }
+  }
+  // macOS synthesizes names for variable-font instances that have no name in
+  // the file (for example "Skia-Regular_Bold"). Such a name is never confirmed,
+  // but when the registry places it in a variable file already added through a
+  // confirmed face, that whole file is already in the package.
+  const unconfirmed = unconfirmedFaces
+    .filter(face => !storedRealPaths.has(normalizeTrackedFilePath(face.path)))
+    .map(face => ({ label: formatFontFaceLabel(face), reasonText: fontHandoff.FONT_REASON_TEXT.unconfirmed }));
+  invalidatePackageReviewForProject(projectId);
+  return { success: true, added, refused, unconfirmed, choices };
+}
+
+function chooseInstalledFontCopy(projectId, offerId) {
+  const offer = typeof offerId === 'string' ? installedFontCopyOffers.get(offerId) : null;
+  if (!offer || offer.projectId !== projectId || offer.expiresAt <= Date.now()) return { error: 'font_choice_expired' };
+  const verified = confirmInstalledFontCandidate(offer.postscriptName, { path: offer.path });
+  if (!verified || verified.sha256 !== offer.sha256) return { error: 'font_changed' };
+  for (const [id, item] of installedFontCopyOffers) {
+    if (item.projectId === projectId && item.postscriptName === offer.postscriptName) installedFontCopyOffers.delete(id);
+  }
+  const stored = storeInstalledFontSelection(projectId, {
+    postscriptName: offer.postscriptName, family: offer.family, style: offer.style, path: offer.path,
+  });
+  if (!stored) return { error: 'not_found' };
+  invalidatePackageReviewForProject(projectId);
+  return stored;
+}
+
+function getProjectFontCandidateGroup(project, rowKey) {
+  const files = deduplicateFiles(getIllustratorScopedProjectView(project)?.files || []);
+  return collectFontCandidates(project, files).groups.find(group => group.key === rowKey) || null;
+}
+
+function setFontRowChoice(projectId, rowKey, choice) {
+  if (typeof rowKey !== 'string' || !FONT_ROW_KEY_PATTERN.test(rowKey) || !['include', 'remove'].includes(choice)) {
+    return { error: 'font_request_invalid' };
+  }
+  const result = mutateProject(projectId, project => {
+    if (!getProjectFontCandidateGroup(project, rowKey)) return { error: 'font_not_found' };
+    const handoff = readProjectFontHandoff(project);
+    if (choice === 'remove') {
+      handoff.installed = handoff.installed.filter(item => getFontRowKey(item.path) !== rowKey);
+      handoff.files = handoff.files.filter(item => getFontRowKey(item.path) !== rowKey);
+      delete handoff.confirmations[rowKey];
+    }
+    handoff.choices[rowKey] = choice;
+    writeProjectFontHandoff(project, handoff);
+    return { success: true };
+  });
+  if (!result) return { error: 'not_found' };
+  invalidatePackageReviewForProject(projectId);
+  return result;
+}
+
+// One font file per call; there is no batch form. The statement is the user's
+// own, bound to the exact bytes they reviewed. Excluded fonts are refused here
+// regardless of what the renderer sends.
+function setFontLicenceConfirmation(projectId, rowKey, request) {
+  if (typeof rowKey !== 'string' || !FONT_ROW_KEY_PATTERN.test(rowKey) || !isRecord(request) ||
+      typeof request.confirmed !== 'boolean' || typeof request.sha256 !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(request.sha256)) return { error: 'font_request_invalid' };
+  const result = mutateProject(projectId, project => {
+    const group = getProjectFontCandidateGroup(project, rowKey);
+    if (!group) return { error: 'font_not_found' };
+    const handoff = readProjectFontHandoff(project);
+    if (!request.confirmed) {
+      delete handoff.confirmations[rowKey];
+      writeProjectFontHandoff(project, handoff);
+      return { success: true };
+    }
+    const inspected = inspectFontFile(group.sourcePath);
+    if (inspected.sha256 !== request.sha256) return { error: 'font_changed' };
+    const gateInput = getFontGateInput(group, inspected, handoff, os.homedir());
+    const gate = fontHandoff.evaluateFontGate({ ...gateInput, choice: 'include', confirmation: null, conflict: false });
+    if (gate.outcome !== 'needs-confirmation') return { error: 'font_not_eligible' };
+    handoff.confirmations[rowKey] = {
+      sha256: inspected.sha256,
+      wordingVersion: fontHandoff.FONT_CONFIRMATION_WORDING_VERSION,
+      confirmedOn: new Date().toISOString().slice(0, 10),
+      postscriptNames: getFontFacePostscriptNames(gateInput.faces).slice(0, 256),
+    };
+    writeProjectFontHandoff(project, handoff);
+    return { success: true };
+  });
+  if (!result) return { error: 'not_found' };
+  invalidatePackageReviewForProject(projectId);
+  return result;
+}
+
+function addFontFilePaths(projectId, filePaths) {
+  const accepted = filePaths.filter(filePath => isStoredFontPath(filePath) && isGatedFontPath(filePath));
+  const result = mutateProject(projectId, project => {
+    const handoff = readProjectFontHandoff(project);
+    let added = 0;
+    for (const filePath of accepted) {
+      const key = getFontRowKey(filePath);
+      if (!key) continue;
+      if (handoff.choices[key] === 'remove') delete handoff.choices[key];
+      if (handoff.files.some(item => getFontRowKey(item.path) === key)) continue;
+      if (handoff.files.length >= MAX_FONT_HANDOFF_SELECTIONS) break;
+      handoff.files.push({ path: filePath, addedAt: Date.now() });
+      added++;
+    }
+    writeProjectFontHandoff(project, handoff);
+    return { success: true, added, ignored: filePaths.length - accepted.length };
+  });
+  if (!result) return { error: 'not_found' };
+  invalidatePackageReviewForProject(projectId);
+  return result;
+}
+
 function getPackageReviewEntryStatus(entry) {
   if (entry.sourceFingerprint.state !== 'present') {
     return entry.sourceFingerprint.state === 'virtual' ? 'unmaterializable' : entry.sourceFingerprint.state;
@@ -22161,9 +22851,23 @@ function createAuthoritativePackageOutputAllocator(layoutMode) {
     throw new PackageReviewChangedError();
   };
 
+  const reserveGroupedOutputName = (rawName, group) => {
+    for (let attempt = 0; attempt < MAX_PACKAGE_PLAN_PATH_ALLOCATION_ATTEMPTS; attempt++) {
+      const outputName = allocateName(rawName);
+      const relativePath = getPackageGroupedOutputRelativePath(outputName, normalizedLayoutMode, group);
+      const relativePathKey = packagePlanRelativePathCollisionKey(relativePath);
+      if (usedRelativePathKeys.has(relativePathKey)) continue;
+      usedRelativePathKeys.add(relativePathKey);
+      relativePathByOutputName.set(outputName, relativePath);
+      return outputName;
+    }
+    throw new PackageReviewChangedError();
+  };
+
   return {
     reserveNameOnly,
     reserveOutputName,
+    reserveGroupedOutputName,
     getOutputRelativePath(outputName) {
       const relativePath = relativePathByOutputName.get(outputName);
       if (!relativePath) throw new PackageReviewChangedError();
@@ -22178,7 +22882,8 @@ async function buildAuthoritativePackagePlan(
   packageSettings,
   destinationFolderName,
   presentationSuppression = { fingerprints: [], nameBases: [], occurrences: [] },
-  onPresentationMedia = null
+  onPresentationMedia = null,
+  fontReview = null
 ) {
   const layoutMode = normalizePackageOutputLayoutMode(packageSettings.outputLayoutMode);
   const outputAllocator = createAuthoritativePackageOutputAllocator(layoutMode);
@@ -22193,6 +22898,8 @@ async function buildAuthoritativePackagePlan(
     relativePath: path.posix.join(outputAllocator.reserveNameOnly(DIAGNOSTICS_FOLDER_NAME), PROVENANCE_MANIFEST_FILENAME),
   } : null;
   entries.forEach((entry, entryIndex) => {
+    // Font files are output only through the font gate (planFontOutputs).
+    if (isGatedFontFile(files[entryIndex])) return;
     const outputName = allocateOutputName(entry.displayName);
     outputNamesByEntryIndex[entryIndex] = outputName;
     if (entry.embedded) {
@@ -22319,6 +23026,7 @@ async function buildAuthoritativePackagePlan(
       expectedOutputs,
     });
   }
+  const fonts = planFontOutputs(fontReview, layoutMode, outputAllocator);
   return {
     schemaVersion: 2,
     collisionPolicy: 'stable-macos-nfc-casefold-v1',
@@ -22328,6 +23036,7 @@ async function buildAuthoritativePackagePlan(
     reviewedSourceInputs,
     deterministicDerivedOutputs,
     diagnosticsMetadata,
+    ...(fonts ? { fonts } : {}),
   };
 }
 
@@ -22426,6 +23135,7 @@ function getPackageSelectionInputSignature(project, reviewedSemantics = false) {
     workingFileChoiceLimit: project.workingFileChoiceLimit ?? null,
     workingSourceLocators: project.workingSourceLocators ?? null,
     excludedAssetKeys: Array.isArray(project.excludedAssetKeys) ? project.excludedAssetKeys : [],
+    ...(project.fontHandoff !== undefined ? { fontHandoff: project.fontHandoff } : {}),
     watchStartedAt: project.watchStartedAt || null,
     createdAt: project.createdAt || null,
     figmaScopeMode: getProjectFigmaScopeMode(project),
@@ -22513,8 +23223,10 @@ async function buildCanonicalPackageReviewManifest(projectId) {
     const membership = getWorkingSourceMembership(currentProject, files);
     bindEmbeddedPsdPackageReviewResources(files, entries);
     const entryStatuses = entries.map(getPackageReviewEntryStatus);
+    // A font row that is missing or changed is skipped and reported by the
+    // font gate; it never blocks the rest of the package.
     if ((hasWorkingSourceSelectionState(currentProject) && files.length === 0) ||
-        membership.blocked || entryStatuses.some(status => status !== 'ready')) {
+        membership.blocked || entryStatuses.some((status, index) => status !== 'ready' && !isGatedFontFile(files[index]))) {
       return {
         project: currentProject,
         files,
@@ -22551,6 +23263,7 @@ async function buildCanonicalPackageReviewManifest(projectId) {
     };
     let plan;
     const presentationMediaByEntry = new Map();
+    const fontReview = evaluateFontHandoff(currentProject, files);
     try {
       plan = await buildAuthoritativePackagePlan(
         files,
@@ -22561,7 +23274,8 @@ async function buildCanonicalPackageReviewManifest(projectId) {
         (entryIndex, fingerprint) => {
           if (!presentationMediaByEntry.has(entryIndex)) presentationMediaByEntry.set(entryIndex, new Set());
           presentationMediaByEntry.get(entryIndex).add(fingerprint);
-        }
+        },
+        fontReview
       );
     } catch (error) {
       if (error instanceof PackageReviewChangedError) {
@@ -22603,6 +23317,7 @@ async function buildCanonicalPackageReviewManifest(projectId) {
       entries,
       plan,
       manifestKey,
+      fontReview,
       reviewedInputSignature, reviewedSettingsKey: packageSettingsKey,
       materializable: true,
     };
@@ -22741,20 +23456,23 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
         ? 'Package root' : path.posix.dirname(output.relativePath),
       status: 'ready',
     })));
+  const ordinaryFiles = manifest.entries.map((entry, index) => ({
+    ...presentations[index],
+    projectRole: hasWorkingSourceSelectionState(manifest.project)
+      ? presentations[index].effectiveRole : presentations[index].projectRole,
+    name: entry.displayName,
+    ext: entry.ext,
+    embedded: entry.embedded,
+    packageFolder: getPackageReviewEntryFolder(manifest.plan, index),
+    status: 'ready',
+  })).filter((_, index) => !isGatedFontFile(manifest.files[index]));
+  const fonts = presentFontReview(manifest.fontReview, manifest.plan);
   return {
     token,
     projectId,
-    files: manifest.entries.map((entry, index) => ({
-      ...presentations[index],
-      projectRole: hasWorkingSourceSelectionState(manifest.project)
-        ? presentations[index].effectiveRole : presentations[index].projectRole,
-      name: entry.displayName,
-      ext: entry.ext,
-      embedded: entry.embedded,
-      packageFolder: getPackageReviewEntryFolder(manifest.plan, index),
-      status: 'ready',
-    })).concat(additionalMedia),
-    totalFiles: manifest.entries.length + additionalMedia.length,
+    files: ordinaryFiles.concat(additionalMedia),
+    totalFiles: ordinaryFiles.length + additionalMedia.length + (manifest.plan.fonts?.inputs.length || 0),
+    ...(fonts ? { fonts } : {}),
     semanticCounts: membership.counts,
     workingFileChoices: getWorkingFileChoicePresentation(manifest.project),
     materializable: true,
@@ -22786,18 +23504,19 @@ async function createUnavailablePackageReview(projectId, manifest) {
       packageReviewFingerprintsMatch(entry.sourceFingerprint, getPackageReviewManifestEntry(manifest.files[index]).sourceFingerprint));
   if (!diskCurrent || !inputSignature || inputSignature !== getPackageSelectionInputSignature(currentProject, true) ||
       settingsKey !== JSON.stringify(getRelevantPackageReviewSettings())) return { error: 'package_review_changed' };
+  const fontFree = manifest.entries.map((entry, index) => ({
+    ...presentations[index],
+    projectRole: hasWorkingSourceSelectionState(manifest.project)
+      ? presentations[index].effectiveRole : presentations[index].projectRole,
+    name: entry.displayName,
+    ext: entry.ext,
+    embedded: entry.embedded,
+    status: manifest.entryStatuses[index] || 'unavailable',
+  })).filter((_, index) => !isGatedFontFile(manifest.files[index]));
   return {
     projectId,
-    files: manifest.entries.map((entry, index) => ({
-      ...presentations[index],
-      projectRole: hasWorkingSourceSelectionState(manifest.project)
-        ? presentations[index].effectiveRole : presentations[index].projectRole,
-      name: entry.displayName,
-      ext: entry.ext,
-      embedded: entry.embedded,
-      status: manifest.entryStatuses[index] || 'unavailable',
-    })),
-    totalFiles: manifest.entries.length,
+    files: fontFree,
+    totalFiles: fontFree.length,
     semanticCounts: membership.counts,
     workingFileChoices: getWorkingFileChoicePresentation(manifest.project),
     materializable: false,
@@ -22894,6 +23613,98 @@ registerTrustedIpcHandler('projects:prepare-package-review', async (event, proje
   return await createPackageReviewResponse(projectId, manifest);
 });
 
+// Font handoff IPC. Every handler re-derives eligibility here; the renderer
+// only names a project, a row key, families or an offer it was given.
+function getInstalledFontFamilyListing(registered) {
+  const families = new Map();
+  for (const row of registered) {
+    if (!row.family || row.postscriptName.startsWith('.')) continue;
+    const exclusion = getFontLocationExclusion(row.path, row.postscriptName);
+    let entry = families.get(row.family);
+    if (!entry) {
+      entry = { family: row.family, styles: new Set(), eligibleCount: 0, reasons: new Set() };
+      families.set(row.family, entry);
+    }
+    if (row.style) entry.styles.add(row.style);
+    if (exclusion) entry.reasons.add(exclusion);
+    else entry.eligibleCount++;
+  }
+  return [...families.values()]
+    .sort((left, right) => left.family.localeCompare(right.family))
+    .slice(0, 5000)
+    .map(entry => {
+      const reason = entry.eligibleCount ? null : [...entry.reasons][0] || 'system';
+      return {
+        family: entry.family,
+        styles: [...entry.styles].sort().slice(0, 64),
+        status: reason ? 'excluded' : 'available',
+        reasonText: reason ? fontHandoff.FONT_REASON_TEXT[reason] : '',
+      };
+    });
+}
+
+registerTrustedIpcHandler('fonts:list-installed', async (event, projectId) => {
+  const assertAccountCurrent = captureAccountAuthorization();
+  assertAccountCurrent();
+  if (!getProjects().some(project => project.id === projectId)) return { error: 'not_found' };
+  try {
+    return { families: getInstalledFontFamilyListing(await listRegisteredFonts()) };
+  } catch (_) {
+    return { error: 'font_registry_unavailable' };
+  }
+});
+
+registerTrustedIpcHandler('fonts:add-installed', async (event, projectId, request) => {
+  const assertAccountCurrent = captureAccountAuthorization();
+  assertAccountCurrent();
+  if (packageInFlight) return { error: 'package_in_flight' };
+  const result = await addInstalledFontFamilies(projectId, request);
+  assertAccountCurrent();
+  return result;
+});
+
+registerTrustedIpcHandler('fonts:choose-installed-copy', async (event, projectId, offerId) => {
+  captureAccountAuthorization()();
+  if (packageInFlight) return { error: 'package_in_flight' };
+  return chooseInstalledFontCopy(projectId, offerId);
+});
+
+registerTrustedIpcHandler('fonts:add-files', async (event, projectId) => {
+  const assertAccountCurrent = captureAccountAuthorization();
+  assertAccountCurrent();
+  if (packageInFlight) return { error: 'package_in_flight' };
+  if (!getProjects().some(project => project.id === projectId)) return { error: 'not_found' };
+  if (pendingFontFilePickers.has(projectId)) return { error: 'font_picker_open' };
+  pendingFontFilePickers.add(projectId);
+  let dialogResult;
+  try {
+    dialogResult = await dialog.showOpenDialog({
+      properties: ['openFile', 'multiSelections'],
+      title: 'Add Font Files',
+      filters: [{ name: 'Font Files', extensions: ['otf', 'ttf', 'ttc', 'otc'] }],
+    });
+  } finally {
+    pendingFontFilePickers.delete(projectId);
+  }
+  showTrayWindow();
+  if (!dialogResult || dialogResult.canceled) return { success: true, added: 0, canceled: true };
+  assertAccountCurrent();
+  if (packageInFlight) return { error: 'package_in_flight' };
+  return addFontFilePaths(projectId, Array.isArray(dialogResult.filePaths) ? dialogResult.filePaths.slice(0, MAX_FONT_HANDOFF_SELECTIONS) : []);
+});
+
+registerTrustedIpcHandler('fonts:set-row-choice', async (event, projectId, rowKey, choice) => {
+  captureAccountAuthorization()();
+  if (packageInFlight) return { error: 'package_in_flight' };
+  return setFontRowChoice(projectId, rowKey, choice);
+});
+
+registerTrustedIpcHandler('fonts:confirm-licence', async (event, projectId, rowKey, request) => {
+  captureAccountAuthorization()();
+  if (packageInFlight) return { error: 'package_in_flight' };
+  return setFontLicenceConfirmation(projectId, rowKey, request);
+});
+
 class PackageReviewChangedError extends Error {
   constructor() {
     super('package_review_changed');
@@ -22961,6 +23772,8 @@ async function openReviewedPackageSources(files, entries) {
   const sources = [];
   try {
     for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
+      // Font rows are read and re-gated by the font output step instead.
+      if (isGatedFontFile(files[entryIndex])) continue;
       const entry = entries[entryIndex];
       const sourcePath = getReviewedPackageSourcePath(files[entryIndex], entry);
       if (!entry || entry.sourceFingerprint?.state !== 'present' || !sourcePath) {
@@ -24699,6 +25512,52 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
       }
     }
 
+    let fontFileCount = 0;
+    if (manifest.plan.fonts) {
+      const fontPlan = manifest.plan.fonts;
+      for (const input of fontPlan.inputs) {
+        const staleFontResult = await abortStalePackage(); if (staleFontResult) return staleFontResult;
+        const allocatedOutputName = allocateOutputName(input.rawName);
+        if (allocatedOutputName !== input.outputName || getOutputRelativePath(allocatedOutputName) !== input.relativePath) {
+          throw new PackageReviewChangedError();
+        }
+        const { buffer, mode } = readGatedFontForPackaging(input, layoutMode);
+        try {
+          const finalPath = packageWrites.prepare(input.relativePath);
+          packageWrites.verify(finalPath);
+          if (packageWrites.isDescriptorBound(finalPath)) await packageWrites.materializeBuffer(finalPath, buffer, mode);
+          else await packageWrites.materializeDirectBuffer(finalPath, buffer, mode);
+          packageWrites.verify(finalPath);
+        } catch (err) {
+          if (err instanceof PackageTransactionInvariantError) return await failPackage(err);
+          return await failPackage('package_write_failed');
+        }
+        copiedCount++;
+        fontFileCount++;
+      }
+      const generated = [
+        ...(fontPlan.oflText ? [[fontPlan.oflText, fontHandoff.OFL_1_1_TEXT, fontHandoff.OFL_TEXT_FILENAME]] : []),
+        [fontPlan.note, fontPlan.note.text, fontHandoff.FONTS_NOTE_FILENAME],
+      ];
+      for (const [output, text, rawName] of generated) {
+        const allocatedOutputName = outputAllocator.reserveGroupedOutputName(rawName, 'fonts');
+        if (allocatedOutputName !== output.outputName || getOutputRelativePath(allocatedOutputName) !== output.relativePath) {
+          throw new PackageReviewChangedError();
+        }
+        try {
+          const finalPath = packageWrites.prepare(output.relativePath);
+          packageWrites.verify(finalPath);
+          const data = Buffer.from(text, 'utf8');
+          if (packageWrites.isDescriptorBound(finalPath)) await packageWrites.materializeBuffer(finalPath, data, OWNER_ONLY_FILE_MODE);
+          else await packageWrites.materializeDirectBuffer(finalPath, data, OWNER_ONLY_FILE_MODE);
+          packageWrites.verify(finalPath);
+        } catch (err) {
+          if (err instanceof PackageTransactionInvariantError) return await failPackage(err);
+          return await failPackage('package_write_failed');
+        }
+      }
+    }
+
     const staleResult = await abortStalePackage(); if (staleResult) return staleResult;
     if (manifest.plan.diagnosticsMetadata) {
       let manifestProject; try { manifestProject = structuredClone(project); recordPresentationMediaExtractionProvenanceForProject(manifestProject, presentationExtractionEvents); recordPackageProvenance(id, packageProvenanceInfo, packageProvenanceEvents, manifestProject); } catch (_) { manifestProject = project; }
@@ -24772,6 +25631,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
       copiedCount,
       embeddedCount,
       totalFiles: copiedCount + embeddedCount,
+      ...(manifest.plan.fonts ? { fontFileCount } : {}),
       folderPath: destFolder,
       errors
     };

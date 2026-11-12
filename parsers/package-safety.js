@@ -13,6 +13,11 @@ const PACKAGE_OUTPUT_LAYOUT_MODES = Object.freeze({
   BY_EXTENSION: 'by-extension-v1',
 });
 const FALLBACK_EXTENSION_FOLDER = 'OTHER';
+// Installable font files share one folder. Reserved: an extension spelled
+// "fonts" goes to OTHER so it cannot merge with Fonts on a case-insensitive disk.
+const FONTS_PACKAGE_FOLDER = 'Fonts';
+const FONT_PACKAGE_EXTENSIONS = new Set(['otf', 'ttf', 'ttc', 'otc']);
+const PACKAGE_OUTPUT_GROUP_FOLDERS = Object.freeze({ fonts: FONTS_PACKAGE_FOLDER });
 const SAFE_EXTENSION_PATTERN = new RegExp(
   `^[a-z0-9][a-z0-9_+-]{0,${MAX_PACKAGE_EXTENSION_LENGTH - 2}}$`
 );
@@ -150,10 +155,12 @@ function getPackageExtensionFolderName(rawOutputName) {
 
   if (
     !SAFE_EXTENSION_PATTERN.test(extension) ||
-    WINDOWS_RESERVED_PACKAGE_COMPONENT_PATTERN.test(extension)
+    WINDOWS_RESERVED_PACKAGE_COMPONENT_PATTERN.test(extension) ||
+    extension === FONTS_PACKAGE_FOLDER.toLowerCase()
   ) {
     return FALLBACK_EXTENSION_FOLDER;
   }
+  if (FONT_PACKAGE_EXTENSIONS.has(extension)) return FONTS_PACKAGE_FOLDER;
   return extension.toUpperCase();
 }
 
@@ -178,6 +185,21 @@ function getPackageOutputRelativePath(rawOutputName, layoutMode) {
     getPackageExtensionFolderName(inputName),
     makeOrganizedPackageLeafPortable(outputName)
   );
+}
+
+// A generated file that belongs with a group (the fonts note and licence text
+// sit beside the fonts). Flat layout keeps everything at the package root.
+function getPackageGroupedOutputRelativePath(rawOutputName, layoutMode, group) {
+  const folder = Object.prototype.hasOwnProperty.call(PACKAGE_OUTPUT_GROUP_FOLDERS, group)
+    ? PACKAGE_OUTPUT_GROUP_FOLDERS[group] : null;
+  if (!folder) throw new Error('Unknown package output group');
+  const inputName = typeof rawOutputName === 'string' ? rawOutputName : '';
+  const outputName = sanitizePackageFileName(
+    getPortablePackageOutputLeafName(inputName).replace(UNSAFE_FILENAME_CHARS, '_'),
+    'file'
+  );
+  if (normalizePackageOutputLayoutMode(layoutMode) === PACKAGE_OUTPUT_LAYOUT_MODES.FLAT) return outputName;
+  return path.posix.join(folder, makeOrganizedPackageLeafPortable(outputName));
 }
 
 function packageCollisionKey(rawName) {
@@ -479,6 +501,7 @@ function removeCreatedPackageFiles(destFolder, filePaths) {
 
 module.exports = {
   FALLBACK_EXTENSION_FOLDER,
+  FONTS_PACKAGE_FOLDER,
   PACKAGE_OUTPUT_LAYOUT_MODES,
   PackageNameAllocationError,
   truncatePackageComponent,
@@ -486,6 +509,7 @@ module.exports = {
   sanitizePackageRelativePath,
   getPackageExtensionFolderName,
   getPackageOutputRelativePath,
+  getPackageGroupedOutputRelativePath,
   normalizePackageOutputLayoutMode,
   packageCollisionKey,
   createPackageNameAllocator,

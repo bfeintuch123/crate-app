@@ -4,7 +4,9 @@ const path = require('path');
 
 const {
   FALLBACK_EXTENSION_FOLDER,
+  FONTS_PACKAGE_FOLDER,
   PACKAGE_OUTPUT_LAYOUT_MODES,
+  getPackageGroupedOutputRelativePath,
   getPackageExtensionFolderName,
   getPackageOutputRelativePath,
   normalizePackageOutputLayoutMode,
@@ -39,6 +41,38 @@ test('file types map to deterministic uppercase extension folders', () => {
   for (const [fileName, folderName] of cases) {
     assert.equal(getPackageExtensionFolderName(fileName), folderName, fileName);
   }
+});
+
+test('every installable font type shares one Fonts folder; web fonts keep their own folders', () => {
+  for (const fileName of ['Brand.otf', 'Brand.OTF', 'Brand.ttf', 'Brand.TtF', 'Brand.ttc', 'Brand.otc']) {
+    assert.equal(getPackageExtensionFolderName(fileName), FONTS_PACKAGE_FOLDER, fileName);
+    assert.equal(
+      getPackageOutputRelativePath(fileName, PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION),
+      `Fonts/${fileName}`
+    );
+    assert.equal(getPackageOutputRelativePath(fileName, PACKAGE_OUTPUT_LAYOUT_MODES.FLAT), fileName);
+  }
+  assert.equal(getPackageExtensionFolderName('Brand.woff'), 'WOFF');
+  assert.equal(getPackageExtensionFolderName('Brand.woff2'), 'WOFF2');
+});
+
+test('the Fonts folder name is reserved: a .fonts extension goes to OTHER', () => {
+  for (const fileName of ['notes.fonts', 'notes.FONTS', 'notes.Fonts']) {
+    assert.equal(getPackageExtensionFolderName(fileName), FALLBACK_EXTENSION_FOLDER, fileName);
+  }
+  assert.equal(getPackageExtensionFolderName('Fonts'), FALLBACK_EXTENSION_FOLDER);
+});
+
+test('font notes join the Fonts folder only when organized', () => {
+  assert.equal(
+    getPackageGroupedOutputRelativePath('Fonts in this package.txt', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION, 'fonts'),
+    'Fonts/Fonts in this package.txt'
+  );
+  assert.equal(
+    getPackageGroupedOutputRelativePath('Fonts in this package.txt', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT, 'fonts'),
+    'Fonts in this package.txt'
+  );
+  assert.throws(() => getPackageGroupedOutputRelativePath('x.txt', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION, 'other'));
 });
 
 test('each safe image extension retains its actual uppercase file type', () => {
