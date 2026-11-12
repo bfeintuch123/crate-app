@@ -164,7 +164,7 @@ function excludedCases() {
     assert.deepEqual(f.current().excludedPendingFiles, []);
   });
 
-  excludedTest('Exclude All remembers every eligible row in order; repeats dedupe; a project file with the same path retires the record', { timeout: 30000 }, async () => {
+  excludedTest('Exclude All remembers every eligible row in order and a repeat Exclude keeps one record in place', { timeout: 30000 }, async () => {
     const rows = ['A.png', 'B.png', 'C.png'].map(name => pendingRow(name));
     const f = await fixture('batch', { pending: rows });
     for (const row of rows) assert.ok(Array.isArray(await f.reject(row.path)));
@@ -176,14 +176,7 @@ function excludedCases() {
     assert.ok(Array.isArray(await f.reject(rows[1].path)));
     assert.deepEqual(f.current().excludedPendingFiles.map(record => record.name), ['A.png', 'B.png', 'C.png']);
 
-    // + Add Files or a direct add puts the file back in the project: the record is no longer shown or kept.
-    metadataTestHooks.mutateProjectForTest(f.id, project => {
-      project.files.push({ path: rows[2].path, name: 'C.png', ext: '.png', source: 'manual-browse', addedAt: Date.now() });
-      return {};
-    });
-    assert.deepEqual(f.current().excludedPendingFiles.map(record => record.name), ['A.png', 'B.png']);
-    assert.ok(f.current().excludedAssetKeys.includes(rows[2].path), 'its exclusion key is unchanged');
-    assert.deepEqual((await f.workspace()).excludedPendingFiles.map(file => file.name), ['A.png', 'B.png']);
+    assert.equal(f.current().excludedAssetKeys.filter(key => key === rows[1].path).length, 1);
   });
 
   excludedTest('a malformed record list is shown as empty, left untouched, and a new Exclude fails closed', { timeout: 30000 }, async () => {
@@ -368,6 +361,7 @@ function excludedCases() {
   excludedTest('+ Add Files of a remembered file includes it and prunes only its record; other records and legacy keys are untouched', { timeout: 30000 }, async () => {
     const rows = [pendingRow('Readd.png'), pendingRow('Other.png')];
     const f = await fixture('add-files-prune', { pending: rows });
+    const originalBytes = fs.readFileSync(desk('Readd.png'));
     f.current().excludedAssetKeys = [desk('Legacy.png')];
     roundTripFakeStore();
     for (const row of rows) assert.ok(Array.isArray(await f.reject(row.path)));
@@ -382,6 +376,10 @@ function excludedCases() {
     assert.deepEqual(ws.excludedPendingFiles.map(file => file.name), ['Other.png']);
     const readded = ws.files.find(file => file.name === 'Readd.png');
     assert.deepEqual([readded.excluded, readded.included], [false, true], 'the explicitly added file is Included');
+    // Exactly one row for the file: one project file, no remembered row, nothing in Needs Review.
+    assert.equal([...ws.files, ...ws.pendingFiles, ...ws.excludedPendingFiles].filter(file => file.name === 'Readd.png').length, 1);
+    assert.equal(f.current().files.filter(file => file.path === desk('Readd.png')).length, 1);
+    assert.deepEqual(fs.readFileSync(desk('Readd.png')), originalBytes, 'the original file is untouched');
     assert.ok((await metadataTestHooks.selectProjectFilesForPackagingForTest(f.id)).some(file => file.path === desk('Readd.png')));
     assert.equal((await metadataTestHooks.selectProjectFilesForPackagingForTest(f.id)).some(file => file.path === desk('Other.png')), false);
   });
