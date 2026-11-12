@@ -139,6 +139,11 @@ test('location classes: Adobe, macOS, app stores and bundles are excluded; user 
   }
   assert.equal(classifyFontLocation('/users/OLIVIA/library/APPLICATION SUPPORT/adobe/x.otf', HOME).kind, 'adobe-fonts');
   assert.equal(classifyFontLocation('relative/Font.otf', HOME).excludedReason, 'unreadable');
+  const deepHome = '/Users/Shared/test-home';
+  assert.equal(classifyFontLocation(`${deepHome}/Library/Application Support/Adobe/x.otf`, deepHome).kind, 'adobe-fonts');
+  assert.equal(classifyFontLocation(`${deepHome}/Library/Fonts/x.otf`, deepHome).kind, 'installed');
+  assert.equal(classifyFontLocation(`${deepHome}/Library/Caches/x.otf`, deepHome).kind, 'app');
+  assert.equal(classifyFontLocation('/opt/home/me/Library/Application Support/Adobe/x.otf', '/opt/home/me').kind, 'adobe-fonts');
 });
 
 test('open-licence evidence needs the font to state SIL OFL 1.1 in every face, not just embedding flags', () => {
@@ -336,4 +341,44 @@ test('a font stored inside another file is excluded whatever the choice or confi
   const unlock = { choice: 'include', confirmation: { sha256: SHA_A, wordingVersion: FONT_CONFIRMATION_WORDING_VERSION } };
   assert.deepEqual(evaluateFontGate(gateInput({ ...unlock, embedded: true, faces: [] })), { outcome: 'excluded', reason: 'embedded', basis: null });
   assert.equal(typeof FONT_REASON_TEXT.embedded, 'string');
+});
+
+test('cloud-synced folders are user files; managed stores on other volumes stay excluded', () => {
+  const cases = [
+    ['/Users/olivia/Library/CloudStorage/Dropbox/Brand Kit/BrandSans-Bold.otf', 'user-file', null],
+    ['/Users/olivia/Library/CloudStorage/GoogleDrive-o@example.com/My Drive/BrandSans.otf', 'user-file', null],
+    ['/Users/olivia/Library/Mobile Documents/com~apple~CloudDocs/Brand/BrandSans.otf', 'user-file', null],
+    ['/Users/olivia/Library/Mobile Documents/iCloud~com~example~fonts/Documents/Rented.otf', 'app', 'app'],
+    ['/Volumes/Work/Library/Application Support/Adobe/CoreSync/plugins/livetype/r/1.otf', 'adobe-fonts', 'adobe-fonts'],
+    ['/Volumes/Old Mac/System/Library/Fonts/Helvetica.ttc', 'system', 'system'],
+    ['/Volumes/Old Mac/Users/x/Library/Application Support/FontManager/A.otf', 'app', 'app'],
+    ['/Volumes/Old Mac/Library/Caches/A.otf', 'app', 'app'],
+  ];
+  for (const [realPath, kind, excludedReason] of cases) {
+    assert.deepEqual(classifyFontLocation(realPath, HOME), { kind, excludedReason }, realPath);
+  }
+});
+
+test('only a positive SIL OFL 1.1 grant counts as open-licence evidence', () => {
+  const positive = [
+    OFL_STATEMENT,
+    'Licensed under the SIL Open Font License, Version 1.1.',
+    'This Font Software is licensed under the SIL Open Font License, Version 1.1. This license is copied below.',
+    'Copyright 2020 The Example Project Authors. This Font Software is licensed under the SIL Open Font License, Version 1.1.',
+  ];
+  for (const licence of positive) assert.equal(detectOpenLicence([{ licence, licenceUrl: null }]), 'ofl-1.1', licence);
+  const negative = [
+    'This font is proprietary. Portions are derived from Foo Sans, which is licensed under the SIL Open Font License, Version 1.1.',
+    'Commercial licence. You may not redistribute. Unlike fonts under the SIL Open Font License 1.1, this font requires a paid licence.',
+    'Based on Foo Sans (SIL Open Font License, Version 1.1); this version is licensed under the Example Desktop EULA.',
+    'See https://openfontlicense.org for the SIL Open Font License 1.1 used by other fonts in this family.',
+  ];
+  for (const licence of negative) assert.equal(detectOpenLicence([{ licence, licenceUrl: 'https://openfontlicense.org' }]), null, licence);
+});
+
+test('a face without a readable English or Macintosh PostScript name is never offered for confirmation', () => {
+  const input = gateInput({ faces: [{ postscriptName: null, restricted: false, licence: null, licenceUrl: null }],
+    confirmation: { sha256: SHA_A, wordingVersion: FONT_CONFIRMATION_WORDING_VERSION } });
+  assert.deepEqual(evaluateFontGate(input), { outcome: 'excluded', reason: 'unnamed', basis: null });
+  assert.equal(typeof FONT_REASON_TEXT.unnamed, 'string');
 });

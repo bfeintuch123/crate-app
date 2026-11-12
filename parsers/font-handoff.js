@@ -214,52 +214,75 @@ function foldPath(value) {
   return `${value || ''}`.normalize('NFC').toLowerCase();
 }
 
-// Judged on the resolved real path. Adobe's whole Application Support folder
-// is excluded because Adobe Fonts storage is not documented precisely.
+// Judged on the resolved real path, on any volume. Adobe's whole Application
+// Support folder is excluded because Adobe Fonts storage is not documented
+// precisely. Cloud-synced folders the user keeps files in are user files.
+const LIBRARY_ROOT = '^(?:/volumes/[^/]+)?(?:/users/[^/]+)?/library/';
+const inLibrary = suffix => new RegExp(`${LIBRARY_ROOT}${suffix}`);
+const ADOBE_STORE = inLibrary('application support/adobe/');
+const SYSTEM_ROOT = /^(?:\/volumes\/[^/]+)?\/(?:system|library\/apple|usr|bin|sbin|private\/var\/db)\//;
+const CLOUD_SYNCED = [inLibrary('cloudstorage/'), inLibrary('mobile documents/com~apple~clouddocs/')];
+const FONTS_FOLDER = inLibrary('fonts/');
+const ANY_LIBRARY = inLibrary('');
+
 function classifyFontLocation(realPath, homeDir) {
   if (typeof realPath !== 'string' || !path.isAbsolute(realPath) || realPath.includes('\0')) {
     return { kind: 'unknown', excludedReason: 'unreadable' };
   }
-  const folded = foldPath(path.resolve(realPath));
+  let folded = foldPath(path.resolve(realPath));
   const home = typeof homeDir === 'string' && path.isAbsolute(homeDir) ? foldPath(path.resolve(homeDir)) : null;
-  const under = prefix => folded.startsWith(prefix.endsWith('/') ? prefix : `${prefix}/`);
-  const libraries = ['/library'];
-  if (home) libraries.push(`${home}/library`);
-  const otherUser = folded.match(/^(\/users\/[^/]+\/library)\//);
-  if (otherUser && !libraries.includes(otherUser[1])) libraries.push(otherUser[1]);
+  // The current user's home folder, wherever it is, maps onto the /Users/<name> pattern.
+  if (home && home !== '/' && folded.startsWith(`${home}/`)) folded = `/users/~${folded.slice(home.length)}`;
 
-  if (libraries.some(library => under(`${library}/application support/adobe`))) {
-    return { kind: 'adobe-fonts', excludedReason: 'adobe-fonts' };
-  }
-  if (under('/system') || under('/library/apple') || under('/usr') || under('/private/var/db') || under('/bin') || under('/sbin')) {
-    return { kind: 'system', excludedReason: 'system' };
-  }
+  if (ADOBE_STORE.test(folded)) return { kind: 'adobe-fonts', excludedReason: 'adobe-fonts' };
+  if (SYSTEM_ROOT.test(folded)) return { kind: 'system', excludedReason: 'system' };
   if (folded.split('/').some(part => /\.(app|framework|bundle|plugin|appex)$/.test(part))) {
     return { kind: 'app', excludedReason: 'app' };
   }
-  for (const library of libraries) {
-    if (under(`${library}/fonts`)) return { kind: 'installed', excludedReason: null };
-    if (under(library)) return { kind: 'app', excludedReason: 'app' };
-  }
+  if (CLOUD_SYNCED.some(pattern => pattern.test(folded))) return { kind: 'user-file', excludedReason: null };
+  if (FONTS_FOLDER.test(folded)) return { kind: 'installed', excludedReason: null };
+  if (ANY_LIBRARY.test(folded)) return { kind: 'app', excludedReason: 'app' };
   return { kind: 'user-file', excludedReason: null };
 }
 
-const OFL_NAME = /\bSIL\s+Open\s+Font\s+Licen[cs]e\b/i;
-const OFL_VERSION = /(?:\bversion\s*|\bv\.?\s*|,\s*|\s)1\.1\b/i;
-const OFL_URL = /^(?:https?:\/\/)?(?:www\.)?(?:scripts\.sil\.org\/(?:OFL\b|cms\/scripts\/page\.php\?[^ ]*\bid=OFL\b)|openfontlicense\.org\b)/i;
-const LICENCE_NEGATION = /\b(?:not|never|no longer)\b[^.]{0,60}\bOpen\s+Font\s+Licen[cs]e\b/i;
+// Real licence evidence from the font's own name table (ID 13): a sentence
+// that grants the SIL OFL 1.1 to this font. A mere mention (derived from,
+// unlike, see) is not a grant, and the embedding field is never a licence.
+const OFL_NAME = String.raw`SIL\s+Open\s+Font\s+Licen[cs]e`;
+const SENTENCE_START = String.raw`(?:^|[.!?]\s+|\n)\s*`;
+const OFL_GRANTS = [
+  new RegExp(`${SENTENCE_START}(?:this\\s+font\\s+software|the\\s+font\\s+software|this\\s+font(?:\\s+family)?|these\\s+fonts)\\s+(?:is|are)\\s+licen[cs]ed\\s+under\\s+the\\s+${OFL_NAME}([^\\n]{0,24})`, 'i'),
+  new RegExp(`${SENTENCE_START}licen[cs]ed\\s+under\\s+the\\s+${OFL_NAME}([^\\n]{0,24})`, 'i'),
+];
+const OFL_VERSION_1_1 = /^,?\s*(?:version\s*|v\.?\s*)?1\.1\b/i;
+const OFL_URL = /(?:^|\s|\()(?:https?:\/\/)?(?:www\.)?(?:scripts\.sil\.org\/(?:OFL\b|cms\/scripts\/page\.php\?[^ ]*\bid=OFL\b)|openfontlicense\.org\b)/i;
+const LICENCE_DISQUALIFIERS = /\b(?:not|never|no longer|proprietary|EULA|end[- ]user licen[cs]e|commercial licen[cs]e|paid licen[cs]e|portions?|derived from|based on|unlike)\b/i;
 
-// Real licence evidence from the font's own name table (IDs 13 and 14). The
-// embedding field is never treated as a licence.
+function grantsOpenLicence(licence, licenceUrl) {
+  for (const pattern of OFL_GRANTS) {
+    const match = pattern.exec(licence);
+    if (!match) continue;
+    // The grant names version 1.1, or names the OFL and points at its official page.
+    if (OFL_VERSION_1_1.test(match[1] || '')) return true;
+    if (!/\b1\.0\b/.test(match[1] || '') && (OFL_URL.test(licence) || OFL_URL.test(` ${licenceUrl || ''}`))) return true;
+  }
+  return false;
+}
+
 function detectOpenLicence(faces) {
   if (!Array.isArray(faces) || faces.length === 0) return null;
   const every = faces.every(face => {
     const licence = typeof face?.licence === 'string' ? face.licence : '';
-    if (!OFL_NAME.test(licence) || LICENCE_NEGATION.test(licence)) return false;
-    if (/\b1\.0\b/.test(licence) && !OFL_VERSION.test(licence)) return false;
-    return OFL_VERSION.test(licence) || OFL_URL.test(typeof face.licenceUrl === 'string' ? face.licenceUrl : '');
+    return grantsOpenLicence(licence, face?.licenceUrl) && !LICENCE_DISQUALIFIERS.test(licenceWithoutOflBody(licence));
   });
   return every ? 'ofl-1.1' : null;
+}
+
+// Fonts sometimes carry the whole OFL text in ID 13; its own words ("may not
+// be sold") must not count as disqualifiers.
+function licenceWithoutOflBody(licence) {
+  const body = licence.search(/SIL OPEN FONT LICENSE Version 1\.1 - 26 February 2007/);
+  return body >= 0 ? licence.slice(0, body) : licence;
 }
 
 function isCurrentConfirmation(confirmation, sha256) {
@@ -291,6 +314,11 @@ function evaluateFontGate(input) {
     return gateResult('excluded', 'system');
   }
   if (faces.some(face => face?.restricted === true)) return gateResult('excluded', 'restricted');
+  // Without a readable English or Macintosh PostScript name, nothing can be
+  // named to the user or confirmed, so the face is not offered.
+  if (faces.some(face => typeof face?.postscriptName !== 'string' || !face.postscriptName)) {
+    return gateResult('excluded', 'unnamed');
+  }
   if (input.identityConfirmed === false) return gateResult('excluded', 'unconfirmed');
   if (input.choice === 'remove') return gateResult('not-included', 'removed');
   if (input.intent !== 'explicit' && input.choice !== 'include') return gateResult('not-included', 'found');
@@ -319,6 +347,7 @@ const FONT_REASON_TEXT = Object.freeze({
   'licence-unknown': 'Crate can\'t tell whether this font\'s licence allows sharing it. Confirm below to include it.',
   duplicate: 'Same file as another font in this package. It is copied once.',
   embedded: 'Stored inside a Photoshop file. Crate can\'t check it, so it isn\'t packaged.',
+  unnamed: 'Crate couldn\'t read this font\'s name in English, so it can\'t be checked or included.',
 });
 
 // The fonts note is read by the people receiving the package, so reasons that

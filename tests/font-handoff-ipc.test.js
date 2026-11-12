@@ -315,7 +315,7 @@ function cases() {
     assert.equal(found.reason, 'found');
     assert.ok(!first.files.some(file => file.name === 'Found-Regular.otf'), 'font never listed as an ordinary asset');
     let out = await packageNow(f, first);
-    assert.deepEqual(listTree(out.result.folderPath), ['Fonts/Fonts in this package.txt', 'PNG/Logo.png']);
+    assert.deepEqual(listTree(out.result.folderPath), ['PNG/Logo.png'], 'a never-chosen font is not named to recipients');
     fs.rmSync(out.result.folderPath, { recursive: true, force: true });
 
     // A confirmation alone does not include a found font.
@@ -529,6 +529,67 @@ function cases() {
     const tree = listTree(result.folderPath);
     assert.ok(!tree.some(file => /\.(otf|ttf|ttc|otc)$/i.test(file)), tree.join(', '));
     assert.match(fs.readFileSync(path.join(result.folderPath, 'Fonts', 'Fonts in this package.txt'), 'utf8'), /Restricted\.otf: Stored inside a Photoshop file/);
+  });
+
+  fontTest('removed and never-chosen fonts are not named to recipients; no note when nothing is left to say', async () => {
+    const f = await fixture('Private names');
+    const file = path.join(f.dir, 'SecretClient-Bold.otf');
+    writeFont(file, { names: englishNames({ family: 'Secret Client', style: 'Bold', postscriptName: 'SecretClient-Bold' }) });
+    manualDialogFor([file]);
+    await callIpcRaw('projects:add-files', f.project.id);
+    const first = await review(f);
+    assert.equal((await callIpcRaw('fonts:set-row-choice', f.project.id, row(first, 'SecretClient-Bold.otf').key, 'remove')).success, true);
+    const removed = await review(f);
+    assert.equal(row(removed, 'SecretClient-Bold.otf').reason, 'removed');
+    const { result } = await packageNow(f, removed);
+    assert.deepEqual(listTree(result.folderPath), ['PNG/Logo.png']);
+  });
+
+  fontTest('a PowerPoint deck that links a font file explains why Package Review cannot package it', async () => {
+    const f = await fixture('Deck font link');
+    const font = path.join(f.dir, 'BrandSans-Bold.otf');
+    writeFont(font, brand('Bold', { licence: OFL_STATEMENT }));
+    const stage = path.join(f.dir, 'zip');
+    const rels = path.join(stage, 'ppt', 'slides', '_rels');
+    fs.mkdirSync(rels, { recursive: true });
+    fs.writeFileSync(path.join(stage, '[Content_Types].xml'), '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>');
+    fs.writeFileSync(path.join(stage, 'ppt', 'slides', 'slide1.xml'), '<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"/>');
+    fs.writeFileSync(path.join(rels, 'slide1.xml.rels'), `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="file://${font}" TargetMode="External"/></Relationships>`);
+    const deck = path.join(f.dir, 'Deck.pptx');
+    assert.equal(realSpawnSync('/usr/bin/zip', ['-q', '-r', deck, '.'], { cwd: stage }).status, 0);
+    manualDialogFor([deck, font]);
+    await callIpcRaw('projects:add-files', f.project.id);
+    await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include');
+    const result = await callIpcRaw('projects:prepare-package-review', f.project.id, f.out);
+    assert.equal(result.materializable, false, JSON.stringify(result));
+    assert.match(result.message || '', /links a font file/);
+    assert.deepEqual(fs.readdirSync(f.out), []);
+  });
+
+  fontTest('adding the real file after its symlink replaces the link', async () => {
+    const f = await fixture('Symlink then file');
+    const real = path.join(f.dir, 'Real-Regular.otf');
+    writeFont(real, { names: englishNames({ family: 'Real', style: 'Regular', postscriptName: 'Real-Regular', licence: OFL_STATEMENT }) });
+    const link = path.join(f.dir, 'Link.otf');
+    fs.symlinkSync(real, link);
+    manualDialogFor([link]);
+    await callIpcRaw('fonts:add-files', f.project.id);
+    assert.equal(row(await review(f), 'Link.otf').reason, 'symlink');
+    manualDialogFor([real]);
+    assert.equal((await callIpcRaw('fonts:add-files', f.project.id)).added, 1);
+    const after = await review(f);
+    assert.equal(after.fonts.rows.length, 1);
+    assert.equal(row(after, 'Real-Regular.otf').outcome, 'included');
+  });
+
+  fontTest('removing an added font leaves no stored choice behind', async () => {
+    const f = await fixture('Prune');
+    const file = path.join(f.dir, 'Gone-Regular.otf');
+    writeFont(file, { names: englishNames({ family: 'Gone', style: 'Regular', postscriptName: 'Gone-Regular' }) });
+    manualDialogFor([file]);
+    await callIpcRaw('fonts:add-files', f.project.id);
+    await callIpcRaw('fonts:set-row-choice', f.project.id, row(await review(f), 'Gone-Regular.otf').key, 'remove');
+    assert.equal(storeInstance.data.projects.find(item => item.id === f.project.id).fontHandoff, undefined);
   });
 
   fontTest('registry failure reports unavailable and leaves packaging untouched', async () => {

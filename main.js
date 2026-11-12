@@ -22124,7 +22124,8 @@ function getSkippedExistingPresentationMediaSuppression(project) {
 // output path: every one passes the font gate in this process at review and
 // again at packaging from the reviewed bytes. A font that is excluded,
 // undecided or unavailable is skipped and reported; it never blocks the rest.
-// Paths stay in main; the renderer sees opaque row keys and file names.
+// The renderer acts on fonts only by opaque row keys; Package Review rows carry
+// file names, not paths (project records sent to the renderer still hold them).
 const FONT_HANDOFF_SCHEMA_VERSION = 1;
 const MAX_FONT_HANDOFF_SELECTIONS = 200;
 const MAX_FONT_REGISTRY_REQUEST_NAMES = 2000;
@@ -22386,6 +22387,9 @@ function getFontRowLabel(row) {
     .join(', ');
 }
 
+// Fonts the sender removed or never chose are not named to recipients.
+const FONT_NOTE_OMITTED_REASONS = new Set(['removed', 'found', 'duplicate']);
+
 function getFontNoteModel(fontReview, inputs, oflTextFileName) {
   const byKey = new Map(fontReview.rows.map(row => [row.group.key, row]));
   return {
@@ -22400,7 +22404,7 @@ function getFontNoteModel(fontReview, inputs, oflTextFileName) {
         faces: row.gateInput.faces,
       };
     }),
-    notIncluded: fontReview.rows.filter(row => row.gate.outcome !== 'included' && row.gate.reason !== 'duplicate')
+    notIncluded: fontReview.rows.filter(row => row.gate.outcome !== 'included' && !FONT_NOTE_OMITTED_REASONS.has(row.gate.reason))
       .map(row => {
         const faces = row.gateInput.faces;
         const label = faces.length ? fontHandoff.describeFontFaces(faces) : sanitizeRendererSourceName(row.group.displayName) || 'Font file';
@@ -22435,6 +22439,10 @@ function planFontOutputs(fontReview, layoutMode, outputAllocator) {
       outputName,
       relativePath: outputAllocator.getOutputRelativePath(outputName),
     });
+  }
+  // Nothing to copy and nothing to tell the recipient: no Fonts folder, no note.
+  if (!inputs.length && !fontReview.rows.some(row => row.gate.outcome !== 'included' && !FONT_NOTE_OMITTED_REASONS.has(row.gate.reason))) {
+    return null;
   }
   const oflNeeded = inputs.some(input => input.basis === 'open-licence');
   const oflOutputName = oflNeeded ? outputAllocator.reserveGroupedOutputName(fontHandoff.OFL_TEXT_FILENAME, 'fonts') : null;
@@ -22643,6 +22651,16 @@ function rememberInstalledFontCopyOffer(projectId, offer) {
   return id;
 }
 
+class PresentationFontLinkError extends Error {
+  constructor() {
+    super('presentation_font_link');
+    this.name = 'PresentationFontLinkError';
+    this.code = 'presentation_font_link';
+  }
+}
+const PRESENTATION_FONT_LINK_MESSAGE = 'A PowerPoint file links a font file. Crate can\'t package a presentation that links a font file. ' +
+  'Remove that link in PowerPoint, or exclude the presentation.';
+
 class FontOperationStaleError extends Error {
   constructor() {
     super('font_operation_stale');
@@ -22792,13 +22810,19 @@ function setFontRowChoice(projectId, rowKey, choice) {
   }
   const result = mutateProject(projectId, project => {
     if (!getProjectFontCandidateGroup(project, rowKey)) return { error: 'font_not_found' };
+
+    const group = getProjectFontCandidateGroup(project, rowKey);
     const handoff = readProjectFontHandoff(project);
     if (choice === 'remove') {
       handoff.installed = handoff.installed.filter(item => getFontRowKey(item.path) !== rowKey);
       handoff.files = handoff.files.filter(item => getFontRowKey(item.path) !== rowKey);
       delete handoff.confirmations[rowKey];
     }
-    handoff.choices[rowKey] = choice;
+    // A row that came only from Crate's own lists disappears when removed, so
+    // no choice needs to be kept for it.
+    const fromProjectFiles = group.embedded || group.origins.has('project-file') || group.origins.has('found');
+    if (choice === 'remove' && !fromProjectFiles) delete handoff.choices[rowKey];
+    else handoff.choices[rowKey] = choice;
     writeProjectFontHandoff(project, handoff);
     return { success: true };
   });
@@ -22849,6 +22873,10 @@ function setFontLicenceConfirmation(projectId, rowKey, request) {
   return result;
 }
 
+function isSymlinkPath(filePath) {
+  try { return fs.lstatSync(filePath).isSymbolicLink(); } catch (_) { return false; }
+}
+
 function addFontFilePaths(projectId, filePaths) {
   const accepted = filePaths.filter(filePath => isStoredFontPath(filePath) && isGatedFontPath(filePath));
   const result = mutateProject(projectId, project => {
@@ -22858,7 +22886,15 @@ function addFontFilePaths(projectId, filePaths) {
       const key = getFontRowKey(filePath);
       if (!key) continue;
       if (handoff.choices[key] === 'remove') delete handoff.choices[key];
-      if (handoff.files.some(item => getFontRowKey(item.path) === key)) continue;
+      const existing = handoff.files.find(item => getFontRowKey(item.path) === key);
+      if (existing) {
+        // The same real file was added through a link: keep the file itself.
+        if (existing.path !== filePath && isSymlinkPath(existing.path) && !isSymlinkPath(filePath)) {
+          existing.path = filePath;
+          added++;
+        }
+        continue;
+      }
       if (handoff.files.length >= MAX_FONT_HANDOFF_SELECTIONS) break;
       handoff.files.push({ path: filePath, addedAt: Date.now() });
       added++;
@@ -22996,6 +23032,9 @@ async function buildAuthoritativePackagePlan(
     const pictureInputs = [];
     const pictureData = Object.create(null);
     for (const link of links) {
+      // A linked font is never an ordinary output, and every link must be
+      // rewritten to a packaged copy, so the presentation cannot be packaged.
+      if (isGatedFontPath(link.resolvedPath)) throw new PresentationFontLinkError();
       const matches = reviewedSourceInputs.filter(candidate =>
         entries[candidate.entryIndex].identity.normalizedPath === normalizeTrackedFilePath(link.resolvedPath));
       if (matches.length !== 1) throw new PackageReviewChangedError();
@@ -23342,7 +23381,7 @@ async function buildCanonicalPackageReviewManifest(projectId) {
         fontReview
       );
     } catch (error) {
-      if (error instanceof PackageReviewChangedError) {
+      if (error instanceof PackageReviewChangedError || error instanceof PresentationFontLinkError) {
         return {
           project: currentProject,
           files,
@@ -23350,6 +23389,7 @@ async function buildCanonicalPackageReviewManifest(projectId) {
           entryStatuses: entries.map(entry => PACKAGE_PRESENTATION_EXTENSIONS.has(entry.ext) ? 'unavailable' : 'ready'),
           reviewedInputSignature, reviewedSettingsKey: packageSettingsKey,
           materializable: false,
+          ...(error instanceof PresentationFontLinkError ? { packageMessage: PRESENTATION_FONT_LINK_MESSAGE } : {}),
         };
       }
       throw error;

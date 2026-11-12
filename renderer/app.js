@@ -5557,7 +5557,8 @@ function renderPackageReviewFonts(project, review) {
       const included = fonts.includedCount || 0;
       const notIncluded = fonts.notIncludedCount || 0;
       summary.textContent = `${included} font file${included === 1 ? '' : 's'} will be included. ` +
-        `${notIncluded} ${notIncluded === 1 ? 'is' : 'are'} not included. Crate doesn't check which fonts your documents use.`;
+        `${notIncluded} ${notIncluded === 1 ? 'is' : 'are'} not included. Crate doesn't check which fonts your documents use. ` +
+        'A note in the package lists the included fonts and the fonts you added that couldn\'t be included.';
     }
   }
   ['#btn-add-installed-fonts', '#btn-add-font-files'].forEach(selector => {
