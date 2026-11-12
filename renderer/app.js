@@ -5336,6 +5336,7 @@ function describeInstalledFontAddResult(result) {
   parts.push(result.added === 1 ? 'Added 1 font.' : `Added ${result.added || 0} fonts.`);
   if (result.refused?.length) parts.push(`${result.refused.length} can't be included.`);
   if (result.unconfirmed?.length) parts.push(`${result.unconfirmed.length} couldn't be confirmed in their installed files.`);
+  if (result.notStored) parts.push(`${result.notStored} couldn't be added because this project has too many fonts.`);
   if (result.choices?.length) parts.push('Choose which copy to use below.');
   return parts.join(' ');
 }
@@ -5557,8 +5558,8 @@ function renderPackageReviewFonts(project, review) {
       const included = fonts.includedCount || 0;
       const notIncluded = fonts.notIncludedCount || 0;
       summary.textContent = `${included} font file${included === 1 ? '' : 's'} will be included. ` +
-        `${notIncluded} ${notIncluded === 1 ? 'is' : 'are'} not included. Crate doesn't check which fonts your documents use. ` +
-        'A note in the package lists the included fonts and the fonts you added that couldn\'t be included.';
+        `${notIncluded} ${notIncluded === 1 ? 'is' : 'are'} not included. Crate doesn't check which fonts your documents use.` +
+        (fonts.noteWritten ? ' A note in the package lists the included fonts and the fonts you added that couldn\'t be included.' : '');
     }
   }
   ['#btn-add-installed-fonts', '#btn-add-font-files'].forEach(selector => {

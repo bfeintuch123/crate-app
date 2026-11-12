@@ -22387,8 +22387,12 @@ function getFontRowLabel(row) {
     .join(', ');
 }
 
-// Fonts the sender removed or never chose are not named to recipients.
-const FONT_NOTE_OMITTED_REASONS = new Set(['removed', 'found', 'duplicate']);
+// Fonts the sender removed or never chose are not named to recipients, whatever
+// else the gate says about them; the sender's choice decides, not the reason.
+function isFontRowOmittedFromNote(row) {
+  const { choice, intent } = row.gateInput;
+  return row.gate.reason === 'duplicate' || choice === 'remove' || (intent !== 'explicit' && choice !== 'include');
+}
 
 function getFontNoteModel(fontReview, inputs, oflTextFileName) {
   const byKey = new Map(fontReview.rows.map(row => [row.group.key, row]));
@@ -22404,7 +22408,7 @@ function getFontNoteModel(fontReview, inputs, oflTextFileName) {
         faces: row.gateInput.faces,
       };
     }),
-    notIncluded: fontReview.rows.filter(row => row.gate.outcome !== 'included' && !FONT_NOTE_OMITTED_REASONS.has(row.gate.reason))
+    notIncluded: fontReview.rows.filter(row => row.gate.outcome !== 'included' && !isFontRowOmittedFromNote(row))
       .map(row => {
         const faces = row.gateInput.faces;
         const label = faces.length ? fontHandoff.describeFontFaces(faces) : sanitizeRendererSourceName(row.group.displayName) || 'Font file';
@@ -22441,7 +22445,7 @@ function planFontOutputs(fontReview, layoutMode, outputAllocator) {
     });
   }
   // Nothing to copy and nothing to tell the recipient: no Fonts folder, no note.
-  if (!inputs.length && !fontReview.rows.some(row => row.gate.outcome !== 'included' && !FONT_NOTE_OMITTED_REASONS.has(row.gate.reason))) {
+  if (!inputs.length && !fontReview.rows.some(row => row.gate.outcome !== 'included' && !isFontRowOmittedFromNote(row))) {
     return null;
   }
   const oflNeeded = inputs.some(input => input.basis === 'open-licence');
@@ -22536,6 +22540,7 @@ function presentFontReview(fontReview, plan) {
     includedCount: inputKeys.size,
     notIncludedCount: rows.filter(row => row.outcome !== 'included' && row.reason !== 'duplicate').length,
     needsConfirmationCount: rows.filter(row => row.outcome === 'needs-confirmation').length,
+    noteWritten: !!plan?.fonts,
   };
 }
 
@@ -22700,7 +22705,7 @@ function storeInstalledFontSelections(projectId, selections, fence) {
       stored++;
     }
     writeProjectFontHandoff(project, handoff);
-    return { success: true, stored };
+    return { success: true, stored, notStored: selections.length - stored };
   });
 }
 
@@ -22780,7 +22785,7 @@ async function addInstalledFontFamilies(projectId, request, fence) {
     .filter(face => !storedRealPaths.has(normalizeTrackedFilePath(face.path)))
     .map(face => ({ label: formatFontFaceLabel(face), reasonText: fontHandoff.FONT_REASON_TEXT.unconfirmed }));
   invalidatePackageReviewForProject(projectId);
-  return { success: true, added, refused, unconfirmed, choices };
+  return { success: true, added, notStored: stored.notStored || 0, refused, unconfirmed, choices };
 }
 
 function chooseInstalledFontCopy(projectId, offerId, fence) {
@@ -22809,9 +22814,8 @@ function setFontRowChoice(projectId, rowKey, choice) {
     return { error: 'font_request_invalid' };
   }
   const result = mutateProject(projectId, project => {
-    if (!getProjectFontCandidateGroup(project, rowKey)) return { error: 'font_not_found' };
-
     const group = getProjectFontCandidateGroup(project, rowKey);
+    if (!group) return { error: 'font_not_found' };
     const handoff = readProjectFontHandoff(project);
     if (choice === 'remove') {
       handoff.installed = handoff.installed.filter(item => getFontRowKey(item.path) !== rowKey);
@@ -23751,11 +23755,14 @@ registerTrustedIpcHandler('fonts:list-installed', async (event, projectId) => {
   const assertAccountCurrent = captureAccountAuthorization();
   assertAccountCurrent();
   if (!getProjects().some(project => project.id === projectId)) return { error: 'not_found' };
+  let registered;
   try {
-    return { families: getInstalledFontFamilyListing(await listRegisteredFonts()) };
+    registered = await listRegisteredFonts();
   } catch (_) {
     return { error: 'font_registry_unavailable' };
   }
+  assertAccountCurrent();
+  return { families: getInstalledFontFamilyListing(registered) };
 });
 
 async function runFencedFontOperation(projectId, action) {

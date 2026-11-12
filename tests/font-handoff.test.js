@@ -382,3 +382,20 @@ test('a face without a readable English or Macintosh PostScript name is never of
   assert.deepEqual(evaluateFontGate(input), { outcome: 'excluded', reason: 'unnamed', basis: null });
   assert.equal(typeof FONT_REASON_TEXT.unnamed, 'string');
 });
+
+test('a grant followed by a restriction is not open-licence evidence', () => {
+  const negative = [
+    'This Font Software is licensed under the SIL Open Font License, Version 1.1, except that redistribution is prohibited.',
+    'Licensed under the SIL Open Font License, Version 1.1 for personal use only.',
+    'Licensed under the SIL Open Font License, Version 1.1. Non-commercial use only.',
+  ];
+  for (const licence of negative) assert.equal(detectOpenLicence([{ licence, licenceUrl: null }]), null, licence);
+  assert.equal(detectOpenLicence([{ licence: 'Licensed under the SIL Open Font License', licenceUrl: 'https://openfontlicense.org.evil.example/' }]), null);
+  assert.equal(detectOpenLicence([{ licence: 'Licensed under the SIL Open Font License', licenceUrl: 'https://openfontlicense.org/' }]), 'ofl-1.1');
+});
+
+test('an OS/2 table too short to hold the embedding field is malformed', () => {
+  const font = buildFont();
+  font.writeUInt32BE(8, tableRecord(font, 'OS/2') + 12);
+  assert.throws(() => readFontFaces(font), error => error instanceof FontReadError && error.code === 'malformed');
+});

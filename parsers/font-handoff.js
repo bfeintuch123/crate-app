@@ -157,6 +157,8 @@ function readFaceAt(buffer, offset, index) {
   }
   const names = readNameTable(buffer, tables.get('name'));
   const os2 = tables.get('OS/2');
+  // A table too short to hold the embedding field cannot vouch for it.
+  if (os2 && os2.length < 10) throw new FontReadError('malformed');
   let fsType = null;
   if (os2 && os2.length >= 10) fsType = buffer.readUInt16BE(os2.offset + 8);
   const namedInstances = readFvar(buffer, tables.get('fvar'), names);
@@ -255,8 +257,10 @@ const OFL_GRANTS = [
   new RegExp(`${SENTENCE_START}licen[cs]ed\\s+under\\s+the\\s+${OFL_NAME}([^\\n]{0,24})`, 'i'),
 ];
 const OFL_VERSION_1_1 = /^,?\s*(?:version\s*|v\.?\s*)?1\.1\b/i;
-const OFL_URL = /(?:^|\s|\()(?:https?:\/\/)?(?:www\.)?(?:scripts\.sil\.org\/(?:OFL\b|cms\/scripts\/page\.php\?[^ ]*\bid=OFL\b)|openfontlicense\.org\b)/i;
-const LICENCE_DISQUALIFIERS = /\b(?:not|never|no longer|proprietary|EULA|end[- ]user licen[cs]e|commercial licen[cs]e|paid licen[cs]e|portions?|derived from|based on|unlike)\b/i;
+// The host must end where the URL ends (a dot only as sentence punctuation).
+const URL_END = String.raw`(?=$|[\s/),&]|[.,](?:\s|$))`;
+const OFL_URL = new RegExp(String.raw`(?:^|\s|\()(?:https?:\/\/)?(?:www\.)?(?:scripts\.sil\.org\/(?:OFL|cms\/scripts\/page\.php\?[^ ]*\bid=OFL)${URL_END}|openfontlicense\.org${URL_END})`, 'i');
+const LICENCE_DISQUALIFIERS = /\b(?:not|never|no longer|proprietary|EULA|end[- ]user licen[cs]e|commercial licen[cs]e|paid licen[cs]e|portions?|derived from|based on|unlike|except|excluding|prohibit(?:s|ed)?|personal use|non-?commercial|restricted)\b/i;
 
 function grantsOpenLicence(licence, licenceUrl) {
   for (const pattern of OFL_GRANTS) {

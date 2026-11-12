@@ -592,6 +592,58 @@ function cases() {
     assert.equal(storeInstance.data.projects.find(item => item.id === f.project.id).fontHandoff, undefined);
   });
 
+  fontTest('the note never names a font the sender removed or never chose, even when it is also excluded', async () => {
+    const f = await fixture('Private excluded names');
+    const removedRestricted = path.join(f.dir, 'ClientSecret-Bold.otf');
+    writeFont(removedRestricted, { fsType: 2, names: englishNames({ family: 'Client Secret', style: 'Bold', postscriptName: 'ClientSecret-Bold' }) });
+    const foundRestricted = path.join(f.dir, 'FoundSecret-Regular.otf');
+    writeFont(foundRestricted, { fsType: 2, names: englishNames({ family: 'Found Secret', style: 'Regular', postscriptName: 'FoundSecret-Regular' }) });
+    const keptRestricted = path.join(f.dir, 'Kept-Regular.otf');
+    writeFont(keptRestricted, { fsType: 2, names: englishNames({ family: 'Kept', style: 'Regular', postscriptName: 'Kept-Regular' }) });
+    manualDialogFor([removedRestricted, keptRestricted]);
+    await callIpcRaw('projects:add-files', f.project.id);
+    const stored = storeInstance.data.projects.find(item => item.id === f.project.id);
+    stored.pendingFiles = [makePendingFile(foundRestricted, 'lastused-scan')];
+    await callIpcRaw('projects:accept-pending', f.project.id, foundRestricted);
+    await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include');
+    const first = await review(f);
+    await callIpcRaw('fonts:set-row-choice', f.project.id, row(first, 'ClientSecret-Bold.otf').key, 'remove');
+    const reviewResult = await review(f);
+    assert.equal(reviewResult.fonts.noteWritten, true);
+    const { result } = await packageNow(f, reviewResult);
+    const note = fs.readFileSync(path.join(result.folderPath, 'Fonts', 'Fonts in this package.txt'), 'utf8');
+    assert.match(note, /Kept-Regular/, 'an explicitly added font that cannot be included is still listed');
+    assert.doesNotMatch(note, /ClientSecret|Client Secret/);
+    assert.doesNotMatch(note, /FoundSecret|Found Secret/);
+  });
+
+  fontTest('the Fonts summary only promises a note when one will be written', async () => {
+    const f = await fixture('No note promise');
+    const file = path.join(f.dir, 'Gone-Regular.otf');
+    writeFont(file, { names: englishNames({ family: 'Gone', style: 'Regular', postscriptName: 'Gone-Regular' }) });
+    manualDialogFor([file]);
+    await callIpcRaw('projects:add-files', f.project.id);
+    await callIpcRaw('fonts:set-row-choice', f.project.id, row(await review(f), 'Gone-Regular.otf').key, 'remove');
+    assert.equal((await review(f)).fonts.noteWritten, false);
+  });
+
+  fontTest('an expired sign-in during the installed-font listing returns nothing', async () => {
+    const f = await fixture('Listing expiry');
+    registerInstalled(path.join(fontsDir(), 'BrandSans-Regular.otf'), 'Regular');
+    const previousNow = testAccountSession.now;
+    setChildProcessHandler(request => {
+      if (!isFontRegistry(request)) return { stdout: '', stderr: '' };
+      testAccountSession.now = () => testAccountSession.accessExpiresAt;
+      return { stdout: JSON.stringify({ mode: 'list', rows: registryRows }) + '\n' };
+    });
+    try {
+      await assert.rejects(callIpcRaw('fonts:list-installed', f.project.id), /Sign in/);
+    } finally {
+      testAccountSession.now = previousNow;
+      installRegistry();
+    }
+  });
+
   fontTest('registry failure reports unavailable and leaves packaging untouched', async () => {
     const f = await fixture();
     registryFailure = true;
