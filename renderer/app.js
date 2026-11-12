@@ -2396,6 +2396,30 @@ async function submitExistingAssetsDecision(decision, { openReview = false } = {
   }
 }
 
+// A focused batch button is disabled while busy and hidden when nothing is
+// left to decide; either drops focus to <body>. Return it to the button when it
+// is usable again, otherwise to the section title.
+function captureBatchControlFocus(button) {
+  return { button, focused: !!button && document.activeElement === button };
+}
+
+function restoreBatchControlFocus(snapshot) {
+  if (!snapshot?.focused || hasModalInteraction()) return null;
+  const current = document.activeElement;
+  if (current && current !== document.body && current !== snapshot.button && current.isConnected) return null;
+  const usable = element => !!element && element.isConnected && !element.disabled &&
+    !element.closest?.('.hidden, .filtered-out');
+  let target = usable(snapshot.button) ? snapshot.button : null;
+  if (!target) {
+    target = ['pending-header', 'asset-review-heading', 'project-file-heading']
+      .map(id => $(`#${id}`))
+      .find(element => element?.isConnected && !element.closest?.('.hidden, .filtered-out')) || null;
+    if (target && target.getAttribute?.('tabindex') == null) target.setAttribute('tabindex', '-1');
+  }
+  target?.focus?.({ preventScroll: true });
+  return target;
+}
+
 async function submitExistingAssetsBatchDecision(decision) {
   const project = state.projects.find(item => item.id === state.selectedProjectId);
   if (!project || !['include', 'skip'].includes(decision)) return false;
@@ -2412,6 +2436,7 @@ async function submitExistingAssetsBatchDecision(decision) {
   if (!isCurrent()) return false;
   const buttons = [$('#btn-include-all-existing'), $('#btn-skip-all-existing')].filter(Boolean);
   const clickedButton = decision === 'include' ? $('#btn-include-all-existing') : $('#btn-skip-all-existing');
+  const batchFocus = captureBatchControlFocus(clickedButton);
   const result = await runRendererAction(`asset-review-batch:${project.id}`, clickedButton, 'Updating…', async () => {
     buttons.forEach(button => { button.disabled = true; });
     restoreAssetReviewBatchControls(project);
@@ -2435,7 +2460,10 @@ async function submitExistingAssetsBatchDecision(decision) {
       showToast('Crate could not update Existing Assets. Try again.');
       return false;
     }
-  }, clickedButton?.textContent || null, reconcileCurrentAssetReviewBatchControls);
+  }, clickedButton?.textContent || null, () => {
+    reconcileCurrentAssetReviewBatchControls();
+    if (isCurrent()) restoreBatchControlFocus(batchFocus);
+  });
   return result;
 }
 
@@ -2525,6 +2553,7 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
   if (!isCurrent()) return false;
   const buttons = [$('#btn-include-all-existing'), $('#btn-skip-all-existing')].filter(Boolean);
   const clickedButton = decision === 'include' ? $('#btn-include-all-existing') : $('#btn-skip-all-existing');
+  const batchFocus = captureBatchControlFocus(clickedButton);
   const result = await runRendererAction(`asset-review-batch:${project.id}`, clickedButton, 'Updating…', async () => {
     buttons.forEach(button => { button.disabled = true; });
     restoreAssetReviewBatchControls(project);
@@ -2571,7 +2600,10 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
       showToast('Crate could not update the assets. Review the list and try the batch action again.');
       return false;
     }
-  }, clickedButton?.textContent || null, reconcileCurrentAssetReviewBatchControls);
+  }, clickedButton?.textContent || null, () => {
+    reconcileCurrentAssetReviewBatchControls();
+    if (isCurrent()) restoreBatchControlFocus(batchFocus);
+  });
   return result;
 }
 
