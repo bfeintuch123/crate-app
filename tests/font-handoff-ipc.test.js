@@ -450,6 +450,26 @@ function cases() {
     assert.deepEqual(listTree(result.folderPath), ['Fonts/Fonts in this package.txt', 'PNG/Logo.png']);
   });
 
+  fontTest('a symlinked font file is never copied; a font reached through a symlinked folder is judged on its real path', async () => {
+    const f = await fixture();
+    const realDir = path.join(f.dir, 'real');
+    const real = path.join(realDir, 'Linked-Regular.otf');
+    writeFont(real, { names: englishNames({ family: 'Linked', style: 'Regular', postscriptName: 'Linked-Regular', licence: OFL_STATEMENT }) });
+    const fileLink = path.join(f.dir, 'Link.otf');
+    fs.symlinkSync(real, fileLink);
+    const adobeDir = path.join(TEST_HOME, 'Library', 'Application Support', 'Adobe', 'CoreSync', 'plugins', 'livetype', 'r');
+    writeFont(path.join(adobeDir, 'Hidden-Regular.otf'), { names: englishNames({ family: 'Hidden', style: 'Regular', postscriptName: 'Hidden-Regular', licence: OFL_STATEMENT }) });
+    const folderLink = path.join(f.dir, 'Brand Kit');
+    fs.symlinkSync(adobeDir, folderLink);
+    manualDialogFor([fileLink, path.join(folderLink, 'Hidden-Regular.otf')]);
+    await callIpcRaw('fonts:add-files', f.project.id);
+    const reviewResult = await review(f);
+    assert.equal(row(reviewResult, 'Link.otf').reason, 'symlink');
+    assert.equal(row(reviewResult, 'Hidden-Regular.otf').reason, 'adobe-fonts');
+    const { result } = await packageNow(f, reviewResult);
+    assert.deepEqual(listTree(result.folderPath), ['Fonts/Fonts in this package.txt', 'PNG/Logo.png']);
+  });
+
   fontTest('registry failure reports unavailable and leaves packaging untouched', async () => {
     const f = await fixture();
     registryFailure = true;
