@@ -2654,7 +2654,7 @@ function baselineCases() {
       assert.equal(review.materializable, false);
       assert.equal(review.token, undefined);
       assert.equal(review.totalFiles, 0);
-      assert.equal(review.message, 'No files are selected for packaging.');
+      assert.equal(review.message, 'No files are included in the package.');
       assert.equal(fs.existsSync(f.paths[0].source), true);
       assert.equal((await f.current()).files.length, 1);
     } finally { await f.cleanup(); }
@@ -7182,7 +7182,7 @@ function excludedSourceMembershipCases() {
     await refreshFromDocuments(a.f, [{ path: a.docs[0], current: false, links: [a.X] }, { path: a.docs[1], current: true, links: [a.X] }]);
     assert.equal(where(a.f, a.X), 'pending');
     const refused = await a.f.review();
-    assert.equal(refused.materializable, false); assert.equal(refused.message, 'No files are selected for packaging.');
+    assert.equal(refused.materializable, false); assert.equal(refused.message, 'No files are included in the package.');
     const b = await inddProject('Both included', ['MixedW.indd', 'MixedK.indd']);
     await refreshFromDocuments(b.f, [{ path: b.docs[0], current: false, links: [b.X] }, { path: b.docs[1], current: true, links: [b.X] }]);
     assert.equal(where(b.f, b.X), 'files');
@@ -7224,7 +7224,7 @@ function excludedSourceMembershipCases() {
       assert.equal((t.f.current().files.find(row => row.path === t.X) || t.f.current().pendingFiles.find(row => row.path === t.X)).dependencyOwners.length, 3);
       const review = await t.f.review();
       if (expected === 'files') assert.deepEqual(await t.f.written(review), ['Mixed.png', path.basename(t.docs[included])], label);
-      else { assert.equal(review.materializable, false, label); assert.equal(review.message, 'No files are selected for packaging.'); }
+      else { assert.equal(review.materializable, false, label); assert.equal(review.message, 'No files are included in the package.'); }
     }
     // Existing row: X is already a row through K; an excluded W reports it later.
     const e = await inddProject('Existing', ['MixedW.indd', 'MixedK.indd']);

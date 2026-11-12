@@ -23613,7 +23613,7 @@ async function createUnavailablePackageReview(projectId, manifest) {
     semanticCounts: membership.counts,
     workingFileChoices: getWorkingFileChoicePresentation(manifest.project),
     materializable: false,
-    message: manifest.packageMessage || (manifest.files.length === 0 ? 'No files are selected for packaging.' :
+    message: manifest.packageMessage || (manifest.files.length === 0 ? 'No files are included in the package.' :
       (membership.counts.relationshipHolds > 0 ? 'Photoshop asset association is unresolved. Your files are preserved; this package is blocked.' :
         membership.blocked ? 'Working-source verification is unresolved. Resolve it before packaging.' :
         'Some files are unavailable. Resolve them before packaging.')),

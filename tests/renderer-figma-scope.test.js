@@ -9323,6 +9323,8 @@ test('a file excluded from Needs Review shows as Excluded with one [+], counts o
   assert.equal(elements['filter-count-excluded'].textContent, '1');
   assert.equal(elements['filter-count-added'].textContent, '0');
   assert.equal(elements['filter-count-missing'].textContent, '0');
+  assert.equal(elements['asset-review-footer-summary'].textContent, '0 assets included · 1 Working File included');
+  assert.match(elements['working-source-summary'].textContent, /^1 included local working file\(s\) · 0 excluded local working file\(s\)/);
   const list = elements['added-assets-list'];
   assert.ok(list.__assetReviewVirtualState, 'remembered rows use the virtualized Added list');
   const row = list.children.find(child => getElementTreeText(child).includes('Texture.png'));

@@ -573,7 +573,7 @@ test('semantic count summary uses backend selected/dependency counts rather than
   Object.assign(f.row, { sourceSelection: 'excluded', includedAsDependency: true, effectiveRole: 'asset' });
   f.renderer.renderAssetWorkspace(f.project, {}, [f.row]);
   assert.equal(f.elements['project-file-count'].textContent, '0 of 1');
-  assert.match(f.elements['working-source-summary'].textContent, /0 selected.*1 excluded.*1 included asset/);
+  assert.match(f.elements['working-source-summary'].textContent, /0 included local working.*1 excluded.*1 included asset/);
   assert.equal(f.elements['metric-excluded-count'].textContent, '1');
 });
 

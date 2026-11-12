@@ -576,6 +576,10 @@ function renderVirtualAssetList(list, items, build) {
   const maxScrollTop = Math.max(0, (virtual.items.length * ASSET_REVIEW_ROW_HEIGHT) - viewportHeight);
   if (Number.isFinite(list.scrollTop) && list.scrollTop > maxScrollTop) list.scrollTop = maxScrollTop;
   const { start, end } = getAssetReviewVirtualRange(list, virtual.items.length);
+  // Shifting the mounted window re-inserts retained rows, and moving a focused
+  // node blurs it. Keep keyboard focus on the same control when it stays mounted.
+  const focused = typeof list.contains === 'function' && list.contains(document.activeElement) &&
+    document.activeElement !== list ? document.activeElement : null;
   reconcileKeyedList(
     list,
     virtual.items.slice(start, end),
@@ -598,6 +602,9 @@ function renderVirtualAssetList(list, items, build) {
     row.setAttribute('aria-selected', String(selected));
     row.classList.toggle('is-selected', selected);
   });
+  if (focused && focused.isConnected && document.activeElement !== focused && list.contains(focused)) {
+    focused.focus?.({ preventScroll: true });
+  }
 }
 
 function resetVirtualAssetList(list) {
@@ -3853,7 +3860,7 @@ function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets,
   const workingSummary = $('#working-source-summary');
   if (workingSummary) {
     workingSummary.classList.add('hidden');
-    workingSummary.textContent = counts ? `${counts.selectedWorkingSources} selected local working file(s) · ${counts.excludedWorkingSources} excluded local working file(s)` +
+    workingSummary.textContent = counts ? `${counts.selectedWorkingSources} included local working file(s) · ${counts.excludedWorkingSources} excluded local working file(s)` +
       `${figmaSourceCount ? ` · ${figmaSourceCount} tracked Figma working file(s)` : ''} · ${counts.includedAssets} included asset(s)` : '';
   }
   // Remembered Needs Review exclusions are not project files, so membership
@@ -3934,7 +3941,7 @@ function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets,
   }
 
   const summary = (counts ? `${counts.includedAssets} asset${counts.includedAssets === 1 ? '' : 's'} included` +
-    ` · ${counts.selectedWorkingSources} ${figmaSourceCount ? 'local ' : ''}Working File${counts.selectedWorkingSources === 1 ? '' : 's'} selected` +
+    ` · ${counts.selectedWorkingSources} ${figmaSourceCount ? 'local ' : ''}Working File${counts.selectedWorkingSources === 1 ? '' : 's'} included` +
     `${figmaSourceCount ? ` · ${figmaSourceCount} Figma Working File${figmaSourceCount === 1 ? '' : 's'} tracked` : ''}` +
     `${workspace?.workingSourceSelectionBlocked ? ' · Verification needs attention' : ''}` : 'Package selection and verification unavailable') +
     `${pendingFiles.length ? ` · ${pendingFiles.length} needs review` : ''}`;
