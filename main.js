@@ -22753,6 +22753,12 @@ function setFontRowChoice(projectId, rowKey, choice) {
 // One font file per call; there is no batch form. The statement is the user's
 // own, bound to the exact bytes they reviewed. Excluded fonts are refused here
 // regardless of what the renderer sends.
+// The user's own calendar date, as they would write it on a statement.
+function formatLocalFontConfirmationDate(date) {
+  const pad = value => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
 function setFontLicenceConfirmation(projectId, rowKey, request) {
   if (typeof rowKey !== 'string' || !FONT_ROW_KEY_PATTERN.test(rowKey) || !isRecord(request) ||
       typeof request.confirmed !== 'boolean' || typeof request.sha256 !== 'string' ||
@@ -22774,7 +22780,7 @@ function setFontLicenceConfirmation(projectId, rowKey, request) {
     handoff.confirmations[rowKey] = {
       sha256: inspected.sha256,
       wordingVersion: fontHandoff.FONT_CONFIRMATION_WORDING_VERSION,
-      confirmedOn: new Date().toISOString().slice(0, 10),
+      confirmedOn: formatLocalFontConfirmationDate(new Date()),
       postscriptNames: getFontFacePostscriptNames(gateInput.faces).slice(0, 256),
     };
     writeProjectFontHandoff(project, handoff);

@@ -238,7 +238,10 @@ test('the confirmation names every face in the file, including every collection 
     { family: 'Brand Sans', style: 'Bold', postscriptName: 'BrandSans-Bold', namedInstances: [] },
   ];
   const statement = getFontConfirmationStatement(faces, 'BrandSans.ttc');
-  assert.match(statement, /BrandSans\.ttc/);
+  assert.match(statement, /BrandSans\.ttc, and all 2 fonts it contains/);
+  assert.equal(getFontConfirmationStatement([faces[1]], 'BrandSans-Bold.otf'),
+    'My licence for this font file, BrandSans-Bold.otf, which contains Brand Sans Bold (BrandSans-Bold), ' +
+    'allows me to give it to the people receiving this package.');
   assert.match(statement, /Brand Sans Regular \(BrandSans-Regular\)/);
   assert.match(statement, /Brand Sans Bold \(BrandSans-Bold\)/);
   assert.match(statement, /licen[cs]e/i);

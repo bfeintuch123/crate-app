@@ -353,7 +353,9 @@ function getFontConfirmationStatement(faces, fileName) {
   const list = Array.isArray(faces) ? faces : [];
   const contents = describeFontFaces(list);
   const name = fileName || 'this font file';
-  const subject = list.length > 1 ? `${name}, and every font in it (${contents})` : `${name} (${contents})`;
+  const subject = list.length > 1
+    ? `${name}, and all ${list.length} fonts it contains (${contents})`
+    : `${name}, which contains ${contents}`;
   return `My licence for this font file, ${subject}, allows me to give it to the people receiving this package.`;
 }
 
