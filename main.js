@@ -23181,7 +23181,7 @@ async function buildCanonicalPackageReviewManifest(projectId) {
       project: currentProject, files, entries,
       entryStatuses: entryStatuses.map((status, index) => excludedRequired[index] ? 'unavailable' : status),
       reviewedInputSignature, reviewedSettingsKey: packageSettingsKey, materializable: false,
-      packageMessage: 'A working file requires an excluded asset. Restore the asset or exclude that working file.',
+      packageMessage: 'A working file requires an excluded asset. Include the asset or exclude that working file.',
     };
     let plan;
     const presentationMediaByEntry = new Map();

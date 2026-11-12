@@ -2022,6 +2022,22 @@ function getPendingAssetsForBatchDecision(project) {
   });
 }
 
+function getAssetCountLabel(count) {
+  return `${count} asset${count === 1 ? '' : 's'}`;
+}
+
+function getPendingDecisionLabel(decision) {
+  return decision === 'include' ? 'included' : 'excluded';
+}
+
+// Row [+] and [x] share the batch reservation, so a row and a batch can never
+// submit at once. Retained virtual rows are reconciled here with the batch.
+function syncPendingRowDecisionControls(blocked) {
+  for (const button of document.querySelectorAll('#pending-file-list .pending-row-action')) {
+    button.disabled = !!blocked;
+  }
+}
+
 function updateAssetReviewBatchControls(project, existingAssets, includedExistingCount, projectionUnavailable = false) {
   const includeAll = $('#btn-include-all-existing');
   const skipAll = $('#btn-skip-all-existing');
@@ -2045,22 +2061,29 @@ function updateAssetReviewBatchControls(project, existingAssets, includedExistin
     controls.setAttribute('aria-label', hasPendingReviewSurface ? 'Review Before Packaging controls' : 'Existing Assets controls');
   }
 
+  // Include All (N) and Exclude All (N) count and act only on rows marked
+  // "Include or Exclude"; with none, both are hidden rather than disabled.
+  const assetCount = getAssetCountLabel(eligiblePendingCount);
+  const hidePendingBatch = hasPendingReviewSurface && eligiblePendingCount === 0;
   if (includeAll) {
     const allIncluded = existingAssets.length > 0 && includedExistingCount === existingAssets.length;
-    includeAll.textContent = hasPendingReviewSurface ? 'Add All' : (allIncluded ? 'All Existing Included' : 'Include All Existing');
-    includeAll.setAttribute('aria-label', hasPendingReviewSurface ? 'Add all assets needing review' : (allIncluded ? 'All existing assets are already included' : 'Include all existing assets'));
+    includeAll.textContent = hasPendingReviewSurface ? `Include All (${eligiblePendingCount})` : (allIncluded ? 'All Existing Included' : 'Include All Existing');
+    includeAll.setAttribute('aria-label', hasPendingReviewSurface ? `Include ${assetCount}` : (allIncluded ? 'All existing assets are already included' : 'Include all existing assets'));
     includeAll.title = !hasPendingReviewSurface && allIncluded ? 'All existing assets are already included.' : '';
+    includeAll.classList.toggle('hidden', hidePendingBatch);
     includeAll.disabled = unavailable || projectionUnavailable || busy || (hasPendingReviewSurface
       ? eligiblePendingCount === 0
       : existingAssets.length === 0 || includedExistingCount === existingAssets.length);
   }
   if (skipAll) {
-    skipAll.textContent = hasPendingReviewSurface ? 'Skip All' : 'Skip All Existing';
-    skipAll.setAttribute('aria-label', hasPendingReviewSurface ? 'Skip all assets needing review' : 'Skip all existing assets');
+    skipAll.textContent = hasPendingReviewSurface ? `Exclude All (${eligiblePendingCount})` : 'Exclude All Existing';
+    skipAll.setAttribute('aria-label', hasPendingReviewSurface ? `Exclude ${assetCount}` : 'Exclude all existing assets');
+    skipAll.classList.toggle('hidden', hidePendingBatch);
     skipAll.disabled = unavailable || projectionUnavailable || busy || (hasPendingReviewSurface
       ? eligiblePendingCount === 0
       : existingAssets.length === 0 || includedExistingCount === 0);
   }
+  syncPendingRowDecisionControls(unavailable || projectionUnavailable || busy);
   for (const button of [includeAll, skipAll].filter(Boolean)) {
     button.setAttribute('aria-busy', String(busy));
     button.classList.toggle('is-action-busy', busy);
@@ -2074,12 +2097,10 @@ function updateAssetReviewBatchControls(project, existingAssets, includedExistin
     else if (busy) message = 'Updating assets. Wait for this action to finish.';
     else if (projectionUnavailable) message = 'Current asset review is unavailable. Review the current project again before using bulk actions.';
     else if (hasPendingReviewSurface) {
-      if (pendingCandidates.length === 0) {
-        message = 'No eligible items.';
-      } else if (eligiblePendingCount === 0) {
-        message = 'Crate cannot identify which files to update. Add All and Skip All are unavailable.';
-      } else if (eligiblePendingCount < visiblePending.length) {
-        message = 'Add All and Skip All apply only to eligible review items. Other items stay unchanged.';
+      if (pendingCandidates.length > 0 && eligiblePendingCount === 0) {
+        message = 'Crate cannot identify which files to update. Include All and Exclude All are unavailable.';
+      } else if (eligiblePendingCount > 0 && eligiblePendingCount < visiblePending.length) {
+        message = 'Include All and Exclude All apply only to eligible review items. Other items stay unchanged.';
       }
     } else if (existingAssets.length === 0) message = 'No existing assets.';
     else if (includedExistingCount === existingAssets.length) message = 'All existing assets are already included.';
@@ -2256,8 +2277,8 @@ async function showExistingAssetsDecisionModal(project, packageRequestId = null)
     $('#existing-assets-modal-title').textContent = `${assets.length} existing asset${assets.length === 1 ? '' : 's'} found`;
     const skippedCount = assets.filter(file => file.excluded === true).length;
     $('#existing-assets-modal-count').textContent = skippedCount > 0
-      ? `${skippedCount} of these assets currently skipped. This choice applies to all existing assets in the project.`
-      : 'Include or skip all existing assets in this project.';
+      ? `${skippedCount} of these assets currently excluded. This choice applies to all existing assets in the project.`
+      : 'Include or exclude all existing assets in this project.';
     const list = $('#existing-assets-modal-list');
     list.innerHTML = '';
     for (const file of assets.slice(0, 4)) {
@@ -2405,7 +2426,7 @@ async function submitExistingAssetsBatchDecision(decision) {
       state.projects = projects;
       await renderFiles();
       if (!isCurrent()) return false;
-      showToast(decision === 'include' ? 'Existing assets included' : 'Existing assets skipped');
+      showToast(decision === 'include' ? 'Existing assets included' : 'Existing assets excluded');
       return true;
     } catch (error) {
       if (!isCurrent()) return false;
@@ -2420,6 +2441,72 @@ async function submitExistingAssetsBatchDecision(decision) {
 function getPendingFilesFromDecisionResult(result, decision) {
   if (decision === 'include') return Array.isArray(result?.pendingFiles) ? result.pendingFiles : null;
   return Array.isArray(result) ? result : null;
+}
+
+// One Needs Review decision through the existing accept/reject IPC. It counts
+// as applied only when the reply no longer lists the candidate.
+async function applyPendingAssetDecision(project, candidate, decision) {
+  const result = decision === 'include'
+    ? await window.crate.acceptPending(project.id, candidate.target)
+    : await window.crate.rejectPending(project.id, candidate.target);
+  const remainingPendingFiles = getPendingFilesFromDecisionResult(result, decision);
+  const candidateTargets = new Set([candidate.target, candidate.stableTarget].filter(Boolean));
+  return Array.isArray(remainingPendingFiles) && !remainingPendingFiles.some(file => (
+    candidateTargets.has(getPendingDecisionStableKey(file))
+  ));
+}
+
+// Per-row [+] / [x] under Needs Review: the same guards and IPC as the batch,
+// for exactly one "Include or Exclude" row.
+async function submitPendingAssetDecision(decision, projectId, rowTarget, button) {
+  const project = state.projects.find(item => item.id === projectId);
+  if (!project || !['include', 'skip'].includes(decision) || !rowTarget) return false;
+  if (rendererActionsInFlight.has(`asset-review-batch:${project.id}`)) return undefined;
+  if (!getCurrentAssetReviewBatchWorkspace(project)) {
+    reconcileCurrentAssetReviewBatchControls();
+    return false;
+  }
+  // Rows can outlive a refresh; resolve the decision from current state only.
+  const matches = getPendingAssetsForBatchDecision(project).filter(candidate => (
+    candidate.target && candidate.target === rowTarget
+  ));
+  if (matches.length !== 1) {
+    reconcileCurrentAssetReviewBatchControls();
+    return false;
+  }
+  const [candidate] = matches;
+  const displayName = candidate.file?.name || candidate.rawFile?.name || 'Asset';
+  const accountEpoch = accountWorkspaceEpoch;
+  const selectionEpoch = projectSelectionEpoch;
+  const isCurrent = () => accountWorkspaceEpoch === accountEpoch &&
+    projectSelectionEpoch === selectionEpoch && state.selectedProjectId === project.id &&
+    accountStatus.canUseWorkspace !== false;
+  if (!isCurrent()) return false;
+  const focus = captureRowActionFocus(button, decision === 'include' ? 'include' : 'exclude');
+  return runRendererAction(`asset-review-batch:${project.id}`, null, null, async () => {
+    restoreAssetReviewBatchControls(project);
+    try {
+      const applied = await applyPendingAssetDecision(project, candidate, decision);
+      if (!isCurrent()) return false;
+      const projects = await getAccountCurrentProjects();
+      if (!isCurrent()) return false;
+      state.projects = projects;
+      await renderFiles();
+      if (!isCurrent()) return false;
+      showToast(applied
+        ? `${displayName} ${getPendingDecisionLabel(decision)}`
+        : `Crate could not ${decision === 'include' ? 'include' : 'exclude'} ${displayName}. Review the list and try again.`);
+      return applied;
+    } catch (error) {
+      if (!isCurrent()) return false;
+      logRendererError('pending asset decision failed', error);
+      showToast(`Crate could not ${decision === 'include' ? 'include' : 'exclude'} ${displayName}. Try again.`);
+      return false;
+    }
+  }, null, () => {
+    reconcileCurrentAssetReviewBatchControls();
+    if (isCurrent()) restoreRowActionFocus(focus);
+  });
 }
 
 async function submitPendingAssetsBatchDecision(decision, project, pendingCandidates) {
@@ -2451,15 +2538,8 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
         }
 
         try {
-          const result = decision === 'include'
-            ? await window.crate.acceptPending(project.id, candidate.target)
-            : await window.crate.rejectPending(project.id, candidate.target);
+          const applied = await applyPendingAssetDecision(project, candidate, decision);
           if (!isCurrent()) return false;
-          const remainingPendingFiles = getPendingFilesFromDecisionResult(result, decision);
-          const candidateTargets = new Set([candidate.target, candidate.stableTarget].filter(Boolean));
-          const applied = Array.isArray(remainingPendingFiles) && !remainingPendingFiles.some(file => (
-            candidateTargets.has(getPendingDecisionStableKey(file))
-          ));
           if (applied) appliedCount += 1;
           else failedCount += 1;
         } catch (error) {
@@ -2475,13 +2555,13 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
       state.projects = projects;
       await renderFiles();
       if (!isCurrent()) return false;
-      const actionLabel = decision === 'include' ? 'added' : 'skipped';
+      const actionLabel = getPendingDecisionLabel(decision);
       if (appliedCount === 0) {
         showToast('No eligible assets were updated. Review the list and try the batch action again.');
       } else if (failedCount > 0) {
-        showToast(`${appliedCount} asset${appliedCount === 1 ? '' : 's'} ${actionLabel}; ${failedCount} left unchanged`);
+        showToast(`${getAssetCountLabel(appliedCount)} ${actionLabel}; ${failedCount} left unchanged`);
       } else {
-        showToast(`${appliedCount} asset${appliedCount === 1 ? '' : 's'} ${actionLabel}`);
+        showToast(`${getAssetCountLabel(appliedCount)} ${actionLabel}`);
       }
       return appliedCount > 0;
     } catch (error) {
@@ -2789,21 +2869,147 @@ function appendFileStatusBadge(row, label, className, title) {
   row.appendChild(badge);
 }
 
+// One square control for every asset [+] and [x]: a 28px native button around
+// a 22px visible box. Always visible, no hover text; the aria-label names it.
+function createRowIconButton(kind, label, className = '') {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `row-icon-button row-action-${kind}${className ? ` ${className}` : ''}`;
+  button.dataset.rowAction = kind;
+  button.setAttribute('aria-label', label);
+  // The glyph is drawn in CSS (two 1.5px strokes), so the button has no text.
+  const box = document.createElement('span');
+  box.className = 'row-icon-box';
+  box.setAttribute('aria-hidden', 'true');
+  button.appendChild(box);
+  return button;
+}
+
+// Per-row decisions re-render keyed (often virtual) lists. Keep focus in the
+// list: the same row's new control, else the same control on the next row,
+// else the section title. Never let it fall back to <body>.
+const ROW_ACTION_LIST_HEADINGS = {
+  'pending-file-list': 'pending-header',
+  'existing-assets-list': 'existing-assets-heading',
+  'added-assets-list': 'added-assets-heading',
+  'working-assets-list': 'working-assets-heading',
+  'project-file-list': 'project-file-heading',
+};
+
+function captureRowActionFocus(button, kind) {
+  const row = button?.closest?.('[data-render-key]') || null;
+  const list = row?.parentElement || null;
+  const owner = list && !list.id ? list.closest?.('[data-render-key]') : null;
+  const siblings = Array.from(list?.children || []);
+  const virtualIndex = Number.parseInt(row?.dataset?.assetIndex, 10);
+  return {
+    kind,
+    key: row?.dataset?.renderKey || null,
+    index: Number.isFinite(virtualIndex) ? virtualIndex : siblings.indexOf(row),
+    listId: list?.id || null,
+    ownerKey: owner?.dataset?.renderKey || null,
+    ownerListId: owner?.parentElement?.id || null,
+    headingId: ROW_ACTION_LIST_HEADINGS[list?.id || owner?.parentElement?.id] ||
+      list?.closest?.('section[aria-labelledby]')?.getAttribute('aria-labelledby') || null,
+  };
+}
+
+function resolveRowActionFocusList(snapshot) {
+  if (snapshot.listId) return $(`#${snapshot.listId}`);
+  if (!snapshot.ownerKey || !snapshot.ownerListId) return null;
+  const owner = Array.from($(`#${snapshot.ownerListId}`)?.children || [])
+    .find(row => row.dataset?.renderKey === snapshot.ownerKey);
+  return owner?.querySelector('.working-source-assets') || null;
+}
+
+function restoreRowActionFocus(snapshot) {
+  if (!snapshot || !snapshot.key || hasModalInteraction()) return null;
+  const usable = element => !!element && element.isConnected && !element.disabled &&
+    !element.closest?.('.hidden, .filtered-out');
+  const list = resolveRowActionFocusList(snapshot);
+  const rows = Array.from(list?.children || []).filter(row => row.dataset?.renderKey);
+  const order = row => {
+    const value = Number.parseInt(row.dataset.assetIndex, 10);
+    return Number.isFinite(value) ? value : rows.indexOf(row);
+  };
+  const same = rows.find(row => row.dataset.renderKey === snapshot.key) || null;
+  let target = same
+    ? [same.querySelector(`.row-action-${snapshot.kind}`), same.querySelector('.row-icon-button')].find(usable) || null
+    : null;
+  if (!target) {
+    target = rows.filter(row => row !== same && order(row) >= snapshot.index)
+      .sort((left, right) => order(left) - order(right))
+      .map(row => row.querySelector(`.row-action-${snapshot.kind}`))
+      .find(usable) || null;
+  }
+  if (!target) {
+    target = [snapshot.headingId, 'asset-review-heading', 'project-file-heading']
+      .map(id => id && $(`#${id}`))
+      .find(element => element?.isConnected && !element.closest?.('.hidden, .filtered-out')) || null;
+    if (target && target.getAttribute?.('tabindex') == null) target.setAttribute('tabindex', '-1');
+  }
+  target?.focus?.({ preventScroll: true });
+  return target;
+}
+
+// Included and Excluded asset rows toggle through the existing remove-file IPC.
+async function submitAssetRowDecision(project, file, kind, button) {
+  if (!button || button.disabled) return false;
+  const displayName = file && file.name ? file.name : 'Asset';
+  const identity = getFileVisualIdentity(file);
+  const accountEpoch = accountWorkspaceEpoch;
+  const selectionEpoch = projectSelectionEpoch;
+  const isCurrent = () => accountWorkspaceEpoch === accountEpoch &&
+    projectSelectionEpoch === selectionEpoch && state.selectedProjectId === project.id &&
+    accountStatus.canUseWorkspace !== false;
+  const focus = captureRowActionFocus(button, kind);
+  button.disabled = true;
+  let confirmed = false;
+  try {
+    await window.crate.removeFile(project.id, identity);
+    if (!isCurrent()) return false;
+    state.projects = await getAccountCurrentProjects();
+    if (!isCurrent()) return false;
+    await renderFiles();
+    if (!isCurrent()) return false;
+    const latest = state.assetWorkspace?.projectId === project.id
+      ? (state.assetWorkspace.files || []).find(row => identity && getFileVisualIdentity(row) === identity)
+      : null;
+    confirmed = !!latest && isPresentedAssetIncluded(latest) === (kind === 'include');
+    showToast(confirmed
+      ? `${displayName} ${kind === 'include' ? 'included' : 'excluded'}`
+      : 'Crate could not confirm that change. Review the asset list.');
+  } catch (error) {
+    logRendererError(kind === 'include' ? 'asset restoration failed' : 'asset exclusion failed', error);
+    if (!isCurrent()) return false;
+    showToast(kind === 'include'
+      ? 'Crate could not include that asset. Try again.'
+      : 'Crate could not exclude that asset. Try again.');
+    button.disabled = false;
+  }
+  // An unchanged row is retained by the keyed list; never leave its control disabled.
+  if (button.isConnected) button.disabled = false;
+  restoreRowActionFocus(focus);
+  return confirmed;
+}
+
 function appendAssetFileRemovalAction(row, project, file, { recovery = false } = {}) {
-  const removeButton = document.createElement('button');
   const displayName = file && file.name ? file.name : 'this asset';
+  if (!recovery) {
+    const excludeButton = createRowIconButton('exclude', `Exclude ${displayName}`, 'app-file-remove');
+    excludeButton.addEventListener('click', event => {
+      event.stopPropagation();
+      void submitAssetRowDecision(project, file, 'exclude', excludeButton);
+    });
+    row.appendChild(excludeButton);
+    return;
+  }
+  const removeButton = document.createElement('button');
   removeButton.type = 'button';
-  removeButton.className = recovery ? 'app-file-recovery' : 'app-file-remove';
-  removeButton.textContent = recovery ? 'Remove' : '\u00D7';
-  removeButton.title = recovery
-    ? `Remove ${displayName} after its first scan failed`
-    : `Exclude ${displayName}`;
-  removeButton.setAttribute(
-    'aria-label',
-    recovery
-      ? `Remove ${displayName} and recover this project from the failed first scan`
-      : `Exclude ${displayName} from this project`
-  );
+  removeButton.className = 'app-file-recovery';
+  removeButton.textContent = 'Remove';
+  removeButton.title = `Remove ${displayName} after its first scan failed`;
+  removeButton.setAttribute('aria-label', `Remove ${displayName} and recover this project from the failed first scan`);
   removeButton.addEventListener('click', async event => {
     event.stopPropagation();
     removeButton.disabled = true;
@@ -2812,10 +3018,8 @@ function appendAssetFileRemovalAction(row, project, file, { recovery = false } =
       state.projects = await getAccountCurrentProjects();
       await renderFiles();
     } catch (error) {
-      logRendererError(recovery ? 'source recovery failed' : 'asset exclusion failed', error);
-      showToast(recovery
-        ? 'Crate could not remove that failed source. Try again.'
-        : 'Crate could not exclude that asset. Try again.');
+      logRendererError('source recovery failed', error);
+      showToast('Crate could not remove that failed source. Try again.');
       removeButton.disabled = false;
     }
   });
@@ -2823,27 +3027,13 @@ function appendAssetFileRemovalAction(row, project, file, { recovery = false } =
 }
 
 function appendAssetFileRestorationAction(row, project, file) {
-  const restoreButton = document.createElement('button');
   const displayName = file && file.name ? file.name : 'this asset';
-  restoreButton.type = 'button';
-  restoreButton.className = 'app-file-remove';
-  restoreButton.textContent = '\u00D7';
-  restoreButton.title = `Include ${displayName}`;
-  restoreButton.setAttribute('aria-label', `Include ${displayName} in this project`);
-  restoreButton.addEventListener('click', async event => {
+  const includeButton = createRowIconButton('include', `Include ${displayName}`, 'app-file-remove');
+  includeButton.addEventListener('click', event => {
     event.stopPropagation();
-    restoreButton.disabled = true;
-    try {
-      await window.crate.removeFile(project.id, getFileVisualIdentity(file));
-      state.projects = await getAccountCurrentProjects();
-      await renderFiles();
-    } catch (error) {
-      logRendererError('asset restoration failed', error);
-      showToast('Crate could not include that asset. Try again.');
-      restoreButton.disabled = false;
-    }
+    void submitAssetRowDecision(project, file, 'include', includeButton);
   });
-  row.appendChild(restoreButton);
+  row.appendChild(includeButton);
 }
 
 function getWorkingSourceRecoveryActions(project, file) {
@@ -2877,7 +3067,7 @@ function appendWorkingSourceRecovery(row, copy, project, file) {
     ? 'Working-file choice changed. Choose this file’s role.'
     : 'Selection unverified. Refresh the project.';
   if (file.includedAsDependency) detail.textContent += ' Required as an asset.';
-  if (actions.length && !actions.includes('restore')) detail.textContent += ' Verify the saved file to restore.';
+  if (actions.length && !actions.includes('restore')) detail.textContent += ' Verify the saved file to include it.';
   copy.appendChild(detail);
   const presentation = { account: accountWorkspaceEpoch, selection: projectSelectionEpoch, tab: tabNavigationEpoch,
     generation: assetWorkspaceRequestGeneration, workspace: assetWorkspaceRequestId, modal: modalLeaseSequence,
@@ -2886,7 +3076,7 @@ function appendWorkingSourceRecovery(row, copy, project, file) {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'working-source-recovery-action';
-    button.textContent = action === 'exclude' ? 'Exclude' : 'Restore';
+    button.textContent = action === 'exclude' ? 'Exclude' : 'Include';
     button.setAttribute('aria-label', `${button.textContent} ${file.name || 'working file'} as a working file`);
     button.disabled = !!workingSourceRecoveryOwner;
     presentation.buttons.push(button);
@@ -2918,7 +3108,7 @@ async function recoverWorkingSourceSelection(project, file, action, presentation
   if (confirm) confirm.disabled = true;
   presentation.detail.focus({ preventScroll: true });
   for (const control of presentation.buttons) control.disabled = true;
-  presentation.detail.textContent = action === 'exclude' ? 'Excluding the working-file role…' : 'Restoring the working-file role…';
+  presentation.detail.textContent = action === 'exclude' ? 'Excluding the working-file role…' : 'Including the working-file role…';
   try {
     let result = null;
     try {
@@ -3096,7 +3286,7 @@ function getWorkingSourceStatus(file) {
       ? 'File changed. Open Package Review.'
       : 'Verification failed. Check file and links; open Package Review.'
   };
-  return { label: 'Selected', detail: file.verificationStatus === 'no-extractor'
+  return { label: 'Included', detail: file.verificationStatus === 'no-extractor'
     ? 'Automatic link checking unavailable.'
     : '' };
 }
@@ -3189,8 +3379,8 @@ function appendWorkingSourceControls(row, copy, project, file) {
   button.className = 'working-source-action';
   button.dataset.sourceIdentity = identity;
   button.disabled = isWorkingSourceActionPending(identity);
-  button.textContent = button.disabled ? (action === 'restore' ? 'Verifying…' : 'Updating…') : action === 'restore' ? 'Restore' : 'Exclude';
-  button.setAttribute('aria-label', `${action === 'restore' ? 'Restore' : 'Exclude'} ${file.name || 'working file'}`);
+  button.textContent = button.disabled ? (action === 'restore' ? 'Verifying…' : 'Updating…') : action === 'restore' ? 'Include' : 'Exclude';
+  button.setAttribute('aria-label', `${action === 'restore' ? 'Include' : 'Exclude'} ${file.name || 'working file'}`);
   button.addEventListener('click', event => { event.stopPropagation(); void changeWorkingSourceSelection(project, file, action); });
   row.appendChild(button);
 }
@@ -3223,7 +3413,7 @@ function createAssetFileRow(
   if (isWorkingSourcePresentation(file)) {
     row.dataset.workingSourceIdentity = getFileVisualIdentity(file) || '';
     row.tabIndex = -1;
-    row.classList.toggle('is-selected-source', !workingChoice && file.sourceSelection === 'selected' && getWorkingSourceStatus(file).label === 'Selected');
+    row.classList.toggle('is-selected-source', !workingChoice && file.sourceSelection === 'selected' && getWorkingSourceStatus(file).label === 'Included');
     row.classList.toggle('has-working-choice', !!workingChoice);
   }
   row.dataset.assetCategory = excluded
@@ -3949,7 +4139,7 @@ function getPendingFileReason(file) {
     return appLabel ? `Observed in ${appLabel}.` : 'Opened during this session.';
   }
 
-  return appLabel ? `Needs review before packaging. Observed in ${appLabel}.` : 'Needs review before packaging.';
+  return appLabel ? `Found in ${appLabel}. Crate isn’t sure it belongs.` : 'Crate isn’t sure it belongs.';
 }
 
 function createFileRow(file) {
@@ -3980,6 +4170,9 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
 
   section.classList.remove('hidden');
   setCountText('pending-assets-count', pending.length);
+  // [+] and [x] appear exactly on the rows Include All / Exclude All count.
+  const decisionTargets = new Set(getPendingAssetsForBatchDecision(project)
+    .map(candidate => candidate.target).filter(Boolean));
   const buildPendingRow = file => {
     const row = document.createElement('div');
     row.className = 'pending-file';
@@ -3999,6 +4192,8 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
       select();
     });
     row.addEventListener('keydown', event => {
+      // Enter and Space on a row button must press that button, not select the row.
+      if (event.target?.closest?.('button')) return;
       if (event.key !== 'Enter' && event.key !== ' ') return;
       event.preventDefault();
       select();
@@ -4006,7 +4201,9 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
     const reason = getPendingFileReason(file);
     const stateLabel = getPendingCaptureState(file) === 'needs-save'
       ? 'Needs Save'
-      : (getPendingCaptureState(file) === 'observed' ? 'Opened' : 'Needs Review');
+      : (getPendingCaptureState(file) === 'observed' ? 'Opened' : 'Include or Exclude');
+    const decisionTarget = getPendingCaptureState(file) === 'pending' ? getPendingDecisionTarget(file) : null;
+    const decidable = !!decisionTarget && decisionTargets.has(decisionTarget);
 
     row.appendChild(createFileVisual(project.id, file, { loadVisual: false }));
     const copy = document.createElement('span');
@@ -4031,6 +4228,26 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
     stateBadge.className = 'pending-state-badge';
     stateBadge.textContent = stateLabel;
     row.appendChild(stateBadge);
+
+    if (decidable) {
+      const displayName = file.name || 'Untitled file';
+      const actions = document.createElement('div');
+      actions.className = 'pending-row-actions';
+      const blocked = accountStatus.canUseWorkspace === false ||
+        rendererActionsInFlight.has(`asset-review-batch:${project.id}`) ||
+        !getCurrentAssetReviewBatchWorkspace(state.projects.find(item => item.id === project.id));
+      for (const [kind, decision] of [['include', 'include'], ['exclude', 'skip']]) {
+        const button = createRowIconButton(kind, `${kind === 'include' ? 'Include' : 'Exclude'} ${displayName}`, 'pending-row-action');
+        button.disabled = blocked;
+        button.addEventListener('click', event => {
+          event.stopPropagation();
+          void submitPendingAssetDecision(decision, project.id, decisionTarget, button);
+        });
+        actions.appendChild(button);
+      }
+      row.classList.add('has-row-actions');
+      row.appendChild(actions);
+    }
 
     return row;
   };

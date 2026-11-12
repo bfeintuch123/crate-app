@@ -694,7 +694,6 @@ body {
 }
 
 .asset-batch-button:focus-visible,
-.app-file-remove:focus-visible,
 .app-file-restore:focus-visible,
 .app-file-recovery:focus-visible {
   outline: 2px solid var(--black);
@@ -1159,14 +1158,9 @@ body {
 
 .asset-card-grid .app-file-remove {
   position: absolute;
-  top: 7px;
-  right: 7px;
+  top: 5px;
+  right: 5px;
   z-index: 2;
-  width: 24px;
-  height: 24px;
-  border: 1px solid var(--gray-200);
-  border-radius: 5px;
-  background: rgba(255, 255, 255, 0.94);
 }
 
 .asset-card-grid .file-status-badge {
@@ -1266,31 +1260,106 @@ body {
   white-space: nowrap;
 }
 
-.app-file-remove {
-  background: none;
-  border: none;
-  color: var(--gray-300);
-  cursor: pointer;
-  font-size: 14px;
-  padding: 2px 4px;
-  border-radius: 3px;
+/* Asset [+] and [x]: a 28px native button around a 22px visible box with a
+   1.5px icon. Always visible at full opacity (no hover reveal, no tooltip). */
+.row-icon-button {
+  box-sizing: border-box;
+  display: inline-grid;
+  place-items: center;
+  flex-shrink: 0;
   width: 28px;
   height: 28px;
-  opacity: 0.5;
-  transition: opacity 0.1s ease, color 0.1s ease, background-color 0.1s ease; /* L10 */
-}
-
-.app-file:hover .app-file-remove {
+  min-width: 28px;
+  min-height: 28px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--gray-700);
+  font-size: 0;
+  line-height: 0;
   opacity: 1;
+  cursor: pointer;
 }
 
-.app-file-remove:focus-visible {
-  opacity: 1;
+.row-icon-box {
+  box-sizing: border-box;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--gray-200);
+  border-radius: 5px;
+  background: var(--white);
 }
 
-.app-file-remove:hover {
-  color: var(--red);
-  background: #fef2f2;
+.row-icon-box {
+  position: relative;
+}
+
+/* Two centered 1.5px strokes in the button's color: + for Include, x for Exclude. */
+.row-icon-box::before,
+.row-icon-box::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 1.5px;
+  height: 9px;
+  border-radius: 1px;
+  background: currentColor;
+  transform: translate(-50%, -50%);
+}
+
+.row-action-include .row-icon-box::after {
+  transform: translate(-50%, -50%) rotate(90deg);
+}
+
+.row-action-exclude .row-icon-box::before {
+  height: 10.5px;
+  transform: translate(-50%, -50%) rotate(45deg);
+}
+
+.row-action-exclude .row-icon-box::after {
+  height: 10.5px;
+  transform: translate(-50%, -50%) rotate(-45deg);
+}
+
+.row-icon-button:hover:not(:disabled) {
+  color: var(--black);
+  background: none;
+}
+
+.row-icon-button:hover:not(:disabled) .row-icon-box {
+  border-color: var(--gray-400);
+}
+
+.row-icon-button:focus-visible {
+  outline: none;
+  color: var(--black);
+}
+
+.row-icon-button:focus-visible .row-icon-box {
+  border-color: var(--gray-400);
+  outline: 2px solid var(--black);
+  outline-offset: 2px;
+}
+
+.row-icon-button:disabled {
+  cursor: wait;
+}
+
+.row-icon-button:disabled .row-icon-box {
+  color: var(--gray-400);
+  background: var(--gray-50);
+}
+
+.pending-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
 }
 
 .app-file-recovery {
