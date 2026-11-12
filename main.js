@@ -6615,6 +6615,9 @@ function normalizeProjectAssetReviewState(project) {
       }
     }
   }
+  // A remembered Needs Review exclusion is no longer shown once the same file
+  // is a project file again; a malformed list is left untouched.
+  if (pruneShadowedExcludedPendingRecords(project)) changed = true;
   return changed;
 }
 
@@ -10453,7 +10456,6 @@ function mutateProject(projectId, fn, { persistIfChanged = false, trustResultCha
   if (!persistIfChanged || !trustResultChanged || resultChanged) {
     normalizeAutoCaptureProjectState(project, packageStageContext ? createLiveObservedFileStageContext(project) : null);
     normalizeProjectAssetReviewState(project);
-    pruneShadowedExcludedPendingRecords(project);
     safelyEnsureProjectProvenance(project);
     retireRemovedPsdReceiptHolds(project, heldPsdMembers);
   }
