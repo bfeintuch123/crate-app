@@ -7015,6 +7015,17 @@ function showV2Results(result) {
   } else {
     missingEl.innerHTML = '';
   }
+  // Quick Package never copies font files (no review step for the font gate).
+  const skippedFonts = Array.isArray(result.fontsNotIncluded) ? result.fontsNotIncluded : [];
+  if (skippedFonts.length > 0) {
+    missingEl.insertAdjacentHTML('beforeend', `
+      <div class="v2-result-missing-header">Fonts not included</div>
+      <div class="v2-result-missing-item">Quick Package doesn't include font files. Use a Crate project and Package Review to add fonts.</div>
+      <div class="v2-result-missing-list">
+        ${skippedFonts.map(font => `<div class="v2-result-missing-item">${escapeHtml(String(font?.name || 'Font file'))}</div>`).join('')}
+      </div>
+    `);
+  }
 
   $('#modal-v2-results').classList.remove('hidden');
   setModalBackgroundState(true);

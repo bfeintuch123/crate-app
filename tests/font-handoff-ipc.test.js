@@ -470,6 +470,22 @@ function cases() {
     assert.deepEqual(listTree(result.folderPath), ['Fonts/Fonts in this package.txt', 'PNG/Logo.png']);
   });
 
+  fontTest('Quick Package never copies a linked font and reports it by name', async () => {
+    const f = await fixture();
+    const zlib = require('node:zlib');
+    const font = path.join(f.dir, 'BrandSans-Bold.otf');
+    writeFont(font, brand('Bold', { licence: OFL_STATEMENT }));
+    const project = path.join(f.dir, 'Edit.prproj');
+    fs.writeFileSync(project, zlib.gzipSync(`<PremiereData><FilePath>${f.image}</FilePath><FilePath>${font}</FilePath></PremiereData>`));
+    const result = await callIpcRaw('v2:package-file', project);
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.deepEqual(result.fontsNotIncluded, [{ name: 'BrandSans-Bold.otf', reason: 'quick-package' }]);
+    const tree = listTree(result.outputDir);
+    assert.ok(tree.some(file => file.endsWith('Logo.png')), tree.join(', '));
+    assert.ok(!tree.some(file => /\.(otf|ttf|ttc|otc)$/i.test(file)), tree.join(', '));
+    assert.ok(!JSON.stringify(result.fontsNotIncluded).includes(f.dir), 'no path in the font report');
+  });
+
   fontTest('registry failure reports unavailable and leaves packaging untouched', async () => {
     const f = await fixture();
     registryFailure = true;

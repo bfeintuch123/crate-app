@@ -25832,6 +25832,7 @@ registerTrustedIpcHandler('v2:package-file', async (event, filePath) => {
         assetsFound: result.assetsFound,
         assetsCopied: result.assetsCopied,
         assetsMissing: result.assetsMissing,
+        ...(result.fontsNotIncluded ? { fontsNotIncluded: result.fontsNotIncluded } : {}),
         outputDir: destFolder,
         files: result.files
       };
