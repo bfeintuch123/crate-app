@@ -3989,11 +3989,11 @@ function isWorkingSourceDiskIdentityCurrent(file, record) {
     .every(key => identity[key] === record.sourceIdentity[key]);
 }
 
-function getWorkingSourceVerification(project, file) {
-  const key = getAssetBaselineSourceRecoveryRouteKey(project, file);
-  const record = project?.workingSourceVerification?.[key];
-  const selection = getWorkingSourceSelection(project, file);
-  if (!record || record.selectionRevision !== selection.revision) return null;
+// The structural checks of a stored working-source verification record, apart
+// from its binding to the current selection revision: the accessor below and
+// the output evidence read by the pre-package pass both use exactly these.
+function isStructurallyValidWorkingSourceRecord(record) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return false;
   if (!['scanned', 'pending', 'failed', 'limited', 'incomplete', 'unavailable', 'stale', 'no-extractor'].includes(record.status) ||
       typeof record.attempt !== 'string' || record.attempt.length > 64 ||
       !Array.isArray(record.requiredReferences) || record.requiredReferences.length > 8192 ||
@@ -4004,7 +4004,7 @@ function getWorkingSourceVerification(project, file) {
       record.inventoryStatus === 'complete' ||
       (['scanned', 'no-extractor'].includes(record.status) &&
         (!/^[a-f0-9]{64}$/.test(record.sourceFingerprint || '') || !record.sourceIdentity ||
-          !['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'].every(key => Number.isFinite(record.sourceIdentity[key]))))) return null;
+          !['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'].every(key => Number.isFinite(record.sourceIdentity[key]))))) return false;
   // "scanned" proves ordinary-route parity on these bytes, never exhaustive
   // inventory certification. No provider can publish a "complete" verdict.
   // This optional domain is published only by a byte-validated PSD scan.
@@ -4015,7 +4015,16 @@ function getWorkingSourceVerification(project, file) {
           path.isAbsolute(output.path) && output.path.length <= 16384 &&
           /^[a-f0-9]{64}$/.test(output.sourceDigest || '') && output.sourceDigest === record.sourceFingerprint &&
           /^[a-f0-9]{64}$/.test(output.outputDigest || '')) ||
-        record.requiredEmbeddedOutputs.reduce((units, output) => units + output.path.length, 0) > 4 * 1024 * 1024)) return null;
+        record.requiredEmbeddedOutputs.reduce((units, output) => units + output.path.length, 0) > 4 * 1024 * 1024)) return false;
+  return true;
+}
+
+function getWorkingSourceVerification(project, file) {
+  const key = getAssetBaselineSourceRecoveryRouteKey(project, file);
+  const record = project?.workingSourceVerification?.[key];
+  const selection = getWorkingSourceSelection(project, file);
+  if (!record || record.selectionRevision !== selection.revision) return null;
+  if (!isStructurallyValidWorkingSourceRecord(record)) return null;
   // A concrete legacy PSD scan proves capture on these bytes, but its ordinary
   // extractor does not publish the PSD's declared dependency inventory. Once
   // selection is engaged, retain that receipt and its known obligations while
@@ -4139,17 +4148,73 @@ function noteDependencyOwnerOnRows(rows, assetPath, ownerPath) {
   for (const row of rows || []) if (normalizeTrackedFilePath(row?.path) === key) changed = noteDependencyOwner(row, ownerPath) || changed;
   return changed;
 }
-// Guard for scans run on a working file's behalf (G1/G3/G4).
-function isUnretainedExcludedScanSource(membership, file) {
+// Guard for scans run on a working file's behalf (G1/G3/G4). Nothing is read or
+// admitted on behalf of an excluded document or of a row withheld with one. The
+// Photoshop parse passes `excludedAssetDocuments: false`: it keeps reading an
+// individually excluded placed PSD so a kept output's cached file can be repaired.
+function isUnretainedExcludedScanSource(membership, file, { excludedAssetDocuments = true } = {}) {
   const fact = file && membership?.facts.get(getTrackedFileDedupKey(file));
   return !!fact && !fact.included &&
-    ((fact.sourceSelection === 'excluded' && fact.selectionReason === 'user-excluded') || fact.excludedSourceOnly === true);
+    ((fact.sourceSelection === 'excluded' && fact.selectionReason === 'user-excluded') || fact.excludedSourceOnly === true ||
+      (excludedAssetDocuments && membership.excludedAssetDocumentKeys?.has(getTrackedFileDedupKey(file)) === true));
+}
+
+// A row excluded only by the bulk "Skip existing assets" decision: not an
+// action on that row (mirrors getIndividualAssetContentExclusions).
+function isBulkSkippedOnlyAssetRow(project, file) {
+  return project?.assetBaseline?.decision === 'skip' && file?.assetOrigin === 'existing' && !file.individualContentExclusion;
+}
+// The exclusion rule applies with a working-file selection record, or when an
+// asset-role row carries its own per-asset exclusion and owns something:
+// another row names it as an owner, producer or parent (a case-insensitive
+// string test over stored fields), or its own stored scan receipt lists a
+// reference or embedded output (one route key per such row, computed only
+// when the project stores receipts). The membership function confirms
+// ownership on normalized paths. A project without such a row does no added work.
+function isExclusionRuleActive(project) {
+  if (hasWorkingSourceSelectionState(project)) return true;
+  const keys = project?.excludedAssetKeys;
+  if (!Array.isArray(keys) || !keys.length) return false;
+  const excluded = new Set(keys), documents = new Map();
+  for (const file of project.files || []) {
+    if (typeof file?.path !== 'string' || !excluded.has(getAssetReviewExclusionKey(file)) || isWorkingSourceFile(file) ||
+        isBulkSkippedOnlyAssetRow(project, file)) continue;
+    documents.set(file.path.toLowerCase(), file);
+  }
+  if (!documents.size) return false;
+  const names = value => typeof value === 'string' && documents.has(value.toLowerCase());
+  if ([...(project.files || []), ...(project.pendingFiles || [])].some(file => file && (
+    (Array.isArray(file.dependencyOwners) && file.dependencyOwners.some(names)) || names(file.captureEvidence?.relationshipSourcePath) ||
+    names(file.captureEvidence?.sourceDocumentPath) || names(file.assetBaselineSourcePath) || names(file.parentPsd) ||
+    names(file.psdResource?.parentPath) || names(file.psdExtractionReceipt?.parentPath)))) return true;
+  const receipts = project.workingSourceVerification;
+  if (!receipts || typeof receipts !== 'object' || !Object.keys(receipts).length) return false;
+  for (const file of documents.values()) {
+    const record = receipts[getAssetBaselineSourceRecoveryRouteKey(project, file)];
+    if ((Array.isArray(record?.requiredReferences) && record.requiredReferences.length > 0) ||
+        (Array.isArray(record?.requiredEmbeddedOutputs) && record.requiredEmbeddedOutputs.length > 0)) return true;
+  }
+  return false;
+}
+// A Photoshop output's extraction record (written only by extractPsdAssets from
+// the parent's own bytes) under the validity conditions of
+// getPsdExtractionResourceIdentity, without its parent identity read.
+function getValidPsdExtractionReceiptParent(row) {
+  const receipt = row?.source === 'psd-embedded' ? row.psdExtractionReceipt : null;
+  if (receipt?.version !== 1 || receipt.current === false || receipt.layerPath !== null ||
+      typeof receipt.parentPath !== 'string' || !path.isAbsolute(receipt.parentPath) ||
+      !/^[a-f0-9]{64}$/.test(receipt.sourceDigest) || !/^[a-f0-9]{64}$/.test(receipt.outputDigest) ||
+      !Number.isInteger(receipt.linkedIndex) || receipt.linkedIndex < 0 || typeof receipt.originalName !== 'string') return null;
+  return receipt.parentPath;
 }
 
 function getWorkingSourceMembership(project, packageFiles = null) {
   const scopedProject = getIllustratorScopedProjectView(project);
   const files = deduplicateFiles(scopedProject?.files || []);
   const engaged = hasWorkingSourceSelectionState(project);
+  // Whether the exclusion rule below applies to this project. Kept separate
+  // from `engaged`, which also gates verification and required-asset roles.
+  const exclusionActive = isExclusionRuleActive(project);
   const recoveryGuardKeys = getWorkingSourceRecoveryGuardKeys(project);
   const recoveryGuardPaths = new Set();
   let recoveryGuardInvalid = recoveryGuardKeys === null;
@@ -4210,10 +4275,6 @@ function getWorkingSourceMembership(project, packageFiles = null) {
       }
     }
   }
-  // Assets reachable only from working files the owner explicitly excluded.
-  // Each working file governs its own closure; Replace history, invalid roots
-  // and excluded roots retained as dependencies contribute nothing here.
-  const unretainedExcludedRoots = new Map(), excludedOnlyPaths = new Set(), keptBridgePaths = new Set(), bridgeMemo = {};
   const sourcePaths = new Set(sources.map(file => normalizeTrackedFilePath(file.path)));
   // Owners recorded on a row count only while they are still project files:
   // a removed file cannot need an asset in the package.
@@ -4230,43 +4291,109 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     recordedOwnerMemo.set(file, keys);
     return keys;
   };
-  // Recorded owners join receipt and row-evidence edges for retention and the
-  // excluded-only walk only; never for requirements, counts or verification.
+  // Recorded owners join receipt and row-evidence edges as ownership links for
+  // the exclusion rule only; never for requirements, counts or verification.
   const ownershipEdges = new Map();
   for (const [source, links] of edges) ownershipEdges.set(source, new Map(links));
-  if (engaged) for (const file of physicalFiles) {
+  // Without a selection record the requirement graph omits embedded-output and
+  // resource edges; they join the ownership links here, for support only.
+  if (exclusionActive && !engaged) {
+    const link = (sourcePath, targetPath) => {
+      const source = normalizeTrackedFilePath(sourcePath), target = normalizeTrackedFilePath(targetPath);
+      if (!source || !target || source === target) return;
+      const links = ownershipEdges.get(source) || new Map(); links.set(target, targetPath); ownershipEdges.set(source, links);
+    };
+    for (const file of files) for (const output of getWorkingSourceVerification(project, file)?.requiredEmbeddedOutputs || []) link(file.path, output.path);
+    for (const file of [...files, ...(scopedProject?.pendingFiles || [])]) {
+      const resource = file.psdResource;
+      if (file.source === 'psd-embedded' && resource?.version === 1 && resource.current !== false &&
+          typeof resource.parentPath === 'string' && path.isAbsolute(resource.parentPath)) link(resource.parentPath, file.path);
+    }
+  }
+  // An extraction record names the placed Photoshop file an output came from
+  // while that file is a project file: an ownership link for support and
+  // withholding only, never a requirement, count or verification input.
+  if (exclusionActive) for (const file of physicalFiles) {
+    const parentKey = normalizeTrackedFilePath(getValidPsdExtractionReceiptParent(file));
+    const key = parentKey && projectPhysicalPaths.has(parentKey) && normalizeTrackedFilePath(file.path);
+    if (!key || key === parentKey) continue;
+    const links = ownershipEdges.get(parentKey) || new Map(); links.set(key, file.path); ownershipEdges.set(parentKey, links);
+  }
+  if (exclusionActive) for (const file of physicalFiles) {
     for (const ownerKey of recordedOwnerKeys(file)) {
       const links = ownershipEdges.get(ownerKey) || new Map(); links.set(normalizeTrackedFilePath(file.path), file.path); ownershipEdges.set(ownerKey, links);
     }
   }
-  // Everything an included working file reaches through that relation stays.
-  const retainedPaths = new Set();
-  if (engaged) {
-    const queue = sources.filter(file => getWorkingSourceSelection(project, file).state !== 'excluded').map(file => normalizeTrackedFilePath(file.path));
-    for (const key of queue) retainedPaths.add(key);
-    for (let index = 0; index < queue.length; index++) {
-      for (const [target] of ownershipEdges.get(queue[index]) || []) if (!retainedPaths.has(target)) { retainedPaths.add(target); queue.push(target); }
+  for (const key of recoveryGuardKeys || []) {
+    const matches = (project.files || []).filter(file=>getAssetBaselineSourceRecoveryRouteKey(project,file)===key);
+    if (matches.length !== 1 || !isWorkingSourceFile(matches[0])) { recoveryGuardInvalid = true; continue; }
+    const root = matches[0], rootPath = normalizeTrackedFilePath(root.path);
+    if (getWorkingSourceSelection(project,root).state === 'excluded' && !requiredByPath.has(rootPath)) continue;
+    const queue = [rootPath];
+    for (let index=0; index<queue.length; index++) {
+      const current = queue[index]; if (recoveryGuardPaths.has(current)) continue;
+      recoveryGuardPaths.add(current);
+      const canonical = (project.files || []).filter(file=>!isScanOnSaveEmbeddedPsdFile(file)&&normalizeTrackedFilePath(file.path)===current);
+      if (canonical.length !== 1 || !byPath.has(current)) { recoveryGuardInvalid = true; continue; }
+      const row = canonical[0], verification = getWorkingSourceVerification(project,row);
+      if (isWorkingSourceFile(row) && (!verification || !['scanned','no-extractor'].includes(verification.status) ||
+          (path.extname(row.path||'').toLowerCase()==='.psd' && verification.provider==='psd-ordinary' && verification.status==='scanned'))) recoveryGuardInvalid = true;
+      for (const [target] of edges.get(current) || []) queue.push(target);
+      for (const output of verification?.requiredEmbeddedOutputs || []) { edge(row.path,output.path); queue.push(normalizeTrackedFilePath(output.path)); }
     }
   }
-  // Assets kept by an existing-assets Include for the exclusion current at the
-  // click act as kept bridges too, settled below in at most one pass per row.
-  const episodeBridges = new Set(), rootClosures = new Map();
-  const walkExcludedOnly = (roots, visited, bridges) => {
+  // Exclusion rule. An excluded document is a row the owner excluded directly
+  // and that nothing requires: a working file excluded with the working-file
+  // control, or an asset-role row that owns something and carries its own
+  // per-asset exclusion. The bulk "Skip existing assets" decision alone is not
+  // an action on a document, and Replace history, invalid selections and
+  // required documents never count.
+  // An excluded document keeps nothing and admits nothing; whatever is written
+  // keeps what it links, whatever the reason it is written. A row is withheld
+  // only when an excluded document reaches it along ownership links, its own
+  // evidence ties it only to excluded documents and rows they reach, and
+  // nothing that is written links it.
+  const keptAsRequired = key => requiredByPath.has(key) && (engaged || recoveryGuardPaths.has(key));
+  const reviewExcludedMemo = new Map();
+  const isReviewExcluded = file => {
+    if (!reviewExcludedMemo.has(file)) reviewExcludedMemo.set(file, isAssetReviewFileExcluded(project, file));
+    return reviewExcludedMemo.get(file);
+  };
+  const unretainedExcludedRoots = new Map(), excludedDocuments = new Map(), excludedAssetDocumentKeys = new Set();
+  if (exclusionActive) {
+    if (engaged) for (const root of sources) {
+      const selection = getWorkingSourceSelection(project, root), rootKey = normalizeTrackedFilePath(root.path);
+      if (selection.state === 'excluded' && selection.reason === 'user-excluded' && rootKey && !requiredByPath.has(rootKey)) {
+        unretainedExcludedRoots.set(rootKey, root); excludedDocuments.set(rootKey, root);
+      }
+    }
+    const individuallyExcluded = new Set(project?.excludedAssetKeys || []);
+    if (individuallyExcluded.size) for (const [key, file] of byPath) {
+      if (!ownershipEdges.has(key) || isWorkingSourceFile(file) || keptAsRequired(key) || !individuallyExcluded.has(getAssetReviewExclusionKey(file)) ||
+          isBulkSkippedOnlyAssetRow(project, file)) continue;
+      excludedDocuments.set(key, file); excludedAssetDocumentKeys.add(getTrackedFileDedupKey(file));
+    }
+  }
+  // Working files follow their own selection and required rows are written,
+  // so no walk enters either.
+  const walkFromExcluded = (roots, visited, stopAtDocuments) => {
     const queue = [...roots];
     for (let index = 0; index < queue.length; index++) {
       for (const [target] of ownershipEdges.get(queue[index]) || []) {
-        if (sourcePaths.has(target) || requiredByPath.has(target) || retainedPaths.has(target) || visited.has(target)) continue;
-        visited.add(target);
-        // An asset the owner kept keeps what it needs: do not walk past it.
-        const targetRow = byPath.get(target);
-        if (targetRow && (episodeBridges.has(target) || isOwnerKeptAfterSourceExclusion(project, targetRow, bridgeMemo))) { bridges?.add(target); continue; }
-        queue.push(target);
+        if (visited.has(target) || sourcePaths.has(target) || keptAsRequired(target) ||
+            (stopAtDocuments && excludedDocuments.has(target))) continue;
+        visited.add(target); queue.push(target);
       }
     }
     return visited;
   };
+  const excludedOnlyPaths = excludedDocuments.size ? walkFromExcluded(excludedDocuments.keys(), new Set(), false) : new Set();
+  // "Include All Existing" keeps an existing asset for the working-file
+  // exclusion current at the click. Each excluded working file's closure stops
+  // at an excluded asset-role document: what that document links stays with it.
+  const rootClosures = new Map();
   const closureOf = rootKey => {
-    if (!rootClosures.has(rootKey)) rootClosures.set(rootKey, walkExcludedOnly([rootKey], new Set(), null));
+    if (!rootClosures.has(rootKey)) rootClosures.set(rootKey, walkFromExcluded([rootKey], new Set(), true));
     return rootClosures.get(rootKey);
   };
   const ownerCandidateKeys = file => {
@@ -4299,43 +4426,67 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     if (overflow) return current.length === overflow.ownerCount && getExistingIncludeEpisodeDigest(currentOwners) === overflow.ownersDigest;
     return current.length > 0 && current.every(([key, revision]) => recorded[key] === revision);
   };
-  if (engaged) {
-    for (const root of sources) {
-      const selection = getWorkingSourceSelection(project, root), rootKey = normalizeTrackedFilePath(root.path);
-      if (selection.state === 'excluded' && selection.reason === 'user-excluded' && rootKey && !requiredByPath.has(rootKey)) {
-        unretainedExcludedRoots.set(rootKey, root);
+  // The per-row evidence test: the row's own ties (producer, parent, recorded
+  // owners) all lead to excluded documents or rows they reach. Returns those
+  // ties, or null when the row is not tied that way (no evidence, an
+  // overflowed owner list, or any tie to anything else keeps the row).
+  const ownerExcluded = key => excludedDocuments.has(key) || excludedOnlyPaths.has(key);
+  const excludedOnlyTies = (file, rowKey) => {
+    const captureSource = getFileCaptureSource(file), logicalEmbedded = isScanOnSaveEmbeddedPsdFile(file);
+    const ties = [];
+    let owned = false;
+    if (DEPENDENCY_CAPTURE_SOURCES.has(captureSource)) {
+      const evidence = file.captureEvidence || {};
+      const producerKey = normalizeTrackedFilePath(evidence.relationshipSourcePath || evidence.sourceDocumentPath || file.assetBaselineSourcePath);
+      const ownerKey = logicalEmbedded ? normalizeTrackedFilePath(file.parentPsd || file.path) : rowKey;
+      owned = !!ownerKey && (excludedOnlyPaths.has(ownerKey) || (logicalEmbedded && excludedDocuments.has(ownerKey)));
+      if (producerKey) { if (!ownerExcluded(producerKey)) return null; ties.push(producerKey); }
+      if (logicalEmbedded && ownerKey) ties.push(ownerKey);
+    }
+    if (!logicalEmbedded && OWNER_RECORD_ELIGIBLE_SOURCES.has(captureSource)) {
+      const recorded = recordedOwnerKeys(file);
+      if (excludedOnlyPaths.has(rowKey) && recorded.length) owned = true;
+      if (file.dependencyOwnersOverflow === true) return null;
+      if (recorded.length) { if (!recorded.every(ownerExcluded)) return null; owned = true; ties.push(...recorded); }
+    }
+    return owned ? ties : null;
+  };
+  // Support: seeds are rows written for their own reasons (an included or
+  // required file, the owner's Include or acceptance, a current existing-assets
+  // Include, or no excluded-only tie). Support flows from written rows along
+  // ownership links and the rows' own ties, never into an excluded document,
+  // and a supported row that is written passes it on.
+  const ownerIntentMemo = {}, evidenceRows = new Set(), withholdable = new Map(), supportedPaths = new Set(), writtenPaths = new Set();
+  if (excludedDocuments.size) {
+    const tiesFrom = new Map();
+    for (const [key, file] of byPath) {
+      if (isWorkingSourceFile(file)) {
+        if (!excludedDocuments.has(key) && (getWorkingSourceSelection(project, file).state === 'selected' || keptAsRequired(key))) writtenPaths.add(key);
+        continue;
       }
+      if (keptAsRequired(key)) { writtenPaths.add(key); continue; }
+      const ties = excludedOnlyPaths.has(key) ? excludedOnlyTies(file, key) : null;
+      if (ties) {
+        evidenceRows.add(key);
+        for (const tie of ties) { const rows = tiesFrom.get(tie) || []; rows.push(key); tiesFrom.set(tie, rows); }
+      }
+      if (excludedDocuments.has(key)) continue;
+      if (ties && !isOwnerKeptAfterSourceExclusion(project, file, ownerIntentMemo) && !isExistingIncludeEpisodeCurrent(file)) withholdable.set(key, file);
+      else if (!isReviewExcluded(file)) writtenPaths.add(key);
     }
-    walkExcludedOnly(unretainedExcludedRoots.keys(), excludedOnlyPaths, keptBridgePaths);
-    const episodeRows = unretainedExcludedRoots.size ? physicalFiles.filter(hasExistingIncludeEpisode) : [];
-    for (let pass = 0; pass < episodeRows.length; pass++) {
-      const added = episodeRows.map(file => normalizeTrackedFilePath(file.path)).filter((key, index) =>
-        excludedOnlyPaths.has(key) && !keptBridgePaths.has(key) && isExistingIncludeEpisodeCurrent(episodeRows[index]));
-      if (!added.length) break;
-      for (const key of added) episodeBridges.add(key);
-      excludedOnlyPaths.clear(); keptBridgePaths.clear(); rootClosures.clear(); rootsByPath = null;
-      walkExcludedOnly(unretainedExcludedRoots.keys(), excludedOnlyPaths, keptBridgePaths);
-    }
-  }
-  for (const key of recoveryGuardKeys || []) {
-    const matches = (project.files || []).filter(file=>getAssetBaselineSourceRecoveryRouteKey(project,file)===key);
-    if (matches.length !== 1 || !isWorkingSourceFile(matches[0])) { recoveryGuardInvalid = true; continue; }
-    const root = matches[0], rootPath = normalizeTrackedFilePath(root.path);
-    if (getWorkingSourceSelection(project,root).state === 'excluded' && !requiredByPath.has(rootPath)) continue;
-    const queue = [rootPath];
-    for (let index=0; index<queue.length; index++) {
-      const current = queue[index]; if (recoveryGuardPaths.has(current)) continue;
-      recoveryGuardPaths.add(current);
-      const canonical = (project.files || []).filter(file=>!isScanOnSaveEmbeddedPsdFile(file)&&normalizeTrackedFilePath(file.path)===current);
-      if (canonical.length !== 1 || !byPath.has(current)) { recoveryGuardInvalid = true; continue; }
-      const row = canonical[0], verification = getWorkingSourceVerification(project,row);
-      if (isWorkingSourceFile(row) && (!verification || !['scanned','no-extractor'].includes(verification.status) ||
-          (path.extname(row.path||'').toLowerCase()==='.psd' && verification.provider==='psd-ordinary' && verification.status==='scanned'))) recoveryGuardInvalid = true;
-      for (const [target] of edges.get(current) || []) queue.push(target);
-      for (const output of verification?.requiredEmbeddedOutputs || []) { edge(row.path,output.path); queue.push(normalizeTrackedFilePath(output.path)); }
+    const queue = [...writtenPaths];
+    const reach = target => {
+      if (supportedPaths.has(target)) return;
+      supportedPaths.add(target);
+      const row = withholdable.get(target);
+      if (row && !isReviewExcluded(row)) { writtenPaths.add(target); queue.push(target); }
+    };
+    for (let index = 0; index < queue.length; index++) {
+      for (const [target] of ownershipEdges.get(queue[index]) || []) reach(target);
+      for (const target of tiesFrom.get(queue[index]) || []) reach(target);
     }
   }
-  const facts = new Map(), ownerIntentMemo = bridgeMemo;
+  const facts = new Map();
   const counts = { selectedWorkingSources: 0, excludedWorkingSources: 0, invalidWorkingSources: 0, includedAssets: 0,
     excludedAssets: 0, unresolvedVerification: 0, missingRequiredReferences: 0, relationshipHolds: 0 };
   for (const file of files) {
@@ -4345,32 +4496,25 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     const selectedSource = source && selection.state === 'selected';
     const recoveryGuarded = recoveryGuardPaths.has(normalizeTrackedFilePath(file.path));
     const includedAsDependency = (engaged || recoveryGuarded) && requiredBy.length > 0;
-    // Withhold a dependency-captured asset only when its own evidence ties it to
-    // an explicitly excluded working file and nothing ties it to another file.
-    let excludedSourceOnly = false;
-    if (engaged && !source && !includedAsDependency && !retainedPaths.has(normalizeTrackedFilePath(file.path))) {
-      const ownerExcluded = key => unretainedExcludedRoots.has(key) || (excludedOnlyPaths.has(key) && !keptBridgePaths.has(key));
-      const captureSource = getFileCaptureSource(file), logicalEmbedded = isScanOnSaveEmbeddedPsdFile(file);
-      let owned = false, contradicted = false;
-      if (DEPENDENCY_CAPTURE_SOURCES.has(captureSource)) {
-        const evidence = file.captureEvidence || {};
-        const producerKey = normalizeTrackedFilePath(evidence.relationshipSourcePath || evidence.sourceDocumentPath || file.assetBaselineSourcePath);
-        const ownerKey = normalizeTrackedFilePath(logicalEmbedded ? file.parentPsd || file.path : file.path);
-        owned = !!ownerKey && (excludedOnlyPaths.has(ownerKey) || (logicalEmbedded && unretainedExcludedRoots.has(ownerKey)));
-        contradicted = !!producerKey && !ownerExcluded(producerKey);
+    // Withhold a row only under the exclusion rule above: an excluded document
+    // reaches it, its own evidence ties it only to excluded documents and rows
+    // they reach, nothing written links it, and the owner did not keep it.
+    let excludedSourceOnly = false, withheld = false;
+    if (excludedDocuments.size && !source && !includedAsDependency) {
+      if (isScanOnSaveEmbeddedPsdFile(file)) {
+        // A logical resource reads its parent's bytes: it is supported while
+        // its parent or producer is written.
+        const ties = excludedOnlyTies(file, null);
+        excludedSourceOnly = !!ties && !ties.some(key => writtenPaths.has(key));
+        withheld = excludedSourceOnly && !isOwnerKeptAfterSourceExclusion(project, file, ownerIntentMemo) && !isExistingIncludeEpisodeCurrent(file);
+      } else {
+        const key = normalizeTrackedFilePath(file.path);
+        excludedSourceOnly = evidenceRows.has(key) && !supportedPaths.has(key);
+        withheld = withholdable.has(key) && !supportedPaths.has(key);
       }
-      if (!logicalEmbedded && OWNER_RECORD_ELIGIBLE_SOURCES.has(captureSource)) {
-        const recorded = recordedOwnerKeys(file);
-        if (excludedOnlyPaths.has(normalizeTrackedFilePath(file.path)) && recorded.length) owned = true;
-        if (file.dependencyOwnersOverflow === true) contradicted = true;
-        else if (recorded.length) { if (recorded.every(ownerExcluded)) owned = true; else contradicted = true; }
-      }
-      excludedSourceOnly = owned && !contradicted;
     }
-    const withheld = excludedSourceOnly && !isOwnerKeptAfterSourceExclusion(project, file, ownerIntentMemo) &&
-      !isExistingIncludeEpisodeCurrent(file);
     const eligible = source ? (selectedSource || includedAsDependency)
-      : ((!isAssetReviewFileExcluded(project, file) && !withheld) || includedAsDependency);
+      : ((!isReviewExcluded(file) && !withheld) || includedAsDependency);
     const included = eligible && (!packageKeys || packageKeys.has(getTrackedFileDedupKey(file)));
     const verification = getWorkingSourceVerification(project, file);
     const persistedVerification = Object.hasOwn(project.workingSourceVerification || {}, getAssetBaselineSourceRecoveryRouteKey(project, file));
@@ -4454,7 +4598,7 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     !/^[a-f0-9]{64}$/.test(key) || !isValidWorkingSourceSelectionRecord(project, key, record)));
   const choiceReviewNames = files.filter(file => file.individualChoiceReview !== undefined)
     .map(file => sanitizeRendererSourceName(file.name || path.basename(file.path || '')) || 'Asset');
-  const membership = { facts, counts, requiredByPath, getExcludedOwnerSelections, choiceReviewNames, blocked: recoveryGuardInvalid || hasWorkingSourceRecoveryHold(project) || selectionInvalid || counts.relationshipHolds > 0 ||
+  const membership = { facts, counts, requiredByPath, getExcludedOwnerSelections, excludedAssetDocumentKeys, choiceReviewNames, blocked: recoveryGuardInvalid || hasWorkingSourceRecoveryHold(project) || selectionInvalid || counts.relationshipHolds > 0 ||
     (engaged && (counts.unresolvedVerification > 0 || counts.missingRequiredReferences > 0)) ||
     [...recoveryGuardPaths].some(key=>{ const row=byPath.get(key), fact=row&&facts.get(getTrackedFileDedupKey(row));
       return !row || !fs.existsSync(row.path) || (packagePaths&&!packagePaths.has(key)) || (isWorkingSourceFile(row)&&
@@ -5780,6 +5924,47 @@ async function refreshWorkingSourceLocators(projectId, observedPaths = null, par
     }
     sendToRenderer('project:updated', { projectId });
   } finally { operation?.close(); }
+}
+
+// Whether the follow-up verification after a pre-package pass scans this working
+// file and can publish its result: selected, in a project whose working files are
+// verified before packaging (a selection, or this file recovery-guarded),
+// included by membership, and its receipt not write-blocked (a recovery record
+// or an invalid stored receipt stops that scan before it starts).
+function isOutputEvidenceVerificationTarget(project, file, membership = null) {
+  const key = file && getAssetBaselineSourceRecoveryRouteKey(project, file);
+  if (!key || getWorkingSourceSelection(project, file).state !== 'selected') return false;
+  if (isWorkingSourceReceiptWriteBlocked(project, file)) return false;
+  if (!hasWorkingSourceSelectionState(project) && !getWorkingSourceRecoveryGuardKeys(project)?.has(key)) return false;
+  return !!(membership || getWorkingSourceMembership(project)).facts.get(getTrackedFileDedupKey(file))?.included;
+}
+
+// Working files whose stored verification record proved another document's
+// damaged output (rule R): each one that is selected and included, in a project
+// whose working files are verified before packaging, is verified again through
+// the same lease and scan the review-time refresh uses. Nothing is written here,
+// and a pass that starts no scan leaves an issued package review untouched.
+async function reverifyOutputEvidenceSources(projectId, keys, parentCurrent = null) {
+  const captured = captureProjectOperation(projectId);
+  const operation = captured && { ...captured, current: (read = null) => captured.current(read) && (!parentCurrent || parentCurrent()) };
+  let started = false;
+  try {
+    for (const key of keys) {
+      const project = getProjects().find(item => item.id === projectId);
+      if (!project || !operation?.current()) return;
+      const file = (project.files || []).find(row => isWorkingSourceFile(row) && getAssetBaselineSourceRecoveryRouteKey(project, row) === key);
+      if (!file || workingSourceScanLeases.has(projectId + ':' + key) || !isOutputEvidenceVerificationTarget(project, file)) continue;
+      const scan = beginWorkingSourceScan(projectId, file.path, operation.current);
+      if (scan) { started = true; await verifyRestoredWorkingSource(projectId, file, scan.attempt, operation); }
+      if (!operation.current()) return;
+    }
+  } finally {
+    operation?.close();
+    if (started) {
+      invalidatePackageReviewForProject(projectId);
+      sendToRenderer('project:updated', { projectId });
+    }
+  }
 }
 
 function getCurrentWorkingSourceContinuationPair(project, pairIdentity, { allowIdentityMismatch = false } = {}) {
@@ -11141,6 +11326,94 @@ function reserveUniqueName(name, usedNames) {
 
 // Concurrent PSDs may reserve the same name while their bytes are staged.
 // Only an exclusive link claims the destination; never replace a sibling.
+// Extracted outputs of this Photoshop file whose cached file is missing and
+// whose row carries an individual choice: name -> the bytes and original name
+// that choice was made on. Only an output with exactly those may refill the
+// name; any other output gets its own row. Also returns the names of other
+// files' outputs in the same folder. Parents are compared per row, and only
+// for a row that names one.
+function getChosenMissingPsdOutputs(project, psdFilePath, extractDir, isNamePresent) {
+  const chosen = new Map(), otherParentNames = new Set();
+  let psdKey = null, choiceKeys = null;
+  for (const row of [...(project?.files || []), ...(project?.pendingFiles || [])]) {
+    if (row.source !== 'psd-embedded') continue;
+    const parentPath = row.psdExtractionReceipt?.parentPath ?? row.psdResource?.parentPath;
+    if (typeof parentPath !== 'string') continue;
+    psdKey ??= normalizeTrackedFilePath(psdFilePath);
+    if (!isDirectCacheChild(extractDir, row.path)) continue;
+    const name = path.basename(row.path).toLowerCase();
+    if (normalizeTrackedFilePath(parentPath) !== psdKey) otherParentNames.add(name);
+    else if (!isNamePresent(name) &&
+        hasIndividualAssetChoice(project, row, choiceKeys ??= new Set(project.excludedAssetKeys || []))) {
+      const receipt = row.psdExtractionReceipt || row.psdResource;
+      chosen.set(name, { name: path.basename(row.path), outputDigest: receipt?.outputDigest, originalName: receipt?.originalName });
+    }
+  }
+  return { chosen, otherParentNames };
+}
+
+// The required embedded outputs of a stored working-source verification record,
+// read raw: only a record that passes every structural check of
+// getWorkingSourceVerification gives any; any other record (malformed in any
+// field, not only in its output list) is not used at all, as evidence, as a
+// claim or as a reason to verify again. Every known status counts. The record's
+// selection revision is deliberately not compared: that revision binds a record
+// to the current selection for packaging authority, and says nothing about
+// whether a byte-validated scan wrote those bytes at that path.
+function getValidRecordedEmbeddedOutputs(record) {
+  if (!isStructurallyValidWorkingSourceRecord(record) || !Array.isArray(record.requiredEmbeddedOutputs)) return null;
+  return record.requiredEmbeddedOutputs;
+}
+
+// Content digests of extracted Photoshop outputs read during extraction, keyed
+// by path and file identity (device, inode, size, mtime and ctime): a file is
+// read once per state. Nothing is stored in the project.
+const psdOutputContentDigests = new Map();
+async function readCachedPsdOutputDigest(filePath, isCurrent, directoryIdentity) {
+  const found = fs.lstatSync(filePath);
+  if (found.isSymbolicLink() || !found.isFile() || found.nlink !== 1) return null;
+  const known = psdOutputContentDigests.get(JSON.stringify([filePath, psdBaselineFileIdentity(found)]));
+  if (known) return known;
+  const snapshot = await readPsdBaselineSnapshot(filePath, isCurrent, directoryIdentity);
+  if (psdOutputContentDigests.size >= 8192) psdOutputContentDigests.delete(psdOutputContentDigests.keys().next().value);
+  psdOutputContentDigests.set(JSON.stringify([filePath, snapshot.identity]), snapshot.digest);
+  return snapshot.digest;
+}
+
+// What this app session itself wrote while extracting a document: exact path ->
+// "parent path\ndigest" entries, compared as stored strings (a differently
+// spelled path simply does not match). Process-local, never stored; package
+// review accepts it only for a row without an individual choice of that same
+// document.
+const psdOutputsWrittenThisSession = new Map();
+function notePsdOutputWritten(filePath, parentPath, digest) {
+  if (!psdOutputsWrittenThisSession.has(filePath)) {
+    if (psdOutputsWrittenThisSession.size >= 8192) psdOutputsWrittenThisSession.delete(psdOutputsWrittenThisSession.keys().next().value);
+    psdOutputsWrittenThisSession.set(filePath, new Set());
+  }
+  psdOutputsWrittenThisSession.get(filePath).add(parentPath + '\n' + digest);
+}
+
+// Replaces one unchanged row's extraction record (an existing field) after its
+// cached file was verified to hold the new record's bytes.
+function rerecordPsdOutputRow(projectId, prior, next, isCurrent) {
+  const snapshot = JSON.stringify(prior);
+  let changed = false;
+  mutateProject(projectId, project => {
+    if (!isCurrent()) return false;
+    const row = [...(project.files || []), ...(project.pendingFiles || [])].find(item => JSON.stringify(item) === snapshot);
+    if (!row) return false;
+    row.psdExtractionReceipt = next;
+    changed = true;
+    return true;
+  });
+  if (changed) {
+    invalidatePackageReviewForProject(projectId);
+    sendToRenderer('project:updated', { projectId });
+  }
+  return changed;
+}
+
 function promoteEmbeddedPsdStage(stage, extractDir, usedNames, assertCurrentAndOwned) {
   for (let attempt = 0; attempt < 1024; attempt++) {
     assertCurrentAndOwned();
@@ -15567,8 +15840,32 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
       pendingIO = consume(message);
       return pendingIO;
     },
-    promote() {
+    promote(reservation = null) {
       check();
+      // Another file's output name is never taken by this file, whether or not
+      // its cached file exists. A missing output of this file whose row carries
+      // an individual choice keeps its name: only a stage with that row's bytes
+      // and original name takes it. Any other stage given a reserved name is
+      // renamed before it is linked; output digests are known only now. The
+      // reserved names are read only when this run staged an output.
+      const { chosen: chosenMissing = null, otherParentNames: otherFileNames = null } =
+        stages.length && reservation ? reservation() : {};
+      if ((chosenMissing?.size || otherFileNames?.size) && stages.length) {
+        const reserved = new Set([...(chosenMissing ? chosenMissing.keys() : []), ...(otherFileNames || [])]);
+        const available = new Map([...(chosenMissing || [])].filter(([name]) => !otherFileNames?.has(name)));
+        for (const name of reserved) usedNames.add(name);
+        for (const stage of stages) {
+          let target = null;
+          for (const [name, chosen] of available) {
+            if (chosen.outputDigest !== stage.outputDigest || chosen.originalName !== stage.embeddedOriginalName) continue;
+            available.delete(name); target = chosen.name; break;
+          }
+          if (target) stage.extractPath = path.join(extractDir, target);
+          else if (reserved.has(path.basename(stage.extractPath).toLowerCase())) {
+            stage.extractPath = path.join(extractDir, reserveUniqueName(stage.embeddedOriginalName, usedNames));
+          }
+        }
+      }
       for (const stage of stages) {
         promoteEmbeddedPsdStage(stage, extractDir, usedNames, () => {
           check();
@@ -16111,7 +16408,23 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
 
     if (workerResult) {
       if (!isCurrent()) return [];
-      return discoveredPaths.concat(workerResult.transaction.promote());
+      // The same rules as the extraction below: another file's output name is
+      // never taken, and a same-parent chosen output is refilled only with its
+      // own bytes. The other-file names come from rows, not from the folder.
+      // promote() asks for them only when this run staged an output.
+      const reservation = () => {
+        const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + projectId);
+        // A folder that cannot be listed holds no cached file: every name is absent.
+        let listing = null;
+        const listNames = () => { try { return new Set(fs.readdirSync(extractDir).map(entry => entry.toLowerCase())); } catch (_) { return new Set(); } };
+        return getChosenMissingPsdOutputs(getProjects().find(project => project.id === projectId), psdFilePath, extractDir,
+          name => (listing ??= listNames()).has(name));
+      };
+      const promoted = workerResult.transaction.promote(reservation);
+      for (const output of promoted) if (output.source === 'psd-embedded' && typeof output.outputDigest === 'string') {
+        notePsdOutputWritten(output.filePath, psdFilePath, output.outputDigest);
+      }
+      return discoveredPaths.concat(promoted);
     }
 
     // Extract embedded files from psd.linkedFiles
@@ -16127,6 +16440,18 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       const project = getProjects().find(project => project.id === projectId);
       const priorEmbeddedRows = [...(project?.files || []), ...(project?.pendingFiles || [])]
         .filter(row => row.source === 'psd-embedded');
+      // An output name that belongs to another file's row is never handed to
+      // this file, even when that row's cached file is missing: the row keeps
+      // its own parent's record. Within the same parent, on every extraction
+      // route (including the owned baseline scan of an unfinished first scan
+      // and, in promote(), the Add Files worker route), a missing output whose
+      // row carries an individual choice is refilled by a later save only with
+      // the bytes that choice was made on; other bytes get their own row. Rows
+      // without a choice keep the ordinary refill.
+      const reservation = getChosenMissingPsdOutputs(project, psdFilePath, extractDir, name => usedEmbeddedNames.has(name));
+      const chosenMissing = reservation.chosen;
+      for (const name of reservation.otherParentNames) usedEmbeddedNames.add(name);
+      for (const name of chosenMissing.keys()) usedEmbeddedNames.add(name);
       const embeddedRecords = [];
       for (const [embeddedIndex, lf] of linkedFiles.entries()) {
         if (!lf.data) continue;
@@ -16148,7 +16473,88 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         for (const row of matches) if (isDirectCacheChild(extractDir, row.path)) {
           usedEmbeddedNames.add(path.basename(row.path).toLowerCase());
         }
-        embeddedRecords.push({ lf, embeddedIndex, outputDigest, matches });
+        // A chosen missing output is refilled only with the bytes it was chosen on.
+        let chosenName = null;
+        if (!matches.length) for (const [name, chosen] of chosenMissing) {
+          if (chosen.outputDigest !== outputDigest || chosen.originalName !== (lf.name || '')) continue;
+          chosenMissing.delete(name); chosenName = chosen.name; break;
+        }
+        embeddedRecords.push({ lf, embeddedIndex, outputDigest, matches, chosenName, byteLength: data.length });
+      }
+      // Rows of this file without an individual choice whose cached file holds
+      // one of this file's current objects (same original name) while their
+      // record names other bytes, the state an ordinary refill leaves now or left
+      // under an older build, take that object's record: verified from the bytes
+      // in memory, written only while the row is unchanged. Rows with a choice,
+      // rows with a resource record and shared paths are never re-recorded.
+      const rerecorded = new Set();
+      // A record is given to at most one row: never one another row of this
+      // file already carries exactly, nor one taken earlier in this extraction
+      // (two rows with one record would trip the existing ambiguity refusal).
+      // Two objects with the same name and bytes are two records.
+      const recordKey = receipt => JSON.stringify([receipt.sourceDigest, receipt.layerPath, receipt.linkedIndex, receipt.originalName, receipt.outputDigest]);
+      let claimedRecords = null;
+      const rerecordRefilledRows = async onlyPaths => {
+        let psdKey = null, choiceKeys = null;
+        for (const row of priorEmbeddedRows) {
+          const receipt = row.psdExtractionReceipt;
+          if (rerecorded.has(row) || !receipt || row.psdResource || receipt.version !== 1 || receipt.current === false ||
+              receipt.layerPath !== null || !isDirectCacheChild(extractDir, row.path) ||
+              (onlyPaths && !onlyPaths.has(normalizeTrackedFilePath(row.path)))) continue;
+          const candidates = embeddedRecords.filter(record => !record.repairOnly &&
+            (record.lf.name || '') === receipt.originalName && record.outputDigest !== receipt.outputDigest);
+          if (!candidates.length ||
+              normalizeTrackedFilePath(receipt.parentPath) !== (psdKey ??= normalizeTrackedFilePath(psdFilePath)) ||
+              hasIndividualAssetChoice(project, row, choiceKeys ??= new Set(project.excludedAssetKeys || [])) ||
+              priorEmbeddedRows.filter(other => normalizeTrackedFilePath(other.path) === normalizeTrackedFilePath(row.path)).length !== 1) continue;
+          let digest = null;
+          try { digest = await readCachedPsdOutputDigest(row.path, isCurrent, directoryIdentity); }
+          catch (_) { if (!isCurrent()) return false; continue; }
+          if (!claimedRecords) {
+            claimedRecords = new Set();
+            for (const other of priorEmbeddedRows) {
+              const held = other.psdExtractionReceipt || other.psdResource;
+              if (held?.version === 1 && held.current !== false && typeof held.parentPath === 'string' &&
+                  normalizeTrackedFilePath(held.parentPath) === psdKey) claimedRecords.add(recordKey(held));
+            }
+          }
+          const nextFor = item => ({ version: 1, parentPath: psdFilePath, sourceDigest, layerPath: null,
+            linkedIndex: item.embeddedIndex, originalName: item.lf.name || '', outputDigest: item.outputDigest });
+          const record = candidates.find(item => item.outputDigest === digest && !claimedRecords.has(recordKey(nextFor(item))));
+          // Unclaimed: the row stays as it is; review accepts it through the row that carries the record.
+          if (!record) continue;
+          const next = nextFor(record);
+          if (!rerecordPsdOutputRow(projectId, row, next, isCurrent)) continue;
+          claimedRecords.add(recordKey(next));
+          rerecorded.add(row);
+          row.psdExtractionReceipt = next;
+          // It is now this save's own row for that object: no new row is made.
+          if (!record.matches.length && !record.chosenName) record.matches = [row];
+        }
+        return isCurrent();
+      };
+      if (!options.onOwnedPsdOutputs && priorEmbeddedRows.length && !await rerecordRefilledRows(null)) return [];
+      // A row of this file whose recorded bytes (digest and original name) are
+      // still in it, but not from this exact save, is examined too: if its cached
+      // file does not hold its recorded bytes (one read per file state), the
+      // rebuild below may restore it. Its record is not changed and this save's
+      // object keeps its own row.
+      if (!options.onOwnedPsdOutputs && priorEmbeddedRows.length) {
+        const examined = new Set(embeddedRecords.flatMap(record => record.matches));
+        let psdKey = null;
+        for (const record of [...embeddedRecords]) for (const row of priorEmbeddedRows) {
+          const receipt = row.psdExtractionReceipt || row.psdResource;
+          if (examined.has(row) || receipt?.version !== 1 || receipt.current === false || receipt.layerPath !== null ||
+              receipt.outputDigest !== record.outputDigest || receipt.originalName !== (record.lf.name || '') ||
+              !isDirectCacheChild(extractDir, row.path) ||
+              normalizeTrackedFilePath(receipt.parentPath) !== (psdKey ??= normalizeTrackedFilePath(psdFilePath))) continue;
+          examined.add(row);
+          let digest = null;
+          try { digest = await readCachedPsdOutputDigest(row.path, isCurrent, directoryIdentity); }
+          catch (_) { if (!isCurrent()) return []; continue; }
+          if (digest === null || digest === receipt.outputDigest) continue;
+          embeddedRecords.push({ ...record, matches: [row], chosenName: null, repairOnly: true });
+        }
       }
       let repairSource = null;
       const assertRepairSource = () => {
@@ -16156,8 +16562,137 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
             fs.realpathSync(psdFilePath) !== repairSource.realPath) throw new Error('asset_baseline_source_changed');
         assertPsdBaselineSnapshot(repairSource);
       };
+      // A row's cached file that holds another document's recorded bytes is set
+      // aside once this file is verified as the repair source: an exclusive link
+      // to a name no output or row can have (output names never start with a
+      // dot), then the row's name is removed. The bytes are never deleted or
+      // overwritten. Any other wrong bytes keep the existing refusal. True only
+      // when the row's path is then free.
+      const setAsideWrongOutput = async (row, outputDigest) => {
+        try {
+          const key = normalizeTrackedFilePath(row.path), rows = [...(project?.files || []), ...(project?.pendingFiles || [])];
+          if (!isDirectCacheChild(extractDir, row.path) ||
+              [...pendingPsdRepairs].some(stage => normalizeTrackedFilePath(stage.extractPath) === key) ||
+              rows.filter(other => normalizeTrackedFilePath(other.path) === key).length !== 1) return false;
+          const found = fs.lstatSync(row.path);
+          if (found.isSymbolicLink() || !found.isFile()) return false;
+          // An earlier set-aside that stopped between its link and the removal of
+          // the row's name left the file with a second link under one of our
+          // set-aside names: that operation is completed, nothing else is.
+          let interruptedAside = null;
+          if (found.nlink === 2) {
+            interruptedAside = fs.readdirSync(extractDir).filter(name => /^\.crate-set-aside-[0-9a-f]{32}(\.[^/]*)?$/.test(name))
+              .map(name => path.join(extractDir, name)).find(candidate => {
+                try { const stat = fs.lstatSync(candidate); return stat.isFile() && stat.dev === found.dev && stat.ino === found.ino; } catch (_) { return false; }
+              }) || null;
+            if (!interruptedAside) return false;
+          } else if (found.nlink !== 1) return false;
+          const digest = (await readPsdBaselineSnapshot(row.path, isCurrent, directoryIdentity)).digest;
+          const parentKey = normalizeTrackedFilePath(psdFilePath);
+          if (digest === outputDigest) return false;
+          // Evidence that the wrong bytes are another document's output: a row of
+          // another document records them, or another document's stored,
+          // byte-validated verification record names this same path with them
+          // (only the old two-document collision produces that).
+          const rowEvidence = rows.some(other => {
+            const receipt = other.psdExtractionReceipt || other.psdResource;
+            return other !== row && receipt?.outputDigest === digest && typeof receipt.parentPath === 'string' &&
+              normalizeTrackedFilePath(receipt.parentPath) !== parentKey;
+          });
+          const recordKeys = [];
+          const ownRow = (project?.files || []).find(file => normalizeTrackedFilePath(file.path) === parentKey);
+          const ownKey = ownRow ? getAssetBaselineSourceRecoveryRouteKey(project, ownRow) : null;
+          for (const [recordKey, record] of Object.entries(project?.workingSourceVerification || {})) {
+            if (recordKey === ownKey) continue;
+            if ((getValidRecordedEmbeddedOutputs(record) || []).some(output =>
+              output.outputDigest === digest && normalizeTrackedFilePath(output.path) === key)) recordKeys.push(recordKey);
+          }
+          if (!rowEvidence && !recordKeys.length) return false;
+          repairSource ||= await readPsdBaselineSnapshot(fs.realpathSync(psdFilePath), isCurrent);
+          assertRepairSource();
+          assertCacheDirectoryIdentity(directoryIdentity, 'psd-extract-directory');
+          const asidePath = interruptedAside || path.join(extractDir, `.crate-set-aside-${crypto.randomBytes(16).toString('hex')}${path.extname(row.path)}`);
+          if (!interruptedAside) fs.linkSync(row.path, asidePath);
+          const kept = fs.lstatSync(asidePath), current = fs.lstatSync(row.path);
+          if (kept.dev !== found.dev || kept.ino !== found.ino || current.dev !== found.dev || current.ino !== found.ino ||
+              current.size !== found.size || current.mtimeMs !== found.mtimeMs) return false;
+          fs.unlinkSync(row.path);
+          // The other document's record still names this path: have it verified again.
+          for (const recordKey of recordKeys) options.onOutputEvidenceRecord?.(recordKey);
+          return true;
+        } catch (_) { return false; }
+      };
+      // Another document's stored record that names a path one of this
+      // document's rows owns can only be left by the old collision; that
+      // document is verified again after the pass (see the pre-package flow).
+      if (options.onOutputEvidenceRecord && priorEmbeddedRows.length && project?.workingSourceVerification) {
+        const parentKey = normalizeTrackedFilePath(psdFilePath);
+        const ownPaths = new Set(priorEmbeddedRows.filter(row => {
+          const receipt = row.psdExtractionReceipt || row.psdResource;
+          return typeof receipt?.parentPath === 'string' && normalizeTrackedFilePath(receipt.parentPath) === parentKey;
+        }).map(row => normalizeTrackedFilePath(row.path)));
+        if (ownPaths.size) {
+          const ownRow = (project.files || []).find(file => normalizeTrackedFilePath(file.path) === parentKey);
+          const ownKey = ownRow ? getAssetBaselineSourceRecoveryRouteKey(project, ownRow) : null;
+          for (const [recordKey, record] of Object.entries(project.workingSourceVerification)) {
+            if (recordKey !== ownKey && (getValidRecordedEmbeddedOutputs(record) || [])
+              .some(output => ownPaths.has(normalizeTrackedFilePath(output.path)))) options.onOutputEvidenceRecord(recordKey);
+          }
+        }
+      }
+      // A document with its own stored verification record gets no new row from
+      // the pre-package pass only when a verification scan of it is certain to
+      // follow: (1) review gates on it (its membership fact requires
+      // verification) and its record is not current for the bytes just read, so
+      // review waits for that scan; or (2) its record names a path another
+      // document's row owns (the old collision) and the follow-up verification
+      // after this pass scans it. That scan makes the one row. Neither holds
+      // while its receipt is write-blocked: no scan of it can publish then.
+      // Otherwise, and for existing rows, the pass works as before.
+      let newRowsOwnedByVerification = null;
+      const verificationOwnsNewRows = () => newRowsOwnedByVerification ??= (() => {
+        if (options.scanOwnsNewWorkingOutputs !== true || !project?.workingSourceVerification) return false;
+        const parentKey = normalizeTrackedFilePath(psdFilePath);
+        const ownRow = (project.files || []).find(file => normalizeTrackedFilePath(file.path) === parentKey && isWorkingSourceFile(file));
+        const ownKey = ownRow && getAssetBaselineSourceRecoveryRouteKey(project, ownRow);
+        const record = ownKey && Object.hasOwn(project.workingSourceVerification, ownKey) ? project.workingSourceVerification[ownKey] : null;
+        if (!record || (!hasWorkingSourceSelectionState(project) && !getWorkingSourceRecoveryGuardKeys(project)?.has(ownKey))) return false;
+        if (isWorkingSourceReceiptWriteBlocked(project, ownRow)) return false;
+        const membership = getWorkingSourceMembership(project);
+        if (membership.facts.get(getTrackedFileDedupKey(ownRow))?.verificationRequired === true &&
+            (!['scanned', 'no-extractor'].includes(record.status) || record.sourceFingerprint !== sourceDigest)) return true;
+        if (!isOutputEvidenceVerificationTarget(project, ownRow, membership)) return false;
+        const claimed = new Set((getValidRecordedEmbeddedOutputs(record) || []).map(output => normalizeTrackedFilePath(output.path)));
+        return [...(project.files || []), ...(project.pendingFiles || [])].some(row => {
+          const receipt = row.psdExtractionReceipt || row.psdResource;
+          return claimed.has(normalizeTrackedFilePath(row.path)) && typeof receipt?.parentPath === 'string' &&
+            normalizeTrackedFilePath(receipt.parentPath) !== parentKey;
+        });
+      })();
+      const getVerifiedDuplicatePair = async (pair, byteLength, outputDigest) => {
+        try {
+          const rows = [...(project?.files || []), ...(project?.pendingFiles || [])];
+          const parentKey = normalizeTrackedFilePath(psdFilePath);
+          const ownRow = (project?.files || []).find(file => normalizeTrackedFilePath(file.path) === parentKey && isWorkingSourceFile(file));
+          const record = ownRow && getWorkingSourceVerification(project, ownRow);
+          if (!record || record.status !== 'scanned' || record.sourceFingerprint !== sourceDigest) return null;
+          const named = pair.filter(row => (record.requiredEmbeddedOutputs || []).some(output =>
+            output.outputDigest === outputDigest && normalizeTrackedFilePath(output.path) === normalizeTrackedFilePath(row.path)));
+          if (named.length !== 1) return null;
+          const choiceKeys = new Set(project.excludedAssetKeys || []);
+          for (const row of pair) {
+            const key = normalizeTrackedFilePath(row.path);
+            if (hasIndividualAssetChoice(project, row, choiceKeys) || !isDirectCacheChild(extractDir, row.path) ||
+                rows.filter(other => normalizeTrackedFilePath(other.path) === key).length !== 1) return null;
+            const snapshot = await readPsdBaselineSnapshot(row.path, isCurrent, directoryIdentity, byteLength);
+            if (snapshot.digest !== outputDigest) return null;
+            assertPsdBaselineSnapshot(snapshot);
+          }
+          return named[0];
+        } catch (_) { return null; }
+      };
       let baselineEmbeddedOrdinal = 0;
-      for (const { lf, embeddedIndex, outputDigest, matches } of embeddedRecords) {
+      for (const { lf, embeddedIndex, outputDigest, matches, chosenName, repairOnly } of embeddedRecords) {
         if (!isCurrent()) return [];
         const data = Buffer.from(lf.data);
         const psdExtractionReceipt = { version: 1, parentPath: psdFilePath, sourceDigest,
@@ -16169,6 +16704,17 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         if (!options.onOwnedPsdOutputs) {
           if (matches.length) {
             const targets = matches.map(row => ({ path: row.path, row: JSON.stringify(row) }));
+            // Two rows an older build left for one object of this save: both are
+            // cleared only when both files hold its verified bytes and this
+            // document's current verification record names exactly one of them.
+            const pair = matches.length === 2 && await getVerifiedDuplicatePair(matches, data.length, outputDigest);
+            if (!isCurrent()) return [];
+            if (pair) {
+              updatePsdExtractionReceiptHolds(projectId, targets, false, isCurrent);
+              discoveredPaths.push({ filePath: pair.path, source: 'psd-embedded',
+                embeddedOriginalName: lf.name || '', embeddedIndex, sourceDigest, outputDigest, psdExtractionReceipt });
+              continue;
+            }
             try {
               if (matches.length !== 1) throw new Error();
               if (!isDirectCacheChild(extractDir, matches[0].path)) throw new Error();
@@ -16177,7 +16723,11 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
               assertPsdBaselineSnapshot(snapshot);
             } catch (error) {
               if (!isCurrent()) return [];
-              if (error.code === 'ENOENT' && matches.length === 1 && isDirectCacheChild(extractDir, matches[0].path)) {
+              const freed = error.code !== 'ENOENT' && matches.length === 1 && await setAsideWrongOutput(matches[0], outputDigest);
+              if (!isCurrent()) return [];
+              // An examined row that is missing, linked, shared or unverified is left as it was.
+              if (repairOnly && !freed) continue;
+              if ((error.code === 'ENOENT' || freed) && matches.length === 1 && isDirectCacheChild(extractDir, matches[0].path)) {
                 try {
                   assertCacheDirectoryIdentity(directoryIdentity, 'psd-extract-directory');
                   repairSource ||= await readPsdBaselineSnapshot(fs.realpathSync(psdFilePath), isCurrent);
@@ -16195,6 +16745,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
               }
             }
             if (!restoreTargets) {
+              if (repairOnly) continue;
               if (![...pendingPsdRepairs].some(stage =>
                 normalizeTrackedFilePath(stage.extractPath) === normalizeTrackedFilePath(matches[0].path))) {
                 updatePsdExtractionReceiptHolds(projectId, targets, false, isCurrent);
@@ -16205,7 +16756,9 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
             }
           }
         }
-        const extractPath = restoreTargets ? restoreTargets[0].path : path.join(extractDir, reserveUniqueName(lf.name, usedEmbeddedNames));
+        // A new object of a document whose verification scan owns new rows.
+        if (!restoreTargets && !chosenName && !matches.length && verificationOwnsNewRows()) continue;
+        const extractPath = restoreTargets ? restoreTargets[0].path : path.join(extractDir, chosenName || reserveUniqueName(lf.name, usedEmbeddedNames));
         const stagedPath = safeCacheTempPath(extractPath);
         const staged = {
           stagedPath,
@@ -16219,6 +16772,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           outputDigest,
           psdExtractionReceipt,
           restoreTargets,
+          repairOnly: repairOnly === true,
           repairSourceSnapshot: restoreTargets ? repairSource : null,
           byteLength: data.length,
           identity: null,
@@ -16269,6 +16823,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         if (finalStat.isSymbolicLink() || !finalStat.isFile() || finalStat.dev !== staged.identity.dev || finalStat.ino !== staged.identity.ino) {
           throw cacheSafetyError('psd-extract-file', 'changed');
         }
+        notePsdOutputWritten(staged.extractPath, psdFilePath, staged.outputDigest);
         if (staged.restoreTargets) {
           if (!isAddFilesSourceIdentityCurrent(finalStat, staged.repairWriteIdentity)) throw new Error('asset_baseline_psd_output_changed');
           staged.repairFinalIdentity = psdBaselineFileIdentity(finalStat);
@@ -16284,7 +16839,8 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           // Keep the prior refusal until this caller accepts the repaired
           // member. Extraction success alone does not retire cleanup ownership.
         }
-        discoveredPaths.push({
+        // A rebuilt older row is not a discovery of this save; that object has its own stage.
+        if (!staged.repairOnly) discoveredPaths.push({
           filePath: staged.extractPath,
           source: 'psd-embedded',
           embeddedOriginalName: staged.embeddedOriginalName,
@@ -16300,6 +16856,14 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           updatePsdExtractionReceiptHolds(projectId, staged.restoreTargets, true, isCurrent);
           options.onOrdinaryScanFailure?.();
         }
+      }
+      // An ordinary refill just wrote this file's current object at an existing
+      // row's path: that row takes the record of what was written, read back.
+      if (!options.onOwnedPsdOutputs && priorEmbeddedRows.length) {
+        const refilled = new Set(invocationFiles.filter(stage => stage.committed && !stage.restoreTargets)
+          .map(stage => normalizeTrackedFilePath(stage.extractPath)));
+        if (refilled.size && priorEmbeddedRows.some(row => refilled.has(normalizeTrackedFilePath(row.path))) &&
+            !await rerecordRefilledRows(refilled)) return [];
       }
     }
 
@@ -17476,10 +18040,13 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   const inDesignSourceIdentity = ext === '.indd' ? getExplicitWorkingFileIdentity(currentProject, sourceRow) : null;
   const verificationScan = hasWorkingSourceSelectionState(currentProject) || !!options.workingSourceAttempt || options.verifySelectedSource === true;
   const previousVerification = sourceRow && getWorkingSourceVerification(currentProject, sourceRow);
-  const sourceFact = sourceRow && getWorkingSourceMembership(currentProject).facts.get(getTrackedFileDedupKey(sourceRow));
+  const sourceMembership = sourceRow && getWorkingSourceMembership(currentProject);
+  const sourceFact = sourceMembership && sourceMembership.facts.get(getTrackedFileDedupKey(sourceRow));
   const excludedPreparation = typeof options.excludedWorkingSourcePreparation === 'function' ? options.excludedWorkingSourcePreparation : null;
-  if (hasWorkingSourceSelectionState(currentProject) && sourceFact && !sourceFact.included &&
-      !(excludedPreparation && excludedPreparation(currentProject, sourceRow) === true)) {
+  // Without a selection record, skip only an excluded document or a row withheld with one.
+  const sourceSkipped = hasWorkingSourceSelectionState(currentProject) ? !!sourceFact && !sourceFact.included
+    : !!sourceRow && isUnretainedExcludedScanSource(sourceMembership, sourceRow);
+  if (sourceSkipped && !(excludedPreparation && excludedPreparation(currentProject, sourceRow) === true)) {
     if (ownsOperation) operation?.close();
     return { success: true, skipped: 'source-excluded' };
   }
@@ -18240,7 +18807,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
     const base = path.basename(presentationPath, ext);
     const currentProject = getProjects().find(p => p.id === projectId);
     if (!currentProject || !isAcceptedProjectFilePath(currentProject, presentationPath)) return;
-    if (hasWorkingSourceSelectionState(currentProject) && isUnretainedExcludedScanSource(getWorkingSourceMembership(currentProject),
+    if (isExclusionRuleActive(currentProject) && isUnretainedExcludedScanSource(getWorkingSourceMembership(currentProject),
       currentProject.files.find(file => normalizeTrackedFilePath(file.path) === normalizeTrackedFilePath(presentationPath)))) return;
 
     // Ensure temp dir exists: ~/.crate/presentation-assets/{projectId}/
@@ -19139,7 +19706,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
           let currentType = null;
           const LINKABLE_EXTS_SNAPSHOT = new Set(['.ai', '.indd', '.idml', '.psd', '.pdf', '.afdesign', '.afpub', '.afphoto']);
           const linkableForParse = [];
-          const snapshotMembership = hasWorkingSourceSelectionState(project) ? getWorkingSourceMembership(project) : null;
+          const snapshotMembership = isExclusionRuleActive(project) ? getWorkingSourceMembership(project) : null;
 
           for (const line of lsofOut.trim().split('\n')) {
             if (line.length === 0) continue;
@@ -19988,7 +20555,7 @@ registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileI
         const fingerprint = getAssetReviewContentFingerprint(removedFile);
         // An asset withheld with its explicitly excluded working file presents
         // as Excluded; Include records the owner's choice on the row itself.
-        const fact = hasWorkingSourceSelectionState(project)
+        const fact = isExclusionRuleActive(project)
           ? getWorkingSourceMembership(project).facts.get(getTrackedFileDedupKey(removedFile)) : null;
         const withheld = fact?.excludedSourceOnly === true && fact.included !== true;
         const reviewExcluded = isAssetReviewFileExcluded(project, removedFile);
@@ -20363,10 +20930,13 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   }
   const operation = captureProjectOperation(projectId); if (!operation) return null;
   const operationCurrent = operation.current;
-  const ordinaryPsdOutputBatches = [], ownerNotes = [];
-  const scanSkipper = scanProject => {
-    const membership = hasWorkingSourceSelectionState(scanProject) ? getWorkingSourceMembership(scanProject) : null;
-    return file => !!membership && isUnretainedExcludedScanSource(membership, file);
+  const ordinaryPsdOutputBatches = [], ownerNotes = [], outputEvidenceRecords = new Set();
+  // The Photoshop parse keeps its merged guard: only with a selection record,
+  // and it goes on reading an individually excluded placed PSD.
+  const scanSkipper = (scanProject, { photoshopParse = false } = {}) => {
+    const active = photoshopParse ? hasWorkingSourceSelectionState(scanProject) : isExclusionRuleActive(scanProject);
+    const membership = active ? getWorkingSourceMembership(scanProject) : null;
+    return file => !!membership && isUnretainedExcludedScanSource(membership, file, { excludedAssetDocuments: !photoshopParse });
   };
   const stagePrePackageFile = (project, file, observation, stageIndex = null) => {
     if (!operationCurrent()) return null;
@@ -20799,12 +21369,14 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   // Works even when Photoshop is not running.
   try {
     const psdFiles = project.files.filter(f => f.ext === '.psd');
-    const skipPsd = scanSkipper(project);
+    const skipPsd = scanSkipper(project, { photoshopParse: true });
     for (const psdFile of psdFiles) {
       if (skipPsd(psdFile)) continue;
       if (!fs.existsSync(psdFile.path)) continue;
       const psdAssets = await extractPsdAssets(psdFile.path, projectId, operationCurrent, {
         onOrdinaryPsdOutputs: outputs => ordinaryPsdOutputBatches.push(outputs),
+        scanOwnsNewWorkingOutputs: true,
+        onOutputEvidenceRecord: key => outputEvidenceRecords.add(key),
       });
       if (!operationCurrent()) return;
       for (const asset of psdAssets) {
@@ -21282,6 +21854,12 @@ end tell`;
       }
     }
     for (const outputs of ordinaryPsdOutputBatches) finishBaselinePsdOutputs(outputs, projectId, operationCurrent);
+    // A repair proven by another document's stored record leaves that record
+    // naming the repaired path: verify that document again with its existing
+    // leased scan, which alone may publish its record.
+    if (outputEvidenceRecords.size && operationCurrent()) {
+      try { await reverifyOutputEvidenceSources(projectId, outputEvidenceRecords, operationCurrent); } catch (_) {}
+    }
     resumeWatcherCoordinatorAfterPackage(projectId);
     if (!operation.current()) restoreFigmaPackageTransferBlock(projectId, previousFigmaPackageBlock);
     operation.close();
@@ -23303,6 +23881,22 @@ function getPackageSelectionInputSignature(project, reviewedSemantics = false) {
   }
 }
 
+// Content digests of extracted Photoshop outputs, keyed by path and the review's
+// stat fingerprint (device, inode, size, mtime and ctime in nanoseconds): any
+// change to a file changes its key, so a repeat review hashes nothing. The read
+// is chunked and has no size cap: a file is unavailable here only because its
+// bytes are wrong or cannot be read, never because it is large.
+const verifiedPsdOutputDigests = new Map();
+function getReviewedPsdOutputDigest(filePath, fingerprint) {
+  const key = JSON.stringify([filePath, fingerprint]);
+  if (verifiedPsdOutputDigests.has(key)) return verifiedPsdOutputDigests.get(key);
+  const value = getStablePackageReviewSourceContentFingerprint(filePath, fingerprint);
+  const digest = value.slice(value.lastIndexOf(':') + 1);
+  if (verifiedPsdOutputDigests.size >= 8192) verifiedPsdOutputDigests.delete(verifiedPsdOutputDigests.keys().next().value);
+  verifiedPsdOutputDigests.set(key, digest);
+  return digest;
+}
+
 function getUnsatisfiedWorkingPsdOutputEntries(project, membership, files, entries = null) {
   const unavailable = new Set(), digestByEntry = new Map();
   const selectionEngaged = hasWorkingSourceSelectionState(project);
@@ -23331,6 +23925,45 @@ function getUnsatisfiedWorkingPsdOutputEntries(project, membership, files, entri
     }
   }
   return unavailable;
+}
+
+// Package review only: an extracted Photoshop output with a current record is
+// written only with bytes that belong to it. A row with an individual choice:
+// exactly its own recorded bytes. A row without one: its own recorded bytes or
+// those another current row of the same document records (what an ordinary
+// refill leaves), or what this session itself wrote there from that document.
+// Any other bytes, whoever wrote them, leave it unavailable;
+// nothing is changed. The package step runs this again and copies only a file
+// whose stat fingerprint is still the one verified here.
+function getMismatchedPsdOutputEntries(project, files, entries) {
+  const mismatched = new Set();
+  let siblings = null, choiceKeys = null;
+  const currentRecord = row => {
+    const receipt = row?.source === 'psd-embedded' ? row.psdExtractionReceipt || row.psdResource : null;
+    return receipt?.version === 1 && receipt.current !== false && typeof receipt.parentPath === 'string' &&
+      /^[a-f0-9]{64}$/.test(receipt.outputDigest || '') ? receipt : null;
+  };
+  files.forEach((file, index) => {
+    const receipt = currentRecord(file);
+    if (!receipt) return;
+    let digest = null;
+    try { digest = getReviewedPsdOutputDigest(file.path, entries[index].sourceFingerprint); } catch (_) { mismatched.add(index); return; }
+    if (digest === receipt.outputDigest) return;
+    if (hasIndividualAssetChoice(project, file, choiceKeys ??= new Set(project.excludedAssetKeys || []))) { mismatched.add(index); return; }
+    if (!siblings) {
+      siblings = new Map();
+      for (const row of [...(project.files || []), ...(project.pendingFiles || [])]) {
+        const record = currentRecord(row);
+        if (!record) continue;
+        const key = normalizeTrackedFilePath(record.parentPath);
+        if (!siblings.has(key)) siblings.set(key, []);
+        siblings.get(key).push([row, record.outputDigest]);
+      }
+    }
+    if (psdOutputsWrittenThisSession.get(file.path)?.has(receipt.parentPath + '\n' + digest)) return;
+    if (!(siblings.get(normalizeTrackedFilePath(receipt.parentPath)) || []).some(([row, recorded]) => recorded === digest && row.path !== file.path)) mismatched.add(index);
+  });
+  return mismatched;
 }
 
 async function buildCanonicalPackageReviewManifest(projectId) {
@@ -23393,6 +24026,7 @@ async function buildCanonicalPackageReviewManifest(projectId) {
       };
     }
     const unavailableOutputs = getUnsatisfiedWorkingPsdOutputEntries(currentProject, membership, files, entries);
+    for (const index of getMismatchedPsdOutputEntries(currentProject, files, entries)) unavailableOutputs.add(index);
     if (unavailableOutputs.size > 0) return {
       project: currentProject, files, entries,
       entryStatuses: entryStatuses.map((status, index) => unavailableOutputs.has(index) ? 'unavailable' : status),

@@ -160,7 +160,7 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
   vm.runInContext('function toggleAssetForTest(project, removedFile) { let changed = false;\n' +
     between("    if (removedFile && inferProjectFileRole(removedFile) === 'asset') {",
       '    project.files = project.files.filter(file => (\n      !matchesProjectFileIdentity') + '  return changed; }', context);
-  api = vm.runInContext('({getWorkingSourceSelection, getWorkingSourceVerification, getWorkingSourceMembership, setWorkingSourceSelection, resolveWorkingFileChoice, getAssetBaselineSourceRecoveryRouteKey, selectProjectFilesForPackaging, beginWorkingSourceScan, collectWorkingSourceScanEvidence, publishWorkingSourceScan, failWorkingSourceScan, workingSourceScanLeases, workingSourceScanOperations, getWorkingSourceDiskIdentity, recordWorkingSourceContinuationCandidate, resolveWorkingSourceContinuation, getWorkingSourceContinuationPresentation, observeIllustratorWorkingSourceContinuation, refreshWorkingSourceLocators, retireInterruptedWorkingSourceScan: typeof retireInterruptedWorkingSourceScan === "function" ? retireInterruptedWorkingSourceScan : null, refreshWorkingSourceVerification, getWorkingFileVerificationReason, isUnretainedExcludedScanSource: typeof isUnretainedExcludedScanSource === "function" ? isUnretainedExcludedScanSource : null})', context);
+  api = vm.runInContext('({getWorkingSourceSelection, getWorkingSourceVerification, getWorkingSourceMembership, setWorkingSourceSelection, resolveWorkingFileChoice, getAssetBaselineSourceRecoveryRouteKey, selectProjectFilesForPackaging, beginWorkingSourceScan, collectWorkingSourceScanEvidence, publishWorkingSourceScan, failWorkingSourceScan, workingSourceScanLeases, workingSourceScanOperations, getWorkingSourceDiskIdentity, recordWorkingSourceContinuationCandidate, resolveWorkingSourceContinuation, getWorkingSourceContinuationPresentation, observeIllustratorWorkingSourceContinuation, refreshWorkingSourceLocators, retireInterruptedWorkingSourceScan: typeof retireInterruptedWorkingSourceScan === "function" ? retireInterruptedWorkingSourceScan : null, refreshWorkingSourceVerification, getWorkingFileVerificationReason, isUnretainedExcludedScanSource: typeof isUnretainedExcludedScanSource === "function" ? isUnretainedExcludedScanSource : null, isExclusionRuleActive: typeof isExclusionRuleActive === "function" ? isExclusionRuleActive : null})', context);
   const source = (name, fileId = name) => {
     const file = { path: `/Users/synthetic/${name}`, name, fileId, ext: path.extname(name), projectRole: 'source' };
     disk.set(file.path, Buffer.from('%PDF-1.7\n%%EOF\n'));
@@ -1782,4 +1782,397 @@ test('scan guard predicate: Replace history, invalid and retained selections are
   await scanWorkingFile(g, kept, [other]);
   assert.equal(factOf(g, other).includedAsDependency, true);
   assert.equal(g.api.isUnretainedExcludedScanSource(g.api.getWorkingSourceMembership(g.project), other), false, 'retained as a dependency');
+});
+
+// ==== Exclusion rule: whatever is written keeps what it links (P); a document
+// the owner excluded directly, and that nothing requires, keeps nothing (Q). ====
+const linkedRow = (f, name, owners, extra = {}) =>
+  dependencyAsset(f, name, { source: 'linked-asset', dependencyOwners: owners.map(file => file.path), ...extra });
+const included = (f, ...files) => { const facts = membershipOf(f).facts; return files.map(file => facts.get(file.path.toLowerCase()).included); };
+const guarded = (f, file, options) => f.api.isUnretainedExcludedScanSource(f.api.getWorkingSourceMembership(f.snapshot()), file, options);
+
+test('exclusion rule: an Include on a placed document keeps what the documents it places link (diamond)', async () => {
+  const f = fixture(), work = f.source('Work.ai'), keep = f.source('Keep.ai');
+  const logo = linkedRow(f, 'Logo.ai', [work]), icon = linkedRow(f, 'Icon.ai', [work, logo]), texture = linkedRow(f, 'Texture.png', [icon]);
+  f.project.files.push(work, keep, logo, icon, texture);
+  await f.command(work, 'exclude');
+  assert.deepEqual(included(f, logo, icon, texture), [false, false, false]);
+  f.toggleAsset(logo);                                                   // per-asset Include
+  assert.deepEqual(included(f, logo, icon, texture), [true, true, true]);
+  f.reload();
+  assert.deepEqual(included(f, logo, icon, texture), [true, true, true], 'after reload');
+  f.toggleAsset(logo);                                                   // per-asset Exclude again
+  assert.deepEqual(included(f, logo, icon, texture), [false, false, false]);
+  await f.command(work, 'restore');
+  // Nothing requires Logo here, so its own per-asset Exclude stays; Work keeps Icon and Texture.
+  assert.deepEqual(included(f, logo, icon, texture), [false, true, true]);
+  f.toggleAsset(logo);
+  assert.deepEqual(included(f, logo, icon, texture), [true, true, true]);
+});
+
+test('exclusion rule: a kept row also reached directly from the excluded file keeps their shared link', async () => {
+  const f = fixture(), work = f.source('Work.ai');
+  const kept = linkedRow(f, 'Kept.ai', [work], { keptAfterSourceExclusion: true }), shared = linkedRow(f, 'Shared.png', [work, kept]);
+  const only = linkedRow(f, 'Only.png', [work]);
+  f.project.files.push(work, kept, shared, only);
+  await f.command(work, 'exclude');
+  assert.deepEqual(included(f, kept, shared, only), [true, true, false]);
+  delete f.project.files.find(row => row.path === kept.path).keptAfterSourceExclusion;
+  assert.deepEqual(included(f, kept, shared, only), [false, false, false], 'without the keep nothing is written');
+});
+
+test('exclusion rule: a document with no owner evidence stays, and so does what it links', async () => {
+  const f = fixture(), work = f.source('Work.ai');
+  // Reached from the excluded file through its row field, but its own source
+  // records no owner: ownership unknown, kept.
+  const unknown = linkedRow(f, 'Unknown.ai', [], { dependencyOwners: undefined, captureEvidence: { relationshipSourcePath: work.path } });
+  const child = linkedRow(f, 'Child.png', [unknown]);
+  f.project.files.push(work, unknown, child);
+  await f.command(work, 'exclude');
+  assert.deepEqual(included(f, unknown, child), [true, true]);
+  assert.equal(factOf(f, child).excludedSourceOnly, false);
+});
+
+test('exclusion rule: a cycle is withheld without outside support and kept with it', async () => {
+  const f = fixture(), work = f.source('Work.ai'), keep = f.source('Keep.ai');
+  const first = linkedRow(f, 'First.ai', [work]), second = linkedRow(f, 'Second.ai', [first]);
+  first.dependencyOwners.push(second.path);
+  f.project.files.push(work, keep, first, second);
+  await f.command(work, 'exclude');
+  assert.deepEqual(included(f, first, second), [false, false], 'no outside support');
+  f.project.files.find(row => row.path === second.path).dependencyOwners.push(keep.path);
+  assert.deepEqual(included(f, first, second), [true, true], 'an included file links one member');
+  // A cycle through an excluded placed document: the document is not written
+  // and supports nothing; the included file still keeps the member it links.
+  f.project.excludedAssetKeys = [first.path];
+  assert.deepEqual(included(f, first, second), [false, true]);
+  assert.equal(guarded(f, first), true);
+  f.project.files.find(row => row.path === second.path).dependencyOwners = [first.path];
+  assert.deepEqual(included(f, first, second), [false, false]);
+});
+
+test('exclusion rule: Replace history and invalid selections are never excluded documents', async () => {
+  const c = continuationFixture();
+  assert.equal((await c.api.resolveWorkingSourceContinuation(c.project.id, continuationRequest(c))).success, true);
+  assert.equal(c.api.getWorkingSourceSelection(c.project, c.a).reason, 'continuation-replaced');
+  const replacedLink = linkedRow(c, 'ReplacedLink.png', [c.a]);
+  c.project.files.push(replacedLink);
+  assert.deepEqual(included(c, replacedLink), [true]);
+  assert.equal(factOf(c, replacedLink).excludedSourceOnly, false);
+  const g = fixture(), work = g.source('Work.ai'), invalid = g.source('Invalid.ai');
+  const invalidOnly = linkedRow(g, 'InvalidOnly.png', [invalid]), both = linkedRow(g, 'Both.png', [work, invalid]);
+  g.project.files.push(work, invalid, invalidOnly, both);
+  await g.command(work, 'exclude');
+  g.project.workingSourceSelections[g.api.getAssetBaselineSourceRecoveryRouteKey(g.project, invalid)] = { state: 'excluded', reason: 'unknown', revision: 1 };
+  assert.equal(g.api.getWorkingSourceSelection(g.project, invalid).state, 'invalid');
+  assert.deepEqual(included(g, invalidOnly, both), [true, true]);
+  assert.equal(guarded(g, invalid), false);
+});
+
+test('exclusion rule: a bulk-skipped document is not an excluded document; its own Exclude makes it one', async () => {
+  const f = fixture(), work = f.source('Work.ai'), other = f.source('Other.ai');
+  const skipped = linkedRow(f, 'Skipped.ai', [other], { assetOrigin: 'existing' }), link = linkedRow(f, 'SkippedLink.png', [skipped]);
+  const reached = linkedRow(f, 'Reached.ai', [work], { assetOrigin: 'existing' }), reachedLink = linkedRow(f, 'ReachedLink.png', [reached]);
+  f.project.files.push(work, other, skipped, link, reached, reachedLink);
+  await f.command(work, 'exclude');
+  f.project.assetBaseline = { decision: 'skip' };
+  f.project.excludedAssetKeys = [skipped.path, reached.path];
+  assert.deepEqual(included(f, skipped, link), [false, true], 'a skipped document keeps its links, as before');
+  assert.equal(guarded(f, skipped), false, 'and is still read');
+  assert.deepEqual(included(f, reached, reachedLink), [false, false], 'reached only from the excluded working file: withheld, as before');
+  f.project.files.find(row => row.path === skipped.path).individualContentExclusion = 'e'.repeat(64);
+  assert.deepEqual(included(f, skipped, link), [false, false], 'an individual Exclude of the document');
+  assert.equal(guarded(f, skipped), true);
+});
+
+test('exclusion rule: a chain of placed documents follows the outer Exclude; Include on the inner keeps inner and deep', async () => {
+  const f = fixture(), keep = f.source('Keep.ai'), other = f.source('Other.ai');
+  const outer = linkedRow(f, 'Outer.ai', [keep]), inner = linkedRow(f, 'Inner.ai', [outer]), deep = linkedRow(f, 'Deep.png', [inner]);
+  f.project.files.push(keep, other, outer, inner, deep);
+  await f.command(other, 'exclude');                                     // a selection record exists
+  assert.deepEqual(included(f, outer, inner, deep), [true, true, true]);
+  f.toggleAsset(outer);
+  assert.deepEqual(included(f, outer, inner, deep), [false, false, false]);
+  assert.equal(factOf(f, inner).excludedSourceOnly, true);
+  f.toggleAsset(inner);                                                  // per-asset Include on the inner document
+  assert.deepEqual(included(f, outer, inner, deep), [false, true, true]);
+  assert.equal(guarded(f, outer), true, 'the excluded outer document is not read');
+  assert.equal(guarded(f, outer, { excludedAssetDocuments: false }), false, 'except by the Photoshop parse');
+  f.toggleAsset(outer);
+  assert.deepEqual(included(f, outer, inner, deep), [true, true, true]);
+});
+
+test('exclusion rule: a document an included file requires is not an excluded document (required-asset override)', async () => {
+  const f = fixture(), keep = f.source('Keep.ai'), other = f.source('Other.ai');
+  const placed = dependencyAsset(f, 'Placed.ai'), nested = linkedRow(f, 'Nested.png', [placed]);
+  f.project.files.push(keep, other, placed, nested);
+  await scanWorkingFile(f, keep, [placed]);
+  await f.command(other, 'exclude');
+  f.project.excludedAssetKeys = [placed.path];
+  assert.equal(factOf(f, placed).includedAsDependency, true);
+  assert.deepEqual(included(f, placed, nested), [true, true]);
+  assert.equal(f.api.getWorkingSourceMembership(f.snapshot()).excludedAssetDocumentKeys.size, 0);
+  assert.equal(guarded(f, placed), false);
+});
+
+test('exclusion rule without a selection record: only an individually excluded document that owns something applies it', () => {
+  const f = fixture(), keep = f.source('Keep.ai');
+  const placed = dependencyAsset(f, 'Placed.ai'), nested = linkedRow(f, 'Nested.png', [placed]), shared = linkedRow(f, 'Shared.png', [placed, keep]);
+  f.project.files.push(keep, placed, nested, shared);
+  assert.deepEqual(included(f, placed, nested, shared), [true, true, true]);
+  f.project.excludedAssetKeys = [nested.path];                           // a leaf: the rule stays inactive
+  assert.deepEqual(included(f, placed, nested, shared), [true, false, true]);
+  assert.equal(f.api.getWorkingSourceMembership(f.snapshot()).excludedAssetDocumentKeys.size, 0);
+  f.project.excludedAssetKeys = [placed.path];
+  assert.deepEqual(included(f, placed, nested, shared), [false, false, true]);
+  assert.deepEqual([factOf(f, nested).excludedSourceOnly, guarded(f, placed)], [true, true]);
+  f.toggleAsset(nested);                                                 // Include on the withheld row
+  assert.deepEqual(included(f, placed, nested, shared), [false, true, true]);
+  assert.equal(f.snapshot().files.find(row => row.path === nested.path).keptAfterSourceExclusion, true);
+  assert.equal(Object.hasOwn(f.snapshot(), 'workingSourceSelections'), false);
+  f.toggleAsset(nested);
+  // Bulk Skip alone is not an Exclude of the document.
+  Object.assign(f.project.files.find(row => row.path === placed.path), { assetOrigin: 'existing' });
+  f.project.assetBaseline = { decision: 'skip' };
+  f.project.excludedAssetKeys = [placed.path];
+  assert.deepEqual(included(f, placed, nested, shared), [false, true, true]);
+  assert.equal(guarded(f, placed), false);
+});
+
+test('exclusion rule without a selection record: the excluded document\'s own receipt is an ownership tie', () => {
+  const f = fixture(), keep = f.source('Keep.ai');
+  const placed = dependencyAsset(f, 'Placed.ai'), linked = dependencyAsset(f, 'Linked.png');
+  f.project.files.push(keep, placed, linked);
+  f.project.excludedAssetKeys = [placed.path];
+  const receipt = requiredReferences => ({ status: 'scanned', attempt: 'synthetic', unresolved: [], requiredReferences,
+    sourceFingerprint: 'a'.repeat(64), sourceIdentity: { dev: 1, ino: 1, size: 1, mtimeMs: 0, ctimeMs: 0 }, selectionRevision: 0 });
+  const key = f.api.getAssetBaselineSourceRecoveryRouteKey(f.project, placed);
+  assert.equal(f.api.isExclusionRuleActive(f.snapshot()), false, 'no receipt');
+  assert.deepEqual(included(f, placed, linked), [false, true]);
+  f.project.workingSourceVerification = { [key]: receipt([]) };
+  assert.equal(f.api.isExclusionRuleActive(f.snapshot()), false, 'an empty receipt');
+  f.project.workingSourceVerification = { [key]: { ...receipt([]), requiredEmbeddedOutputs: [] } };
+  assert.equal(f.api.isExclusionRuleActive(f.snapshot()), false, 'no embedded outputs either');
+  f.project.workingSourceVerification = { [key]: receipt([{ path: linked.path }]) };
+  assert.equal(f.api.isExclusionRuleActive(f.snapshot()), true, 'a receipt-only tie');
+  assert.deepEqual(included(f, placed, linked), [false, false]);
+  assert.equal(Object.hasOwn(f.snapshot(), 'workingSourceSelections'), false);
+  f.project.workingSourceVerification = { [key]: { ...receipt([]), requiredEmbeddedOutputs: [{ path: linked.path, sourceDigest: 'a'.repeat(64), outputDigest: 'b'.repeat(64) }] } };
+  assert.equal(f.api.isExclusionRuleActive(f.snapshot()), true, 'an embedded-output-only tie');
+  f.project.excludedAssetKeys = [];
+  assert.equal(f.api.isExclusionRuleActive(f.snapshot()), false, 'nothing individually excluded');
+});
+
+test('exclusion rule: a Photoshop output follows the parent its extraction record names', () => {
+  const f = fixture(), keep = f.source('Keep.ai');
+  const placed = dependencyAsset(f, 'Placed.psd'), receipt = { version: 1, parentPath: placed.path, sourceDigest: 'b'.repeat(64),
+    layerPath: null, linkedIndex: 0, originalName: 'Layer.png', outputDigest: 'c'.repeat(64) };
+  const output = dependencyAsset(f, 'Layer.png', { source: 'psd-embedded', psdExtractionReceipt: receipt });
+  const legacy = dependencyAsset(f, 'Legacy.png', { source: 'psd-embedded' });
+  f.project.files.push(keep, placed, output, legacy);
+  f.project.excludedAssetKeys = [placed.path];
+  assert.deepEqual(included(f, placed, output, legacy), [false, false, true], 'a legacy output without a record stays');
+  assert.equal(guarded(f, placed), true); assert.equal(guarded(f, placed, { excludedAssetDocuments: false }), false);
+  const row = () => f.project.files.find(item => item.path === output.path);
+  row().keptAfterSourceExclusion = true;
+  assert.deepEqual(included(f, output), [true], 'an Include stays on its row');
+  delete row().keptAfterSourceExclusion;
+  for (const changed of [{ current: false }, { outputDigest: 'short' }, { linkedIndex: -1 }, { layerPath: 'Group/Layer' }, { parentPath: '/Users/synthetic/Gone.psd' }]) {
+    row().psdExtractionReceipt = { ...receipt, ...changed };
+    assert.deepEqual(included(f, output), [true], 'ignored record keeps the row: ' + JSON.stringify(changed));
+  }
+});
+
+// Seeded random projects checked against an independent statement of the rule:
+// every row's expected inclusion is a least fixed point (seeds are rows written
+// for their own reasons; a withheld candidate is written once any written row
+// links it), computed by relaxation over the raw stored fields.
+function seededRandom(seed) {
+  return () => { seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+function randomExclusionProject(f, rand) {
+  const chance = p => rand() < p, pick = list => list[Math.floor(rand() * list.length)];
+  const some = (list, max) => { const out = list.filter(() => chance(max / Math.max(1, list.length))); return out; };
+  const project = { id: 'project-a', status: 'paused', files: [], excludedAssetKeys: [] };
+  if (chance(0.7)) project.workingSourceSelections = {};
+  const sources = Array.from({ length: 2 + Math.floor(rand() * 3) }, (_, i) => f.source(`S${i}.ai`));
+  const docs = Array.from({ length: 1 + Math.floor(rand() * 4) }, (_, i) => Object.assign(f.asset(`D${i}.ai`), { source: 'scan-on-open' }));
+  const assets = Array.from({ length: 2 + Math.floor(rand() * 6) }, (_, i) => Object.assign(f.asset(`A${i}.png`), { source: 'scan-on-open' }));
+  project.files.push(...sources, ...docs, ...assets);
+  const key = file => f.api.getAssetBaselineSourceRecoveryRouteKey(project, file);
+  if (project.workingSourceSelections) for (const file of sources) {
+    const r = rand();
+    if (r < 0.4) project.workingSourceSelections[key(file)] = { state: 'excluded', reason: 'user-excluded', revision: 1 + Math.floor(rand() * 3) };
+    else if (r < 0.5) project.workingSourceSelections[key(file)] = { state: 'excluded', reason: 'unknown', revision: 1 };
+    else if (r < 0.75) project.workingSourceSelections[key(file)] = { state: 'selected', reason: null, revision: 1 + Math.floor(rand() * 3) };
+  }
+  for (const file of [...sources, ...docs]) if (chance(sources.includes(file) ? 0.6 : 0.3)) {
+    project.workingSourceVerification ||= {};
+    project.workingSourceVerification[key(file)] = { status: 'scanned', attempt: 'synthetic', unresolved: [],
+      requiredReferences: [...some([...docs, ...assets], 1.5), ...(chance(0.1) ? [pick(sources)] : [])].filter(ref => ref !== file).map(ref => ({ path: ref.path })),
+      sourceFingerprint: 'a'.repeat(64), sourceIdentity: { dev: 1, ino: 1, size: 1, mtimeMs: 0, ctimeMs: 0 },
+      selectionRevision: f.api.getWorkingSourceSelection(project, file).revision };
+  }
+  const owners = [...sources, ...docs];
+  if (chance(0.2)) project.assetBaseline = { decision: 'skip' };
+  for (const row of [...docs, ...assets]) {
+    const r = rand();
+    row.source = r < 0.45 ? 'scan-on-open' : r < 0.9 ? 'linked-asset' : 'manual-browse';
+    const others = owners.filter(owner => owner !== row);
+    if (chance(0.45)) row.captureEvidence = { relationshipSourcePath: pick(others).path };
+    else if (chance(0.15)) row.assetBaselineSourcePath = pick(sources).path;
+    if (chance(0.7)) {
+      row.dependencyOwners = some(others, 1.6).map(owner => owner.path);
+      if (!row.dependencyOwners.length) row.dependencyOwners.push(pick(others).path);
+      if (chance(0.08)) row.dependencyOwners.push('/Users/synthetic/Removed.ai');
+      if (chance(0.05)) row.dependencyOwnersOverflow = true;
+    }
+    if (assets.includes(row) && chance(0.15)) {
+      // A Photoshop output: its extraction record names its parent (valid, stale or not a project file).
+      row.source = 'psd-embedded'; delete row.dependencyOwners; delete row.dependencyOwnersOverflow;
+      row.psdExtractionReceipt = { version: 1, parentPath: chance(0.1) ? '/Users/synthetic/GoneParent.psd' : pick(docs).path, sourceDigest: 'b'.repeat(64),
+        layerPath: null, linkedIndex: 0, originalName: 'Embedded.png', outputDigest: 'c'.repeat(64), ...(chance(0.1) ? { current: false } : {}) };
+    }
+    if (chance(0.08)) row.keptAfterSourceExclusion = true;
+    if (chance(0.06)) row.acceptedPending = true;
+    if (chance(0.35)) row.assetOrigin = 'existing';
+    if (project.assetBaseline && row.assetOrigin === 'existing' && chance(0.5)) project.excludedAssetKeys.push(row.path);
+    if (chance(project.workingSourceSelections ? 0.18 : 0.3)) {
+      if (!project.excludedAssetKeys.includes(row.path)) project.excludedAssetKeys.push(row.path);
+      row.individualContentExclusion = 'e'.repeat(64);
+    }
+  }
+  const userExcluded = sources.filter(file => project.workingSourceSelections?.[key(file)]?.reason === 'user-excluded');
+  if (userExcluded.length) for (const row of [...docs, ...assets]) if (chance(0.12)) {
+    const chosen = some(userExcluded, 1.2);
+    if (!chosen.length) continue;
+    row.existingIncludeEpisode = { version: 1, owners: Object.fromEntries(chosen.map(file => {
+      const revision = project.workingSourceSelections[key(file)].revision;
+      return [key(file), chance(0.25) ? revision + 1 : revision];
+    })) };
+  }
+  return project;
+}
+// Independent statement of the rule over raw fields (no production helper but
+// the route key used to find a file's stored records).
+function expectedExclusionInclusion(project, keyOf) {
+  const lower = value => typeof value === 'string' ? value.toLowerCase() : '';
+  const rows = project.files, byKey = new Map(rows.map(row => [lower(row.path), row]));
+  const isSource = row => row.projectRole === 'source';
+  const engaged = Object.hasOwn(project, 'workingSourceSelections');
+  const selection = row => {
+    const record = engaged ? project.workingSourceSelections[keyOf(row)] : undefined;
+    if (!record) return { state: 'selected', revision: 0 };
+    if (record.state === 'selected') return { state: 'selected', revision: record.revision };
+    if (record.reason === 'user-excluded') return { state: 'excluded', userExcluded: true, revision: record.revision };
+    return { state: 'invalid', revision: 0 };
+  };
+  const dependencyCapture = row => row.source === 'scan-on-open' || row.source === 'psd-embedded';
+  const eligible = row => dependencyCapture(row) || row.source === 'linked-asset';
+  const producerOf = row => lower(row.captureEvidence?.relationshipSourcePath || row.captureEvidence?.sourceDocumentPath || row.assetBaselineSourcePath);
+  const ownersOf = row => eligible(row) && row.dependencyOwnersOverflow !== true && Array.isArray(row.dependencyOwners)
+    ? row.dependencyOwners.map(lower).filter(owner => byKey.has(owner)) : [];
+  const requirementLinks = [], links = [];
+  for (const row of rows) {
+    const receipt = project.workingSourceVerification?.[keyOf(row)];
+    if (receipt && receipt.selectionRevision === selection(row).revision) for (const ref of receipt.requiredReferences) requirementLinks.push([lower(row.path), lower(ref.path)]);
+    if (producerOf(row)) requirementLinks.push([producerOf(row), lower(row.path)]);
+  }
+  links.push(...requirementLinks);
+  for (const row of rows) for (const owner of ownersOf(row)) links.push([owner, lower(row.path)]);
+  for (const row of rows) {
+    const receipt = row.source === 'psd-embedded' ? row.psdExtractionReceipt : null;
+    if (receipt && receipt.current !== false && byKey.has(lower(receipt.parentPath))) links.push([lower(receipt.parentPath), lower(row.path)]);
+  }
+  const from = new Map();
+  for (const [a, b] of links) if (a !== b) { if (!from.has(a)) from.set(a, new Set()); from.get(a).add(b); }
+  const required = new Set();
+  for (const root of rows.filter(row => isSource(row) && selection(row).state !== 'excluded')) {
+    const seen = new Set([lower(root.path)]), queue = [lower(root.path)];
+    while (queue.length) { const at = queue.shift(); for (const [a, b] of requirementLinks) if (a === at && a !== b) { if (b !== lower(root.path)) required.add(b); if (!seen.has(b)) { seen.add(b); queue.push(b); } } }
+  }
+  const keptAsRequired = k => engaged && required.has(k);
+  // The rule is active with a selection record, or when an individually
+  // excluded asset-role row owns something (no selection record).
+  const excluded = new Set(), workingRoots = [];
+  for (const row of rows) {
+    const k = lower(row.path);
+    if (isSource(row)) { if (engaged && selection(row).userExcluded && !required.has(k)) { excluded.add(k); workingRoots.push(row); } continue; }
+    if (from.has(k) && project.excludedAssetKeys.includes(row.path) && !keptAsRequired(k) &&
+        !(project.assetBaseline?.decision === 'skip' && row.assetOrigin === 'existing' && !row.individualContentExclusion)) excluded.add(k);
+  }
+  const active = engaged || excluded.size > 0;
+  const walk = (roots, stop) => {
+    const seen = new Set(), queue = [...roots];
+    while (queue.length) for (const next of from.get(queue.shift()) || []) {
+      const row = byKey.get(next);
+      if (seen.has(next) || (row && isSource(row)) || keptAsRequired(next) || stop(next)) continue;
+      seen.add(next); queue.push(next);
+    }
+    return seen;
+  };
+  const reached = walk(excluded, () => false);
+  const excludedish = k => excluded.has(k) || reached.has(k);
+  const tied = row => {
+    const k = lower(row.path), dependency = dependencyCapture(row), producer = producerOf(row), owners = ownersOf(row);
+    if (dependency && producer && !excludedish(producer)) return false;
+    if (eligible(row) && row.dependencyOwnersOverflow === true) return false;
+    if (owners.length && !owners.every(excludedish)) return false;
+    return (dependency && reached.has(k)) || (owners.length > 0 && (reached.has(k) || owners.every(excludedish)));
+  };
+  const closures = new Map(workingRoots.map(root => [root, walk([lower(root.path)], k => excluded.has(k) && !isSource(byKey.get(k)))]));
+  const episodeCurrent = row => {
+    const recorded = row.existingIncludeEpisode?.owners;
+    if (!recorded) return false;
+    const keys = [lower(row.path), producerOf(row), ...ownersOf(row)].filter(Boolean), current = {};
+    for (const root of workingRoots) if (keys.some(k => k === lower(root.path) || closures.get(root).has(k))) current[keyOf(root)] = selection(root).revision;
+    const entries = Object.entries(current);
+    return entries.length > 0 && entries.every(([k, revision]) => recorded[k] === revision);
+  };
+  const written = new Set(), candidates = [];
+  for (const row of rows) {
+    const k = lower(row.path);
+    if (isSource(row)) { if (selection(row).state === 'selected' || keptAsRequired(k)) written.add(k); continue; }
+    if (keptAsRequired(k)) { written.add(k); continue; }
+    if (project.excludedAssetKeys.includes(row.path)) continue;
+    const ownKeep = row.source === 'manual-browse' || row.keptAfterSourceExclusion === true || row.acceptedPending === true;
+    if (active && excluded.size && tied(row) && !ownKeep && !episodeCurrent(row)) candidates.push(k);
+    else written.add(k);
+  }
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const k of candidates) if (!written.has(k) && !project.excludedAssetKeys.includes(byKey.get(k).path) &&
+        links.some(([a, b]) => b === k && written.has(a))) { written.add(k); changed = true; }
+  }
+  const supported = candidates.filter(k => written.has(k)).length;
+  return { written, withheld: candidates.length - supported, supported, excludedAssets: new Set([...excluded].filter(k => !isSource(byKey.get(k)))) };
+}
+
+test('exclusion rule: seeded random projects match an independent fixed point of the rule', () => {
+  const f = fixture(), rand = seededRandom(0x5eed2611);
+  const mismatch = { omitted: 0, extra: 0, projects: 0, excludedDocuments: 0 }, examples = [];
+  let rows = 0, withheld = 0, supported = 0, withExcludedDocuments = 0, withoutRecord = 0, withheldWithoutRecord = 0;
+  const PROJECTS = 2500;
+  for (let index = 0; index < PROJECTS; index++) {
+    const project = randomExclusionProject(f, rand);
+    const membership = f.api.getWorkingSourceMembership(project);
+    const expected = expectedExclusionInclusion(project, file => f.api.getAssetBaselineSourceRecoveryRouteKey(project, file));
+    let bad = false;
+    if (expected.excludedAssets.size) withExcludedDocuments++;
+    withheld += expected.withheld; supported += expected.supported;
+    if (!Object.hasOwn(project, 'workingSourceSelections')) { withoutRecord++; withheldWithoutRecord += expected.withheld; }
+    for (const row of project.files) {
+      rows++;
+      const actual = membership.facts.get(row.path.toLowerCase()).included, want = expected.written.has(row.path.toLowerCase());
+      if (actual === want) continue;
+      bad = true; if (want) mismatch.omitted++; else mismatch.extra++;
+      if (examples.length < 3) examples.push({ index, row: row.name, want, actual });
+    }
+    const actualDocuments = [...(membership.excludedAssetDocumentKeys || [])].sort(), wantDocuments = [...expected.excludedAssets].sort();
+    if (JSON.stringify(actualDocuments) !== JSON.stringify(wantDocuments)) mismatch.excludedDocuments++;
+    if (bad) mismatch.projects++;
+  }
+  console.log('# EXCLUSION_PROPERTY ' + JSON.stringify({ generated: PROJECTS, rows, withheld, supported, withExcludedDocuments, withoutRecord, withheldWithoutRecord, mismatch }));
+  assert.deepEqual(mismatch, { omitted: 0, extra: 0, projects: 0, excludedDocuments: 0 }, JSON.stringify(examples));
 });
