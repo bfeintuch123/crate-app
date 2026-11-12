@@ -22830,12 +22830,14 @@ function getPackageSelectionInputSignature(project, reviewedSemantics = false) {
 
 // Content digests of extracted Photoshop outputs, keyed by path and the review's
 // stat fingerprint (device, inode, size, mtime and ctime in nanoseconds): any
-// change to a file changes its key, so a repeat review hashes nothing.
+// change to a file changes its key, so a repeat review hashes nothing. The read
+// is chunked and has no size cap: a file is unavailable here only because its
+// bytes are wrong or cannot be read, never because it is large.
 const verifiedPsdOutputDigests = new Map();
 function getReviewedPsdOutputDigest(filePath, fingerprint) {
   const key = JSON.stringify([filePath, fingerprint]);
   if (verifiedPsdOutputDigests.has(key)) return verifiedPsdOutputDigests.get(key);
-  const value = getStablePackageReviewSourceContentFingerprint(filePath, fingerprint, MAX_PARSE_FILE_SIZE);
+  const value = getStablePackageReviewSourceContentFingerprint(filePath, fingerprint);
   const digest = value.slice(value.lastIndexOf(':') + 1);
   if (verifiedPsdOutputDigests.size >= 8192) verifiedPsdOutputDigests.delete(verifiedPsdOutputDigests.keys().next().value);
   verifiedPsdOutputDigests.set(key, digest);
@@ -22861,8 +22863,9 @@ function getUnsatisfiedWorkingPsdOutputEntries(project, membership, files, entri
           // Cache failures too: shared producer obligations cannot retry this
           // same physical output within one fresh projection.
           digestByEntry.set(index, null);
-          digestByEntry.set(index, getReviewedPsdOutputDigest(files[index].path,
-            entries ? entries[index].sourceFingerprint : getPackageReviewSourceFingerprint(files[index].path)));
+          const fingerprint = getStablePackageReviewSourceContentFingerprint(files[index].path,
+            entries ? entries[index].sourceFingerprint : getPackageReviewSourceFingerprint(files[index].path), MAX_PARSE_FILE_SIZE);
+          digestByEntry.set(index, fingerprint.slice(fingerprint.lastIndexOf(':') + 1));
         }
         if (digestByEntry.get(index) !== output.outputDigest) unavailable.add(index);
       } catch (_) { unavailable.add(index); }

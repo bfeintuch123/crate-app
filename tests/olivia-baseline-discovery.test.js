@@ -8822,6 +8822,20 @@ function excludedSourceMembershipCases() {
       'refill then change': { rows: ['Embedded-Layer.png PlacedA 4bc8ff77 4bc8ff77', 'Embedded-Layer_1.png PlacedB B B', 'Embedded-Layer_2.png PlacedA 869b19a6 869b19a6'], setAside: [], holds: [], written: ['Embedded-Layer.png=4bc8ff77', 'Embedded-Layer_1.png=B', 'Embedded-Layer_2.png=869b19a6'] },
     });
   }, { realMainPsd: true }));
+  // Verification has no size cap: an output larger than the 300 MB parse limit whose bytes match its
+  // record stays available (a sparse file, so the test writes almost nothing to disk; the package
+  // itself is not written).
+  baselineTest('Photoshop outputs: an output above the parse size limit with matching bytes stays available', { timeout: 300000 }, () => withEnv(async () => {
+    const t = await psdPlaced('r11'), [a0] = t.outputs(t.A), size = 300 * 1024 * 1024 + 1;
+    fs.rmSync(a0.path);
+    const fd = fs.openSync(a0.path, 'w'); fs.ftruncateSync(fd, size); fs.closeSync(fd);
+    const hash = require('crypto').createHash('sha256'), zeros = Buffer.alloc(1024 * 1024);
+    for (let left = size; left > 0; left -= zeros.length) hash.update(left >= zeros.length ? zeros : zeros.subarray(0, left));
+    t.f.current().files.find(row => row.path === a0.path).psdExtractionReceipt.outputDigest = hash.digest('hex');
+    roundTripFakeStore();
+    const review = await t.f.review();
+    assert.equal(review.materializable, true, 'a large output with its recorded bytes is not unavailable');
+  }, { realMainPsd: true }));
   // Package review reads each extracted output once per file state: first review, a second review and a
   // review after another pre-package pass, for 1, 10 and 100 outputs (bc94955 reads none at review).
   baselineTest('Photoshop outputs: package review reads each extracted output once per file state', { timeout: 600000 }, () => withEnv(async () => {
