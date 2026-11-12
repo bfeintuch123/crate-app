@@ -22339,6 +22339,8 @@ function getFontGateInput(group, inspected, handoff, homeDir) {
     choice: handoff.choices[group.key] || null,
     sha256: inspected.sha256,
     confirmation: handoff.confirmations[group.key] || null,
+    // Computed here from the bytes main read; never taken from the renderer or the project file.
+    catalogRelease: inspected.parsed ? fontHandoff.findCatalogRelease(inspected.sha256, inspected.parsed) : null,
   };
 }
 
@@ -22394,8 +22396,9 @@ function isFontRowOmittedFromNote(row) {
   return row.gate.reason === 'duplicate' || choice === 'remove' || (intent !== 'explicit' && choice !== 'include');
 }
 
-function getFontNoteModel(fontReview, inputs, oflTextFileName) {
+function getFontNoteModel(fontReview, inputs, licenceOutputs) {
   const byKey = new Map(fontReview.rows.map(row => [row.group.key, row]));
+  const licenceNames = new Map(licenceOutputs.map(output => [output.licenceKey, path.posix.basename(output.relativePath)]));
   return {
     included: inputs.map(input => {
       const row = byKey.get(input.rowKey);
@@ -22406,6 +22409,8 @@ function getFontNoteModel(fontReview, inputs, oflTextFileName) {
         basis: input.basis,
         confirmedOn: input.gate.confirmation?.confirmedOn || null,
         faces: row.gateInput.faces,
+        release: input.basis === 'verified-release' ? row.gateInput.catalogRelease : null,
+        licenceFileName: input.licenceKey ? licenceNames.get(input.licenceKey) || null : null,
       };
     }),
     notIncluded: fontReview.rows.filter(row => row.gate.outcome !== 'included' && !isFontRowOmittedFromNote(row))
@@ -22415,8 +22420,12 @@ function getFontNoteModel(fontReview, inputs, oflTextFileName) {
         const label = named ? fontHandoff.describeFontFaces(faces) : sanitizeRendererSourceName(row.group.displayName) || 'Font file';
         return { label, reason: row.gate.reason || 'licence-unknown' };
       }),
-    oflTextFileName,
   };
+}
+
+// One licence file per verified release licence, named after its family.
+function getFontLicenceOutputRawName(licence) {
+  return `${licence.name} - OFL.txt`;
 }
 
 // Plans font outputs after every ordinary and derived output so a package with
@@ -22436,6 +22445,7 @@ function planFontOutputs(fontReview, layoutMode, outputAllocator) {
       sourceFingerprint: row.inspected.fingerprint,
       sha256: row.inspected.sha256,
       basis: row.gate.basis,
+      licenceKey: row.gate.basis === 'verified-release' ? row.gateInput.catalogRelease.licence.key : null,
       origin: getFontRowOrigin(row.group),
       gate: {
         intent: row.gateInput.intent,
@@ -22452,16 +22462,31 @@ function planFontOutputs(fontReview, layoutMode, outputAllocator) {
   if (!inputs.length && !fontReview.rows.some(row => row.gate.outcome !== 'included' && !isFontRowOmittedFromNote(row))) {
     return null;
   }
-  const oflNeeded = inputs.some(input => input.basis === 'open-licence');
-  const oflOutputName = oflNeeded ? outputAllocator.reserveGroupedOutputName(fontHandoff.OFL_TEXT_FILENAME, 'fonts') : null;
+  const licenceByKey = new Map();
+  for (const input of inputs) {
+    if (input.licenceKey) licenceByKey.set(input.licenceKey, fontReview.rows.find(row => row.group.key === input.rowKey).gateInput.catalogRelease.licence);
+  }
+  const licences = [...licenceByKey.keys()].sort().map(licenceKey => {
+    const licence = licenceByKey.get(licenceKey);
+    const outputName = outputAllocator.reserveGroupedOutputName(getFontLicenceOutputRawName(licence), 'fonts');
+    return { licenceKey, sha256: licence.sha256, outputName, relativePath: outputAllocator.getOutputRelativePath(outputName) };
+  });
   const noteOutputName = outputAllocator.reserveGroupedOutputName(fontHandoff.FONTS_NOTE_FILENAME, 'fonts');
-  const text = fontHandoff.buildFontsNote(getFontNoteModel(fontReview, inputs, oflOutputName));
+  const text = fontHandoff.buildFontsNote(getFontNoteModel(fontReview, inputs, licences));
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     inputs,
-    oflText: oflOutputName ? { outputName: oflOutputName, relativePath: outputAllocator.getOutputRelativePath(oflOutputName) } : null,
+    licences,
     note: { outputName: noteOutputName, relativePath: outputAllocator.getOutputRelativePath(noteOutputName), text },
   };
+}
+
+// The verified licence text for a planned licence output, from the bundled catalog only.
+function getPlannedFontLicence(output) {
+  for (const entry of fontHandoff.FONT_RELEASE_CATALOG.entries.values()) {
+    if (entry.licence.key === output.licenceKey && entry.licence.sha256 === output.sha256) return entry.licence;
+  }
+  throw new PackageReviewChangedError();
 }
 
 // Packaging-time gate: the reviewed bytes are read again, hashed, parsed and
@@ -22489,8 +22514,13 @@ function readGatedFontForPackaging(input, layoutMode) {
     sha256: facts.sha256,
     confirmation: input.gate.confirmation,
     conflict: false,
+    catalogRelease: fontHandoff.findCatalogRelease(facts.sha256, facts.parsed),
   });
   if (gate.outcome !== 'included' || gate.basis !== input.basis) throw new PackageReviewChangedError();
+  const release = fontHandoff.findCatalogRelease(facts.sha256, facts.parsed);
+  if ((input.licenceKey || null) !== (gate.basis === 'verified-release' && release ? release.licence.key : null)) {
+    throw new PackageReviewChangedError();
+  }
   if (getPackageGroupedOutputRelativePath(input.outputName, layoutMode, 'fonts') !== input.relativePath) throw new PackageReviewChangedError();
   const mode = Number(BigInt(input.sourceFingerprint.source.mode) & 0o777n) || OWNER_ONLY_FILE_MODE;
   return { buffer, mode };
@@ -22509,7 +22539,7 @@ function presentFontReview(fontReview, plan) {
     const { outcome, reason, basis } = row.gate;
     const excluded = outcome === 'excluded' || outcome === 'unavailable';
     const needsStatement = outcome === 'needs-confirmation' || basis === 'confirmed' ||
-      (reason === 'found' && !fontHandoff.detectOpenLicence(faces) && faces.length > 0 && !excluded);
+      (reason === 'found' && !row.gateInput.catalogRelease && faces.length > 0 && !excluded);
     return {
       key: row.group.key,
       fileName,
@@ -22531,7 +22561,7 @@ function presentFontReview(fontReview, plan) {
         ? fontHandoff.getFontConfirmationStatement(faces, fileName) : null,
       statementVersion: fontHandoff.FONT_CONFIRMATION_WORDING_VERSION,
       confirmed: fontHandoff.isCurrentConfirmation(row.gateInput.confirmation, row.inspected.sha256),
-      canConfirm: !excluded && reason !== 'removed' && reason !== 'conflict' && basis !== 'open-licence' && faces.length > 0,
+      canConfirm: !excluded && reason !== 'removed' && reason !== 'conflict' && basis !== 'verified-release' && faces.length > 0,
       canRemove: row.gateInput.choice !== 'remove',
       canInclude: reason === 'found' || reason === 'removed',
       packageFolder: inputKeys.has(row.group.key) ? getFontFolderLabel(plan) : null,
@@ -25669,7 +25699,10 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
         fontFileCount++;
       }
       const generated = [
-        ...(fontPlan.oflText ? [[fontPlan.oflText, fontHandoff.OFL_1_1_TEXT, fontHandoff.OFL_TEXT_FILENAME]] : []),
+        ...(fontPlan.licences || []).map(output => {
+          const licence = getPlannedFontLicence(output);
+          return [output, licence.text, getFontLicenceOutputRawName(licence)];
+        }),
         [fontPlan.note, fontPlan.note.text, fontHandoff.FONTS_NOTE_FILENAME],
       ];
       for (const [output, text, rawName] of generated) {

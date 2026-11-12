@@ -16,6 +16,7 @@ const RUNTIME_PARSER_FILES = Object.freeze([
   'figma-redaction.js',
   'figma.js',
   'font-handoff.js',
+  'font-release-catalog.js',
   'indesign.js',
   'index.js',
   'linked-asset-matcher.js',

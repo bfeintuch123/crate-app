@@ -59,6 +59,15 @@ function cases() {
     return { names: englishNames({ family: 'Brand Sans', style, postscriptName: `BrandSans-${style}`, ...extra }) };
   }
   const fontsDir = () => path.join(TEST_HOME, 'Library', 'Fonts');
+  // Round 8: exact upstream bytes of a catalogued release (google/fonts at a pinned commit).
+  const POPPINS_DIR = path.join(__dirname, 'fixtures', 'fonts', 'poppins');
+  const POPPINS_BYTES = fs.readFileSync(path.join(POPPINS_DIR, 'Poppins-Regular.ttf'));
+  const POPPINS_OFL = fs.readFileSync(path.join(POPPINS_DIR, 'OFL.txt'));
+  function writePoppins(filePath) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, POPPINS_BYTES);
+    return POPPINS_BYTES;
+  }
 
   async function fixture(name = 'Fonts') {
     resetTestHomeWorkspace();
@@ -233,23 +242,32 @@ function cases() {
     assert.equal(row(refreshed, 'BrandSans-Bold.otf').confirmed, false);
   });
 
-  fontTest('open-licence font added by the user is included with the licence text, and can be removed', async () => {
+  fontTest('a verified-release font added by the user is included with its published licence file, and can be removed', async () => {
     const f = await fixture();
     await callIpcRaw('settings:update', 'packageOutputLayoutMode', 'flat');
-    const file = path.join(f.dir, 'Open-Regular.ttf');
-    const bytes = writeFont(file, { signature: 'TRUE', names: englishNames({ family: 'Open', style: 'Regular', postscriptName: 'Open-Regular', licence: OFL_STATEMENT }) });
-    manualDialogFor([file]);
+    const file = path.join(f.dir, 'Poppins-Regular.ttf');
+    const bytes = writePoppins(file);
+    // A font that only states the OFL in its own text asks, as round 8 requires.
+    const stated = path.join(f.dir, 'Open-Regular.ttf');
+    writeFont(stated, { signature: 'TRUE', names: englishNames({ family: 'Open', style: 'Regular', postscriptName: 'Open-Regular', licence: OFL_STATEMENT }) });
+    manualDialogFor([file, stated]);
     await callIpcRaw('fonts:add-files', f.project.id);
     const reviewResult = await review(f);
-    const open = row(reviewResult, 'Open-Regular.ttf');
+    const open = row(reviewResult, 'Poppins-Regular.ttf');
     assert.equal(open.outcome, 'included');
-    assert.equal(open.basis, 'open-licence');
+    assert.equal(open.basis, 'verified-release');
+    assert.equal(open.canConfirm, false);
     assert.equal(open.packageFolder, 'Package root');
+    assert.equal(row(reviewResult, 'Open-Regular.ttf').outcome, 'needs-confirmation');
     const { result } = await packageNow(f, reviewResult);
-    assert.deepEqual(listTree(result.folderPath), ['Fonts in this package.txt', 'Logo.png', 'Open-Regular.ttf', 'SIL Open Font License 1.1.txt']);
-    assert.deepEqual(fs.readFileSync(path.join(result.folderPath, 'Open-Regular.ttf')), bytes);
-    assert.match(fs.readFileSync(path.join(result.folderPath, 'SIL Open Font License 1.1.txt'), 'utf8'), /^SIL OPEN FONT LICENSE Version 1\.1/);
+    assert.deepEqual(listTree(result.folderPath), ['Fonts in this package.txt', 'Logo.png', 'Poppins - OFL.txt', 'Poppins-Regular.ttf']);
+    assert.deepEqual(fs.readFileSync(path.join(result.folderPath, 'Poppins-Regular.ttf')), bytes);
+    assert.deepEqual(fs.readFileSync(path.join(result.folderPath, 'Poppins - OFL.txt')), POPPINS_OFL, 'the licence file published with the release');
+    const note = fs.readFileSync(path.join(result.folderPath, 'Fonts in this package.txt'), 'utf8');
+    assert.match(note, /google\/fonts at commit 35e77c3854970a550d9894a85aba21420813a019/);
+    assert.match(note, /does not prove anyone's rights/);
     fs.rmSync(result.folderPath, { recursive: true, force: true });
+    await callIpcRaw('fonts:set-row-choice', f.project.id, row(reviewResult, 'Open-Regular.ttf').key, 'remove');
 
     assert.equal((await callIpcRaw('fonts:set-row-choice', f.project.id, open.key, 'remove')).success, true);
     const removed = await review(f);
@@ -394,9 +412,10 @@ function cases() {
     const a = path.join(f.dir, 'BrandSans-Bold.otf');
     const b = path.join(f.dir, 'BrandSans-Bold-v9.otf');
     const c = path.join(f.dir, 'BrandSans-Bold copy.otf');
-    const ofl = { licence: OFL_STATEMENT };
-    writeFont(a, brand('Bold', ofl));
-    writeFont(b, brand('Bold', { ...ofl, version: 'Version 9' }));
+    // Catalogued bytes, and a one-byte change of them that claims the same font name.
+    writePoppins(a);
+    const changed = Buffer.from(POPPINS_BYTES); changed[changed.length - 1] ^= 0x01;
+    fs.writeFileSync(b, changed);
     manualDialogFor([a, b]);
     await callIpcRaw('fonts:add-files', f.project.id);
     const conflict = await review(f);
@@ -414,7 +433,7 @@ function cases() {
     ]);
     const { result } = await packageNow(f, identical);
     assert.deepEqual(listTree(result.folderPath), ['Fonts/BrandSans-Bold.otf', 'Fonts/Fonts in this package.txt',
-      'Fonts/SIL Open Font License 1.1.txt', 'PNG/Logo.png']);
+      'Fonts/Poppins - OFL.txt', 'PNG/Logo.png']);
   });
 
   fontTest('a missing or unreadable font is skipped and reported; the rest of the package proceeds', async () => {
@@ -580,7 +599,7 @@ function cases() {
     assert.equal((await callIpcRaw('fonts:add-files', f.project.id)).added, 1);
     const after = await review(f);
     assert.equal(after.fonts.rows.length, 1);
-    assert.equal(row(after, 'Real-Regular.otf').outcome, 'included');
+    assert.equal(row(after, 'Real-Regular.otf').reason, 'licence-unknown', 'the real file is judged, not the link');
   });
 
   fontTest('removing an added font leaves no stored choice behind', async () => {
@@ -702,7 +721,7 @@ function cases() {
     const restricted = path.join(f.dir, 'Hidden.otf​');
     writeFont(restricted, { fsType: 2, names: englishNames({ family: 'Hidden', style: 'Regular', postscriptName: 'Hidden-Regular' }) });
     const open = path.join(f.dir, 'Open.otf⁠');
-    const openBytes = writeFont(open, { names: englishNames({ family: 'Open', style: 'Regular', postscriptName: 'Open-Regular', licence: OFL_STATEMENT }) });
+    const openBytes = writePoppins(open);
     const png = path.join(f.dir, 'Photo.png​');
     fs.writeFileSync(png, createSyntheticPngBytes());
     manualDialogFor([restricted, open, png]);
@@ -754,7 +773,7 @@ function cases() {
       writeFont(file, { fsType: 2, names: englishNames({ family: ps.split('-')[0], style: 'Regular', postscriptName: ps }) });
     }
     const open = path.join(f.dir, 'Open.otf~');
-    const openBytes = writeFont(open, { names: englishNames({ family: 'Open', style: 'Regular', postscriptName: 'Open-Regular', licence: OFL_STATEMENT }) });
+    const openBytes = writePoppins(open);
     const photo = path.join(f.dir, 'Photo.png⠀');
     fs.writeFileSync(photo, createSyntheticPngBytes());
     manualDialogFor([hidden, lock, open, photo]);
@@ -823,8 +842,7 @@ function cases() {
       licence: OFL_STATEMENT, licenceUrl: 'https://openfontlicense.org',
       copyright: 'Copyright 2026 Synthetic Foundry. Commercial font. Do not redistribute. The OFL statement in name ID 13 does not grant a licence for this font.' }) });
     const open = path.join(f.dir, 'Open.otf');
-    const openBytes = writeFont(open, { names: englishNames({ family: 'Open', style: 'Regular', postscriptName: 'Open-Regular',
-      licence: OFL_STATEMENT, licenceUrl: 'https://openfontlicense.org', copyright: 'Copyright 2026 The Open Project Authors. All Rights Reserved.' }) });
+    const openBytes = writePoppins(open);
     manualDialogFor([restrictedBit]);
     await callIpcRaw('projects:add-files', f.project.id);
     manualDialogFor([conflict, open]);
@@ -833,7 +851,7 @@ function cases() {
     assert.equal(row(before, 'RestrictedBit.otf').reason, 'restricted');
     assert.equal(row(before, 'Conflict.otf').outcome, 'needs-confirmation');
     assert.equal(row(before, 'Conflict.otf').reason, 'licence-unknown');
-    assert.equal(row(before, 'Open.otf').basis, 'open-licence');
+    assert.equal(row(before, 'Open.otf').basis, 'verified-release');
     const restrictedRow = row(before, 'RestrictedBit.otf');
     await callIpcRaw('fonts:set-row-choice', f.project.id, restrictedRow.key, 'include');
     const refused = await callIpcRaw('fonts:confirm-licence', f.project.id, restrictedRow.key, { confirmed: true, sha256: restrictedRow.sha256 });
@@ -865,17 +883,95 @@ function cases() {
         licence: OFL_STATEMENT, licenceUrl: 'https://openfontlicense.org', ...extra }), ...records] });
     }
     const open = path.join(f.dir, 'Open.otf');
-    const openBytes = writeFont(open, { names: [...englishNames({ family: 'Open', style: 'Regular', postscriptName: 'Open-Regular',
-      licence: OFL_STATEMENT, licenceUrl: 'https://openfontlicense.org', copyright: 'Copyright 2020 The Open Project Authors (https://github.com/example/open)' }),
-      nameRecord(7, 'Open is a trademark of Synthetic Foundry.'), nameRecord(10, 'Designed by Synthetic Foundry.')] });
+    const openBytes = writePoppins(open);
     manualDialogFor([...cases.map(([file]) => path.join(f.dir, file)), open]);
     await callIpcRaw('fonts:add-files', f.project.id);
     const reviewResult = await review(f);
     for (const [file] of cases) assert.equal(row(reviewResult, file).outcome, 'needs-confirmation', file);
-    assert.equal(row(reviewResult, 'Open.otf').basis, 'open-licence');
+    assert.equal(row(reviewResult, 'Open.otf').basis, 'verified-release');
     const { result } = await packageNow(f, reviewResult);
     assert.deepEqual(listTree(result.folderPath).filter(item => item.endsWith('.otf')), ['Fonts/Open.otf']);
     assert.deepEqual(fs.readFileSync(path.join(result.folderPath, 'Fonts', 'Open.otf')), openBytes);
+  });
+
+  fontTest('round 8: catalogued bytes are excluded in Adobe Fonts, auto-included when installed, and a changed copy needs consent', async () => {
+    const f = await fixture('Round eight');
+    const adobeCopy = path.join(TEST_HOME, 'Library', 'Application Support', 'Adobe', 'CoreSync', 'plugins', 'livetype', 'r', 'Poppins-Regular.ttf');
+    writePoppins(adobeCopy);
+    const installed = path.join(fontsDir(), 'Poppins-Regular.ttf');
+    writePoppins(installed);
+    registryRows.push(['Poppins-Regular', 'Poppins', 'Regular', installed]);
+    manualDialogFor([adobeCopy]);
+    await callIpcRaw('fonts:add-files', f.project.id);
+    assert.equal((await callIpcRaw('fonts:add-installed', f.project.id, { families: ['Poppins'] })).added, 1);
+    const before = await review(f);
+    const rows = before.fonts.rows;
+    const installedRow = rows.find(item => item.origin === 'installed');
+    assert.deepEqual([installedRow.outcome, installedRow.basis], ['included', 'verified-release']);
+    const adobeRow = rows.find(item => item.reason === 'adobe-fonts');
+    assert.ok(adobeRow, JSON.stringify(rows));
+    const refused = await callIpcRaw('fonts:confirm-licence', f.project.id, adobeRow.key, { confirmed: true, sha256: installedRow.sha256 });
+    assert.notEqual(refused.success, true, 'an Adobe Fonts copy cannot be confirmed even with catalogued bytes');
+    const { result } = await packageNow(f);
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.deepEqual(listTree(result.folderPath).filter(item => /Poppins/.test(item)), ['Fonts/Poppins - OFL.txt', 'Fonts/Poppins-Regular.ttf']);
+    fs.rmSync(result.folderPath, { recursive: true, force: true });
+    assert.deepEqual(fs.readFileSync(installed), POPPINS_BYTES, 'installed font unchanged');
+
+    // A one-byte-changed copy that claims the same font: neither file silently wins.
+    const changed = path.join(f.dir, 'Poppins-Edited.ttf');
+    const changedBytes = Buffer.from(POPPINS_BYTES); changedBytes[changedBytes.length - 1] ^= 0x01;
+    fs.writeFileSync(changed, changedBytes);
+    manualDialogFor([changed]);
+    await callIpcRaw('fonts:add-files', f.project.id);
+    const both = await review(f);
+    assert.deepEqual(both.fonts.rows.filter(item => item.reason !== 'adobe-fonts').map(item => item.reason).sort(), ['conflict', 'conflict']);
+  });
+
+  fontTest('round 8: a changed copy of a catalogued release is included only through its own confirmation, without a licence file', async () => {
+    const f = await fixture('Round eight consent');
+    const changed = path.join(f.dir, 'Poppins-Edited.ttf');
+    const changedBytes = Buffer.from(POPPINS_BYTES); changedBytes[changedBytes.length - 1] ^= 0x01;
+    fs.writeFileSync(changed, changedBytes);
+    manualDialogFor([changed]);
+    await callIpcRaw('fonts:add-files', f.project.id);
+    const before = await review(f);
+    const target = row(before, 'Poppins-Edited.ttf');
+    assert.deepEqual([target.outcome, target.reason, target.canConfirm], ['needs-confirmation', 'licence-unknown', true]);
+    assert.equal((await callIpcRaw('fonts:confirm-licence', f.project.id, target.key, { confirmed: true, sha256: target.sha256 })).success, true);
+    const after = await review(f);
+    assert.equal(row(after, 'Poppins-Edited.ttf').basis, 'confirmed');
+    const { result } = await packageNow(f, after);
+    assert.deepEqual(listTree(result.folderPath), ['Fonts/Fonts in this package.txt', 'Fonts/Poppins-Edited.ttf', 'PNG/Logo.png']);
+    assert.deepEqual(fs.readFileSync(path.join(result.folderPath, 'Fonts', 'Poppins-Edited.ttf')), changedBytes);
+  });
+
+  fontTest('round 8: catalogued bytes swapped for a changed copy after review stop packaging; nothing is written', async () => {
+    const f = await fixture('Round eight swap');
+    const file = path.join(f.dir, 'Poppins-Regular.ttf');
+    writePoppins(file);
+    manualDialogFor([file]);
+    await callIpcRaw('fonts:add-files', f.project.id);
+    const reviewed = await review(f);
+    assert.equal(row(reviewed, 'Poppins-Regular.ttf').basis, 'verified-release');
+    const changedBytes = Buffer.from(POPPINS_BYTES); changedBytes[changedBytes.length - 1] ^= 0x01;
+    fs.writeFileSync(file, changedBytes);
+    const stale = await callIpcRaw('projects:package', f.project.id, f.out, reviewed.token);
+    assert.equal(stale.error, 'package_review_changed', JSON.stringify(stale));
+    assert.deepEqual(fs.readdirSync(f.out), []);
+  });
+
+  fontTest('round 8: Quick Package never copies a catalogued font a document links', async () => {
+    const f = await fixture('Round eight quick');
+    const linked = path.join(f.dir, 'Poppins-Regular.ttf');
+    writePoppins(linked);
+    const project = path.join(f.dir, 'Edit.prproj');
+    fs.writeFileSync(project, require('node:zlib').gzipSync(`<PremiereData><FilePath>${f.image}</FilePath><FilePath>${linked}</FilePath></PremiereData>`));
+    const out = path.join(f.dir, 'quick-out'); fs.mkdirSync(out);
+    const result = await require('../parsers').packageMasterFile(project, out);
+    const copied = listTree(out);
+    assert.ok(!copied.some(item => /Poppins/.test(item)), copied.join(', '));
+    assert.deepEqual((result.fontsNotIncluded || []).map(item => item.name), ['Poppins-Regular.ttf']);
   });
 
   fontTest('registry failure reports unavailable and leaves packaging untouched', async () => {

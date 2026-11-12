@@ -10,6 +10,7 @@
 //   permission   - the gate below; being installed, readable or matched never
 //                  establishes permission by itself.
 
+const crypto = require('crypto');
 const path = require('path');
 
 const GATED_FONT_EXTENSIONS = new Set(['.otf', '.ttf', '.ttc', '.otc']);
@@ -20,13 +21,8 @@ const MAX_NAME_RECORDS = 4096;
 const MAX_FVAR_INSTANCES = 1024;
 const MAX_FONT_NAME_TEXT_LENGTH = 4000;
 const MAX_FONT_IDENTITY_TEXT_LENGTH = 255;
-// Licence evidence (name IDs 13 and 14) decoded per file, across every record
-// and face. Identical spans are judged once; past this budget the remaining
-// records are not decoded and the file asks for the per-font confirmation.
-const MAX_LICENCE_EVIDENCE_BYTES = 2 * 1024 * 1024;
 
 const FONTS_NOTE_FILENAME = 'Fonts in this package.txt';
-const OFL_TEXT_FILENAME = 'SIL Open Font License 1.1.txt';
 // Draft product copy pending Bryant/legal review. Bumping the version
 // invalidates earlier confirmations because each records the wording it saw.
 const FONT_CONFIRMATION_WORDING_VERSION = 'draft-2026-11-11-v1';
@@ -121,110 +117,8 @@ function nameRecordScore(platform, encoding, language) {
   return 0;
 }
 
-// Licence records are decoded only from encodings Crate reads exactly.
-function licenceRecordDecoder(platform, encoding) {
-  if (platform === 0 || (platform === 3 && (encoding === 0 || encoding === 1 || encoding === 10))) return 'utf16';
-  if (platform === 1 && encoding === 0) return 'mac-roman';
-  return null;
-}
-
-// Notices beside an OFL statement are judged by a bounded classifier, not by
-// trying to understand free text. Each copyright (0), trademark (7) and
-// description (10) record must be made only of a few known notice forms, and
-// every notice-like record (0, 7, 8, 9, 10, 11, 12) must contain none of a
-// closed list of licensing and instruction words. Anything else is uncertain
-// and asks for the per-file confirmation. Separators and invisible
-// characters become spaces before judging (TAB, U+2028 and NBSP keep word
-// boundaries), and text is also judged with invisible characters removed,
-// so neither form can hide wording. A word mixing Latin with Cyrillic or
-// Greek letters is uncertain. English only: other-language notices do not
-// match the known forms and so ask for the confirmation.
-const LICENSING_WORDS = new RegExp(`\\b(?:${[
-  'shar(?:e|es|ed|ing|eable|able)', 're?distribut\\w*', '(?:sub|un)?licen[cs]\\w*', 'permi(?:t|ts|tted|tting|ssion|ssions|ssible)',
-  '(?:dis)?allow\\w*', '(?:un)?authori[sz]\\w*', 'prohibit\\w*', 'forbid\\w*', 'restrict\\w*', 'private\\w*', 'internal\\w*', 'in-house',
-  'confidential\\w*', 'proprietary', 'exclusiv\\w*', 'only', 'not', 'no', 'never', 'none', 'nor', 'without', 'except\\w*', 'unless',
-  'trial\\w*', 'demo\\w*', 'evaluat\\w*', '(?:non)?commercial\\w*', 'personal\\w*', 'paid', 'pay\\w*', 'purchas\\w*', 'buy\\w*', 'bought',
-  'sell\\w*', 'sold', 'sales?', 'resale\\w*', 'rent\\w*', 'leas(?:e|ed|es|ing)', 'lend\\w*', 'transfer\\w*', 'giv(?:e|es|en|ing)', 'gave',
-  'send\\w*', 'sent', 'cop(?:y|ies|ied|ying)', 'duplicat\\w*', 'reproduc\\w*', 'embed\\w*', 'install\\w*', 'eula', 'terms?', 'condition\\w*',
-  'agreement\\w*', 'contract\\w*', '(?:il)?legal\\w*', 'infring\\w*', 'owner\\w*', 'requir\\w*', 'must', 'shall', 'cannot', 'may', 'you',
-  'your\\w*', 'keep\\w*', 'kept', 'please', 'do', 'does', 'did', 'done', 'us(?:e|es|ed|ing|age|er|ers)', 'access\\w*', 'grant\\w*',
-  'rights?', 'staff', 'employees?', 'clients?', 'customers?', 'watermark\\w*', 'warrant\\w*', 'liab\\w*',
-].join('|')})\\b|n['\\u2019]t\\b`, 'i');
-// Exact phrases that real OFL notices use and that are not terms.
-const ALLOWED_NOTICE_PHRASES = /\ball rights reserved\b|\b(?:with )?reserved font names?\b|\band may be registered in certain jurisdictions\b/gi;
-const MIXED_SCRIPT_WORD = /(?=\S*\p{Script=Latin})(?=\S*[\p{Script=Cyrillic}\p{Script=Greek}])\S+/u;
-const CORPORATE_SUFFIX_PIECE = /^(?:inc|ltd|llc|gmbh|co|corp|plc|ag|ab|bv|b\.v|nv|sa|s\.a|sas|srl|s\.r\.l|s\.r\.o|pty|kk|oy|as)$/i;
-const COPYRIGHT_PIECE = /^(?:(?:(?:portions|digitized data|font data) )?(?:copyright\b|©|\(c\))|all rights reserved$|(?:with )?reserved font names?\b)/i;
-const TRADEMARK_PIECE = /\b(?:is|are) (?:a |an |the )?(?:registered )?trademarks? (?:of|owned by)\b/i;
-const CREDIT_VERB = '(?:designed|created|drawn|developed|produced|engineered|hinted|mastered|digiti[sz]ed)';
-const DESCRIPTION_PIECE = new RegExp(`^(?:data (?:un)?hinted|${CREDIT_VERB}(?:,? and ${CREDIT_VERB})* by .+)$`, 'i');
-const NAME_WARNING_WORDS = /\b(?:trial|demo|evaluation|personal|unlicen[cs]ed|watermark(?:ed)?)\b/i;
-const NOTICE_NAME_IDS = new Set([0, 7, 8, 9, 10, 11, 12]);
-const FONT_NAME_IDS = new Set([1, 2, 4, 16, 17, 18, 21, 22]);
-
-function noticeTextForms(raw) {
-  const folded = raw.normalize('NFKC');
-  const squash = text => text.replace(/\s+/g, ' ').trim();
-  const spaced = squash(folded.replace(/[\p{Cc}\p{Cf}\p{Z}]/gu, ' '));
-  const joined = squash(folded.replace(/\p{Cf}/gu, '').replace(/[\p{Cc}\p{Z}]/gu, ' '));
-  return spaced === joined ? [spaced] : [spaced, joined];
-}
-
-// Sentence pieces: split after . ; ! ? when a space or a capital letter follows,
-// so "Foundry. sharing" and "Foundry.Sharing" are separate pieces while
-// "github.com" and "s.r.o" stay whole.
-function noticePieces(text) {
-  return text.split(/(?<=[.;!?])(?=\s|\p{Lu})/u).map(piece => piece.trim().replace(/[.;!?]+$/u, '').trim()).filter(Boolean);
-}
-
-function isKnownNoticeText(nameId, text) {
-  if (!text) return true;
-  if (MIXED_SCRIPT_WORD.test(text)) return false;
-  if (LICENSING_WORDS.test(text.replace(ALLOWED_NOTICE_PHRASES, ' '))) return false;
-  const pieces = noticePieces(text);
-  const fits = pattern => pieces.every(piece => pattern.test(piece) || CORPORATE_SUFFIX_PIECE.test(piece));
-  if (nameId === 0) return fits(COPYRIGHT_PIECE);
-  if (nameId === 7) return fits(TRADEMARK_PIECE);
-  if (nameId === 10) return fits(DESCRIPTION_PIECE);
-  return true;
-}
-
-// Safety evidence is separate from display: display uses one English record
-// per name ID, while automatic inclusion needs every licence (13) and licence
-// URL (14) record, on every platform, encoding and language, to state the
-// OFL, every notice record to pass the classifier above, and no font name to
-// say trial, demo or similar. A licence or notice record that is
-// unsupported, undecodable or past the evidence budget makes the face
-// uncertain; an unreadable font-name record is only display text and is
-// skipped. Only the decision is kept, never the untruncated text.
-const EVIDENCE_NAME_IDS = new Set([13, 14, ...NOTICE_NAME_IDS, ...FONT_NAME_IDS]);
-function judgeEvidenceText(nameId, raw) {
-  if (nameId === 13) return isRecognizedOflLicence(cleanFontText(raw, Infinity));
-  if (nameId === 14) {
-    const text = cleanFontText(raw, Infinity);
-    return text !== null && isRecognizedOflUrl(text);
-  }
-  const forms = noticeTextForms(raw);
-  if (FONT_NAME_IDS.has(nameId)) return forms.every(text => !NAME_WARNING_WORDS.test(text) && !MIXED_SCRIPT_WORD.test(text));
-  return forms.every(text => isKnownNoticeText(nameId, text));
-}
-
-function judgeLicenceRecord(buffer, evidence, nameId, platform, encoding, offset, length) {
-  const decoder = licenceRecordDecoder(platform, encoding);
-  if (!decoder || (decoder === 'utf16' && length % 2 !== 0)) return FONT_NAME_IDS.has(nameId);
-  const key = `${nameId}:${decoder}:${offset}:${length}`;
-  if (evidence.verdicts.has(key)) return evidence.verdicts.get(key);
-  evidence.bytes += length;
-  if (evidence.bytes > MAX_LICENCE_EVIDENCE_BYTES) return false;
-  const raw = buffer.subarray(offset, offset + length);
-  const verdict = judgeEvidenceText(nameId, decoder === 'mac-roman' ? decodeMacRoman(raw) : decodeUtf16be(raw));
-  evidence.verdicts.set(key, verdict);
-  return verdict;
-}
-
-function readNameTable(buffer, table, evidence) {
-  const licence = { seen: false, recognized: true };
-  if (!table) return { names: new Map(), oflEvidence: false };
+function readNameTable(buffer, table) {
+  if (!table) return new Map();
   needIn(buffer, table, table.offset, 6);
   const count = buffer.readUInt16BE(table.offset + 2);
   const storage = table.offset + buffer.readUInt16BE(table.offset + 4);
@@ -241,18 +135,11 @@ function readNameTable(buffer, table, evidence) {
     const offset = storage + buffer.readUInt16BE(base + 10);
     const score = nameRecordScore(platform, encoding, language);
     needIn(buffer, table, offset, length);
-    if (EVIDENCE_NAME_IDS.has(nameId)) {
-      if (nameId === 13) licence.seen = true;
-      if (licence.recognized && !judgeLicenceRecord(buffer, evidence, nameId, platform, encoding, offset, length)) licence.recognized = false;
-    }
     if (!score || (best.get(nameId)?.score || 0) >= score) continue;
     const raw = buffer.subarray(offset, offset + length);
     best.set(nameId, { score, text: platform === 1 ? decodeMacRoman(raw) : decodeUtf16be(raw) });
   }
-  return {
-    names: new Map([...best].map(([nameId, record]) => [nameId, record.text])),
-    oflEvidence: licence.seen && licence.recognized,
-  };
+  return new Map([...best].map(([nameId, record]) => [nameId, record.text]));
 }
 
 function readFvar(buffer, table, names) {
@@ -280,7 +167,7 @@ function readFvar(buffer, table, names) {
   return instances;
 }
 
-function readFaceAt(buffer, offset, index, evidence) {
+function readFaceAt(buffer, offset, index) {
   need(buffer, offset, 12);
   const signature = buffer.readUInt32BE(offset);
   if (signature !== 0x00010000 && signature !== 0x4f54544f && signature !== 0x74727565) {
@@ -301,18 +188,15 @@ function readFaceAt(buffer, offset, index, evidence) {
     if (tables.has(tag)) throw new FontReadError('malformed');
     tables.set(tag, { offset: tableOffset, length });
   }
-  const { names, oflEvidence } = readNameTable(buffer, tables.get('name'), evidence);
+  const names = readNameTable(buffer, tables.get('name'));
   const os2 = tables.get('OS/2');
   // A table too short to hold the embedding field cannot vouch for it.
   if (os2 && os2.length < 10) throw new FontReadError('malformed');
   let fsType = null;
   if (os2 && os2.length >= 10) fsType = buffer.readUInt16BE(os2.offset + 8);
   // The restricted bit (0x0002) excludes the font in any combination (0x3,
-  // 0x6, 0xA ...), stricter than the spec's "least restrictive bit wins". A
-  // missing field, the reserved bit 0, or bits 2 and 3 together cannot vouch
-  // for an open licence, so such a face asks for the confirmation instead.
+  // 0x6, 0xA ...), stricter than the spec's "least restrictive bit wins".
   const restricted = fsType !== null && (fsType & 0x0002) !== 0;
-  const permissionClear = fsType !== null && (fsType & 0x0001) === 0 && (fsType & 0x000c) !== 0x000c;
   const namedInstances = readFvar(buffer, tables.get('fvar'), names);
   return {
     index,
@@ -324,10 +208,9 @@ function readFaceAt(buffer, offset, index, evidence) {
     copyright: cleanFontText(names.get(0)),
     licence: cleanFontText(names.get(13)),
     licenceTruncated: isFontTextTruncated(names.get(13)),
+    // The font's own notices: display text only. Nothing the file says about
+    // itself grants automatic inclusion (see the verified-release catalog).
     licenceUrl: cleanIdentityText(names.get(14)),
-    // Permission is judged from this decision over every licence record,
-    // never from the display text above.
-    oflEvidence: oflEvidence && permissionClear,
     fsType,
     // OpenType OS/2 fsType bit 1: "Restricted License embedding".
     restricted,
@@ -339,17 +222,16 @@ function readFaceAt(buffer, offset, index, evidence) {
 function readFontFaces(buffer) {
   if (!Buffer.isBuffer(buffer) || buffer.length < 12) throw new FontReadError('malformed');
   if (buffer.length > MAX_FONT_FILE_BYTES) throw new FontReadError('too-large');
-  const evidence = { bytes: 0, verdicts: new Map() };
   try {
     if (buffer.toString('latin1', 0, 4) === 'ttcf') {
       const count = buffer.readUInt32BE(8);
       if (count === 0 || count > MAX_COLLECTION_FACES) throw new FontReadError('malformed');
       need(buffer, 12, count * 4);
       const faces = [];
-      for (let index = 0; index < count; index++) faces.push(readFaceAt(buffer, buffer.readUInt32BE(12 + index * 4), index, evidence));
+      for (let index = 0; index < count; index++) faces.push(readFaceAt(buffer, buffer.readUInt32BE(12 + index * 4), index));
       return { collection: true, faces };
     }
-    return { collection: false, faces: [readFaceAt(buffer, 0, 0, evidence)] };
+    return { collection: false, faces: [readFaceAt(buffer, 0, 0)] };
   } catch (error) {
     if (error instanceof FontReadError) throw error;
     throw new FontReadError('malformed');
@@ -404,54 +286,80 @@ function classifyFontLocation(realPath, homeDir) {
   return { kind: 'user-file', excludedReason: null };
 }
 
-// Conservative open-licence recognition. A font counts as SIL OFL 1.1 only when
-// its whole licence text (ID 13, untruncated, whitespace normalized) is one of
-// the recognized OFL statements, optionally followed by the exact OFL 1.1 text,
-// and its licence URL (ID 14), if any, is exactly a known OFL address. Any other
-// or extra wording, however worded, goes to the per-font confirmation: nothing
-// is excluded by this check, so uncertainty never means auto-inclusion.
-const OFL_URLS = ['https://openfontlicense.org', 'http://openfontlicense.org', 'https://scripts.sil.org/OFL', 'http://scripts.sil.org/OFL'];
-const escapeRegExp = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-const OFL_URL_PATTERN = `(?:${OFL_URLS.map(url => `${escapeRegExp(url)}/?`).join('|')})`;
-const OFL_STATEMENT_HEADS = [
-  'This Font Software is licensed under the SIL Open Font License, Version 1.1',
-  'Licensed under the SIL Open Font License, Version 1.1',
-];
-const OFL_STATEMENT_TAILS = [
-  `This license is available with a FAQ at: ${OFL_URL_PATTERN}\\.?`,
-  `This license is copied below, and is also available with a FAQ at: ${OFL_URL_PATTERN}\\.?`,
-  escapeRegExp('This Font Software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the SIL Open Font License for the specific language, permissions and limitations governing your use of this Font Software.'),
-];
-const OFL_STATEMENT = new RegExp(`^(?:${OFL_STATEMENT_HEADS.map(escapeRegExp).join('|')})\\.?(?: (?:${OFL_STATEMENT_TAILS.join('|')}))?$`);
+// Verified-release catalog. Automatic inclusion needs the file's exact bytes
+// (SHA-256 computed by main from the reviewed bytes, and again at packaging) to
+// equal an entry in the bundled catalog, and its faces to equal the entry's.
+// Only the catalog's own entry object counts: callers, renderer input and
+// project files cannot construct one. A catalog that fails validation is empty,
+// so nothing is included automatically and every other check is unchanged.
+const FONT_RELEASE_CATALOG_SCHEMA = 'crate-font-release-catalog/1';
 const OFL_BODY_HEADER = 'SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007';
-const squashLicenceText = text => `${text || ''}`.replace(/^-{3,}$/gm, ' ').replace(/\s+/g, ' ').trim();
+const OFL_STATEMENT_HEADER = /^Copyright [^\n]+ This Font Software is licensed under the SIL Open Font License, Version 1\.1\. This license is copied below, and is also available with a FAQ at: https?:\/\/(?:scripts\.sil\.org\/OFL|openfontlicense\.org) -{3,}$/;
+const squashLicenceText = text => `${text || ''}`.replace(/\s+/g, ' ').trim();
+const HEX_64 = /^[a-f0-9]{64}$/;
+const HEX_40 = /^[a-f0-9]{40}$/;
+const EMPTY_CATALOG = Object.freeze({ ok: false, error: 'not-loaded', entries: new Map() });
 
-function isRecognizedOflLicence(licence) {
-  const text = squashLicenceText(licence);
-  if (!text) return false;
+function isPublishedOflText(text) {
+  if (typeof text !== 'string') return false;
   const bodyAt = text.indexOf(OFL_BODY_HEADER);
-  if (bodyAt < 0) return OFL_STATEMENT.test(text);
-  // The exact OFL 1.1 text may follow the statement, with nothing after it.
-  return OFL_STATEMENT.test(text.slice(0, bodyAt).trim()) && text.slice(bodyAt) === squashLicenceText(OFL_1_1_TEXT);
+  return bodyAt > 0 && OFL_STATEMENT_HEADER.test(squashLicenceText(text.slice(0, bodyAt))) &&
+    squashLicenceText(text.slice(bodyAt)) === squashLicenceText(OFL_1_1_TEXT);
 }
 
-function isRecognizedOflUrl(url) {
-  if (url === null || url === undefined || url === '') return true;
-  return new RegExp(`^${OFL_URL_PATTERN}$`).test(`${url}`.trim());
+function loadFontReleaseCatalog(data) {
+  const fail = error => Object.freeze({ ok: false, error, entries: new Map() });
+  try {
+    if (!data || typeof data !== 'object' || data.schema !== FONT_RELEASE_CATALOG_SCHEMA) return fail('schema');
+    if (!data.licences || typeof data.licences !== 'object' || !Array.isArray(data.entries) || !data.entries.length) return fail('shape');
+    const licences = new Map();
+    for (const [key, licence] of Object.entries(data.licences)) {
+      if (!licence || licence.id !== 'OFL-1.1' || typeof licence.name !== 'string' || !licence.name ||
+        typeof licence.repository !== 'string' || !HEX_40.test(licence.commit || '') || typeof licence.path !== 'string' ||
+        !HEX_64.test(licence.sha256 || '') || !isPublishedOflText(licence.text) ||
+        crypto.createHash('sha256').update(licence.text, 'utf8').digest('hex') !== licence.sha256) {
+        return fail('licence');
+      }
+      licences.set(key, Object.freeze({ key, id: licence.id, name: licence.name, repository: licence.repository,
+        commit: licence.commit, path: licence.path, sha256: licence.sha256, text: licence.text }));
+    }
+    const entries = new Map();
+    for (const entry of data.entries) {
+      const source = entry && entry.source;
+      if (!entry || !HEX_64.test(entry.sha256 || '') || entries.has(entry.sha256) || !Number.isSafeInteger(entry.size) || entry.size <= 0 ||
+        typeof entry.family !== 'string' || typeof entry.collection !== 'boolean' || !Array.isArray(entry.faces) || !entry.faces.length ||
+        !entry.faces.every(name => typeof name === 'string' && name) || !source || typeof source.repository !== 'string' ||
+        !HEX_40.test(source.commit || '') || typeof source.path !== 'string' || !licences.has(entry.licence)) {
+        return fail('entry');
+      }
+      const licence = licences.get(entry.licence);
+      if (licence.repository !== source.repository || licence.commit !== source.commit) return fail('entry');
+      entries.set(entry.sha256, Object.freeze({
+        sha256: entry.sha256, size: entry.size, family: entry.family, collection: entry.collection,
+        faces: Object.freeze([...entry.faces]),
+        source: Object.freeze({ repository: source.repository, commit: source.commit, path: source.path }),
+        licence,
+      }));
+    }
+    return Object.freeze({ ok: true, error: null, entries });
+  } catch (_) {
+    return fail('invalid');
+  }
 }
 
-function detectOpenLicence(faces) {
-  if (!Array.isArray(faces) || faces.length === 0) return null;
-  const every = faces.every(face => {
-    if (!face) return false;
-    // Faces read from a file carry the reader's decision over every licence
-    // record (oflEvidence). Plain descriptor objects (tests, callers) fall back
-    // to their single licence/licenceUrl, never when marked truncated.
-    if (typeof face.oflEvidence === 'boolean') return face.oflEvidence;
-    if (face.licenceTruncated === true) return false;
-    return isRecognizedOflLicence(face.licence) && isRecognizedOflUrl(face.licenceUrl);
-  });
-  return every ? 'ofl-1.1' : null;
+let FONT_RELEASE_CATALOG = EMPTY_CATALOG;
+
+function findCatalogRelease(sha256, parsed) {
+  if (typeof sha256 !== 'string' || !parsed || !Array.isArray(parsed.faces)) return null;
+  const entry = FONT_RELEASE_CATALOG.entries.get(sha256);
+  if (!entry || parsed.collection !== entry.collection || parsed.faces.length !== entry.faces.length) return null;
+  return parsed.faces.every((face, index) => face && face.postscriptName === entry.faces[index]) ? entry : null;
+}
+
+function isCatalogMatch(input, faces) {
+  const entry = typeof input.sha256 === 'string' ? FONT_RELEASE_CATALOG.entries.get(input.sha256) : undefined;
+  return !!entry && input.catalogRelease === entry && faces.length === entry.faces.length &&
+    faces.every((face, index) => face.postscriptName === entry.faces[index]);
 }
 
 function isCurrentConfirmation(confirmation, sha256) {
@@ -492,7 +400,7 @@ function evaluateFontGate(input) {
   if (input.choice === 'remove') return gateResult('not-included', 'removed');
   if (input.intent !== 'explicit' && input.choice !== 'include') return gateResult('not-included', 'found');
   if (input.conflict) return gateResult('not-included', 'conflict');
-  if (detectOpenLicence(faces)) return gateResult('included', null, 'open-licence');
+  if (isCatalogMatch(input, faces)) return gateResult('included', null, 'verified-release');
   if (isCurrentConfirmation(input.confirmation, input.sha256)) return gateResult('included', null, 'confirmed');
   return gateResult('needs-confirmation', 'licence-unknown');
 }
@@ -579,8 +487,9 @@ function indentBlock(value, prefix) {
 }
 
 // Deterministic text. Holds no local paths: only package file names, font
-// names and the font's own notices, treated as untrusted text.
-function buildFontsNote({ included = [], notIncluded = [], oflTextFileName = null } = {}) {
+// names, verified-release sources from the bundled catalog, and (for fonts the
+// sender confirmed) the font's own notices, labelled as untrusted text.
+function buildFontsNote({ included = [], notIncluded = [] } = {}) {
   const lines = [
     'Fonts in this package',
     '',
@@ -606,8 +515,13 @@ function buildFontsNote({ included = [], notIncluded = [], oflTextFileName = nul
     }
     lines.push(`  SHA-256: ${item.sha256}`);
     lines.push(`  How it was added: ${FONT_ORIGIN_TEXT[item.origin] || FONT_ORIGIN_TEXT['added-file']}`);
-    if (item.basis === 'open-licence') {
-      lines.push(`  Basis: the font file states the SIL Open Font License 1.1.${oflTextFileName ? ` The licence text is in "${oflTextFileName}".` : ''}`);
+    if (item.basis === 'verified-release' && item.release) {
+      lines.push('  Basis: this file is byte-identical to a published open-licence font release on Crate\'s');
+      lines.push(`  verified list: ${noteLine(item.release.source.repository)} at commit ${noteLine(item.release.source.commit)},`);
+      lines.push(`  file ${noteLine(item.release.source.path)}.`);
+      lines.push(`  Licence: SIL Open Font License 1.1${item.licenceFileName ? `, published with it, in "${noteLine(item.licenceFileName)}"` : ''}.`);
+      lines.push('  This shows the file matches that release. It does not prove anyone\'s rights to use or share it.');
+      continue;
     } else {
       lines.push(`  Basis: the sender stated on ${noteLine(item.confirmedOn)} that their licence allows giving this font file`);
       lines.push('  to the people receiving this package. Crate did not verify this.');
@@ -721,7 +635,17 @@ FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
 OTHER DEALINGS IN THE FONT SOFTWARE.
 `;
 
+// Loaded after OFL_1_1_TEXT, which validation compares against.
+FONT_RELEASE_CATALOG = (() => {
+  try {
+    return loadFontReleaseCatalog(require('./font-release-catalog'));
+  } catch (_) {
+    return Object.freeze({ ok: false, error: 'missing', entries: new Map() });
+  }
+})();
+
 module.exports = {
+  FONT_RELEASE_CATALOG,
   FONTS_NOTE_FILENAME,
   FONT_CONFIRMATION_WORDING_VERSION,
   FONT_REASON_TEXT,
@@ -730,16 +654,16 @@ module.exports = {
   MAX_FONT_FILE_BYTES,
   MAX_FONT_NAME_TEXT_LENGTH,
   OFL_1_1_TEXT,
-  OFL_TEXT_FILENAME,
   buildFontsNote,
   classifyFontLocation,
   cleanFontText,
   describeFontFaces,
-  detectOpenLicence,
   evaluateFontGate,
+  findCatalogRelease,
   findFace,
   getFontConfirmationStatement,
   isCurrentConfirmation,
   isGatedFontName,
+  loadFontReleaseCatalog,
   readFontFaces,
 };

@@ -5484,10 +5484,10 @@ function createPackageReviewFontRow(row, projectId) {
     contents.textContent = `${row.collection ? 'Collection. ' : ''}Contains: ${row.contents}`;
     item.appendChild(contents);
   }
-  if (row.basis === 'open-licence') {
+  if (row.basis === 'verified-release') {
     const basis = document.createElement('div');
     basis.className = 'package-review-font-reason';
-    basis.textContent = 'The font file states the SIL Open Font License. Its licence text is added beside it.';
+    basis.textContent = 'This exact file matches an open-licence font release on Crate\'s verified list. Its published licence file is added beside it.';
     item.appendChild(basis);
   }
   if (row.reasonText && row.outcome !== 'included') {

@@ -112,7 +112,18 @@ test('hostile name text is bounded and stripped of control characters', () => {
   assert.ok(face.family.length <= fontHandoff.MAX_FONT_NAME_TEXT_LENGTH);
 });
 
-const { classifyFontLocation, detectOpenLicence, evaluateFontGate, FONT_CONFIRMATION_WORDING_VERSION } = fontHandoff;
+const { classifyFontLocation, evaluateFontGate, FONT_CONFIRMATION_WORDING_VERSION } = fontHandoff;
+// Round 8: automatic inclusion comes only from the verified-release catalog
+// (exact bytes). The earlier text-based licence cases are kept as controls: run
+// through the gate, none of these synthetic fonts can auto-include, so this
+// helper returns 'ofl-1.1' only for a verified-release match.
+const detectOpenLicence = faces => {
+  if (!Array.isArray(faces) || !faces.length) return null;
+  const basis = evaluateFontGate({ file: { state: 'present' }, readError: null,
+    faces: faces.map(face => ({ postscriptName: 'Control-Regular', ...face })), location: { excludedReason: null },
+    intent: 'explicit', choice: null, sha256: 'c'.repeat(64), confirmation: null, conflict: false }).basis;
+  return basis === 'verified-release' ? 'ofl-1.1' : null;
+};
 const HOME = '/Users/olivia';
 
 test('location classes: Adobe, macOS, app stores and bundles are excluded; user folders are eligible', () => {
@@ -146,9 +157,9 @@ test('location classes: Adobe, macOS, app stores and bundles are excluded; user 
   assert.equal(classifyFontLocation('/opt/home/me/Library/Application Support/Adobe/x.otf', '/opt/home/me').kind, 'adobe-fonts');
 });
 
-test('open-licence evidence needs the font to state SIL OFL 1.1 in every face, not just embedding flags', () => {
+test('round 8 control: a font stating SIL OFL 1.1 in every face no longer auto-includes by itself', () => {
   const ofl = { licence: OFL_STATEMENT, licenceUrl: 'https://openfontlicense.org', fsType: 0 };
-  assert.equal(detectOpenLicence([ofl]), 'ofl-1.1');
+  assert.equal(detectOpenLicence([ofl]), null);
   // Round 4: an unversioned grant is not a recognized OFL statement, even with the OFL URL.
   assert.equal(detectOpenLicence([{ licence: 'Licensed under the SIL Open Font License', licenceUrl: 'http://scripts.sil.org/OFL' }]), null);
   assert.equal(detectOpenLicence([{ licence: null, licenceUrl: null, fsType: 0 }]), null);
@@ -189,9 +200,9 @@ test('a confirmation is bound to the exact bytes and wording; a changed file nee
   assert.equal(evaluateFontGate(gateInput({ confirmation: { sha256: SHA_A } })).outcome, 'needs-confirmation');
 });
 
-test('open-licence fonts the user added are included without a confirmation and can be removed', () => {
+test('round 8 control: an OFL statement the user added asks for the confirmation, and can be removed', () => {
   const faces = [{ postscriptName: 'Open-Regular', restricted: false, licence: OFL_STATEMENT, licenceUrl: null }];
-  assert.deepEqual(evaluateFontGate(gateInput({ faces })), { outcome: 'included', reason: null, basis: 'open-licence' });
+  assert.deepEqual(evaluateFontGate(gateInput({ faces })), { outcome: 'needs-confirmation', reason: 'licence-unknown', basis: null });
   assert.deepEqual(evaluateFontGate(gateInput({ faces, choice: 'remove' })), { outcome: 'not-included', reason: 'removed', basis: null });
 });
 
@@ -200,7 +211,7 @@ test('a font found while watching is never included by default, even when open-l
   const confirmation = { sha256: SHA_A, wordingVersion: FONT_CONFIRMATION_WORDING_VERSION };
   assert.equal(evaluateFontGate(gateInput({ faces, intent: 'found' })).reason, 'found');
   assert.equal(evaluateFontGate(gateInput({ intent: 'found', confirmation })).reason, 'found');
-  assert.equal(evaluateFontGate(gateInput({ faces, intent: 'found', choice: 'include' })).outcome, 'included');
+  assert.equal(evaluateFontGate(gateInput({ faces, intent: 'found', choice: 'include' })).outcome, 'needs-confirmation');
   assert.equal(evaluateFontGate(gateInput({ intent: 'found', choice: 'include' })).outcome, 'needs-confirmation');
   assert.equal(evaluateFontGate(gateInput({ intent: 'found', choice: 'include', confirmation })).outcome, 'included');
 });
@@ -268,25 +279,29 @@ test('fonts note lists included and excluded fonts without paths or completeness
       faces: [{ family: 'Brand Sans', style: 'Bold', postscriptName: 'BrandSans-Bold', version: 'Version 1.000',
         copyright: 'Copyright 2026 Example', licence: 'Desktop licence', licenceUrl: null, namedInstances: [] }],
     }, {
-      fileName: 'Open-Regular.ttf',
+      fileName: 'Poppins-Regular.ttf',
       sha256: SHA_B,
       origin: 'added-file',
-      basis: 'open-licence',
-      faces: [{ family: 'Open', style: 'Regular', postscriptName: 'Open-Regular', version: 'Version 2.0',
-        copyright: 'Copyright 2020 The Open Project Authors', licence: OFL_STATEMENT, licenceUrl: null, namedInstances: [] }],
+      basis: 'verified-release',
+      faces: [{ family: 'Poppins', style: 'Regular', postscriptName: 'Poppins-Regular', version: 'Version 4.003',
+        copyright: 'Copyright 2020 The Poppins Project Authors', licence: OFL_STATEMENT, licenceUrl: null, namedInstances: [] }],
+      release: { source: { repository: 'https://github.com/google/fonts', commit: '35e77c3854970a550d9894a85aba21420813a019',
+        path: 'ofl/poppins/Poppins-Regular.ttf' } },
+      licenceFileName: 'Poppins - OFL.txt',
     }],
     notIncluded: [{ label: 'Cloud Serif Regular (CloudSerif-Regular)', reason: 'adobe-fonts' },
       { label: 'Brand Sans Regular (BrandSans-Regular)', reason: 'licence-unknown' },
       { label: 'Found Regular (Found-Regular)', reason: 'found' },
       { label: 'Gone Regular (Gone-Regular)', reason: 'removed' }],
-    oflTextFileName: 'SIL Open Font License 1.1.txt',
   });
   assert.match(note, /BrandSans-Bold\.otf/);
   assert.match(note, new RegExp(SHA_A));
   assert.match(note, /stated on 2026-11-11/);
   assert.match(note, /Crate did not verify/);
-  assert.match(note, /SIL Open Font License 1\.1\.txt/);
-  assert.match(note, /Copyright 2020 The Open Project Authors/);
+  assert.match(note, /"Poppins - OFL\.txt"/);
+  assert.match(note, /ofl\/poppins\/Poppins-Regular\.ttf/);
+  assert.doesNotMatch(note, /Copyright 2020 The Poppins Project Authors/, 'verified fonts are not described by their own notices');
+  assert.match(note, /Copyright 2026 Example/, 'confirmed fonts keep their own notices, labelled as from the font');
   assert.match(note, /CloudSerif-Regular/);
   assert.match(note, /Adobe Fonts/);
   assert.match(note, /may need their own licen[cs]e/i);
@@ -298,7 +313,7 @@ test('fonts note lists included and excluded fonts without paths or completeness
 });
 
 test('fonts note is deterministic and the bundled OFL text is the full licence', () => {
-  const model = { included: [], notIncluded: [{ label: 'X (X-Regular)', reason: 'system' }], oflTextFileName: null };
+  const model = { included: [], notIncluded: [{ label: 'X (X-Regular)', reason: 'system' }] };
   assert.equal(buildFontsNote(model), buildFontsNote(model));
   assert.match(OFL_1_1_TEXT, /^SIL OPEN FONT LICENSE Version 1\.1 - 26 February 2007/m);
   assert.match(OFL_1_1_TEXT, /PERMISSION & CONDITIONS/);
@@ -365,7 +380,7 @@ test('only a positive SIL OFL 1.1 grant counts as open-licence evidence', () => 
     OFL_STATEMENT,
     'Licensed under the SIL Open Font License, Version 1.1.',
   ];
-  for (const licence of positive) assert.equal(detectOpenLicence([{ licence, licenceUrl: null }]), 'ofl-1.1', licence);
+  for (const licence of positive) assert.equal(detectOpenLicence([{ licence, licenceUrl: null }]), null, licence);
   const negative = [
     'This font is proprietary. Portions are derived from Foo Sans, which is licensed under the SIL Open Font License, Version 1.1.',
     'Commercial licence. You may not redistribute. Unlike fonts under the SIL Open Font License 1.1, this font requires a paid licence.',
@@ -410,7 +425,7 @@ test('font file names are judged as written: trailing spaces and dots do not hid
 
 test('an OFL licence header only exempts the canonical OFL body; anything else is still checked', () => {
   const grant = 'This Font Software is licensed under the SIL Open Font License, Version 1.1. ';
-  assert.equal(detectOpenLicence([{ licence: grant + OFL_1_1_TEXT, licenceUrl: null }]), 'ofl-1.1');
+  assert.equal(detectOpenLicence([{ licence: grant + OFL_1_1_TEXT, licenceUrl: null }]), null);
   const header = 'SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007';
   assert.equal(detectOpenLicence([{ licence: `${grant}${header}\nRedistribution is prohibited. Personal use only.`, licenceUrl: null }]), null);
   assert.equal(detectOpenLicence([{ licence: `${grant}${OFL_1_1_TEXT}\nAdditional terms: redistribution is prohibited.`, licenceUrl: null }]), null);
@@ -423,7 +438,7 @@ test('licence evidence is never judged from truncated text', () => {
   assert.equal(detectOpenLicence([face]), null);
   const short = readFontFaces(buildFont({ names: englishNames({ licence: OFL_STATEMENT }) })).faces[0];
   assert.equal(short.licenceTruncated, false);
-  assert.equal(detectOpenLicence([short]), 'ofl-1.1');
+  assert.equal(detectOpenLicence([short]), null);
 });
 
 test('more self-contradicting licence phrasings need the confirmation', () => {
@@ -439,12 +454,12 @@ const INSTALLED_OFL_FORMS = [
   ['This Font Software is licensed under the SIL Open Font License, Version 1.1. This Font Software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the SIL Open Font License for the specific language, permissions and limitations governing your use of this Font Software.', 'http://scripts.sil.org/OFL'],
 ];
 
-test('round 4: the OFL statements real installed fonts carry are recognized', () => {
-  for (const [licence, licenceUrl] of INSTALLED_OFL_FORMS) assert.equal(detectOpenLicence([{ licence, licenceUrl }]), 'ofl-1.1', licence);
-  assert.equal(detectOpenLicence([{ licence: OFL_STATEMENT, licenceUrl: 'https://openfontlicense.org' }]), 'ofl-1.1');
-  assert.equal(detectOpenLicence([{ licence: 'Licensed under the SIL Open Font License, Version 1.1', licenceUrl: null }]), 'ofl-1.1');
+test('round 4 control: the OFL statements real installed fonts carry no longer auto-include by themselves', () => {
+  for (const [licence, licenceUrl] of INSTALLED_OFL_FORMS) assert.equal(detectOpenLicence([{ licence, licenceUrl }]), null, licence);
+  assert.equal(detectOpenLicence([{ licence: OFL_STATEMENT, licenceUrl: 'https://openfontlicense.org' }]), null);
+  assert.equal(detectOpenLicence([{ licence: 'Licensed under the SIL Open Font License, Version 1.1', licenceUrl: null }]), null);
   // Line breaks and spacing are not wording.
-  assert.equal(detectOpenLicence([{ licence: OFL_STATEMENT.replace(/ /g, '\n  '), licenceUrl: null }]), 'ofl-1.1');
+  assert.equal(detectOpenLicence([{ licence: OFL_STATEMENT.replace(/ /g, '\n  '), licenceUrl: null }]), null);
 });
 
 test('round 4: uncertain or extra licence wording needs the per-font confirmation', () => {
@@ -473,7 +488,7 @@ test('round 4: whole licence evidence and URL are judged before display truncati
   const grant = 'This Font Software is licensed under the SIL Open Font License, Version 1.1. This license is copied below, and is also available with a FAQ at: https://openfontlicense.org';
   const full = readFontFaces(buildFont({ names: englishNames({ licence: `${grant}\n\n${OFL_1_1_TEXT}` }) })).faces[0];
   assert.equal(full.licenceTruncated, true, 'display text is capped');
-  assert.equal(detectOpenLicence([full]), 'ofl-1.1', 'the exact full OFL text is recognized from the untruncated evidence');
+  assert.equal(detectOpenLicence([full]), null, 'the exact full OFL text is recognized from the untruncated evidence');
   const tail = readFontFaces(buildFont({ names: englishNames({ licence: `${grant}\n\n${OFL_1_1_TEXT}\nRedistribution is prohibited.` }) })).faces[0];
   assert.equal(detectOpenLicence([tail]), null, 'a clause beyond the display cap is still seen');
   const longUrl = readFontFaces(buildFont({ names: englishNames({ licence: OFL_STATEMENT,
@@ -536,15 +551,15 @@ test('round 5: Fable counterexamples - a disagreeing secondary licence record as
   assert.equal(detectOpenLicence(split), null);
 });
 
-test('round 5: every platform, encoding and language record is judged; agreeing records still count as open licence', () => {
+test('round 5: every platform, encoding and language record is judged; agreeing records no longer auto-include without a catalog match', () => {
   const allAgree = oflFace([...englishNames({ licence: OFL_STATEMENT, licenceUrl: 'https://openfontlicense.org' }),
     nameRecord(13, OFL_STATEMENT, 1, 0, 0), nameRecord(14, 'https://openfontlicense.org', 1, 0, 0),
     nameRecord(13, OFL_STATEMENT, 3, 1, 0x0407), nameRecord(13, OFL_STATEMENT, 3, 10, 0x0411),
     nameRecord(13, OFL_STATEMENT, 0, 3, 0), nameRecord(13, OFL_STATEMENT, 1, 0, 2)]);
-  assert.equal(detectOpenLicence(allAgree), 'ofl-1.1');
-  assert.equal(roundFiveGate(allAgree).basis, 'open-licence');
+  assert.equal(detectOpenLicence(allAgree), null);
+  assert.equal(roundFiveGate(allAgree).outcome, 'needs-confirmation');
   // Macintosh-only OFL statement still counts.
-  assert.equal(detectOpenLicence(oflFace([...englishNames({}), nameRecord(13, OFL_STATEMENT, 1, 0, 0)])), 'ofl-1.1');
+  assert.equal(detectOpenLicence(oflFace([...englishNames({}), nameRecord(13, OFL_STATEMENT, 1, 0, 0)])), null);
   // A disagreeing record on any platform or language, for the licence or its URL, asks.
   const disagreeing = [
     nameRecord(13, restrictive, 0, 3, 0),
@@ -609,7 +624,7 @@ test('round 5: licence evidence work and memory stay bounded on duplicate and hu
   const sharedFont = buildFont({ nameTable: rawNameTable([...shared, ...identity.records], Buffer.concat([statement, identity.storage])) });
   let started = Date.now();
   const sharedFaces = readFontFaces(sharedFont).faces;
-  assert.equal(detectOpenLicence(sharedFaces), 'ofl-1.1');
+  assert.equal(detectOpenLicence(sharedFaces), null);
   assert.ok(Date.now() - started < 5000, 'shared spans are not decoded 4,000 times');
   // 4,000 distinct overlapping ~64 KB spans: the evidence budget runs out and the font asks.
   const identity2 = identityRecords(0);
@@ -647,7 +662,7 @@ test('round 5: the FAQ address inside a statement must be exactly a known OFL ad
     assert.equal(detectOpenLicence([{ licence: `${grant} This license is copied below, and is also available with a FAQ at: ${tail}`, licenceUrl: null }]), null, tail);
   }
   for (const tail of ['https://scripts.sil.org/OFL', 'https://scripts.sil.org/OFL.', 'https://openfontlicense.org/', 'http://openfontlicense.org.']) {
-    assert.equal(detectOpenLicence([{ licence: `${grant} This license is available with a FAQ at: ${tail}`, licenceUrl: null }]), 'ofl-1.1', tail);
+    assert.equal(detectOpenLicence([{ licence: `${grant} This license is available with a FAQ at: ${tail}`, licenceUrl: null }]), null, tail);
   }
 });
 
@@ -711,9 +726,9 @@ test('round 6: the restricted embedding bit excludes the font in every combinati
   }
 });
 
-test('round 6: an embedding field that is missing or uses reserved or conflicting bits is not open-licence evidence', () => {
+test('round 6: an embedding field that is missing or uses reserved or conflicting bits never grants inclusion', () => {
   for (const fsType of [0x0, 0x4, 0x8, 0x100, 0x200, 0x108]) {
-    assert.equal(detectOpenLicence(readFontFaces(buildFont({ fsType, names: oflNames() })).faces), 'ofl-1.1', fsType.toString(16));
+    assert.equal(detectOpenLicence(readFontFaces(buildFont({ fsType, names: oflNames() })).faces), null, fsType.toString(16));
   }
   const uncertain = [
     ['bit 0', buildFont({ fsType: 0x1, names: oflNames() })],
@@ -781,7 +796,7 @@ test('round 6: restrictive trademark or description records ask for the confirma
   for (const record of cases) assert.equal(detectOpenLicence(oflFace([...oflNames(), record])), null, JSON.stringify({ ...record, data: undefined }));
 });
 
-test('round 6: ordinary OFL copyright, trademark and description text is still recognized', () => {
+test('round 6 control: ordinary OFL notices now ask unless the exact file is catalogued', () => {
   const copyrights = [
     'Copyright 2011 The Roboto Project Authors (https://github.com/example/roboto)',
     'Copyright (c) 2010, Jane Doe (jane@example.com), with Reserved Font Name "Brand Sans".',
@@ -796,15 +811,15 @@ test('round 6: ordinary OFL copyright, trademark and description text is still r
       // Round 7: free prose descriptions are uncertain; designer credits still pass.
       nameRecord(10, 'Designed by Synthetic Foundry design team.'),
       nameRecord(0, copyright, 1, 0, 0)]);
-    assert.equal(detectOpenLicence(faces), 'ofl-1.1', copyright);
-    assert.equal(roundFiveGate(faces).basis, 'open-licence', copyright);
+    assert.equal(detectOpenLicence(faces), null, copyright);
+    assert.equal(roundFiveGate(faces).outcome, 'needs-confirmation', copyright);
   }
   // An empty copyright record states nothing and does not block recognition.
-  assert.equal(detectOpenLicence(oflFace([...oflNames(), nameRecord(0, '', 1, 0, 0), nameRecord(7, '   ', 3, 1, 0x0407)])), 'ofl-1.1');
+  assert.equal(detectOpenLicence(oflFace([...oflNames(), nameRecord(0, '', 1, 0, 0), nameRecord(7, '   ', 3, 1, 0x0407)])), null);
 });
 
 test('round 6: earlier cases keep their outcomes', () => {
-  assert.equal(detectOpenLicence(oflFace(oflNames())), 'ofl-1.1');
+  assert.equal(detectOpenLicence(oflFace(oflNames())), null);
   assert.equal(detectOpenLicence(oflFace([...oflNames(), nameRecord(13, restrictive, 1, 0, 0)])), null, 'R5-2 disagreeing licence record');
   assert.equal(detectOpenLicence(oflFace(englishNames({ licence: `${OFL_STATEMENT} Trial.` }))), null, 'R4-A1 extra wording');
   assert.equal(readFontFaces(buildFont({ fsType: 2, names: oflNames() })).faces[0].restricted, true, 'fsType 2');
@@ -905,7 +920,7 @@ test('round 7: mixed, translated or unreadable notice records stay uncertain', (
   for (const record of cases) assert.equal(detectOpenLicence(withNotice([record])), null, JSON.stringify({ ...record, data: undefined }));
 });
 
-test('round 7: real OFL notice forms still auto-include (forms from OFL fonts bundled in apps on this Mac)', () => {
+test('round 7 control: real OFL notice forms now ask unless the exact file is catalogued', () => {
   const notices = [
     ['Copyright 2016 The Inter Project Authors (https://github.com/rsms/inter)', 'Inter UI and Inter is a trademark of rsms.', null],
     ['Copyright 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono)', 'JetBrains Mono is a trademark of JetBrains s.r.o.', null],
@@ -924,7 +939,161 @@ test('round 7: real OFL notice forms still auto-include (forms from OFL fonts bu
     if (description) records.push(nameRecord(10, description));
     records.push(nameRecord(8, 'Synthetic Foundry'), nameRecord(9, 'Jane Doe'), nameRecord(11, 'https://foundry.example'), nameRecord(12, 'https://janedoe.example'));
     const faces = withNotice(records, { copyright });
-    assert.equal(detectOpenLicence(faces), 'ofl-1.1', copyright);
-    assert.equal(roundFiveGate(faces).basis, 'open-licence', copyright);
+    assert.equal(detectOpenLicence(faces), null, copyright);
+    assert.equal(roundFiveGate(faces).outcome, 'needs-confirmation', copyright);
   }
+});
+
+// Round 8 (Bryant approved verified-file hashes): automatic inclusion comes only
+// from the bundled catalog of specific open-licence releases, matched by the
+// exact bytes. Nothing in a font's own text grants it any more.
+const fs8 = require('node:fs');
+const path8 = require('node:path');
+const crypto8 = require('node:crypto');
+const sha8 = bytes => crypto8.createHash('sha256').update(bytes).digest('hex');
+const POPPINS = fs8.readFileSync(path8.join(__dirname, 'fixtures', 'fonts', 'poppins', 'Poppins-Regular.ttf'));
+const POPPINS_OFL = fs8.readFileSync(path8.join(__dirname, 'fixtures', 'fonts', 'poppins', 'OFL.txt'), 'utf8');
+const PINNED_COMMIT = '35e77c3854970a550d9894a85aba21420813a019';
+function verifiedGate(bytes, extra = {}) {
+  const parsed = readFontFaces(bytes);
+  const sha256 = sha8(bytes);
+  return evaluateFontGate({ file: { state: 'present' }, readError: null, faces: parsed.faces, location: { excludedReason: null },
+    intent: 'explicit', choice: null, sha256, confirmation: null, conflict: false,
+    catalogRelease: fontHandoff.findCatalogRelease(sha256, parsed), ...extra });
+}
+
+test('round 8: the bundled catalog loads, is pinned to one upstream commit, and its licences are the verified OFL files', () => {
+  const catalog = fontHandoff.FONT_RELEASE_CATALOG;
+  assert.equal(catalog.ok, true, catalog.error);
+  assert.equal(catalog.entries.size, 26);
+  for (const entry of catalog.entries.values()) {
+    assert.match(entry.sha256, /^[a-f0-9]{64}$/);
+    assert.equal(entry.source.repository, 'https://github.com/google/fonts');
+    assert.equal(entry.source.commit, PINNED_COMMIT);
+    assert.match(entry.source.path, /^ofl\/(inter|roboto|opensans|montserrat|poppins)\/[^/]+\.ttf$/);
+    assert.ok(entry.faces.length >= 1);
+    const licence = entry.licence;
+    assert.equal(licence.id, 'OFL-1.1');
+    assert.equal(sha8(Buffer.from(licence.text, 'utf8')), licence.sha256, 'licence text matches its recorded hash');
+    assert.ok(licence.text.includes('SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007'));
+  }
+  const poppins = catalog.entries.get(sha8(POPPINS));
+  assert.ok(poppins, 'the upstream fixture bytes are catalogued');
+  assert.equal(poppins.source.path, 'ofl/poppins/Poppins-Regular.ttf');
+  assert.deepEqual(poppins.faces, ['Poppins-Regular']);
+  assert.equal(poppins.licence.text, POPPINS_OFL, 'the licence is the OFL.txt beside the font upstream');
+});
+
+test('round 8: exact upstream bytes auto-include as a verified release', () => {
+  assert.deepEqual(verifiedGate(POPPINS), { outcome: 'included', reason: null, basis: 'verified-release' });
+});
+
+test('round 8: any byte change, metadata edit, truncation or other release misses and asks for the confirmation', () => {
+  const flipped = Buffer.from(POPPINS); flipped[flipped.length - 1] ^= 0x01;
+  const renamed = Buffer.from(POPPINS);
+  const at = renamed.indexOf(Buffer.from('Poppins', 'latin1'));
+  if (at >= 0) renamed[at] = 'Q'.charCodeAt(0);
+  const utf16At = renamed.indexOf(Buffer.from('\u0000P\u0000o\u0000p', 'latin1'));
+  if (utf16At >= 0) renamed[utf16At + 1] = 'Q'.charCodeAt(0);
+  for (const [label, bytes] of [['last byte', flipped], ['name text', renamed]]) {
+    assert.notEqual(sha8(bytes), sha8(POPPINS), label);
+    assert.deepEqual(verifiedGate(bytes), { outcome: 'needs-confirmation', reason: 'licence-unknown', basis: null }, label);
+  }
+  // A synthetic font that states the OFL in every record, the old auto-include case, now asks.
+  assert.equal(verifiedGate(buildFont({ names: englishNames({ licence: OFL_STATEMENT, licenceUrl: 'https://openfontlicense.org' }) })).outcome, 'needs-confirmation');
+  // Contradictory or hidden wording in an uncatalogued file asks too.
+  for (const copyright of ['Copyright 2026 Synthetic Foundry Hands Off', 'Copyright 2026 The Ask Before Passing On Project Authors']) {
+    assert.equal(verifiedGate(buildFont({ names: englishNames({ licence: OFL_STATEMENT, copyright }) })).outcome, 'needs-confirmation', copyright);
+  }
+});
+
+test('round 8: hard exclusions and the sender\'s choices win over a catalog match', () => {
+  const confirmation = { sha256: sha8(POPPINS), wordingVersion: FONT_CONFIRMATION_WORDING_VERSION };
+  for (const [extra, expected] of [
+    [{ location: { excludedReason: 'adobe-fonts' } }, 'adobe-fonts'],
+    [{ location: { excludedReason: 'system' } }, 'system'],
+    [{ location: { excludedReason: 'app' } }, 'app'],
+    [{ embedded: true }, 'embedded'],
+    [{ file: { state: 'symlink' } }, 'symlink'],
+    [{ readError: 'malformed' }, 'malformed'],
+    [{ identityConfirmed: false }, 'unconfirmed'],
+    [{ choice: 'remove', confirmation }, 'removed'],
+    [{ intent: 'found' }, 'found'],
+    [{ conflict: true }, 'conflict'],
+  ]) assert.equal(verifiedGate(POPPINS, extra).reason, expected, JSON.stringify(extra));
+  const restrictedFaces = readFontFaces(POPPINS).faces.map(face => ({ ...face, restricted: true }));
+  assert.equal(verifiedGate(POPPINS, { faces: restrictedFaces, confirmation }).reason, 'restricted');
+});
+
+test('round 8: a match needs the catalog\'s own entry for these exact bytes and faces; nothing else can stand in for it', () => {
+  const parsed = readFontFaces(POPPINS);
+  const entry = fontHandoff.findCatalogRelease(sha8(POPPINS), parsed);
+  assert.ok(entry);
+  // Faces that differ from the catalog's faces do not match, even with the catalogued hash.
+  assert.equal(fontHandoff.findCatalogRelease(sha8(POPPINS), { collection: false, faces: [{ postscriptName: 'Other-Regular' }] }), null);
+  assert.equal(fontHandoff.findCatalogRelease(sha8(POPPINS), { collection: true, faces: parsed.faces }), null);
+  assert.equal(fontHandoff.findCatalogRelease('f'.repeat(64), parsed), null);
+  assert.equal(fontHandoff.findCatalogRelease(null, parsed), null);
+  // The gate accepts only the catalog's own entry object for the same sha256.
+  const synthetic = buildFont({ names: englishNames({ postscriptName: 'Poppins-Regular' }) });
+  for (const forged of [{ ...entry }, JSON.parse(JSON.stringify(entry)), true, 'verified-release', { sha256: sha8(synthetic) }, entry]) {
+    assert.notEqual(verifiedGate(synthetic, { catalogRelease: forged }).basis, 'verified-release', JSON.stringify(forged).slice(0, 60));
+  }
+  assert.notEqual(verifiedGate(POPPINS, { catalogRelease: { ...entry } }).basis, 'verified-release', 'a copy of the entry is not the entry');
+});
+
+test('round 8: consent can include only an otherwise eligible font the catalog does not match', () => {
+  const synthetic = buildFont({ names: englishNames({ postscriptName: 'Brand-Regular' }) });
+  const confirmation = { sha256: sha8(synthetic), wordingVersion: FONT_CONFIRMATION_WORDING_VERSION };
+  assert.equal(verifiedGate(synthetic, { confirmation }).basis, 'confirmed');
+  assert.equal(verifiedGate(synthetic, { confirmation, location: { excludedReason: 'adobe-fonts' } }).reason, 'adobe-fonts');
+  assert.equal(verifiedGate(buildFont({ fsType: 2, names: englishNames({ postscriptName: 'Brand-Regular' }) }), { confirmation }).reason, 'restricted');
+  // A confirmation for other bytes does not carry over.
+  assert.equal(verifiedGate(synthetic, { confirmation: { ...confirmation, sha256: sha8(POPPINS) } }).outcome, 'needs-confirmation');
+});
+
+test('round 8: a missing, malformed or inconsistent catalog fails closed', () => {
+  const { loadFontReleaseCatalog } = fontHandoff;
+  const good = require('../parsers/font-release-catalog');
+  assert.equal(loadFontReleaseCatalog(good).ok, true);
+  const clone = () => JSON.parse(JSON.stringify(good));
+  const broken = [
+    undefined, null, 42, {}, { schema: 'other', licences: {}, entries: [] },
+    (() => { const c = clone(); c.entries[0].sha256 = 'XYZ'; return c; })(),
+    (() => { const c = clone(); c.entries.push({ ...c.entries[0] }); return c; })(),
+    (() => { const c = clone(); c.entries[0].licence = 'missing/OFL.txt'; return c; })(),
+    (() => { const c = clone(); const key = Object.keys(c.licences)[0]; c.licences[key].text += ' Redistribution prohibited.'; return c; })(),
+    (() => { const c = clone(); const key = Object.keys(c.licences)[0]; c.licences[key].id = 'Apache-2.0'; return c; })(),
+    (() => { const c = clone(); c.entries[0].faces = []; return c; })(),
+    (() => { const c = clone(); c.entries[0].source.commit = 'main'; return c; })(),
+  ];
+  for (const data of broken) {
+    const loaded = loadFontReleaseCatalog(data);
+    assert.equal(loaded.ok, false);
+    assert.equal(loaded.entries.size, 0, 'nothing auto-includes from a catalog that fails validation');
+  }
+});
+
+test('round 8: no network, update or telemetry path in the font modules; the catalog ships with the app', () => {
+  for (const file of ['../parsers/font-handoff.js', '../parsers/font-release-catalog.js']) {
+    const source = fs8.readFileSync(path8.join(__dirname, file), 'utf8');
+    assert.doesNotMatch(source, /require\(['"](?:https?|net|tls|dns|child_process|electron)['"]\)|\bfetch\(|XMLHttpRequest|WebSocket/, file);
+  }
+  const inventory = fs8.readFileSync(path8.join(__dirname, '..', 'scripts', 'verify-app-contents.js'), 'utf8');
+  assert.match(inventory, /'font-release-catalog\.js'/);
+});
+
+test('round 8: the fonts note names the verified source and licence file for a catalogued font, not the font\'s own notices', () => {
+  const faces = readFontFaces(POPPINS).faces;
+  const release = fontHandoff.findCatalogRelease(sha8(POPPINS), readFontFaces(POPPINS));
+  const note = fontHandoff.buildFontsNote({
+    included: [{ fileName: 'Poppins-Regular.ttf', sha256: sha8(POPPINS), origin: 'added-file', basis: 'verified-release', faces,
+      release, licenceFileName: 'Poppins - OFL.txt' }],
+    notIncluded: [],
+  });
+  assert.match(note, /ofl\/poppins\/Poppins-Regular\.ttf/);
+  assert.match(note, new RegExp(PINNED_COMMIT));
+  assert.match(note, /"Poppins - OFL\.txt"/);
+  assert.match(note, /did not verify|does not prove|not legal advice/i);
+  assert.doesNotMatch(note, /\(from the font\)/);
 });
