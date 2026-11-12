@@ -15726,13 +15726,16 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
       pendingIO = consume(message);
       return pendingIO;
     },
-    promote(chosenMissing = null, otherFileNames = null) {
+    promote(reservation = null) {
       check();
       // Another file's output name is never taken by this file, whether or not
       // its cached file exists. A missing output of this file whose row carries
       // an individual choice keeps its name: only a stage with that row's bytes
       // and original name takes it. Any other stage given a reserved name is
-      // renamed before it is linked; output digests are known only now.
+      // renamed before it is linked; output digests are known only now. The
+      // reserved names are read only when this run staged an output.
+      const { chosen: chosenMissing = null, otherParentNames: otherFileNames = null } =
+        stages.length && typeof reservation === 'function' ? reservation() || {} : {};
       if ((chosenMissing?.size || otherFileNames?.size) && stages.length) {
         const reserved = new Set([...(chosenMissing ? chosenMissing.keys() : []), ...(otherFileNames || [])]);
         const available = new Map([...(chosenMissing || [])].filter(([name]) => !otherFileNames?.has(name)));
@@ -16294,14 +16297,16 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       // The same rules as the extraction below: another file's output name is
       // never taken, and a same-parent chosen output is refilled only with its
       // own bytes. The other-file names come from rows, not from the folder.
-      const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + projectId);
-      // The folder exists only if this run staged an output; a folder that
-      // cannot be listed holds no cached file, so every name is absent.
-      let listing = null;
-      const listNames = () => { try { return new Set(fs.readdirSync(extractDir).map(entry => entry.toLowerCase())); } catch (_) { return new Set(); } };
-      const { chosen, otherParentNames } = getChosenMissingPsdOutputs(getProjects().find(project => project.id === projectId), psdFilePath, extractDir,
-        name => (listing ??= listNames()).has(name));
-      return discoveredPaths.concat(workerResult.transaction.promote(chosen, otherParentNames));
+      // promote() asks for them only when this run staged an output.
+      const reservation = () => {
+        const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + projectId);
+        // A folder that cannot be listed holds no cached file: every name is absent.
+        let listing = null;
+        const listNames = () => { try { return new Set(fs.readdirSync(extractDir).map(entry => entry.toLowerCase())); } catch (_) { return new Set(); } };
+        return getChosenMissingPsdOutputs(getProjects().find(project => project.id === projectId), psdFilePath, extractDir,
+          name => (listing ??= listNames()).has(name));
+      };
+      return discoveredPaths.concat(workerResult.transaction.promote(reservation));
     }
 
     // Extract embedded files from psd.linkedFiles
