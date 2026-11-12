@@ -9291,3 +9291,53 @@ test('[+] and [x] are always-visible 22px boxes in a 28px native button with no 
     }
   }
 });
+
+test('a file excluded from Needs Review shows as Excluded with one [+], counts only as Excluded, and Include goes through accept', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const working = { name: 'Working.ai', ext: '.ai', assetOrigin: 'added', projectRole: 'source', protectedSource: true,
+    visualIdentity: 'working-identity', visualRevision: 'working-revision' };
+  const remembered = { name: 'Texture.png', ext: '.png', assetOrigin: 'added', projectRole: 'asset', protectedSource: false,
+    sourceRecoveryAllowed: false, included: false, excluded: true, excludedPending: true, visualIdentity: 'remembered-identity', visualRevision: null };
+  const project = { id: 'remembered-exclusion', name: 'Remembered', type: 'branding', status: 'watching',
+    files: [{ name: 'Working.ai', path: '/synthetic/Working.ai', ext: '.ai', projectRole: 'source' }], pendingFiles: [],
+    excludedAssetKeys: ['/synthetic/Texture.png'], assetBaseline: { status: 'included', decision: 'include' } };
+  let accepted = false;
+  const calls = [];
+  const counts = () => ({ includedAssets: accepted ? 1 : 0, selectedWorkingSources: 1, excludedWorkingSources: 0, invalidWorkingSources: 0, excludedAssets: 0 });
+  const renderer = loadRendererHelpers(document, { crate: {
+    getProjects: async () => [cloneTestValue(project)],
+    getAssetWorkspace: async projectId => ({
+      projectId,
+      files: accepted ? [working, { ...remembered, included: true, excluded: false, excludedPending: undefined }] : [working],
+      pendingFiles: [],
+      excludedPendingFiles: accepted ? [] : [remembered],
+      semanticCounts: counts(),
+    }),
+    acceptPending: async (...args) => { calls.push(args); accepted = true; return { files: [], pendingFiles: [] }; },
+    removeFile: async () => { assert.fail('a remembered exclusion is included through accept, never remove-file'); },
+  } });
+  renderer.testProject = project;
+  vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id; state.assetReviewOpen = true;', renderer);
+  await renderer.renderFiles();
+
+  assert.equal(elements['filter-count-excluded'].textContent, '1');
+  assert.equal(elements['filter-count-added'].textContent, '0');
+  assert.equal(elements['filter-count-missing'].textContent, '0');
+  const list = elements['added-assets-list'];
+  assert.ok(list.__assetReviewVirtualState, 'remembered rows use the virtualized Added list');
+  const row = list.children.find(child => getElementTreeText(child).includes('Texture.png'));
+  assert.ok(row.className.includes('is-excluded'));
+  const buttons = row.children.filter(child => child.tagName === 'BUTTON');
+  assert.equal(buttons.length, 1);
+  assert.equal(buttons[0].dataset.rowAction, 'include');
+  assert.equal(buttons[0].getAttribute('aria-label'), 'Include Texture.png');
+  assert.equal(buttons[0].title, undefined);
+
+  buttons[0].click();
+  await settleRendererActions(renderer);
+  assert.deepEqual(calls, [[project.id, 'remembered-identity']]);
+  assert.equal(elements['toast-message'].textContent, 'Texture.png included');
+  assert.equal(elements['filter-count-excluded'].textContent, '0');
+  assert.equal(elements['filter-count-added'].textContent, '1');
+  assert.equal(document.activeElement.dataset.rowAction, 'exclude', 'focus moves to the same row\'s new [x]');
+});

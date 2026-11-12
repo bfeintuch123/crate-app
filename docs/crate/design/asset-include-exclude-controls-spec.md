@@ -76,7 +76,7 @@ Feedback and access
 - Behavior is tested through the existing renderer harnesses at the highest available seam: what the designer sees and what action each button sends.
 - Tests cover the per-row + and x on "Include or Exclude" rows, the absence of buttons on Needs Save and Opened rows, the batch counts and labels in singular and plural, hiding the batch buttons at zero, the confirmation messages, the screen-reader labels, the absence of hover text, the always-visible styling, the working-file labels and the focus move after a decision.
 - Existing tests that pinned the old words are updated only where the approved wording requires it. No safety assertion is weakened.
-- The reversible exclusion from Needs Review (criterion 11) is tested once its design is settled; see Further Notes.
+- The reversible exclusion from Needs Review (criterion 11) is tested through the real main-process handlers: a plain asset and a working-file type, Exclude All, repeats, malformed saved data, legacy exclusions, and a scale case with more than a thousand remembered rows.
 
 ## Out of Scope
 
@@ -90,6 +90,8 @@ Feedback and access
 
 Merge ordering: this work must not merge before the font handoff PR (#327) merges. After #327 merges, origin/v2.4.x is merged into this branch with a normal merge commit (no rebase), conflicts are resolved, and CI and both independent reviews run again on the new head. The draft Needs Save reminder PR (#318) changes the same pending pills and may conflict.
 
-Pending design: working-file-type Needs Review rows. A row marked "Include or Exclude" can be a working-file type, such as an AI, PSD, INDD or PDF file. Including one from Needs Review makes it a working file, and working files are excluded through the working-file choice rather than the asset exclusion list. How such a row is recorded when the designer Excludes it, so that criterion 11 holds for it too, is still being designed and is not decided here.
+Working-file-type Needs Review rows. A row marked "Include or Exclude" can be a working-file type, such as an AI, PSD, INDD or PDF file. Excluding any row keeps today's effects and also remembers the row itself, without making it a project file. The Excluded tab shows it as an Excluded asset of Added origin with one + button. Including it from there runs exactly the same steps as including it from Needs Review, so a working-file type becomes a working file, is checked the same way, and raises the same Replace or Keep both choice when another working file is already included.
 
-Known limit: files excluded from Needs Review before this change were never kept as project files, so they cannot appear in the Excluded tab.
+Storage. Each remembered row keeps only the row's own identity fields, never its capture details. There is no new limit on how many rows can be remembered; the list grows only when the designer excludes a row.
+
+Known limits: files excluded from Needs Review before this change were remembered only by their exclusion, so they cannot appear in the Excluded tab. A remembered row is no longer shown once the same file is added to the project again, for example with + Add Files; it then appears as that project file and keeps its exclusion until the designer includes it. Remembered rows show the file type instead of a thumbnail.

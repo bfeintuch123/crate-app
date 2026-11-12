@@ -454,6 +454,7 @@ function getRendererItemSignature(item) {
     protectedSource: item.protectedSource === true,
     sourceRecoveryAllowed: item.sourceRecoveryAllowed === true,
     excluded: item.excluded === true,
+    excludedPending: item.excludedPending === true,
     currentWorkingSources: item.currentWorkingSources,
     sourceSelection: item.sourceSelection,
     workingFileChoice: getWorkingFileChoiceForSource(state.projects.find(project => project.id === state.selectedProjectId), item),
@@ -2033,7 +2034,7 @@ function getPendingDecisionLabel(decision) {
 // Row [+] and [x] share the batch reservation, so a row and a batch can never
 // submit at once. Retained virtual rows are reconciled here with the batch.
 function syncPendingRowDecisionControls(blocked) {
-  for (const button of document.querySelectorAll('#pending-file-list .pending-row-action')) {
+  for (const button of document.querySelectorAll('.pending-row-action')) {
     button.disabled = !!blocked;
   }
 }
@@ -3036,6 +3037,67 @@ function appendAssetFileRestorationAction(row, project, file) {
   row.appendChild(includeButton);
 }
 
+// A file excluded from Needs Review is included through the same accept
+// transition as [+] under Needs Review, sharing its reservation and guards.
+async function submitExcludedPendingInclusion(projectId, identity, button) {
+  const project = state.projects.find(item => item.id === projectId);
+  if (!project || !identity) return false;
+  if (rendererActionsInFlight.has(`asset-review-batch:${project.id}`)) return undefined;
+  if (!getCurrentAssetReviewBatchWorkspace(project)) {
+    reconcileCurrentAssetReviewBatchControls();
+    return false;
+  }
+  const records = state.assetWorkspace?.excludedPendingFiles || [];
+  const matches = records.filter(file => file?.excludedPending === true && getFileVisualIdentity(file) === identity);
+  if (matches.length !== 1) return false;
+  const displayName = matches[0].name || 'Asset';
+  const accountEpoch = accountWorkspaceEpoch;
+  const selectionEpoch = projectSelectionEpoch;
+  const isCurrent = () => accountWorkspaceEpoch === accountEpoch &&
+    projectSelectionEpoch === selectionEpoch && state.selectedProjectId === project.id &&
+    accountStatus.canUseWorkspace !== false;
+  const focus = captureRowActionFocus(button, 'include');
+  return runRendererAction(`asset-review-batch:${project.id}`, null, null, async () => {
+    restoreAssetReviewBatchControls(project);
+    try {
+      const result = await window.crate.acceptPending(project.id, identity);
+      if (!isCurrent()) return false;
+      const projects = await getAccountCurrentProjects();
+      if (!isCurrent()) return false;
+      state.projects = projects;
+      await renderFiles();
+      if (!isCurrent()) return false;
+      const workspace = state.assetWorkspace?.projectId === project.id ? state.assetWorkspace : null;
+      const included = !!result && !!workspace &&
+        !(workspace.excludedPendingFiles || []).some(file => getFileVisualIdentity(file) === identity) &&
+        (workspace.files || []).some(file => getFileVisualIdentity(file) === identity);
+      showToast(included ? `${displayName} included` : `Crate could not include ${displayName}. Try again.`);
+      return included;
+    } catch (error) {
+      if (!isCurrent()) return false;
+      logRendererError('excluded asset inclusion failed', error);
+      showToast(`Crate could not include ${displayName}. Try again.`);
+      return false;
+    }
+  }, null, () => {
+    reconcileCurrentAssetReviewBatchControls();
+    if (isCurrent()) restoreRowActionFocus(focus);
+  });
+}
+
+function appendExcludedPendingInclusionAction(row, project, file) {
+  const displayName = file && file.name ? file.name : 'this asset';
+  const identity = getFileVisualIdentity(file);
+  const button = createRowIconButton('include', `Include ${displayName}`, 'app-file-remove pending-row-action');
+  button.disabled = !identity || accountStatus.canUseWorkspace === false ||
+    rendererActionsInFlight.has(`asset-review-batch:${project.id}`);
+  button.addEventListener('click', event => {
+    event.stopPropagation();
+    void submitExcludedPendingInclusion(project.id, identity, button);
+  });
+  row.appendChild(button);
+}
+
 function getWorkingSourceRecoveryActions(project, file) {
   const recovery = file?.selectionRecovery;
   const identity = getFileVisualIdentity(file);
@@ -3499,6 +3561,9 @@ function createAssetFileRow(
     required.setAttribute('aria-label', `Why ${file.name || 'this asset'} is required: ${explanation}`);
     required.addEventListener('click', event => { event.stopPropagation(); showToast(explanation); });
     row.appendChild(required);
+  } else if (file?.excludedPending === true) {
+    appendFileStatusBadge(row, 'Excluded', 'excluded', 'Excluded from this package');
+    appendExcludedPendingInclusionAction(row, project, file);
   } else if (excluded) {
     appendFileStatusBadge(row, 'Excluded', 'excluded', 'Excluded from this package');
     appendAssetFileRestorationAction(row, project, file);
@@ -3759,7 +3824,12 @@ function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets,
     workingSummary.textContent = counts ? `${counts.selectedWorkingSources} selected local working file(s) · ${counts.excludedWorkingSources} excluded local working file(s)` +
       `${figmaSourceCount ? ` · ${figmaSourceCount} tracked Figma working file(s)` : ''} · ${counts.includedAssets} included asset(s)` : '';
   }
-  const excludedCount = counts ? counts.excludedWorkingSources + counts.excludedAssets : excluded.length;
+  // Remembered Needs Review exclusions are not project files, so membership
+  // counts never include them; they count in the Excluded tab only.
+  const excludedPendingCount = addedAssets.filter(file => file?.excludedPending === true).length;
+  const excludedCount = counts
+    ? counts.excludedWorkingSources + counts.excludedAssets + excludedPendingCount
+    : excluded.length;
   setCountText('metric-excluded-count', excludedCount);
   setCountText('filter-count-all', existingAssets.length + addedAssets.length + pendingFiles.length);
   setCountText('filter-count-existing', includedExisting.length);
@@ -3932,10 +4002,16 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
   const existingAssets = files.filter(file => (
     file && file.protectedSource !== true && file.projectRole !== 'source' && file.assetOrigin === 'existing'
   ));
-  const addedAssets = files.filter(file => (
+  // Files excluded from Needs Review are remembered as Excluded rows of Added
+  // origin; they use the same virtualized list as every other added asset.
+  const excludedPendingAssets = state.assetWorkspace?.projectId === project.id &&
+    Array.isArray(state.assetWorkspace.excludedPendingFiles)
+    ? state.assetWorkspace.excludedPendingFiles.filter(file => file && file.excludedPending === true)
+    : [];
+  const addedAssets = [...files.filter(file => (
     file && file.protectedSource !== true && file.projectRole !== 'source' &&
     file.assetOrigin !== 'existing'
-  ));
+  )), ...excludedPendingAssets];
 
   renderAssetPanelList($('#working-assets-list'), project, sourceFiles, {
     protectedSource: true,

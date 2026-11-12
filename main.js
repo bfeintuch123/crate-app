@@ -2661,6 +2661,132 @@ function createAcceptedPendingFile(fileEntry) {
   return acceptedFile;
 }
 
+// --- Excluded Needs Review records ---
+// Excluding a Needs Review row keeps today's effects (row removed, exclusion
+// key, rejection provenance) and also remembers a stripped copy of the row in
+// project.excludedPendingFiles, so the Excluded tab can show it and Include can
+// replay the ordinary accept transition. A record is never a project file: it
+// carries no acceptedPending marker or accept provenance, and it never enters
+// a package. There is no capacity limit; the list grows only with rejects.
+const EXCLUDED_PENDING_RECORD_VERSION = 1;
+const EXCLUDED_PENDING_RECORD_FIELDS = ['excludedRecordVersion', 'excludedAt', 'excludedAppFamily'];
+// Capture metadata (including the full captureEvidence blob) and acceptance
+// markers are never stored; only the app family that accept reads is kept.
+const EXCLUDED_PENDING_FORBIDDEN_FIELDS = [
+  'captureState', 'captureReason', 'captureEvidence', 'acceptedPending', 'acceptedPendingAppFamily',
+];
+
+function isValidExcludedPendingRecord(record) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return false;
+  if (record.excludedRecordVersion !== EXCLUDED_PENDING_RECORD_VERSION) return false;
+  if (typeof record.path !== 'string' || !record.path.trim()) return false;
+  if (record.name !== undefined && typeof record.name !== 'string') return false;
+  if (!Number.isFinite(record.excludedAt)) return false;
+  if (record.excludedAppFamily !== undefined && !getExactAppFamilyMarker(record.excludedAppFamily)) return false;
+  return EXCLUDED_PENDING_FORBIDDEN_FIELDS.every(field => !Object.prototype.hasOwnProperty.call(record, field));
+}
+
+// A malformed list is shown as empty and left untouched on disk; callers that
+// would write a new record fail closed instead of overwriting it.
+function readExcludedPendingRecords(project) {
+  const raw = project?.excludedPendingFiles;
+  if (raw === undefined) return { valid: true, records: [] };
+  if (!Array.isArray(raw) || !raw.every(isValidExcludedPendingRecord)) return { valid: false, records: [] };
+  return { valid: true, records: raw };
+}
+
+function createExcludedPendingRecord(fileEntry, excludedAt = Date.now()) {
+  const record = { ...stripLiveCaptureMetadata(fileEntry) };
+  for (const field of [...EXCLUDED_PENDING_RECORD_FIELDS, ...EXCLUDED_PENDING_FORBIDDEN_FIELDS]) delete record[field];
+  record.excludedRecordVersion = EXCLUDED_PENDING_RECORD_VERSION;
+  record.excludedAt = excludedAt;
+  const appFamily = getAcceptedPendingAppFamily(fileEntry);
+  if (appFamily) record.excludedAppFamily = appFamily;
+  return record;
+}
+
+// Rebuild the pending row that accept expects. The app family travels the
+// same way the live row carried it, so createAcceptedPendingFile produces the
+// same accepted record (fields and order) as accepting the original row.
+function materializeExcludedPendingRecord(record) {
+  const entry = { ...record };
+  for (const field of EXCLUDED_PENDING_RECORD_FIELDS) delete entry[field];
+  if (record.excludedAppFamily) entry.captureEvidence = { appFamily: record.excludedAppFamily };
+  return entry;
+}
+
+// Decide what rejecting a pending row stores. Rows without a path or key keep
+// today's behavior. A key already excluded without a record (a legacy skip)
+// is never given a record, so legacy keys are never shown, counted or deleted.
+function planExcludedPendingRecord(project, fileEntry) {
+  if (!fileEntry || typeof fileEntry.path !== 'string' || !fileEntry.path.trim()) return { record: null };
+  if (!normalizeTrackedFilePath(fileEntry.path)) return { record: null };
+  const exclusionKey = getAssetReviewExclusionKey(fileEntry);
+  if (!exclusionKey) return { record: null };
+  const state = readExcludedPendingRecords(project);
+  if (!state.valid) return { error: 'excluded_pending_records_invalid' };
+  const dedupKey = getTrackedFileDedupKey(fileEntry);
+  const replaceIndex = state.records.findIndex(record => getTrackedFileDedupKey(record) === dedupKey);
+  if (replaceIndex === -1 && (project.excludedAssetKeys || []).includes(exclusionKey)) return { record: null };
+  return { record: createExcludedPendingRecord(fileEntry), replaceIndex };
+}
+
+function storeExcludedPendingRecord(project, plan) {
+  if (!plan?.record) return;
+  const records = [...readExcludedPendingRecords(project).records];
+  // Dedupe keeps the original position so the Excluded order stays stable.
+  if (plan.replaceIndex >= 0) records[plan.replaceIndex] = plan.record;
+  else records.push(plan.record);
+  project.excludedPendingFiles = records;
+}
+
+// Including a file retires every record for it. Its exclusion key is deleted
+// only when no remaining record still needs it; legacy keys never have a
+// record, so they are never touched here.
+function releaseExcludedPendingRecords(project, fileEntry) {
+  const state = readExcludedPendingRecords(project);
+  if (!state.valid || !state.records.length) return false;
+  const dedupKey = getTrackedFileDedupKey(fileEntry);
+  const released = state.records.filter(record => getTrackedFileDedupKey(record) === dedupKey);
+  if (!released.length) return false;
+  const remaining = state.records.filter(record => !released.includes(record));
+  project.excludedPendingFiles = remaining;
+  const stillNeeded = new Set(remaining.map(record => getAssetReviewExclusionKey(record)).filter(Boolean));
+  const releasedKeys = new Set(released.map(record => getAssetReviewExclusionKey(record)).filter(key => key && !stillNeeded.has(key)));
+  if (releasedKeys.size) {
+    project.excludedAssetKeys = (project.excludedAssetKeys || []).filter(key => !releasedKeys.has(key));
+  }
+  return true;
+}
+
+// A record stops being shown once the same file is a project file again (for
+// example after + Add Files or a direct add). Its exclusion key is unchanged.
+function pruneShadowedExcludedPendingRecords(project) {
+  const state = readExcludedPendingRecords(project);
+  if (!state.valid || !state.records.length) return false;
+  const fileKeys = getTrackedFileKeySet(project.files);
+  const kept = state.records.filter(record => !fileKeys.has(getTrackedFileDedupKey(record)));
+  if (kept.length === state.records.length) return false;
+  project.excludedPendingFiles = kept;
+  return true;
+}
+
+// The Excluded tab shows valid, unshadowed records under the same Illustrator
+// activation scope as Needs Review rows.
+function getProjectedExcludedPendingEntries(project, scopedProject) {
+  const state = readExcludedPendingRecords(project);
+  if (!state.valid || !state.records.length) return [];
+  const scopedState = readExcludedPendingRecords(scopedProject);
+  const scopedPaths = new Set((scopedState.valid ? scopedState.records : [])
+    .map(record => normalizeTrackedFilePath(record.path)).filter(Boolean));
+  const fileKeys = getTrackedFileKeySet(project.files);
+  return state.records
+    .filter(record => scopedPaths.has(normalizeTrackedFilePath(record.path)) &&
+      !fileKeys.has(getTrackedFileDedupKey(record)))
+    .map(materializeExcludedPendingRecord)
+    .filter(entry => isIllustratorScopedFileAllowed(project, entry));
+}
+
 function classifyLiveObservedFile(project, fileEntry, observation = {}, stageIndex = null) {
   const normalizedPath = normalizeTrackedFilePath(fileEntry && fileEntry.path);
   if (!project || !fileEntry || !normalizedPath) {
@@ -6702,6 +6828,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   if (!project || !scopedProject) return null;
   const projectFiles = project.files;
   const projectPendingFiles = project.pendingFiles;
+  const projectExcludedPendingFiles = project.excludedPendingFiles;
   const selectionSignature = getPackageSelectionInputSignature(project);
   const illustratorScope = getIllustratorActivationScope(projectId);
   const cacheEpoch = getFileVisualProjectCacheEpoch(projectId);
@@ -6721,6 +6848,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
     fileVisualProjectCacheGeneration === cacheGeneration &&
     project.files === projectFiles &&
     project.pendingFiles === projectPendingFiles &&
+    project.excludedPendingFiles === projectExcludedPendingFiles &&
     selectionSignature === getPackageSelectionInputSignature(currentProjectAfterSelection) &&
     getIllustratorActivationScope(projectId) === illustratorScope &&
     currentProjectAfterSelection
@@ -6742,6 +6870,23 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   })));
   const pendingFiles = await Promise.all((scopedProject.pendingFiles || []).map(async (file, sourceIndex) => ({
     ...(await createRendererFilePresentation(project, file, membership, attribution)),
+    sourceIndex,
+  })));
+  // Excluded Needs Review records: Excluded rows of Added origin with one [+].
+  // They are never working files or package members until Include accepts them.
+  const excludedPendingEntries = getProjectedExcludedPendingEntries(project, scopedProject);
+  const excludedPendingFiles = await Promise.all(excludedPendingEntries.map(async (entry, sourceIndex) => ({
+    ...(await createRendererFilePresentation(project, entry, membership, null)),
+    assetOrigin: 'added',
+    projectRole: 'asset',
+    protectedSource: false,
+    sourceRecoveryAllowed: false,
+    included: false,
+    excluded: true,
+    excludedPending: true,
+    // File visuals stay limited to project and Needs Review files; the row
+    // shows its type badge instead of a thumbnail.
+    visualRevision: null,
     sourceIndex,
   })));
   const visualRecords = new Map();
@@ -6772,6 +6917,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
     fileVisualProjectCacheGeneration === cacheGeneration &&
     project.files === projectFiles &&
     project.pendingFiles === projectPendingFiles &&
+    project.excludedPendingFiles === projectExcludedPendingFiles &&
     selectionSignature === getPackageSelectionInputSignature(currentProject) &&
     getIllustratorActivationScope(projectId) === illustratorScope &&
     currentProject && diskInput === captureWorkingSourcePresentationDiskInput(presentedFiles,
@@ -6815,6 +6961,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
     projectId,
     files,
     pendingFiles,
+    excludedPendingFiles,
     trackedFigmaFiles,
     semanticCounts: membership.counts,
     workingSourceSelectionBlocked: membership.blocked || membership.choiceReviewNames.length > 0,
@@ -10306,6 +10453,7 @@ function mutateProject(projectId, fn, { persistIfChanged = false, trustResultCha
   if (!persistIfChanged || !trustResultChanged || resultChanged) {
     normalizeAutoCaptureProjectState(project, packageStageContext ? createLiveObservedFileStageContext(project) : null);
     normalizeProjectAssetReviewState(project);
+    pruneShadowedExcludedPendingRecords(project);
     safelyEnsureProjectProvenance(project);
     retireRemovedPsdReceiptHolds(project, heldPsdMembers);
   }
@@ -20605,10 +20753,21 @@ registerTrustedIpcHandler('projects:accept-pending', async (event, projectId, fi
       const idx = (project.pendingFiles || []).findIndex(f => (
         f.path === filePath || createProjectFileVisualIdentity(project.id, f) === filePath
       ));
-    if (idx === -1) return null;
-    if (!isIllustratorScopedFileAllowed(project, project.pendingFiles[idx])) return null;
+    // Include from the Excluded tab replays this same accept transition for a
+    // remembered Needs Review row. Pending rows keep their existing lookup.
+    let excludedEntry = null;
+    if (idx === -1) {
+      excludedEntry = readExcludedPendingRecords(project).records.map(materializeExcludedPendingRecord).find(entry => (
+        entry.path === filePath || createProjectFileVisualIdentity(project.id, entry) === filePath
+      )) || null;
+      if (!excludedEntry) return null;
+    }
+    if (!isIllustratorScopedFileAllowed(project, excludedEntry || project.pendingFiles[idx])) return null;
 
-    const [file] = project.pendingFiles.splice(idx, 1);
+    const [file] = excludedEntry ? [excludedEntry] : project.pendingFiles.splice(idx, 1);
+    // Retire the record and its own exclusion key in this same mutation,
+    // before any scan, so the file is never both Included and excluded.
+    releaseExcludedPendingRecords(project, file);
     const acceptedKey = getTrackedFileDedupKey(file);
     const acceptedPaths = getTrackedFileKeySet(project.files);
 
@@ -20655,18 +20814,35 @@ registerTrustedIpcHandler('projects:accept-pending', async (event, projectId, fi
   } finally { operation.close(); }
 });
 
+// The reject transition for one Needs Review row inside a project mutation.
+function rejectPendingFileInProject(project, filePath) {
+  const file = (project.pendingFiles || []).find(f => (
+    f.path === filePath || createProjectFileVisualIdentity(project.id, f) === filePath
+  ));
+  // Fail closed before any change: a malformed record list is never
+  // overwritten, so the row stays in Needs Review with no key or provenance.
+  const recordPlan = file ? planExcludedPendingRecord(project, file) : null;
+  if (recordPlan?.error) return { refusal: recordPlan.error };
+  project.pendingFiles = (project.pendingFiles || []).filter(f => f !== file);
+  if (file) {
+    recordPendingFileDecision(project, file, 'rejected');
+    storeExcludedPendingRecord(project, recordPlan);
+  }
+  return { pendingFiles: project.pendingFiles };
+}
+
 registerTrustedIpcHandler('projects:reject-pending', (event, projectId, filePath) => {
+  let refusal = null;
   const result = mutateProject(projectId, (project) => {
-    const file = (project.pendingFiles || []).find(f => (
-      f.path === filePath || createProjectFileVisualIdentity(project.id, f) === filePath
-    ));
-    project.pendingFiles = (project.pendingFiles || []).filter(f => f !== file);
-    if (file) {
-      recordPendingFileDecision(project, file, 'rejected');
+    const outcome = rejectPendingFileInProject(project, filePath);
+    if (outcome.refusal) {
+      refusal = outcome.refusal;
+      return null;
     }
-    return { pendingFiles: project.pendingFiles };
+    return outcome;
   });
 
+  if (refusal) return { success: false, error: refusal };
   if (!result) return null;
 
   sendProjectFileStateToRenderer(projectId);
