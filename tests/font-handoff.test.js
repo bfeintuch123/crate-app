@@ -695,3 +695,118 @@ test('round 5 property: no single trailing character outside letters and digits 
     }
   }
 });
+
+// Round 6 (Bryant kept automatic inclusion for recognized open-licence fonts):
+// conservative checks on the embedding field and on copyright, trademark and
+// description records. Uncertainty asks for the per-file confirmation; the
+// restricted bit stays a hard exclusion in every combination.
+const confirmationFor = sha256 => ({ sha256, wordingVersion: FONT_CONFIRMATION_WORDING_VERSION });
+const oflNames = (extra = {}) => englishNames({ licence: OFL_STATEMENT, licenceUrl: 'https://openfontlicense.org', ...extra });
+
+test('round 6: the restricted embedding bit excludes the font in every combination, even with OFL text and a confirmation', () => {
+  for (const fsType of [0x2, 0x3, 0x6, 0xa, 0xe, 0x102, 0x302, 0xf]) {
+    const faces = readFontFaces(buildFont({ fsType, names: oflNames() })).faces;
+    assert.equal(faces[0].restricted, true, fsType.toString(16));
+    assert.equal(roundFiveGate(faces, { confirmation: confirmationFor('a'.repeat(64)), choice: 'include' }).reason, 'restricted', fsType.toString(16));
+  }
+});
+
+test('round 6: an embedding field that is missing or uses reserved or conflicting bits is not open-licence evidence', () => {
+  for (const fsType of [0x0, 0x4, 0x8, 0x100, 0x200, 0x108]) {
+    assert.equal(detectOpenLicence(readFontFaces(buildFont({ fsType, names: oflNames() })).faces), 'ofl-1.1', fsType.toString(16));
+  }
+  const uncertain = [
+    ['bit 0', buildFont({ fsType: 0x1, names: oflNames() })],
+    ['bits 0+2', buildFont({ fsType: 0x5, names: oflNames() })],
+    ['bits 0+3', buildFont({ fsType: 0x9, names: oflNames() })],
+    ['bits 2+3', buildFont({ fsType: 0xc, names: oflNames() })],
+    ['no OS/2 table', buildFont({ os2: false, names: oflNames() })],
+  ];
+  for (const [label, font] of uncertain) {
+    const faces = readFontFaces(font).faces;
+    assert.equal(faces[0].restricted, false, label);
+    assert.equal(detectOpenLicence(faces), null, label);
+    assert.deepEqual(roundFiveGate(faces), { outcome: 'needs-confirmation', reason: 'licence-unknown', basis: null }, label);
+    assert.equal(roundFiveGate(faces, { confirmation: confirmationFor('a'.repeat(64)) }).basis, 'confirmed', label);
+  }
+});
+
+const ASTRA_ID0 = 'Copyright 2026 Synthetic Foundry. Commercial font. Do not redistribute. The OFL statement in name ID 13 does not grant a licence for this font.';
+const RESTRICTIVE_COPYRIGHTS = [
+  ASTRA_ID0,
+  'Copyright 2026 Synthetic Foundry. Commercial font.',
+  'Copyright 2026 Synthetic Foundry, do not redistribute',
+  'Copyright 2026 Synthetic Foundry. Not for sharing.',
+  'Copyright 2026 Synthetic Foundry, not for redistribution',
+  'Copyright 2026 Synthetic Foundry (licence required for sharing)',
+  'Copyright 2026 Synthetic Foundry. Redistribution prohibited.',
+  'Copyright 2026 Synthetic Foundry; sharing requires a licence',
+  'Copyright 2026 Synthetic Foundry. Personal use only.',
+  'Copyright 2026 Synthetic Foundry. Trial version.',
+  'Copyright 2026 Synthetic Foundry. EULA applies.',
+  'Copyright 2026 Synthetic Foundry. You may not give this file to others.',
+  'Copyright 2026 Synthetic Foundry. This font isn\'t open source.',
+  'Copyright 2026 Synthetic Foundry. Licensed to Brand Co. only.',
+  'Copyright 2026 Synthetic Foundry. Nicht weitergeben.',
+  'Synthetic Foundry 2026. Commercial licence.',
+  'Urheberrecht 2026 Synthetic Foundry.',
+];
+
+test('round 6: a copyright notice that restricts, negates or is not a copyright notice asks for the confirmation (Astra finding 2 and variants)', () => {
+  for (const copyright of RESTRICTIVE_COPYRIGHTS) {
+    const faces = oflFace(oflNames({ copyright }));
+    assert.equal(detectOpenLicence(faces), null, copyright);
+    assert.equal(roundFiveGate(faces).outcome, 'needs-confirmation', copyright);
+  }
+  // On any platform or language record, not only the displayed one.
+  for (const record of [nameRecord(0, ASTRA_ID0, 1, 0, 0), nameRecord(0, 'Copyright 2026 X. Nicht weitergeben.', 3, 1, 0x0407),
+    nameRecord(0, 'Copyright 2026 X. Do not redistribute.', 0, 3, 0)]) {
+    const faces = oflFace([...oflNames(), record]);
+    assert.equal(faces[0].copyright, 'Copyright 2026 Example Type Foundry', 'display keeps the English Windows record');
+    assert.equal(detectOpenLicence(faces), null, JSON.stringify(record));
+  }
+  // A copyright record Crate cannot decode is uncertain.
+  assert.equal(detectOpenLicence(oflFace([...oflNames(), { id: 0, platform: 3, encoding: 2, language: 0x0411, text: '', data: Buffer.from([0x82, 0xa0]) }])), null);
+});
+
+test('round 6: restrictive trademark or description records ask for the confirmation', () => {
+  const cases = [
+    nameRecord(7, 'Brand Sans is a trademark of Synthetic Foundry and may not be shared.'),
+    nameRecord(7, 'Not licensed for redistribution.', 1, 0, 0),
+    nameRecord(10, 'A commercial font. Redistribution is prohibited.'),
+    nameRecord(10, 'Demo version for evaluation.'),
+    nameRecord(10, 'Do not share this font without a licence.', 3, 1, 0x0809),
+    { id: 10, platform: 3, encoding: 4, language: 0x0404, text: '', data: Buffer.from([0xa4, 0x40]) },
+  ];
+  for (const record of cases) assert.equal(detectOpenLicence(oflFace([...oflNames(), record])), null, JSON.stringify({ ...record, data: undefined }));
+});
+
+test('round 6: ordinary OFL copyright, trademark and description text is still recognized', () => {
+  const copyrights = [
+    'Copyright 2011 The Roboto Project Authors (https://github.com/example/roboto)',
+    'Copyright (c) 2010, Jane Doe (jane@example.com), with Reserved Font Name "Brand Sans".',
+    'Copyright 2012 Google Inc. All Rights Reserved.',
+    '© 2020 Synthetic Foundry',
+    'Copyright 2015-2020 The Brand Sans Authors; Portions copyright 2010 Other Type.',
+    'Copyright 2019 The Brand Sans Project Authors. Reserved Font Name: Brand Sans.',
+    'Digitized data copyright 2010, Example Type.',
+  ];
+  for (const copyright of copyrights) {
+    const faces = oflFace([...oflNames({ copyright }), nameRecord(7, 'Brand Sans is a trademark of Synthetic Foundry.'),
+      nameRecord(10, 'Brand Sans is a humanist face. It is not a display face, and it is free for commercial use under the OFL.'),
+      nameRecord(0, copyright, 1, 0, 0)]);
+    assert.equal(detectOpenLicence(faces), 'ofl-1.1', copyright);
+    assert.equal(roundFiveGate(faces).basis, 'open-licence', copyright);
+  }
+  // An empty copyright record states nothing and does not block recognition.
+  assert.equal(detectOpenLicence(oflFace([...oflNames(), nameRecord(0, '', 1, 0, 0), nameRecord(7, '   ', 3, 1, 0x0407)])), 'ofl-1.1');
+});
+
+test('round 6: earlier cases keep their outcomes', () => {
+  assert.equal(detectOpenLicence(oflFace(oflNames())), 'ofl-1.1');
+  assert.equal(detectOpenLicence(oflFace([...oflNames(), nameRecord(13, restrictive, 1, 0, 0)])), null, 'R5-2 disagreeing licence record');
+  assert.equal(detectOpenLicence(oflFace(englishNames({ licence: `${OFL_STATEMENT} Trial.` }))), null, 'R4-A1 extra wording');
+  assert.equal(readFontFaces(buildFont({ fsType: 2, names: oflNames() })).faces[0].restricted, true, 'fsType 2');
+  const collection = readFontFaces(buildCollection([{ names: oflNames() }, { names: oflNames({ postscriptName: 'B-Two', copyright: ASTRA_ID0 }) }])).faces;
+  assert.equal(detectOpenLicence(collection), null, 'one face of a collection with a restrictive copyright');
+});

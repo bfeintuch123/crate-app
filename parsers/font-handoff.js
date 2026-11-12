@@ -128,12 +128,40 @@ function licenceRecordDecoder(platform, encoding) {
   return null;
 }
 
+// Wording that restricts sharing, used on the copyright (0), trademark (7)
+// and description (10) records. English only; the description uses the
+// narrow list because prose often says "not" or "no".
+const RESTRICTION_WORDING = /redistribut|prohibit|forbid|\bdo not (?:share|distribute|copy|redistribute|sell|give)|\bdon['\u2019]t (?:share|distribute|copy|redistribute|sell|give)|\bmay not\b|\bmust not\b|\bcannot\b|\bnot (?:be )?(?:licen[cs]ed|permitted|allowed|granted|for (?:sale|sharing|distribution|redistribution|resale))|\bcommercial (?:font|licen[cs]e|use only)|\bproprietary\b|\beula\b|\btrial\b|\bdemo\b|\bpersonal use\b|\bevaluation\b|\bpurchase|licen[cs]e (?:is )?(?:required|needed)|without (?:a |the )?(?:licen[cs]e|permission)/i;
+const NEGATION_WORDING = /\bnot\b|n['\u2019]t\b|\bno\b|\bnever\b|\bonly\b|\bexcept\b|\brequire|\bpermission\b|\brestrict|\bcommercial\b/i;
+const COPYRIGHT_SENTENCE = /^(?:copyright\b|\u00a9|\(c\)|all rights reserved|portions? copyright\b|digitized data copyright\b|font data copyright\b|(?:with )?reserved font names?\b)/i;
+
+// A copyright record counts only when every sentence is a copyright notice
+// and nothing restricts or negates: other sentences are not checked as terms,
+// so they make the face uncertain.
+function isPlainCopyrightNotice(text) {
+  const squashed = squashLicenceText(text);
+  if (RESTRICTION_WORDING.test(squashed) || NEGATION_WORDING.test(squashed)) return false;
+  return squashed.split(/(?<=[.;!?])\s+(?=[\p{Lu}\u00a9(])/u).every(sentence => COPYRIGHT_SENTENCE.test(sentence));
+}
+
 // Safety evidence is separate from display: display uses one English record
-// per name ID, while permission needs every licence (13) and licence URL (14)
-// record, on every platform, encoding and language, to state the OFL. A
-// record that is unsupported, undecodable, empty, different or past the
-// evidence budget makes the face uncertain. Only the decision is kept, never
-// the untruncated text.
+// per name ID, while automatic inclusion needs every licence (13) and licence
+// URL (14) record, on every platform, encoding and language, to state the
+// OFL, and every copyright (0), trademark (7) and description (10) record to
+// be free of restriction wording. A record that is unsupported, undecodable,
+// different or past the evidence budget makes the face uncertain. Only the
+// decision is kept, never the untruncated text.
+const EVIDENCE_NAME_IDS = new Set([0, 7, 10, 13, 14]);
+function judgeEvidenceText(nameId, text) {
+  if (nameId === 13) return isRecognizedOflLicence(text);
+  if (nameId === 14) return text !== null && isRecognizedOflUrl(text);
+  if (text === null) return true;
+  if (nameId === 0) return isPlainCopyrightNotice(text);
+  const squashed = squashLicenceText(text);
+  if (nameId === 7) return !RESTRICTION_WORDING.test(squashed) && !NEGATION_WORDING.test(squashed);
+  return !RESTRICTION_WORDING.test(squashed);
+}
+
 function judgeLicenceRecord(buffer, evidence, nameId, platform, encoding, offset, length) {
   const decoder = licenceRecordDecoder(platform, encoding);
   if (!decoder || (decoder === 'utf16' && length % 2 !== 0)) return false;
@@ -142,8 +170,7 @@ function judgeLicenceRecord(buffer, evidence, nameId, platform, encoding, offset
   evidence.bytes += length;
   if (evidence.bytes > MAX_LICENCE_EVIDENCE_BYTES) return false;
   const raw = buffer.subarray(offset, offset + length);
-  const text = cleanFontText(decoder === 'mac-roman' ? decodeMacRoman(raw) : decodeUtf16be(raw), Infinity);
-  const verdict = nameId === 13 ? isRecognizedOflLicence(text) : text !== null && isRecognizedOflUrl(text);
+  const verdict = judgeEvidenceText(nameId, cleanFontText(decoder === 'mac-roman' ? decodeMacRoman(raw) : decodeUtf16be(raw), Infinity));
   evidence.verdicts.set(key, verdict);
   return verdict;
 }
@@ -167,7 +194,7 @@ function readNameTable(buffer, table, evidence) {
     const offset = storage + buffer.readUInt16BE(base + 10);
     const score = nameRecordScore(platform, encoding, language);
     needIn(buffer, table, offset, length);
-    if (nameId === 13 || nameId === 14) {
+    if (EVIDENCE_NAME_IDS.has(nameId)) {
       if (nameId === 13) licence.seen = true;
       if (licence.recognized && !judgeLicenceRecord(buffer, evidence, nameId, platform, encoding, offset, length)) licence.recognized = false;
     }
@@ -233,6 +260,12 @@ function readFaceAt(buffer, offset, index, evidence) {
   if (os2 && os2.length < 10) throw new FontReadError('malformed');
   let fsType = null;
   if (os2 && os2.length >= 10) fsType = buffer.readUInt16BE(os2.offset + 8);
+  // The restricted bit (0x0002) excludes the font in any combination (0x3,
+  // 0x6, 0xA ...), stricter than the spec's "least restrictive bit wins". A
+  // missing field, the reserved bit 0, or bits 2 and 3 together cannot vouch
+  // for an open licence, so such a face asks for the confirmation instead.
+  const restricted = fsType !== null && (fsType & 0x0002) !== 0;
+  const permissionClear = fsType !== null && (fsType & 0x0001) === 0 && (fsType & 0x000c) !== 0x000c;
   const namedInstances = readFvar(buffer, tables.get('fvar'), names);
   return {
     index,
@@ -247,10 +280,10 @@ function readFaceAt(buffer, offset, index, evidence) {
     licenceUrl: cleanIdentityText(names.get(14)),
     // Permission is judged from this decision over every licence record,
     // never from the display text above.
-    oflEvidence,
+    oflEvidence: oflEvidence && permissionClear,
     fsType,
-    // OpenType OS/2 fsType bits 0-3: value 2 is "Restricted License embedding".
-    restricted: fsType !== null && (fsType & 0x000f) === 0x0002,
+    // OpenType OS/2 fsType bit 1: "Restricted License embedding".
+    restricted,
     variable: namedInstances !== null,
     namedInstances: namedInstances || [],
   };

@@ -813,6 +813,45 @@ function cases() {
     assert.deepEqual(fs.readFileSync(path.join(out.result.folderPath, 'Fonts', 'BrandSans-Bold.otf')), boldBytes);
   });
 
+  fontTest('round 6: a restricted-bit combination is excluded and a contradicting copyright notice asks for the confirmation (Astra 4735dff findings 1 and 2)', async () => {
+    const f = await fixture('Round six');
+    const restrictedBit = path.join(f.dir, 'RestrictedBit.otf');
+    writeFont(restrictedBit, { fsType: 0x0003, names: englishNames({ family: 'RestrictedBit', style: 'Regular', postscriptName: 'RestrictedBit-Regular',
+      licence: OFL_STATEMENT, licenceUrl: 'https://openfontlicense.org' }) });
+    const conflict = path.join(f.dir, 'Conflict.otf');
+    const conflictBytes = writeFont(conflict, { names: englishNames({ family: 'Conflict', style: 'Regular', postscriptName: 'Conflict-Regular',
+      licence: OFL_STATEMENT, licenceUrl: 'https://openfontlicense.org',
+      copyright: 'Copyright 2026 Synthetic Foundry. Commercial font. Do not redistribute. The OFL statement in name ID 13 does not grant a licence for this font.' }) });
+    const open = path.join(f.dir, 'Open.otf');
+    const openBytes = writeFont(open, { names: englishNames({ family: 'Open', style: 'Regular', postscriptName: 'Open-Regular',
+      licence: OFL_STATEMENT, licenceUrl: 'https://openfontlicense.org', copyright: 'Copyright 2026 The Open Project Authors. All Rights Reserved.' }) });
+    manualDialogFor([restrictedBit]);
+    await callIpcRaw('projects:add-files', f.project.id);
+    manualDialogFor([conflict, open]);
+    await callIpcRaw('fonts:add-files', f.project.id);
+    const before = await review(f);
+    assert.equal(row(before, 'RestrictedBit.otf').reason, 'restricted');
+    assert.equal(row(before, 'Conflict.otf').outcome, 'needs-confirmation');
+    assert.equal(row(before, 'Conflict.otf').reason, 'licence-unknown');
+    assert.equal(row(before, 'Open.otf').basis, 'open-licence');
+    const restrictedRow = row(before, 'RestrictedBit.otf');
+    await callIpcRaw('fonts:set-row-choice', f.project.id, restrictedRow.key, 'include');
+    const refused = await callIpcRaw('fonts:confirm-licence', f.project.id, restrictedRow.key, { confirmed: true, sha256: restrictedRow.sha256 });
+    assert.notEqual(refused.success, true, 'a restricted font cannot be confirmed');
+    let out = await packageNow(f, await review(f));
+    assert.deepEqual(listTree(out.result.folderPath).filter(item => item.endsWith('.otf')), ['Fonts/Open.otf']);
+    assert.deepEqual(fs.readFileSync(path.join(out.result.folderPath, 'Fonts', 'Open.otf')), openBytes);
+    fs.rmSync(out.result.folderPath, { recursive: true, force: true });
+    const target = row(before, 'Conflict.otf');
+    assert.equal((await callIpcRaw('fonts:confirm-licence', f.project.id, target.key, { confirmed: true, sha256: target.sha256 })).success, true);
+    const after = await review(f);
+    assert.equal(row(after, 'Conflict.otf').basis, 'confirmed');
+    assert.equal(row(after, 'RestrictedBit.otf').reason, 'restricted');
+    out = await packageNow(f, after);
+    assert.deepEqual(listTree(out.result.folderPath).filter(item => item.endsWith('.otf')), ['Fonts/Conflict.otf', 'Fonts/Open.otf']);
+    assert.deepEqual(fs.readFileSync(path.join(out.result.folderPath, 'Fonts', 'Conflict.otf')), conflictBytes);
+  });
+
   fontTest('registry failure reports unavailable and leaves packaging untouched', async () => {
     const f = await fixture();
     registryFailure = true;
