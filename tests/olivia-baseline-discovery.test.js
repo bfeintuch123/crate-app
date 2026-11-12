@@ -9177,6 +9177,143 @@ function excludedSourceMembershipCases() {
     results.written = embeddedOnly(await packaged(t.f));
     pinned(results, { first: { rows: ['Embedded-Layer.png DocA A A', 'Embedded-Layer_1.png DocB B B'], setAside: [], holds: [], review: 'OK' }, second: { rows: ['Embedded-Layer.png DocA A A', 'Embedded-Layer_1.png DocB B B'], setAside: [], holds: [], review: 'OK' }, written: ['Embedded-Layer.png=A', 'Embedded-Layer_1.png=B'] });
   }, { realMainPsd: true }));
+  // Confirm in app order: the owner is shown a review (pass, then review); confirming runs the pass again
+  // and packages with the token of the review already shown.
+  const confirmInAppOrder = async f => {
+    const review = await openReview(f);
+    if (review.materializable !== true) return 'review blocked: ' + (review.message || review.error || '');
+    await prePackage(f);
+    const result = await callIpcRaw('projects:package', f.id, desk('out-' + f.id.slice(-6)), review.token);
+    if (!result || result.success !== true) return 'refused: ' + String(result && (result.error || result.message));
+    const names = walk(result.folderPath).filter(file => /^Embedded-Layer/.test(path.basename(file)))
+      .map(file => path.basename(file) + '=' + recovery.label(recovery.onDisk(file))).sort();
+    fs.rmSync(result.folderPath, { recursive: true, force: true });
+    return names;
+  };
+  for (const bState of ['no selection', 'B included', 'B excluded', 'B unreadable', 'B missing']) for (const choice of ['none', 'include', 'accept']) {
+    baselineTest(`Photoshop outputs: the released takeover state packages in confirm order (${bState}, A ${choice})`, { timeout: 300000 }, () => withEnv(async () => {
+      const t = await releasedTakeover('r22' + bState.replace(/[^a-z]/gi, '').slice(0, 5) + choice[0], { choice });
+      if (bState !== 'no selection') await t.f.select(bState === 'B excluded' ? t.B : t.K, 'exclude');
+      if (bState === 'B unreadable') fs.chmodSync(t.B, 0o000);
+      if (bState === 'B missing') fs.rmSync(t.B);
+      const results = { first: await confirmInAppOrder(t.f) };
+      if (bState === 'B unreadable') fs.chmodSync(t.B, 0o644);                          // readable again before the next confirm
+      if (bState === 'B missing') await t.f.select(t.B, 'exclude');                     // the owner's exit
+      results.second = await confirmInAppOrder(t.f);
+      results.third = await confirmInAppOrder(t.f);
+      results.bRows = t.outputs(t.B).length;
+      const both = ['Embedded-Layer.png=A', 'Embedded-Layer_1.png=B'], onlyA = ['Embedded-Layer.png=A'];
+      const blocked = 'review blocked: Working-source verification is unresolved. Resolve it before packaging.';
+      // Same for every choice on A's row; never a stale-token refusal.
+      pinned(results, ({
+        'no selection': { first: both, second: both, third: both, bRows: 1 },
+        'B included': { first: both, second: both, third: both, bRows: 1 },
+        'B excluded': { first: onlyA, second: onlyA, third: onlyA, bRows: 0 },
+        'B unreadable': { first: blocked, second: both, third: both, bRows: 1 },
+        'B missing': { first: blocked, second: onlyA, third: onlyA, bRows: 0 },
+      })[bState]);
+    }, { realMainPsd: true }));
+  }
+  // The same confirm order for the other flows, and B excluded after the repair, then restored.
+  for (const flow of ['healthy in place', 'healthy replacing', 'two rows clear', 'no selection then selection', 'current recorded', 'B excluded then restored']) {
+    baselineTest(`Photoshop outputs: confirm order packages the reviewed files (${flow})`, { timeout: 300000 }, () => withEnv(async () => {
+      const results = {};
+      const tag = 'r23' + flow.replace(/[^a-z]/g, '').slice(0, 8);
+      let f, outputsOf = null, B = null;
+      if (flow.startsWith('healthy') || flow === 'two rows clear') {
+        const A = desk(`DocA-${tag}.psd`), K = desk(`Keep-${tag}.ai`), Z = desk(`Other-${tag}.ai`);
+        f = await newProject('Confirm ' + tag, { before() { writeWorking('.psd', A, [], 611); writeWorking('.ai', K, []); writeWorking('.ai', Z, []); } });
+        await f.add(A); await f.add(K); await f.add(Z); await f.select(Z, 'exclude');
+        if (flow === 'healthy replacing') { const next = desk(`next-${tag}.psd`); writeWorking('.psd', next, [], 644); fs.renameSync(next, A); }
+        else writeWorking('.psd', A, [], 644);
+        await verifyScan(f, A);
+        if (flow === 'two rows clear') {
+          const p = f.current(), [kept] = p.files.filter(row => row.source === 'psd-embedded'), r = kept.psdResource || kept.psdExtractionReceipt;
+          const dup = { ...JSON.parse(JSON.stringify(kept)), fileId: kept.fileId + '-dup', path: path.join(path.dirname(kept.path), 'Embedded-Layer_7.png'), name: 'Embedded-Layer_7.png',
+            psdExtractionReceipt: { version: 1, parentPath: A, sourceDigest: r.sourceDigest, layerPath: null, linkedIndex: r.linkedIndex, originalName: r.originalName, outputDigest: r.outputDigest } };
+          delete dup.psdResource; fs.copyFileSync(kept.path, dup.path); p.files.push(dup);
+          p.workingSourceRelationshipHolds = [kept.path, dup.path].map(sourcePath => ({ reason: 'psd-extraction-receipt-unverified', sourcePath }));
+          roundTripFakeStore();
+        }
+      } else if (flow === 'current recorded') {
+        const t = await recovery.addedDocs(tag); f = t.f;
+        const Z = desk(`Other-${tag}.ai`); writeWorking('.ai', Z, []); await f.add(Z); await f.select(Z, 'exclude');
+      } else {
+        const t = await releasedTakeover(tag); f = t.f; outputsOf = t.outputs; B = t.B;
+        if (flow === 'no selection then selection') { await openReview(f); await f.select(t.K, 'exclude'); }
+        if (flow === 'B excluded then restored') { await f.select(t.K, 'exclude'); await openReview(f); await f.select(B, 'exclude'); }
+      }
+      // Packaging sets the project status to packaged, after which a scan publishes nothing (existing), so
+      // B is restored before the first package here.
+      if (flow === 'B excluded then restored') { const r = await openReview(f); results.excluded = r.materializable === true; await f.select(B, 'restore'); }
+      results.first = await confirmInAppOrder(f);
+      results.again = await confirmInAppOrder(f);
+      if (outputsOf) results.bRows = outputsOf(B).length;
+      const both = ['Embedded-Layer.png=A', 'Embedded-Layer_1.png=B'], fresh = ['Embedded-Layer_1.png=5c9de92d'];
+      pinned(results, ({
+        'healthy in place': { first: fresh, again: fresh },
+        'healthy replacing': { first: fresh, again: fresh },
+        'two rows clear': { first: [...fresh, 'Embedded-Layer_7.png=5c9de92d'], again: [...fresh, 'Embedded-Layer_7.png=5c9de92d'] },
+        // B's object twice: the pass's row and the verification scan's row (the two-row clear applies).
+        'no selection then selection': { first: [...both, 'Embedded-Layer_2.png=B'], again: [...both, 'Embedded-Layer_2.png=B'], bRows: 2 },
+        'current recorded': { first: both, again: both },
+        'B excluded then restored': { excluded: true, first: both, again: both, bRows: 1 },
+      })[flow]);
+    }, { realMainPsd: true }));
+  }
+  // A save that replaces the file, end to end in app order: the document keeps its kernel document identity
+  // (answered here for the synthetic file), so opening review runs the pass and then the review-time rescan.
+  baselineTest('Photoshop outputs: a replacing save is verified at review and gets one row (document identity kept)', { timeout: 300000 }, () => withEnv(async () => {
+    const { state } = recovery;
+    const A = desk('DocA-r24.psd'), K = desk('Keep-r24.ai'), Z = desk('Other-r24.ai');
+    const f = await newProject('Replacing r24', { before() { writeWorking('.psd', A, [], 611); writeWorking('.ai', K, []); writeWorking('.ai', Z, []); } });
+    let identityReads = 0;
+    setChildProcessHandler(invocation => {
+      const args = Array.isArray(invocation.args) ? invocation.args : [];
+      if (invocation.kind === 'execFile' && invocation.command === '/usr/bin/osascript' && args.length && path.basename(args[args.length - 1]) === 'crate-source-document-identity.js') {
+        identityReads++;
+        return { stdout: JSON.stringify({ documentId: '424242', volumeUuid: '12345678-1234-4234-8234-123456789abc' }), stderr: '' };
+      }
+      return passthroughInner(invocation);
+    });
+    await f.add(A); await f.add(K); await f.add(Z); await f.select(Z, 'exclude');
+    const dir = path.dirname(f.current().files.find(row => row.source === 'psd-embedded').path);
+    const look = async () => { const review = await openReview(f); return { ...state(f, dir), review: review.materializable === true ? 'OK' : 'blocked: ' + (review.message || review.error || '') }; };
+    const results = { before: await look() };
+    const next = desk('next-r24.psd'); writeWorking('.psd', next, [], 644); fs.renameSync(next, A);      // replace the file
+    results.afterSave = await look();
+    results.again = await look();
+    results.confirmed = await confirmInAppOrder(f);
+    results.identityRead = identityReads > 0;
+    const fresh = { rows: ['Embedded-Layer_1.png DocA 5c9de92d 5c9de92d'], setAside: [], holds: [], review: 'OK' };
+    pinned(results, { before: { rows: ['Embedded-Layer.png DocA A A'], setAside: [], holds: [], review: 'OK' }, afterSave: fresh, again: fresh,
+      confirmed: ['Embedded-Layer_1.png=5c9de92d'], identityRead: true });
+  }, { realMainPsd: true }));
+  // The follow-up verification held longer than the existing 30-second package-review wait: that review
+  // returns the existing typed error, the scan still completes, and the next open review succeeds.
+  baselineTest('Photoshop outputs: a follow-up verification that outlasts the review wait', { timeout: 300000 }, () => withEnv(async () => {
+    const { state } = recovery;
+    const t = await releasedTakeover('r25');
+    await t.f.select(t.K, 'exclude');
+    const gate = gateReads(t.B, 'hold', true);
+    const results = {};
+    try {
+      const pass = callIpcRaw('projects:pre-package-scan', t.f.id);
+      await gate.arrived;
+      const review = await callIpcRaw('projects:prepare-package-review', t.f.id, desk('out-' + t.f.id.slice(-6)));
+      // The scan has the existing 30-second Add Files scan timeout, the same as the review's existing wait:
+      // whichever ends first, the review is not materializable and names an existing state.
+      results.reviewDuringScanMaterializable = review.materializable === true;
+      results.reviewDuringScanState = ['package_scan_in_flight', 'Working-source verification is unresolved. Resolve it before packaging.']
+        .includes(review.error || review.message) ? 'existing typed stop' : String(review.error || review.message);
+      gate.release();
+      await pass;
+    } finally { gate.restore(); }
+    const next = await openReview(t.f);
+    results.next = { ...state(t.f, t.dir), review: next.materializable === true ? 'OK' : 'blocked', bRows: t.outputs(t.B).length };
+    pinned(results, { reviewDuringScanMaterializable: false, reviewDuringScanState: 'existing typed stop',
+      next: { rows: ['Embedded-Layer.png DocA A A', 'Embedded-Layer_1.png DocB B B'], setAside: ['B'], holds: [], review: 'OK', bRows: 1 } });
+  }, { realMainPsd: true }));
   // Verification has no size cap: an output larger than the 300 MB parse limit whose bytes match its
   // record stays available (a sparse file, so the test writes almost nothing to disk; the package
   // itself is not written).

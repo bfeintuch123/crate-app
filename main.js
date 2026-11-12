@@ -5918,10 +5918,12 @@ async function refreshWorkingSourceLocators(projectId, observedPaths = null, par
 // Working files whose stored verification record proved another document's
 // damaged output (rule R): each one that is selected and included, in a project
 // whose working files are verified before packaging, is verified again through
-// the same lease and scan the review-time refresh uses. Nothing is written here.
+// the same lease and scan the review-time refresh uses. Nothing is written here,
+// and a pass that starts no scan leaves an issued package review untouched.
 async function reverifyOutputEvidenceSources(projectId, keys, parentCurrent = null) {
   const captured = captureProjectOperation(projectId);
   const operation = captured && { ...captured, current: (read = null) => captured.current(read) && (!parentCurrent || parentCurrent()) };
+  let started = false;
   try {
     for (const key of keys) {
       const project = getProjects().find(item => item.id === projectId);
@@ -5931,12 +5933,16 @@ async function reverifyOutputEvidenceSources(projectId, keys, parentCurrent = nu
       if (!hasWorkingSourceSelectionState(project) && !getWorkingSourceRecoveryGuardKeys(project)?.has(key)) continue;
       if (!getWorkingSourceMembership(project).facts.get(getTrackedFileDedupKey(file))?.included) continue;
       const scan = beginWorkingSourceScan(projectId, file.path, operation.current);
-      if (scan) await verifyRestoredWorkingSource(projectId, file, scan.attempt, operation);
+      if (scan) { started = true; await verifyRestoredWorkingSource(projectId, file, scan.attempt, operation); }
       if (!operation.current()) return;
     }
-    invalidatePackageReviewForProject(projectId);
-    sendToRenderer('project:updated', { projectId });
-  } finally { operation?.close(); }
+  } finally {
+    operation?.close();
+    if (started) {
+      invalidatePackageReviewForProject(projectId);
+      sendToRenderer('project:updated', { projectId });
+    }
+  }
 }
 
 function getCurrentWorkingSourceContinuationPair(project, pairIdentity, { allowIdentityMismatch = false } = {}) {
