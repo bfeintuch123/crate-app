@@ -22369,7 +22369,7 @@ function getFontNoteModel(fontReview, inputs, oflTextFileName) {
         sha256: input.sha256,
         origin: input.origin,
         basis: input.basis,
-        confirmedOn: input.confirmation?.confirmedOn || null,
+        confirmedOn: input.gate.confirmation?.confirmedOn || null,
         faces: row.gateInput.faces,
       };
     }),

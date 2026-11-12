@@ -266,7 +266,10 @@ test('fonts note lists included and excluded fonts without paths or completeness
       faces: [{ family: 'Open', style: 'Regular', postscriptName: 'Open-Regular', version: 'Version 2.0',
         copyright: 'Copyright 2020 The Open Project Authors', licence: OFL_STATEMENT, licenceUrl: null, namedInstances: [] }],
     }],
-    notIncluded: [{ label: 'Cloud Serif Regular (CloudSerif-Regular)', reason: 'adobe-fonts' }],
+    notIncluded: [{ label: 'Cloud Serif Regular (CloudSerif-Regular)', reason: 'adobe-fonts' },
+      { label: 'Brand Sans Regular (BrandSans-Regular)', reason: 'licence-unknown' },
+      { label: 'Found Regular (Found-Regular)', reason: 'found' },
+      { label: 'Gone Regular (Gone-Regular)', reason: 'removed' }],
     oflTextFileName: 'SIL Open Font License 1.1.txt',
   });
   assert.match(note, /BrandSans-Bold\.otf/);
@@ -279,6 +282,9 @@ test('fonts note lists included and excluded fonts without paths or completeness
   assert.match(note, /Adobe Fonts/);
   assert.match(note, /may need their own licen[cs]e/i);
   assert.doesNotMatch(note, /\/Users\/|\/Library\/|\/Volumes\//);
+  // Recipient-facing: never instructions addressed to the sender.
+  assert.doesNotMatch(note.slice(note.indexOf('Fonts not included')), /below|\b[Yy]ou\b/);
+  assert.match(note, /BrandSans-Regular\): The sender did not confirm/);
   for (const banned of [/all fonts/i, /complete/i, /ready to edit/i, /safe to share/i]) assert.doesNotMatch(note, banned);
 });
 

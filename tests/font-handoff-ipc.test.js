@@ -147,6 +147,8 @@ function cases() {
     const firstNote = fs.readFileSync(path.join(first.result.folderPath, 'Fonts', 'Fonts in this package.txt'), 'utf8');
     assert.match(firstNote, /Included font files \(0\)/);
     assert.match(firstNote, /BrandSans-Bold/);
+    assert.match(firstNote, /did not confirm that their licen[cs]e allows sharing it/);
+    assert.doesNotMatch(firstNote.slice(firstNote.indexOf('Fonts not included')), /below|\b[Yy]ou\b/);
     assert.doesNotMatch(firstNote, new RegExp(TEST_HOME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     fs.rmSync(first.result.folderPath, { recursive: true, force: true });
 
@@ -165,6 +167,7 @@ function cases() {
     assert.deepEqual(fs.readFileSync(path.join(second.result.folderPath, 'Fonts', 'BrandSans-Bold.otf')), bytes);
     const note = fs.readFileSync(path.join(second.result.folderPath, 'Fonts', 'Fonts in this package.txt'), 'utf8');
     assert.match(note, /Crate did not verify this/);
+    assert.match(note, /stated on \d{4}-\d{2}-\d{2} that/);
     assert.match(note, new RegExp(sha(bytes)));
     assert.deepEqual(fs.readFileSync(bold), bytes, 'installed font unchanged');
   });

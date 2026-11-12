@@ -309,6 +309,20 @@ const FONT_REASON_TEXT = Object.freeze({
   duplicate: 'Same file as another font in this package. It is copied once.',
 });
 
+// The fonts note is read by the people receiving the package, so reasons that
+// address the sender in Package Review are restated for them.
+const FONT_NOTE_REASON_TEXT = Object.freeze({
+  'licence-unknown': 'The sender did not confirm that their licence allows sharing it.',
+  found: 'Found on the sender\'s Mac while the project was watched; not chosen for this package.',
+  removed: 'The sender removed it from this package.',
+  conflict: 'Another font file had the same font name with different contents; neither was chosen.',
+  app: 'Belongs to another app or font service on the sender\'s Mac.',
+  symlink: 'The sender\'s file was a link to another file; links are not copied.',
+  missing: 'The font file was no longer available on the sender\'s Mac.',
+  unreadable: 'Crate couldn\'t open this font file on the sender\'s Mac.',
+  'adobe-fonts': 'Activated through Adobe Fonts. It can\'t be packaged. Activate it with your own Adobe account.',
+});
+
 const FONT_ORIGIN_TEXT = Object.freeze({
   installed: 'Installed on the sender\'s Mac; chosen by the sender in Crate',
   'added-file': 'Added by the sender',
@@ -400,7 +414,8 @@ function buildFontsNote({ included = [], notIncluded = [], oflTextFileName = nul
   lines.push(`Fonts not included (${notIncluded.length})`);
   if (!notIncluded.length) lines.push('  None.');
   for (const item of notIncluded) {
-    lines.push(`- ${noteLine(item.label)}: ${FONT_REASON_TEXT[item.reason] || FONT_REASON_TEXT.unreadable}`);
+    const reasonText = FONT_NOTE_REASON_TEXT[item.reason] || FONT_REASON_TEXT[item.reason] || FONT_NOTE_REASON_TEXT.unreadable;
+    lines.push(`- ${noteLine(item.label)}: ${reasonText}`);
   }
   lines.push('');
   return lines.join('\n');
