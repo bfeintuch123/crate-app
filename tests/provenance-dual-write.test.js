@@ -1060,6 +1060,8 @@ Module._extensions['.js'] = function loadMainWithMetadataTestHooks(module, filen
     workspaceEvidenceGateAnchor);
   return module._compile(`${source}
 module.exports.__crateMetadataTestHooks = {
+  // An app restart, for extracted Photoshop outputs: forget what this session wrote and hashed.
+  forgetPsdOutputSessionMemory() { psdOutputsWrittenThisSession.clear(); psdOutputContentDigests.clear(); verifiedPsdOutputDigests.clear(); },
   controlLiveAppStartupPoll() {
     const priorSchedule = scheduleWatcherStartupTimer, priorPoll = pollPsForProject;
     const scheduled = [];
