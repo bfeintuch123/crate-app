@@ -149,7 +149,8 @@ test('location classes: Adobe, macOS, app stores and bundles are excluded; user 
 test('open-licence evidence needs the font to state SIL OFL 1.1 in every face, not just embedding flags', () => {
   const ofl = { licence: OFL_STATEMENT, licenceUrl: 'https://openfontlicense.org', fsType: 0 };
   assert.equal(detectOpenLicence([ofl]), 'ofl-1.1');
-  assert.equal(detectOpenLicence([{ licence: 'Licensed under the SIL Open Font License', licenceUrl: 'http://scripts.sil.org/OFL' }]), 'ofl-1.1');
+  // Round 4: an unversioned grant is not a recognized OFL statement, even with the OFL URL.
+  assert.equal(detectOpenLicence([{ licence: 'Licensed under the SIL Open Font License', licenceUrl: 'http://scripts.sil.org/OFL' }]), null);
   assert.equal(detectOpenLicence([{ licence: null, licenceUrl: null, fsType: 0 }]), null);
   assert.equal(detectOpenLicence([{ licence: 'Licensed under the Apache License, Version 2.0', licenceUrl: null }]), null);
   assert.equal(detectOpenLicence([{ licence: 'This font is not licensed under the SIL Open Font License 1.1.', licenceUrl: null }]), null);
@@ -363,8 +364,6 @@ test('only a positive SIL OFL 1.1 grant counts as open-licence evidence', () => 
   const positive = [
     OFL_STATEMENT,
     'Licensed under the SIL Open Font License, Version 1.1.',
-    'This Font Software is licensed under the SIL Open Font License, Version 1.1. This license is copied below.',
-    'Copyright 2020 The Example Project Authors. This Font Software is licensed under the SIL Open Font License, Version 1.1.',
   ];
   for (const licence of positive) assert.equal(detectOpenLicence([{ licence, licenceUrl: null }]), 'ofl-1.1', licence);
   const negative = [
@@ -372,6 +371,9 @@ test('only a positive SIL OFL 1.1 grant counts as open-licence evidence', () => 
     'Commercial licence. You may not redistribute. Unlike fonts under the SIL Open Font License 1.1, this font requires a paid licence.',
     'Based on Foo Sans (SIL Open Font License, Version 1.1); this version is licensed under the Example Desktop EULA.',
     'See https://openfontlicense.org for the SIL Open Font License 1.1 used by other fonts in this family.',
+    // Round 4: anything beyond a recognized statement asks for the confirmation.
+    'This Font Software is licensed under the SIL Open Font License, Version 1.1. This license is copied below.',
+    'Copyright 2020 The Example Project Authors. This Font Software is licensed under the SIL Open Font License, Version 1.1.',
   ];
   for (const licence of negative) assert.equal(detectOpenLicence([{ licence, licenceUrl: 'https://openfontlicense.org' }]), null, licence);
 });
@@ -391,7 +393,7 @@ test('a grant followed by a restriction is not open-licence evidence', () => {
   ];
   for (const licence of negative) assert.equal(detectOpenLicence([{ licence, licenceUrl: null }]), null, licence);
   assert.equal(detectOpenLicence([{ licence: 'Licensed under the SIL Open Font License', licenceUrl: 'https://openfontlicense.org.evil.example/' }]), null);
-  assert.equal(detectOpenLicence([{ licence: 'Licensed under the SIL Open Font License', licenceUrl: 'https://openfontlicense.org/' }]), 'ofl-1.1');
+  assert.equal(detectOpenLicence([{ licence: 'Licensed under the SIL Open Font License', licenceUrl: 'https://openfontlicense.org/' }]), null);
 });
 
 test('an OS/2 table too short to hold the embedding field is malformed', () => {
@@ -428,4 +430,63 @@ test('more self-contradicting licence phrasings need the confirmation', () => {
   for (const tail of ['Cannot be shared.', 'Redistribution forbidden.', 'Use only when obtained from the vendor.']) {
     assert.equal(detectOpenLicence([{ licence: `${OFL_STATEMENT} ${tail}`, licenceUrl: null }]), null, tail);
   }
+});
+
+// Round 4 (authorized by Bryant): recognized OFL statements only; disguised font names.
+const INSTALLED_OFL_FORMS = [
+  ['This Font Software is licensed under the SIL Open Font License, Version 1.1. This license is available with a FAQ at: https://scripts.sil.org/OFL', 'https://scripts.sil.org/OFL'],
+  ['This Font Software is licensed under the SIL Open Font License, Version 1.1. This license is available with a FAQ at: http://scripts.sil.org/OFL', 'http://scripts.sil.org/OFL'],
+  ['This Font Software is licensed under the SIL Open Font License, Version 1.1. This Font Software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the SIL Open Font License for the specific language, permissions and limitations governing your use of this Font Software.', 'http://scripts.sil.org/OFL'],
+];
+
+test('round 4: the OFL statements real installed fonts carry are recognized', () => {
+  for (const [licence, licenceUrl] of INSTALLED_OFL_FORMS) assert.equal(detectOpenLicence([{ licence, licenceUrl }]), 'ofl-1.1', licence);
+  assert.equal(detectOpenLicence([{ licence: OFL_STATEMENT, licenceUrl: 'https://openfontlicense.org' }]), 'ofl-1.1');
+  assert.equal(detectOpenLicence([{ licence: 'Licensed under the SIL Open Font License, Version 1.1', licenceUrl: null }]), 'ofl-1.1');
+  // Line breaks and spacing are not wording.
+  assert.equal(detectOpenLicence([{ licence: OFL_STATEMENT.replace(/ /g, '\n  '), licenceUrl: null }]), 'ofl-1.1');
+});
+
+test('round 4: uncertain or extra licence wording needs the per-font confirmation', () => {
+  const grant = 'This Font Software is licensed under the SIL Open Font License, Version 1.1.';
+  const cases = [
+    `${grant} Sharing requires a licence from the foundry.`,
+    `${grant} Trial version for evaluation.`,
+    `${grant} Demo. Payment is required for use.`,
+    `${OFL_STATEMENT} Redistribution is prohibited.`,
+    `${OFL_STATEMENT}, except for commercial use`,
+    `${grant} ${OFL_1_1_TEXT} Additional terms apply.`,
+    `${grant} ${OFL_1_1_TEXT.replace('may be sold', 'may not be sold')}`,
+    'Licensed under the SIL Open Font License',
+    'This Font Software is licensed under the SIL Open Font License, Version 1.0.',
+    'Licensed under the Apache License, Version 2.0.',
+  ];
+  for (const licence of cases) assert.equal(detectOpenLicence([{ licence, licenceUrl: null }]), null, licence);
+  // The licence URL must be exactly a known OFL address.
+  for (const licenceUrl of ['https://openfontlicense.org.evil.example', 'https://openfontlicense.org,evil', 'https://foundry.example/eula',
+    `${'a '.repeat(114)}https://openfontlicense.org`]) {
+    assert.equal(detectOpenLicence([{ licence: OFL_STATEMENT, licenceUrl }]), null, licenceUrl);
+  }
+});
+
+test('round 4: whole licence evidence and URL are judged before display truncation', () => {
+  const grant = 'This Font Software is licensed under the SIL Open Font License, Version 1.1. This license is copied below, and is also available with a FAQ at: https://openfontlicense.org';
+  const full = readFontFaces(buildFont({ names: englishNames({ licence: `${grant}\n\n${OFL_1_1_TEXT}` }) })).faces[0];
+  assert.equal(full.licenceTruncated, true, 'display text is capped');
+  assert.equal(detectOpenLicence([full]), 'ofl-1.1', 'the exact full OFL text is recognized from the untruncated evidence');
+  const tail = readFontFaces(buildFont({ names: englishNames({ licence: `${grant}\n\n${OFL_1_1_TEXT}\nRedistribution is prohibited.` }) })).faces[0];
+  assert.equal(detectOpenLicence([tail]), null, 'a clause beyond the display cap is still seen');
+  const longUrl = readFontFaces(buildFont({ names: englishNames({ licence: OFL_STATEMENT,
+    licenceUrl: `${'a '.repeat(114)}https://openfontlicense.org.evil.example/terms` }) })).faces[0];
+  assert.equal(detectOpenLicence([longUrl]), null, 'the URL is judged untruncated');
+});
+
+test('round 4: invisible, format and compatibility characters do not hide a font extension', () => {
+  const { isGatedFontName } = fontHandoff;
+  const disguised = ['Hidden.otf​', 'Hidden.otf‌', 'Hidden.otf‍', 'Hidden.otf﻿', 'Hidden.otf­',
+    'Hidden.otf️', 'Hidden.otf‏', 'Hidden.otf ', 'Hidden.otf　', 'Hidden.o​tf', 'Hidden．ｏｔｆ',
+    'Hidden.TTC⁠', 'Hidden.ttf\u0007', 'Hidden.otc‮'];
+  for (const name of disguised) assert.equal(isGatedFontName(name), true, JSON.stringify(name));
+  const ordinary = ['Brand.bin', 'Brand.otf.png', 'Brand.png​', 'x.otfx', 'x.woff2', 'x.оtf', 'otf', 'Brand'];
+  for (const name of ordinary) assert.equal(isGatedFontName(name), false, JSON.stringify(name));
 });

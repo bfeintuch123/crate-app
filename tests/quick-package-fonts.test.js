@@ -128,6 +128,33 @@ for (const flat of [false, true]) test(`PSD: a linked font whose name ends in a 
   assert.deepEqual((result.fontsNotIncluded || []).map(item => item.name).sort(), ['Boundary.otf ', 'Dotted.OTF.']);
 });
 
+test('round 4: Quick Package never copies a linked font hidden behind an invisible character; ordinary files still copy', async t => {
+  const w = workspace(t);
+  const hidden = path.join(w.root, 'Brand Kit', 'Hidden.otf​');
+  fs.writeFileSync(hidden, buildFont({ fsType: 2 }));
+  const photo = path.join(w.root, 'Brand Kit', 'Photo.png​');
+  fs.writeFileSync(photo, Buffer.alloc(900, 3));
+  const linkedFile = (file, id) => ({ id, name: path.basename(file), childDocumentID: '',
+    linkedFile: { fileSize: 800, name: path.basename(file), fullPath: file, originalPath: file, relativePath: '' } });
+  const psd = path.join(w.root, 'Comp.psd');
+  fs.writeFileSync(psd, ag.writePsdBuffer({ width: 1, height: 1, linkedFiles: [
+    linkedFile(w.image, '11111111-1111-4111-8111-111111111111'),
+    linkedFile(hidden, '55555555-5555-4555-8555-555555555555'),
+    linkedFile(photo, '66666666-6666-4666-8666-666666666666'),
+  ] }));
+  const result = await packageMasterFile(psd, w.out);
+  const copied = listOutput(w.out);
+  assert.ok(!copied.some(file => file.includes('Hidden')), copied.join(', '));
+  assert.ok(copied.some(file => file.endsWith('Photo.png​')), copied.join(', '));
+  assert.deepEqual((result.fontsNotIncluded || []).map(item => item.name), ['Hidden.otf​']);
+  const idmlLinks = [w.image, hidden].map(file => `<Link LinkResourceURI="file://${encodeURI(file)}"/>`).join('');
+  const idml = zip(w.root, 'Layout.idml', { 'Spreads/Spread_1.xml': `<Spread>${idmlLinks}</Spread>` });
+  const out2 = path.join(w.root, 'out2'); fs.mkdirSync(out2);
+  const idmlResult = await packageMasterFile(idml, out2);
+  assert.ok(!listOutput(out2).some(file => file.includes('Hidden')), listOutput(out2).join(', '));
+  assert.deepEqual((idmlResult.fontsNotIncluded || []).map(item => item.name), ['Hidden.otf​']);
+});
+
 test('PPTX: an external link to a font file fails closed with an explanation and writes nothing', async t => {
   const w = workspace(t);
   const rel = (id, type, target) => `<Relationship Id="${id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/${type}" Target="file://${target}" TargetMode="External"/>`;

@@ -697,6 +697,55 @@ function cases() {
     assert.doesNotMatch(note, /Unnamed font/);
   });
 
+  fontTest('round 4: a font file with an invisible character after its extension is gated, keeps its name, and is never copied when restricted', async () => {
+    const f = await fixture('Disguised');
+    const restricted = path.join(f.dir, 'Hidden.otf​');
+    writeFont(restricted, { fsType: 2, names: englishNames({ family: 'Hidden', style: 'Regular', postscriptName: 'Hidden-Regular' }) });
+    const open = path.join(f.dir, 'Open.otf⁠');
+    const openBytes = writeFont(open, { names: englishNames({ family: 'Open', style: 'Regular', postscriptName: 'Open-Regular', licence: OFL_STATEMENT }) });
+    const png = path.join(f.dir, 'Photo.png​');
+    fs.writeFileSync(png, createSyntheticPngBytes());
+    manualDialogFor([restricted, open, png]);
+    await callIpcRaw('projects:add-files', f.project.id);
+    await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include');
+    const reviewResult = await review(f);
+    assert.equal(row(reviewResult, 'Hidden.otf​').reason, 'restricted');
+    assert.ok(!reviewResult.files.some(item => /Hidden|Open/.test(item.name)), 'fonts are not ordinary outputs');
+    assert.ok(reviewResult.files.some(item => item.name === 'Photo.png​'), 'an ordinary file with the same suffix stays ordinary');
+    // Open-licence font added by the user through Add Files: included after Include.
+    assert.equal(row(reviewResult, 'Open.otf⁠').origin, 'project-file');
+    const { result } = await packageNow(f, reviewResult);
+    const tree = listTree(result.folderPath);
+    assert.ok(!tree.some(item => item.includes('Hidden')), tree.join(', '));
+    assert.ok(tree.includes('Fonts/Open.otf⁠'), 'output name unchanged, in the Fonts folder: ' + tree.join(', '));
+    assert.deepEqual(fs.readFileSync(path.join(result.folderPath, 'Fonts', 'Open.otf⁠')), openBytes);
+    assert.ok(tree.some(item => item.endsWith('Photo.png​')), 'ordinary asset still copied');
+  });
+
+  fontTest('round 4: contradictory or spoofed licence wording asks for the per-font confirmation before any copy', async () => {
+    const f = await fixture('Contradiction');
+    const cases = [
+      ['Trial.otf', englishNames({ family: 'Trial', style: 'Regular', postscriptName: 'Trial-Regular', licence: `${OFL_STATEMENT} Trial version for evaluation.` })],
+      ['Spoof.otf', englishNames({ family: 'Spoof', style: 'Regular', postscriptName: 'Spoof-Regular', licence: 'Licensed under the SIL Open Font License',
+        licenceUrl: `${'a '.repeat(114)}https://openfontlicense.org.evil.example/terms` })],
+    ];
+    for (const [name, names] of cases) { writeFont(path.join(f.dir, name), { names }); }
+    manualDialogFor(cases.map(([name]) => path.join(f.dir, name)));
+    await callIpcRaw('fonts:add-files', f.project.id);
+    const before = await review(f);
+    for (const [name] of cases) assert.equal(row(before, name).outcome, 'needs-confirmation', name);
+    let out = await packageNow(f, before);
+    assert.deepEqual(listTree(out.result.folderPath).filter(item => item.endsWith('.otf')), []);
+    fs.rmSync(out.result.folderPath, { recursive: true, force: true });
+    const trial = row(before, 'Trial.otf');
+    assert.equal((await callIpcRaw('fonts:confirm-licence', f.project.id, trial.key, { confirmed: true, sha256: trial.sha256 })).success, true);
+    const after = await review(f);
+    assert.equal(row(after, 'Trial.otf').basis, 'confirmed');
+    assert.equal(row(after, 'Spoof.otf').outcome, 'needs-confirmation');
+    out = await packageNow(f, after);
+    assert.deepEqual(listTree(out.result.folderPath).filter(item => item.endsWith('.otf')), ['Fonts/Trial.otf']);
+  });
+
   fontTest('registry failure reports unavailable and leaves packaging untouched', async () => {
     const f = await fixture();
     registryFailure = true;

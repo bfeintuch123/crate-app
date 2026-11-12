@@ -22426,7 +22426,10 @@ function planFontOutputs(fontReview, layoutMode, outputAllocator) {
   const inputs = [];
   for (const row of fontReview.rows) {
     if (row.gate.outcome !== 'included') continue;
-    const outputName = outputAllocator.reserveOutputName(row.group.displayName);
+    // Every packaged font goes to the Fonts group (or the root when flat), even
+    // when its name only classifies as a font once invisible characters are
+    // ignored; the output name itself is never changed.
+    const outputName = outputAllocator.reserveGroupedOutputName(row.group.displayName, 'fonts');
     inputs.push({
       rowKey: row.group.key,
       sourcePath: row.group.sourcePath,
@@ -22488,7 +22491,7 @@ function readGatedFontForPackaging(input, layoutMode) {
     conflict: false,
   });
   if (gate.outcome !== 'included' || gate.basis !== input.basis) throw new PackageReviewChangedError();
-  if (getPackageOutputRelativePath(input.outputName, layoutMode) !== input.relativePath) throw new PackageReviewChangedError();
+  if (getPackageGroupedOutputRelativePath(input.outputName, layoutMode, 'fonts') !== input.relativePath) throw new PackageReviewChangedError();
   const mode = Number(BigInt(input.sourceFingerprint.source.mode) & 0o777n) || OWNER_ONLY_FILE_MODE;
   return { buffer, mode };
 }
@@ -25647,7 +25650,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
       const fontPlan = manifest.plan.fonts;
       for (const input of fontPlan.inputs) {
         const staleFontResult = await abortStalePackage(); if (staleFontResult) return staleFontResult;
-        const allocatedOutputName = allocateOutputName(input.rawName);
+        const allocatedOutputName = outputAllocator.reserveGroupedOutputName(input.rawName, 'fonts');
         if (allocatedOutputName !== input.outputName || getOutputRelativePath(allocatedOutputName) !== input.relativePath) {
           throw new PackageReviewChangedError();
         }
