@@ -9314,6 +9314,53 @@ function excludedSourceMembershipCases() {
     pinned(results, { reviewDuringScanMaterializable: false, reviewDuringScanState: 'existing typed stop',
       next: { rows: ['Embedded-Layer.png DocA A A', 'Embedded-Layer_1.png DocB B B'], setAside: ['B'], holds: [], review: 'OK', bRows: 1 } });
   }, { realMainPsd: true }));
+  // A recorded document the review does not gate on, or that the follow-up verification would not scan,
+  // keeps getting rows from the pass exactly as before: an excluded, never-scanned working Photoshop file
+  // that an included file requires (its placeholder record is assigned, as the selection handler writes it
+  // for a file excluded before any scan), and a document whose record claims another document's path but
+  // which is excluded and read only because an included file requires it.
+  for (const variant of ['excluded never-scanned, required', 'claiming record, excluded but required']) {
+    baselineTest(`Photoshop outputs: the pass still makes rows for a document no scan will follow (${variant})`, { timeout: 300000 }, () => withEnv(async () => {
+      const { state } = recovery;
+      const results = {};
+      if (variant.startsWith('excluded')) {
+        const A = desk('DocA-r26.psd'), W = desk('Work-r26.ai'), Z = desk('Other-r26.ai');
+        const f = await newProject('Never scanned r26', { before() { writeWorking('.psd', A, [], 611); writeWorking('.ai', W, [A]); writeWorking('.ai', Z, []); } });
+        await f.add(A); await f.add(W); await f.add(Z); await f.select(Z, 'exclude'); await f.select(A, 'exclude');
+        const p = f.current(), aRow = p.files.find(row => row.path === A), key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(p, aRow);
+        const prior = p.workingSourceVerification[key];
+        p.workingSourceVerification[key] = { version: 1, status: 'unavailable', reason: 'not-scanned', attempt: prior.attempt, selectionRevision: prior.selectionRevision,
+          requiredReferences: [], unresolved: [] };
+        roundTripFakeStore();
+        const ws = await f.workspace(), fact = ws.files.find(row => row.name === path.basename(A));
+        results.aFact = { included: fact.included === true, dependency: fact.includedAsDependency === true, verificationRequired: fact.verificationRequired === true };
+        const dir = path.dirname(p.files.find(row => row.source === 'psd-embedded').path);
+        writeWorking('.psd', A, [], 644);                                                  // saved with a new embedded object
+        const review = await openReview(f);
+        results.afterSave = { ...state(f, dir), review: review.materializable === true ? 'OK' : 'blocked: ' + (review.message || review.error || '') };
+        results.confirmed = await confirmInAppOrder(f);
+      } else {
+        const t = await releasedTakeover('r27');
+        const W = desk('Work-r27.ai'); writeWorking('.ai', W, [t.B]); await t.f.add(W);
+        await t.f.select(t.K, 'exclude'); await t.f.select(t.B, 'exclude');
+        const ws = await t.f.workspace(), fact = ws.files.find(row => row.name === path.basename(t.B));
+        results.bFact = { included: fact.included === true, dependency: fact.includedAsDependency === true };
+        const review = await openReview(t.f);
+        results.afterPass = { ...state(t.f, t.dir), review: review.materializable === true ? 'OK' : 'blocked: ' + (review.message || review.error || '') };
+        // B's stale claim counts while B is a required dependency and no scan of B follows; the owner's
+        // existing Restore of B verifies it again.
+        await t.f.select(t.B, 'restore');
+        results.afterRestoringB = { ...state(t.f, t.dir), records: t.records() };
+        results.confirmed = await confirmInAppOrder(t.f);
+      }
+      // The first is identical on 48f7d09; in the second, B gets its row as on 48f7d09 (A is now repaired, and
+      // after the Restore B's object is packaged twice: the pass's row and the scan's row).
+      pinned(results, ({
+        'excluded never-scanned, required': { aFact: { included: true, dependency: true, verificationRequired: false }, afterSave: { rows: ['Embedded-Layer.png DocA A A', 'Embedded-Layer_1.png DocA 5c9de92d 5c9de92d'], setAside: [], holds: [], review: 'OK' }, confirmed: ['Embedded-Layer.png=A', 'Embedded-Layer_1.png=5c9de92d'] },
+        'claiming record, excluded but required': { bFact: { included: true, dependency: true }, afterPass: { rows: ['Embedded-Layer.png DocA A A', 'Embedded-Layer_1.png DocB B B'], setAside: ['B'], holds: [], review: 'blocked: Working-source verification is unresolved. Resolve it before packaging.' }, afterRestoringB: { rows: ['Embedded-Layer.png DocA A A', 'Embedded-Layer_1.png DocB B B', 'Embedded-Layer_2.png DocB B B'], setAside: ['B'], holds: [], records: ['Embedded-Layer.png A', 'Embedded-Layer_2.png B'] }, confirmed: ['Embedded-Layer.png=A', 'Embedded-Layer_1.png=B', 'Embedded-Layer_2.png=B'] },
+      })[variant]);
+    }, { realMainPsd: true }));
+  }
   // Verification has no size cap: an output larger than the 300 MB parse limit whose bytes match its
   // record stays available (a sparse file, so the test writes almost nothing to disk; the package
   // itself is not written).

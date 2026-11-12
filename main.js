@@ -5915,6 +5915,16 @@ async function refreshWorkingSourceLocators(projectId, observedPaths = null, par
   } finally { operation?.close(); }
 }
 
+// Whether the follow-up verification after a pre-package pass scans this working
+// file: selected, in a project whose working files are verified before packaging
+// (a selection, or this file recovery-guarded), and included by membership.
+function isOutputEvidenceVerificationTarget(project, file, membership = null) {
+  const key = file && getAssetBaselineSourceRecoveryRouteKey(project, file);
+  if (!key || getWorkingSourceSelection(project, file).state !== 'selected') return false;
+  if (!hasWorkingSourceSelectionState(project) && !getWorkingSourceRecoveryGuardKeys(project)?.has(key)) return false;
+  return !!(membership || getWorkingSourceMembership(project)).facts.get(getTrackedFileDedupKey(file))?.included;
+}
+
 // Working files whose stored verification record proved another document's
 // damaged output (rule R): each one that is selected and included, in a project
 // whose working files are verified before packaging, is verified again through
@@ -5929,9 +5939,7 @@ async function reverifyOutputEvidenceSources(projectId, keys, parentCurrent = nu
       const project = getProjects().find(item => item.id === projectId);
       if (!project || !operation?.current()) return;
       const file = (project.files || []).find(row => isWorkingSourceFile(row) && getAssetBaselineSourceRecoveryRouteKey(project, row) === key);
-      if (!file || getWorkingSourceSelection(project, file).state !== 'selected' || workingSourceScanLeases.has(projectId + ':' + key)) continue;
-      if (!hasWorkingSourceSelectionState(project) && !getWorkingSourceRecoveryGuardKeys(project)?.has(key)) continue;
-      if (!getWorkingSourceMembership(project).facts.get(getTrackedFileDedupKey(file))?.included) continue;
+      if (!file || workingSourceScanLeases.has(projectId + ':' + key) || !isOutputEvidenceVerificationTarget(project, file)) continue;
       const scan = beginWorkingSourceScan(projectId, file.path, operation.current);
       if (scan) { started = true; await verifyRestoredWorkingSource(projectId, file, scan.attempt, operation); }
       if (!operation.current()) return;
@@ -16620,13 +16628,14 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           }
         }
       }
-      // A document with its own stored verification record, in a project whose
-      // working files are verified before packaging, gets no new row from the
-      // pre-package pass when a verification scan of it is certain to follow:
-      // its record is not current for the bytes just read (review waits for
-      // that scan), or its record names a path another document's row owns (the
-      // old collision; it is verified again after this pass). The scan then
-      // makes the one row. Otherwise, and for existing rows, nothing changes.
+      // A document with its own stored verification record gets no new row from
+      // the pre-package pass only when a verification scan of it is certain to
+      // follow: (1) review gates on it (its membership fact requires
+      // verification) and its record is not current for the bytes just read, so
+      // review waits for that scan; or (2) its record names a path another
+      // document's row owns (the old collision) and the follow-up verification
+      // after this pass scans it. That scan makes the one row. Otherwise, and
+      // for existing rows, the pass works as before.
       let newRowsOwnedByVerification = null;
       const verificationOwnsNewRows = () => newRowsOwnedByVerification ??= (() => {
         if (options.scanOwnsNewWorkingOutputs !== true || !project?.workingSourceVerification) return false;
@@ -16635,7 +16644,10 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         const ownKey = ownRow && getAssetBaselineSourceRecoveryRouteKey(project, ownRow);
         const record = ownKey && Object.hasOwn(project.workingSourceVerification, ownKey) ? project.workingSourceVerification[ownKey] : null;
         if (!record || (!hasWorkingSourceSelectionState(project) && !getWorkingSourceRecoveryGuardKeys(project)?.has(ownKey))) return false;
-        if (record.status !== 'scanned' || record.sourceFingerprint !== sourceDigest) return true;
+        const membership = getWorkingSourceMembership(project);
+        if (membership.facts.get(getTrackedFileDedupKey(ownRow))?.verificationRequired === true &&
+            (!['scanned', 'no-extractor'].includes(record.status) || record.sourceFingerprint !== sourceDigest)) return true;
+        if (!isOutputEvidenceVerificationTarget(project, ownRow, membership)) return false;
         const claimed = new Set((getValidRecordedEmbeddedOutputs(record) || []).map(output => normalizeTrackedFilePath(output.path)));
         return [...(project.files || []), ...(project.pendingFiles || [])].some(row => {
           const receipt = row.psdExtractionReceipt || row.psdResource;
