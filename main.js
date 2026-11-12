@@ -22153,7 +22153,7 @@ function getFontRelevantNames(file) {
 // gate alone decides whether anything is written for it.
 function isGatedFontFile(file) {
   if (!file || typeof file !== 'object') return false;
-  return getFontRelevantNames(file).some(name => fontHandoff.GATED_FONT_EXTENSIONS.has(path.extname(name).toLowerCase()));
+  return getFontRelevantNames(file).some(name => fontHandoff.isGatedFontName(name));
 }
 
 // A font-named resource inside a Photoshop file has no file of its own.
@@ -22162,7 +22162,7 @@ function isEmbeddedFontResource(file) {
 }
 
 function isGatedFontPath(filePath) {
-  return typeof filePath === 'string' && fontHandoff.GATED_FONT_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+  return fontHandoff.isGatedFontName(filePath);
 }
 
 function getFontRowKey(filePath) {
@@ -22411,7 +22411,8 @@ function getFontNoteModel(fontReview, inputs, oflTextFileName) {
     notIncluded: fontReview.rows.filter(row => row.gate.outcome !== 'included' && !isFontRowOmittedFromNote(row))
       .map(row => {
         const faces = row.gateInput.faces;
-        const label = faces.length ? fontHandoff.describeFontFaces(faces) : sanitizeRendererSourceName(row.group.displayName) || 'Font file';
+        const named = faces.length > 0 && faces.every(face => typeof face.postscriptName === 'string' && face.postscriptName);
+        const label = named ? fontHandoff.describeFontFaces(faces) : sanitizeRendererSourceName(row.group.displayName) || 'Font file';
         return { label, reason: row.gate.reason || 'licence-unknown' };
       }),
     oflTextFileName,
@@ -22816,6 +22817,7 @@ function setFontRowChoice(projectId, rowKey, choice) {
   const result = mutateProject(projectId, project => {
     const group = getProjectFontCandidateGroup(project, rowKey);
     if (!group) return { error: 'font_not_found' };
+    if (choice === 'include' && group.embedded) return { error: 'font_not_eligible' };
     const handoff = readProjectFontHandoff(project);
     if (choice === 'remove') {
       handoff.installed = handoff.installed.filter(item => getFontRowKey(item.path) !== rowKey);
@@ -22886,6 +22888,7 @@ function addFontFilePaths(projectId, filePaths) {
   const result = mutateProject(projectId, project => {
     const handoff = readProjectFontHandoff(project);
     let added = 0;
+    let notStored = 0;
     for (const filePath of accepted) {
       const key = getFontRowKey(filePath);
       if (!key) continue;
@@ -22899,12 +22902,15 @@ function addFontFilePaths(projectId, filePaths) {
         }
         continue;
       }
-      if (handoff.files.length >= MAX_FONT_HANDOFF_SELECTIONS) break;
+      if (handoff.files.length >= MAX_FONT_HANDOFF_SELECTIONS) {
+        notStored++;
+        continue;
+      }
       handoff.files.push({ path: filePath, addedAt: Date.now() });
       added++;
     }
     writeProjectFontHandoff(project, handoff);
-    return { success: true, added, ignored: filePaths.length - accepted.length };
+    return { success: true, added, notStored, ignored: filePaths.length - accepted.length };
   });
   if (!result) return { error: 'not_found' };
   invalidatePackageReviewForProject(projectId);

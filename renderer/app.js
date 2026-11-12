@@ -5592,7 +5592,10 @@ function bindPackageReviewFontControls() {
   });
   $('#btn-add-font-files')?.addEventListener('click', () => runPackageReviewFontAction(
     id => window.crate.addFontFiles(id),
-    result => (result.canceled ? '' : (result.added === 1 ? 'Added 1 font file.' : `Added ${result.added || 0} font files.`))));
+    result => (result.canceled ? '' : [
+      result.added === 1 ? 'Added 1 font file.' : `Added ${result.added || 0} font files.`,
+      result.notStored ? `${result.notStored} couldn't be added because this project has too many fonts.` : '',
+    ].filter(Boolean).join(' '))));
 }
 
 function renderPackageReview(project, review, message = '', suppliedLease = null) {

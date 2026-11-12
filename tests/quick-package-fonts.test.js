@@ -108,6 +108,26 @@ test('PSD: a smart object linked to a font file is reported, never copied', asyn
   assertFontsReportedNotCopied(result, w, [w.fonts.restricted]);
 });
 
+for (const flat of [false, true]) test(`PSD: a linked font whose name ends in a space or dot is still never copied (flat ${flat})`, async t => {
+  const w = workspace(t);
+  const spaced = path.join(w.root, 'Brand Kit', 'Boundary.otf ');
+  const dotted = path.join(w.root, 'Brand Kit', 'Dotted.OTF.');
+  fs.writeFileSync(spaced, buildFont({ fsType: 2 }));
+  fs.writeFileSync(dotted, buildFont({ fsType: 2 }));
+  const linkedFile = (file, id) => ({ id, name: path.basename(file), childDocumentID: '',
+    linkedFile: { fileSize: 800, name: path.basename(file), fullPath: file, originalPath: file, relativePath: '' } });
+  const psd = path.join(w.root, 'Comp.psd');
+  fs.writeFileSync(psd, ag.writePsdBuffer({ width: 1, height: 1, linkedFiles: [
+    linkedFile(w.image, '11111111-1111-4111-8111-111111111111'),
+    linkedFile(spaced, '33333333-3333-4333-8333-333333333333'),
+    linkedFile(dotted, '44444444-4444-4444-8444-444444444444'),
+  ] }));
+  const result = await packageMasterFile(psd, w.out, { flat });
+  const copied = listOutput(w.out);
+  assert.ok(!copied.some(file => /\.(otf|ttf|ttc|otc)[ .]*$/i.test(file)), copied.join(', '));
+  assert.deepEqual((result.fontsNotIncluded || []).map(item => item.name).sort(), ['Boundary.otf ', 'Dotted.OTF.']);
+});
+
 test('PPTX: an external link to a font file fails closed with an explanation and writes nothing', async t => {
   const w = workspace(t);
   const rel = (id, type, target) => `<Relationship Id="${id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/${type}" Target="file://${target}" TargetMode="External"/>`;

@@ -399,3 +399,33 @@ test('an OS/2 table too short to hold the embedding field is malformed', () => {
   font.writeUInt32BE(8, tableRecord(font, 'OS/2') + 12);
   assert.throws(() => readFontFaces(font), error => error instanceof FontReadError && error.code === 'malformed');
 });
+
+test('font file names are judged as written: trailing spaces and dots do not hide a font extension', () => {
+  const { isGatedFontName } = fontHandoff;
+  for (const name of ['Boundary.otf ', 'Boundary.OTF.', 'x.ttc . ', 'dir/x.TTF', 'x.otc\t']) assert.equal(isGatedFontName(name), true, JSON.stringify(name));
+  for (const name of ['x.otfx', 'x.woff', 'x.woff2', 'otf', '', null]) assert.equal(isGatedFontName(name), false, JSON.stringify(name));
+});
+
+test('an OFL licence header only exempts the canonical OFL body; anything else is still checked', () => {
+  const grant = 'This Font Software is licensed under the SIL Open Font License, Version 1.1. ';
+  assert.equal(detectOpenLicence([{ licence: grant + OFL_1_1_TEXT, licenceUrl: null }]), 'ofl-1.1');
+  const header = 'SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007';
+  assert.equal(detectOpenLicence([{ licence: `${grant}${header}\nRedistribution is prohibited. Personal use only.`, licenceUrl: null }]), null);
+  assert.equal(detectOpenLicence([{ licence: `${grant}${OFL_1_1_TEXT}\nAdditional terms: redistribution is prohibited.`, licenceUrl: null }]), null);
+});
+
+test('licence evidence is never judged from truncated text', () => {
+  const long = `${OFL_STATEMENT} ${'x'.repeat(4100)} Redistribution is prohibited. Personal use only.`;
+  const face = readFontFaces(buildFont({ names: englishNames({ licence: long }) })).faces[0];
+  assert.equal(face.licenceTruncated, true);
+  assert.equal(detectOpenLicence([face]), null);
+  const short = readFontFaces(buildFont({ names: englishNames({ licence: OFL_STATEMENT }) })).faces[0];
+  assert.equal(short.licenceTruncated, false);
+  assert.equal(detectOpenLicence([short]), 'ofl-1.1');
+});
+
+test('more self-contradicting licence phrasings need the confirmation', () => {
+  for (const tail of ['Cannot be shared.', 'Redistribution forbidden.', 'Use only when obtained from the vendor.']) {
+    assert.equal(detectOpenLicence([{ licence: `${OFL_STATEMENT} ${tail}`, licenceUrl: null }]), null, tail);
+  }
+});

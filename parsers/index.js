@@ -24,12 +24,13 @@
 const fs = require('fs');
 const path = require('path');
 const { isParserAdmissionError } = require('./admission-budgets');
-const { GATED_FONT_EXTENSIONS } = require('./font-handoff');
+const { isGatedFontName } = require('./font-handoff');
 const {
   assertSafeCopySource,
   copyFileIntoPackage,
   ensureSafePackageDirectory,
   removeCreatedPackageFiles,
+  sanitizePackageFileName,
   writeFileIntoPackage,
 } = require('./package-safety');
 
@@ -167,8 +168,10 @@ function getParserInfo(extOrPath) {
 const QUICK_PACKAGE_FONT_LINK_MESSAGE = 'This presentation links a font file. Quick Package can\'t include font files. ' +
   'Use a Crate project and Package Review to add fonts.';
 
+// Judged by the source name and by the name it would be written under.
 function isGatedFontAsset(asset) {
-  return !!asset && typeof asset.path === 'string' && GATED_FONT_EXTENSIONS.has(path.extname(asset.path).toLowerCase());
+  if (!asset || typeof asset.path !== 'string') return false;
+  return isGatedFontName(asset.path) || isGatedFontName(sanitizePackageFileName(path.basename(asset.path), 'asset'));
 }
 
 async function packageMasterFile(filePath, outputDir, options = {}) {

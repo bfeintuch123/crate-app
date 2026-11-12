@@ -522,13 +522,14 @@ function cases() {
     assert.equal(embedded.reason, 'embedded');
     assert.equal(embedded.canConfirm, false);
     assert.equal(embedded.canInclude, false);
-    await callIpcRaw('fonts:set-row-choice', f.project.id, embedded.key, 'include');
+    assert.equal((await callIpcRaw('fonts:set-row-choice', f.project.id, embedded.key, 'include')).error, 'font_not_eligible');
     assert.equal(row(await review(f), 'Restricted.otf').outcome, 'excluded');
     const { result } = await packageNow(f);
     assert.equal(result.success, true, JSON.stringify(result));
     const tree = listTree(result.folderPath);
     assert.ok(!tree.some(file => /\.(otf|ttf|ttc|otc)$/i.test(file)), tree.join(', '));
-    assert.match(fs.readFileSync(path.join(result.folderPath, 'Fonts', 'Fonts in this package.txt'), 'utf8'), /Restricted\.otf: Stored inside a Photoshop file/);
+    // Never chosen by the sender, so it is not named to recipients and no note is written.
+    assert.deepEqual(tree, ['PNG/Logo.png']);
   });
 
   fontTest('removed and never-chosen fonts are not named to recipients; no note when nothing is left to say', async () => {
@@ -642,6 +643,58 @@ function cases() {
       testAccountSession.now = previousNow;
       installRegistry();
     }
+  });
+
+  fontTest('a font added through Add Files with a trailing space in its name is gated, not copied as an asset', async () => {
+    const f = await fixture('Spaced name');
+    const file = path.join(f.dir, 'Boundary.otf ');
+    writeFont(file, { fsType: 2, names: englishNames({ family: 'Boundary', style: 'Regular', postscriptName: 'Boundary-Regular' }) });
+    manualDialogFor([file]);
+    await callIpcRaw('projects:add-files', f.project.id);
+    const reviewResult = await review(f);
+    assert.ok(!reviewResult.files.some(item => /Boundary/.test(item.name)), 'not an ordinary output');
+    const { result } = await packageNow(f, reviewResult);
+    assert.ok(!listTree(result.folderPath).some(item => /Boundary/.test(item)), listTree(result.folderPath).join(', '));
+  });
+
+  fontTest('include is refused for a font stored inside a Photoshop file', async () => {
+    const f = await fixture('Embedded include');
+    const parentPsd = path.join(f.dir, 'Parent.psd');
+    fs.writeFileSync(parentPsd, Buffer.from('PSD container bytes'));
+    currentPsdFixture = { children: [], linkedFiles: [{ name: 'Secret.otf', data: buildFont() }] };
+    await setProjectFiles(f.project.id, { files: [
+      { path: f.image, name: 'Logo.png', ext: '.png', addedAt: Date.now(), source: 'manual-browse' },
+      { path: parentPsd, parentPsd, name: 'Secret.otf', ext: '.otf', source: 'scan-on-save-embedded', embedded: true,
+        embeddedOriginalName: 'Secret.otf', embeddedIndex: 0, fileId: 'synthetic-secret' },
+    ] });
+    const key = row(await review(f), 'Secret.otf').key;
+    assert.equal((await callIpcRaw('fonts:set-row-choice', f.project.id, key, 'include')).error, 'font_not_eligible');
+  });
+
+  fontTest('Add font files reports files it could not add at the project limit', async () => {
+    const f = await fixture('File limit');
+    const stored = storeInstance.data.projects.find(item => item.id === f.project.id);
+    stored.fontHandoff = { version: 1, installed: [], choices: {}, confirmations: {},
+      files: Array.from({ length: 199 }, (_, index) => ({ path: path.join(f.dir, `Pad-${index}.otf`), addedAt: index })) };
+    const a = path.join(f.dir, 'A.otf'); const b = path.join(f.dir, 'B.otf'); const c = path.join(f.dir, 'C.otf');
+    for (const file of [a, b, c]) writeFont(file, brand('Bold'));
+    manualDialogFor([a, b, c]);
+    const result = await callIpcRaw('fonts:add-files', f.project.id);
+    assert.equal(result.added, 1);
+    assert.equal(result.notStored, 2);
+  });
+
+  fontTest('a font with no readable English name is named in the note by its file name', async () => {
+    const f = await fixture('Unnamed note');
+    const { nameRecord } = require('./font-fixtures');
+    const file = path.join(f.dir, 'Localized.otf');
+    writeFont(file, { names: [nameRecord(6, 'Lokal-PS', 3, 1, 0x0407), nameRecord(1, 'Lokal', 3, 1, 0x0407)] });
+    manualDialogFor([file]);
+    await callIpcRaw('fonts:add-files', f.project.id);
+    const { result } = await packageNow(f);
+    const note = fs.readFileSync(path.join(result.folderPath, 'Fonts', 'Fonts in this package.txt'), 'utf8');
+    assert.match(note, /- Localized\.otf: /);
+    assert.doesNotMatch(note, /Unnamed font/);
   });
 
   fontTest('registry failure reports unavailable and leaves packaging untouched', async () => {

@@ -60,6 +60,20 @@ function cleanFontText(value, limit = MAX_FONT_NAME_TEXT_LENGTH) {
   return [...cleaned].slice(0, limit).join('');
 }
 
+// Bounded display text can drop words; permission is never judged from it.
+function isFontTextTruncated(value, limit = MAX_FONT_NAME_TEXT_LENGTH) {
+  const full = cleanFontText(value, Infinity);
+  return !!full && [...full].length > limit;
+}
+
+// A file counts as a font by the name it will be written under: trailing
+// spaces and dots are dropped by package name sanitizing and by macOS.
+function isGatedFontName(name) {
+  if (typeof name !== 'string' || !name) return false;
+  const leaf = path.posix.basename(name.replace(/\\/g, '/')).replace(/[\s.]+$/u, '');
+  return GATED_FONT_EXTENSIONS.has(path.extname(leaf).toLowerCase());
+}
+
 function cleanIdentityText(value) {
   const cleaned = cleanFontText(value, MAX_FONT_IDENTITY_TEXT_LENGTH);
   return cleaned ? cleaned.replace(/\n/g, ' ') : null;
@@ -171,6 +185,7 @@ function readFaceAt(buffer, offset, index) {
     version: cleanIdentityText(names.get(5)),
     copyright: cleanFontText(names.get(0)),
     licence: cleanFontText(names.get(13)),
+    licenceTruncated: isFontTextTruncated(names.get(13)),
     licenceUrl: cleanIdentityText(names.get(14)),
     fsType,
     // OpenType OS/2 fsType bits 0-3: value 2 is "Restricted License embedding".
@@ -260,7 +275,7 @@ const OFL_VERSION_1_1 = /^,?\s*(?:version\s*|v\.?\s*)?1\.1\b/i;
 // The host must end where the URL ends (a dot only as sentence punctuation).
 const URL_END = String.raw`(?=$|[\s/),&]|[.,](?:\s|$))`;
 const OFL_URL = new RegExp(String.raw`(?:^|\s|\()(?:https?:\/\/)?(?:www\.)?(?:scripts\.sil\.org\/(?:OFL|cms\/scripts\/page\.php\?[^ ]*\bid=OFL)${URL_END}|openfontlicense\.org${URL_END})`, 'i');
-const LICENCE_DISQUALIFIERS = /\b(?:not|never|no longer|proprietary|EULA|end[- ]user licen[cs]e|commercial licen[cs]e|paid licen[cs]e|portions?|derived from|based on|unlike|except|excluding|prohibit(?:s|ed)?|personal use|non-?commercial|restricted)\b/i;
+const LICENCE_DISQUALIFIERS = /\b(?:not|never|no longer|cannot|only|forbid(?:s|den)?|proprietary|EULA|end[- ]user licen[cs]e|commercial licen[cs]e|paid licen[cs]e|portions?|derived from|based on|unlike|except|excluding|prohibit(?:s|ed)?|personal use|non-?commercial|restricted)\b/i;
 
 function grantsOpenLicence(licence, licenceUrl) {
   for (const pattern of OFL_GRANTS) {
@@ -276,6 +291,7 @@ function grantsOpenLicence(licence, licenceUrl) {
 function detectOpenLicence(faces) {
   if (!Array.isArray(faces) || faces.length === 0) return null;
   const every = faces.every(face => {
+    if (face?.licenceTruncated === true) return false;
     const licence = typeof face?.licence === 'string' ? face.licence : '';
     return grantsOpenLicence(licence, face?.licenceUrl) && !LICENCE_DISQUALIFIERS.test(licenceWithoutOflBody(licence));
   });
@@ -284,9 +300,13 @@ function detectOpenLicence(faces) {
 
 // Fonts sometimes carry the whole OFL text in ID 13; its own words ("may not
 // be sold") must not count as disqualifiers.
+// Only the exact OFL 1.1 text (whitespace aside) is exempt; an altered body or
+// extra terms after it are checked like any other licence text.
 function licenceWithoutOflBody(licence) {
   const body = licence.search(/SIL OPEN FONT LICENSE Version 1\.1 - 26 February 2007/);
-  return body >= 0 ? licence.slice(0, body) : licence;
+  if (body < 0) return licence;
+  const squash = text => text.replace(/\s+/g, ' ').trim();
+  return squash(licence.slice(body)) === squash(OFL_1_1_TEXT) ? licence.slice(0, body) : licence;
 }
 
 function isCurrentConfirmation(confirmation, sha256) {
@@ -575,5 +595,6 @@ module.exports = {
   findFace,
   getFontConfirmationStatement,
   isCurrentConfirmation,
+  isGatedFontName,
   readFontFaces,
 };
