@@ -16510,7 +16510,18 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
               [...pendingPsdRepairs].some(stage => normalizeTrackedFilePath(stage.extractPath) === key) ||
               rows.filter(other => normalizeTrackedFilePath(other.path) === key).length !== 1) return false;
           const found = fs.lstatSync(row.path);
-          if (found.isSymbolicLink() || !found.isFile() || found.nlink !== 1) return false;
+          if (found.isSymbolicLink() || !found.isFile()) return false;
+          // An earlier set-aside that stopped between its link and the removal of
+          // the row's name left the file with a second link under one of our
+          // set-aside names: that operation is completed, nothing else is.
+          let interruptedAside = null;
+          if (found.nlink === 2) {
+            interruptedAside = fs.readdirSync(extractDir).filter(name => /^\.crate-set-aside-[0-9a-f]{32}(\.[^/]*)?$/.test(name))
+              .map(name => path.join(extractDir, name)).find(candidate => {
+                try { const stat = fs.lstatSync(candidate); return stat.isFile() && stat.dev === found.dev && stat.ino === found.ino; } catch (_) { return false; }
+              }) || null;
+            if (!interruptedAside) return false;
+          } else if (found.nlink !== 1) return false;
           const digest = (await readPsdBaselineSnapshot(row.path, isCurrent, directoryIdentity)).digest;
           const parentKey = normalizeTrackedFilePath(psdFilePath);
           if (digest === outputDigest || !rows.some(other => {
@@ -16521,8 +16532,8 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           repairSource ||= await readPsdBaselineSnapshot(fs.realpathSync(psdFilePath), isCurrent);
           assertRepairSource();
           assertCacheDirectoryIdentity(directoryIdentity, 'psd-extract-directory');
-          const asidePath = path.join(extractDir, `.crate-set-aside-${crypto.randomBytes(16).toString('hex')}${path.extname(row.path)}`);
-          fs.linkSync(row.path, asidePath);
+          const asidePath = interruptedAside || path.join(extractDir, `.crate-set-aside-${crypto.randomBytes(16).toString('hex')}${path.extname(row.path)}`);
+          if (!interruptedAside) fs.linkSync(row.path, asidePath);
           const kept = fs.lstatSync(asidePath), current = fs.lstatSync(row.path);
           if (kept.dev !== found.dev || kept.ino !== found.ino || current.dev !== found.dev || current.ino !== found.ino ||
               current.size !== found.size || current.mtimeMs !== found.mtimeMs) return false;

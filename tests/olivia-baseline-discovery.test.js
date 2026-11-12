@@ -8826,7 +8826,7 @@ function excludedSourceMembershipCases() {
   // a stale row whose record names the old object and whose file holds the current one, plus a second row
   // recording the current object. Every pass keeps both rows as they are (a record goes to at most one
   // row), with no hold, and packages the same bytes.
-  for (const variant of ['one stale row', 'two stale rows', 'document changed again']) {
+  for (const variant of ['one stale row', 'two stale rows', 'document changed again', 'saved again with the same object']) {
     baselineTest(`Photoshop outputs: the older-build refill state keeps packaging on every pass (${variant})`, { timeout: 300000 }, () => withEnv(async () => {
       const { state, packaged } = recovery;
       const sha = data => require('crypto').createHash('sha256').update(data).digest('hex');
@@ -8842,21 +8842,52 @@ function excludedSourceMembershipCases() {
       for (const row of [...extra, recorded]) { fs.writeFileSync(row.path, current); t.f.current().files.push(row); }
       roundTripFakeStore();
       if (variant === 'document changed again') writeWorking('.psd', t.A, [], 646);
+      if (variant === 'saved again with the same object') {                            // the duplicate's record now names an older save
+        const link = desk('Extra-r12.png'); fs.writeFileSync(link, png(698)); writeWorking('.psd', t.A, [link], 645);
+      }
       const passes = [];
       for (let pass = 0; pass < 3; pass++) {
         await prePackage(t.f);
-        passes.push({ ...state(t.f, dir), written: embeddedOnly(await packaged(t.f)) });
+        const saveDigest = sha(fs.readFileSync(t.A));
+        passes.push({ ...state(t.f, dir), written: embeddedOnly(await packaged(t.f)),
+          exactMatch: t.outputs(t.A).filter(row => row.psdExtractionReceipt.sourceDigest === saveDigest).map(row => path.basename(row.path)) });
       }
       assert.ok(passes.every(item => JSON.stringify(item) === JSON.stringify(passes[0])), 'every pass the same');
       // Rows, files and written bytes as bc94955 gives for the same state (d9cd1fd held both rows from pass 2).
       const d = '4bc8ff77', rows = ['Embedded-Layer.png PlacedA A ' + d, 'Embedded-Layer_1.png PlacedB B B', `Embedded-Layer_2.png PlacedA ${d} ${d}`];
       const written = [`Embedded-Layer.png=${d}`, 'Embedded-Layer_1.png=B', `Embedded-Layer_2.png=${d}`];
       assert.deepEqual(passes[0], {
-        'one stale row': { rows, setAside: [], holds: [], written },
-        'two stale rows': { rows: [...rows, 'Embedded-Layer_3.png PlacedA A ' + d], setAside: [], holds: [], written: [...written, `Embedded-Layer_3.png=${d}`] },
+        'one stale row': { rows, setAside: [], holds: [], written, exactMatch: ['Embedded-Layer_2.png'] },
+        'two stale rows': { rows: [...rows, 'Embedded-Layer_3.png PlacedA A ' + d], setAside: [], holds: [], written: [...written, `Embedded-Layer_3.png=${d}`],
+          exactMatch: ['Embedded-Layer_2.png'] },
         'document changed again': { rows: [...rows, 'Embedded-Layer_3.png PlacedA 869b19a6 869b19a6'], setAside: [], holds: [],
-          written: [...written, 'Embedded-Layer_3.png=869b19a6'] },
+          written: [...written, 'Embedded-Layer_3.png=869b19a6'], exactMatch: ['Embedded-Layer_3.png'] },
+        'saved again with the same object': { rows: [`Embedded-Layer.png PlacedA ${d} ${d}`, ...rows.slice(1)], setAside: [], holds: [], written,
+          exactMatch: ['Embedded-Layer.png'] },
       }[variant]);
+    }, { realMainPsd: true }));
+  }
+  // A set-aside that stopped between its link and the removal of the row's name (the row's file then has
+  // a second link under one of our set-aside names) is completed by the next pass; a second link under any
+  // other name keeps the existing refusal.
+  for (const variant of ['our set-aside name', 'another name']) {
+    baselineTest(`Photoshop outputs: an interrupted set-aside is completed only under its own name (${variant})`, { timeout: 300000 }, () => withEnv(async () => {
+      const { state, packaged, setAside } = recovery;
+      const t = await psdPlaced('r13' + variant[0]), [a0] = t.outputs(t.A), dir = path.dirname(a0.path);
+      fs.writeFileSync(a0.path, png(622));                                              // B's bytes; B's row still records them
+      const second = path.join(dir, variant === 'our set-aside name' ? '.crate-set-aside-' + '0123456789abcdef'.repeat(2) + '.png' : 'other-link.png');
+      fs.linkSync(a0.path, second);
+      roundTripFakeStore();
+      await prePackage(t.f);
+      const results = { ...state(t.f, dir), written: embeddedOnly(await packaged(t.f)), asideNames: setAside(dir),
+        secondHolds: recovery.onDisk(second) === recovery.dB };
+      assert.deepEqual(results, variant === 'our set-aside name' ? {
+        rows: ['Embedded-Layer.png PlacedA A A', 'Embedded-Layer_1.png PlacedB B B'], setAside: ['B'], holds: [],
+        written: ['Embedded-Layer.png=A', 'Embedded-Layer_1.png=B'], asideNames: [path.basename(second)], secondHolds: true,
+      } : {
+        rows: ['Embedded-Layer.png PlacedA A B', 'Embedded-Layer_1.png PlacedB B B'], setAside: [], holds: ['psd-extraction-receipt-unverified Embedded-Layer.png'],
+        written: 'blocked: Photoshop asset association is unresolved. Your files are preserved; this package is blocked.', asideNames: [], secondHolds: true,
+      });
     }, { realMainPsd: true }));
   }
   // Verification has no size cap: an output larger than the 300 MB parse limit whose bytes match its
