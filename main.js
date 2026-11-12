@@ -15735,7 +15735,7 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
       // renamed before it is linked; output digests are known only now. The
       // reserved names are read only when this run staged an output.
       const { chosen: chosenMissing = null, otherParentNames: otherFileNames = null } =
-        stages.length && typeof reservation === 'function' ? reservation() || {} : {};
+        stages.length && reservation ? reservation() : {};
       if ((chosenMissing?.size || otherFileNames?.size) && stages.length) {
         const reserved = new Set([...(chosenMissing ? chosenMissing.keys() : []), ...(otherFileNames || [])]);
         const available = new Map([...(chosenMissing || [])].filter(([name]) => !otherFileNames?.has(name)));
