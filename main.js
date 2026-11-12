@@ -5915,6 +5915,30 @@ async function refreshWorkingSourceLocators(projectId, observedPaths = null, par
   } finally { operation?.close(); }
 }
 
+// Working files whose stored verification record proved another document's
+// damaged output (rule R): each one that is selected and included, in a project
+// whose working files are verified before packaging, is verified again through
+// the same lease and scan the review-time refresh uses. Nothing is written here.
+async function reverifyOutputEvidenceSources(projectId, keys, parentCurrent = null) {
+  const captured = captureProjectOperation(projectId);
+  const operation = captured && { ...captured, current: (read = null) => captured.current(read) && (!parentCurrent || parentCurrent()) };
+  try {
+    for (const key of keys) {
+      const project = getProjects().find(item => item.id === projectId);
+      if (!project || !operation?.current()) return;
+      const file = (project.files || []).find(row => isWorkingSourceFile(row) && getAssetBaselineSourceRecoveryRouteKey(project, row) === key);
+      if (!file || getWorkingSourceSelection(project, file).state !== 'selected' || workingSourceScanLeases.has(projectId + ':' + key)) continue;
+      if (!hasWorkingSourceSelectionState(project) && !getWorkingSourceRecoveryGuardKeys(project)?.has(key)) continue;
+      if (!getWorkingSourceMembership(project).facts.get(getTrackedFileDedupKey(file))?.included) continue;
+      const scan = beginWorkingSourceScan(projectId, file.path, operation.current);
+      if (scan) await verifyRestoredWorkingSource(projectId, file, scan.attempt, operation);
+      if (!operation.current()) return;
+    }
+    invalidatePackageReviewForProject(projectId);
+    sendToRenderer('project:updated', { projectId });
+  } finally { operation?.close(); }
+}
+
 function getCurrentWorkingSourceContinuationPair(project, pairIdentity, { allowIdentityMismatch = false } = {}) {
   const state = project?.workingSourceContinuations;
   const pair = state?.pairs?.[pairIdentity];
@@ -11300,6 +11324,21 @@ function getChosenMissingPsdOutputs(project, psdFilePath, extractDir, isNamePres
   return { chosen, otherParentNames };
 }
 
+// The required embedded outputs of a stored working-source verification record,
+// read raw and validated as getWorkingSourceVerification validates them; null
+// for a malformed record, which is then not used at all.
+function getValidRecordedEmbeddedOutputs(record) {
+  const outputs = record && typeof record === 'object' ? record.requiredEmbeddedOutputs : undefined;
+  if (!Array.isArray(outputs) || outputs.length > 8192 || !/^[a-f0-9]{64}$/.test(record.sourceFingerprint || '')) return null;
+  let units = 0;
+  for (const output of outputs) {
+    if (!output || typeof output.path !== 'string' || !path.isAbsolute(output.path) || output.path.length > 16384 ||
+        output.sourceDigest !== record.sourceFingerprint || !/^[a-f0-9]{64}$/.test(output.outputDigest || '')) return null;
+    units += output.path.length;
+  }
+  return units > 4 * 1024 * 1024 ? null : outputs;
+}
+
 // Content digests of extracted Photoshop outputs read during extraction, keyed
 // by path and file identity (device, inode, size, mtime and ctime): a file is
 // read once per state. Nothing is stored in the project.
@@ -16524,11 +16563,25 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           } else if (found.nlink !== 1) return false;
           const digest = (await readPsdBaselineSnapshot(row.path, isCurrent, directoryIdentity)).digest;
           const parentKey = normalizeTrackedFilePath(psdFilePath);
-          if (digest === outputDigest || !rows.some(other => {
+          if (digest === outputDigest) return false;
+          // Evidence that the wrong bytes are another document's output: a row of
+          // another document records them, or another document's stored,
+          // byte-validated verification record names this same path with them
+          // (only the old two-document collision produces that).
+          const rowEvidence = rows.some(other => {
             const receipt = other.psdExtractionReceipt || other.psdResource;
             return other !== row && receipt?.outputDigest === digest && typeof receipt.parentPath === 'string' &&
               normalizeTrackedFilePath(receipt.parentPath) !== parentKey;
-          })) return false;
+          });
+          const recordKeys = [];
+          const ownRow = (project?.files || []).find(file => normalizeTrackedFilePath(file.path) === parentKey);
+          const ownKey = ownRow ? getAssetBaselineSourceRecoveryRouteKey(project, ownRow) : null;
+          for (const [recordKey, record] of Object.entries(project?.workingSourceVerification || {})) {
+            if (recordKey === ownKey) continue;
+            if ((getValidRecordedEmbeddedOutputs(record) || []).some(output =>
+              output.outputDigest === digest && normalizeTrackedFilePath(output.path) === key)) recordKeys.push(recordKey);
+          }
+          if (!rowEvidence && !recordKeys.length) return false;
           repairSource ||= await readPsdBaselineSnapshot(fs.realpathSync(psdFilePath), isCurrent);
           assertRepairSource();
           assertCacheDirectoryIdentity(directoryIdentity, 'psd-extract-directory');
@@ -16538,8 +16591,73 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           if (kept.dev !== found.dev || kept.ino !== found.ino || current.dev !== found.dev || current.ino !== found.ino ||
               current.size !== found.size || current.mtimeMs !== found.mtimeMs) return false;
           fs.unlinkSync(row.path);
+          // The other document's record still names this path: have it verified again.
+          for (const recordKey of recordKeys) options.onOutputEvidenceRecord?.(recordKey);
           return true;
         } catch (_) { return false; }
+      };
+      // Another document's stored record that names a path one of this
+      // document's rows owns can only be left by the old collision; that
+      // document is verified again after the pass (see the pre-package flow).
+      if (options.onOutputEvidenceRecord && priorEmbeddedRows.length && project?.workingSourceVerification) {
+        const parentKey = normalizeTrackedFilePath(psdFilePath);
+        const ownPaths = new Set(priorEmbeddedRows.filter(row => {
+          const receipt = row.psdExtractionReceipt || row.psdResource;
+          return typeof receipt?.parentPath === 'string' && normalizeTrackedFilePath(receipt.parentPath) === parentKey;
+        }).map(row => normalizeTrackedFilePath(row.path)));
+        if (ownPaths.size) {
+          const ownRow = (project.files || []).find(file => normalizeTrackedFilePath(file.path) === parentKey);
+          const ownKey = ownRow ? getAssetBaselineSourceRecoveryRouteKey(project, ownRow) : null;
+          for (const [recordKey, record] of Object.entries(project.workingSourceVerification)) {
+            if (recordKey !== ownKey && (getValidRecordedEmbeddedOutputs(record) || [])
+              .some(output => ownPaths.has(normalizeTrackedFilePath(output.path)))) options.onOutputEvidenceRecord(recordKey);
+          }
+        }
+      }
+      // A document with its own stored verification record, in a project whose
+      // working files are verified before packaging, gets no new row from the
+      // pre-package pass when a verification scan of it is certain to follow:
+      // its record is not current for the bytes just read (review waits for
+      // that scan), or its record names a path another document's row owns (the
+      // old collision; it is verified again after this pass). The scan then
+      // makes the one row. Otherwise, and for existing rows, nothing changes.
+      let newRowsOwnedByVerification = null;
+      const verificationOwnsNewRows = () => newRowsOwnedByVerification ??= (() => {
+        if (options.scanOwnsNewWorkingOutputs !== true || !project?.workingSourceVerification) return false;
+        const parentKey = normalizeTrackedFilePath(psdFilePath);
+        const ownRow = (project.files || []).find(file => normalizeTrackedFilePath(file.path) === parentKey && isWorkingSourceFile(file));
+        const ownKey = ownRow && getAssetBaselineSourceRecoveryRouteKey(project, ownRow);
+        const record = ownKey && Object.hasOwn(project.workingSourceVerification, ownKey) ? project.workingSourceVerification[ownKey] : null;
+        if (!record || (!hasWorkingSourceSelectionState(project) && !getWorkingSourceRecoveryGuardKeys(project)?.has(ownKey))) return false;
+        if (record.status !== 'scanned' || record.sourceFingerprint !== sourceDigest) return true;
+        const claimed = new Set((getValidRecordedEmbeddedOutputs(record) || []).map(output => normalizeTrackedFilePath(output.path)));
+        return [...(project.files || []), ...(project.pendingFiles || [])].some(row => {
+          const receipt = row.psdExtractionReceipt || row.psdResource;
+          return claimed.has(normalizeTrackedFilePath(row.path)) && typeof receipt?.parentPath === 'string' &&
+            normalizeTrackedFilePath(receipt.parentPath) !== parentKey;
+        });
+      })();
+      const getVerifiedDuplicatePair = async (pair, byteLength, outputDigest) => {
+        try {
+          const rows = [...(project?.files || []), ...(project?.pendingFiles || [])];
+          const parentKey = normalizeTrackedFilePath(psdFilePath);
+          const ownRow = (project?.files || []).find(file => normalizeTrackedFilePath(file.path) === parentKey && isWorkingSourceFile(file));
+          const record = ownRow && getWorkingSourceVerification(project, ownRow);
+          if (!record || record.status !== 'scanned' || record.sourceFingerprint !== sourceDigest) return null;
+          const named = pair.filter(row => (record.requiredEmbeddedOutputs || []).some(output =>
+            output.outputDigest === outputDigest && normalizeTrackedFilePath(output.path) === normalizeTrackedFilePath(row.path)));
+          if (named.length !== 1) return null;
+          const choiceKeys = new Set(project.excludedAssetKeys || []);
+          for (const row of pair) {
+            const key = normalizeTrackedFilePath(row.path);
+            if (hasIndividualAssetChoice(project, row, choiceKeys) || !isDirectCacheChild(extractDir, row.path) ||
+                rows.filter(other => normalizeTrackedFilePath(other.path) === key).length !== 1) return null;
+            const snapshot = await readPsdBaselineSnapshot(row.path, isCurrent, directoryIdentity, byteLength);
+            if (snapshot.digest !== outputDigest) return null;
+            assertPsdBaselineSnapshot(snapshot);
+          }
+          return named[0];
+        } catch (_) { return null; }
       };
       let baselineEmbeddedOrdinal = 0;
       for (const { lf, embeddedIndex, outputDigest, matches, chosenName, repairOnly } of embeddedRecords) {
@@ -16554,6 +16672,17 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         if (!options.onOwnedPsdOutputs) {
           if (matches.length) {
             const targets = matches.map(row => ({ path: row.path, row: JSON.stringify(row) }));
+            // Two rows an older build left for one object of this save: both are
+            // cleared only when both files hold its verified bytes and this
+            // document's current verification record names exactly one of them.
+            const pair = matches.length === 2 && await getVerifiedDuplicatePair(matches, data.length, outputDigest);
+            if (!isCurrent()) return [];
+            if (pair) {
+              updatePsdExtractionReceiptHolds(projectId, targets, false, isCurrent);
+              discoveredPaths.push({ filePath: pair.path, source: 'psd-embedded',
+                embeddedOriginalName: lf.name || '', embeddedIndex, sourceDigest, outputDigest, psdExtractionReceipt });
+              continue;
+            }
             try {
               if (matches.length !== 1) throw new Error();
               if (!isDirectCacheChild(extractDir, matches[0].path)) throw new Error();
@@ -16595,6 +16724,8 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
             }
           }
         }
+        // A new object of a document whose verification scan owns new rows.
+        if (!restoreTargets && !chosenName && !matches.length && verificationOwnsNewRows()) continue;
         const extractPath = restoreTargets ? restoreTargets[0].path : path.join(extractDir, chosenName || reserveUniqueName(lf.name, usedEmbeddedNames));
         const stagedPath = safeCacheTempPath(extractPath);
         const staged = {
@@ -20767,7 +20898,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   }
   const operation = captureProjectOperation(projectId); if (!operation) return null;
   const operationCurrent = operation.current;
-  const ordinaryPsdOutputBatches = [], ownerNotes = [];
+  const ordinaryPsdOutputBatches = [], ownerNotes = [], outputEvidenceRecords = new Set();
   // The Photoshop parse keeps its merged guard: only with a selection record,
   // and it goes on reading an individually excluded placed PSD.
   const scanSkipper = (scanProject, { photoshopParse = false } = {}) => {
@@ -21212,6 +21343,8 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
       if (!fs.existsSync(psdFile.path)) continue;
       const psdAssets = await extractPsdAssets(psdFile.path, projectId, operationCurrent, {
         onOrdinaryPsdOutputs: outputs => ordinaryPsdOutputBatches.push(outputs),
+        scanOwnsNewWorkingOutputs: true,
+        onOutputEvidenceRecord: key => outputEvidenceRecords.add(key),
       });
       if (!operationCurrent()) return;
       for (const asset of psdAssets) {
@@ -21689,6 +21822,12 @@ end tell`;
       }
     }
     for (const outputs of ordinaryPsdOutputBatches) finishBaselinePsdOutputs(outputs, projectId, operationCurrent);
+    // A repair proven by another document's stored record leaves that record
+    // naming the repaired path: verify that document again with its existing
+    // leased scan, which alone may publish its record.
+    if (outputEvidenceRecords.size && operationCurrent()) {
+      try { await reverifyOutputEvidenceSources(projectId, outputEvidenceRecords, operationCurrent); } catch (_) {}
+    }
     resumeWatcherCoordinatorAfterPackage(projectId);
     if (!operation.current()) restoreFigmaPackageTransferBlock(projectId, previousFigmaPackageBlock);
     operation.close();
