@@ -43,6 +43,8 @@ replaceExactlyOnce("  readPsd: () => {\n    if (currentPsdFixture instanceof Err
   "  readPsd: (buffer, options) => {\n    if (globalThis.__crateRealMainPsdBytes && currentPsdFixture === 'actual-source-buffer' && Buffer.isBuffer(buffer)) return originalLoad.call(Module, 'ag-psd/dist/index.js', module).readPsd(buffer, options);\n    if (currentPsdFixture instanceof Error) throw currentPsdFixture;\n    if (typeof currentPsdFixture === 'function') return currentPsdFixture(buffer);");
 // Locator refresh for proven renames, as in the working-file choice suite.
 replaceExactlyOnce('  captureProjectOperation,\n  runScanOnOpen', '  applyLiveAppEvidenceRefresh, refreshWorkingSourceLocators,\n  captureProjectOperation,\n  runScanOnOpen');
+// The shared structural check of stored verification records and the output evidence read.
+replaceExactlyOnce('  captureProjectOperation,\n  runScanOnOpen', '  isStructurallyValidWorkingSourceRecord, getValidRecordedEmbeddedOutputs,\n  captureProjectOperation,\n  runScanOnOpen');
 const compiled = new Module(harnessPath, module);
 compiled.filename = harnessPath;
 compiled.paths = Module._nodeModulePaths(__dirname);
@@ -9361,6 +9363,131 @@ function excludedSourceMembershipCases() {
       })[variant]);
     }, { realMainPsd: true }));
   }
+  // ---- Stored verification records are evidence only when they pass every structural check of
+  // getWorkingSourceVerification; the selection revision is not compared (it binds a record to the current
+  // selection for packaging authority, not to what a byte-validated scan wrote at a path).
+  const bRecordOf = t => {
+    const p = t.f.current(), aKey = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(p, p.files.find(row => row.path === t.A));
+    const [key, record] = Object.entries(p.workingSourceVerification).find(([k, r]) => k !== aKey && (r.requiredEmbeddedOutputs || []).some(o => o.path === t.a0.path));
+    return { key, record, bRow: p.files.find(row => row.path === t.B) };
+  };
+  const breakRecord = (record, variant) => {
+    if (variant === 'unknown status and numeric attempt') { record.status = 'not-a-status'; record.attempt = 7; }
+    if (variant === 'attempt too long') record.attempt = 'a'.repeat(65);
+    if (variant === 'malformed requiredReferences') record.requiredReferences = [{ path: 'relative.png' }];
+    if (variant === 'inventoryStatus complete') record.inventoryStatus = 'complete';
+    if (variant === 'scanned without identity') { record.status = 'scanned'; delete record.sourceIdentity; }
+    if (variant === 'requiredReferences deleted') delete record.requiredReferences;
+  };
+  // Malformed outside the output list, with B excluded so no row of B can vouch: A's row stays refused,
+  // nothing is set aside, B's record is left exactly as it was (no follow-up verification), in confirm order.
+  for (const variant of ['unknown status and numeric attempt', 'attempt too long', 'malformed requiredReferences', 'inventoryStatus complete', 'scanned without identity', 'requiredReferences deleted']) {
+    baselineTest(`Photoshop outputs: a structurally invalid record of another document is no evidence (${variant})`, { timeout: 300000 }, () => withEnv(async () => {
+      const { state } = recovery;
+      const t = await releasedTakeover('r28' + variant.replace(/[^a-z]/g, '').slice(0, 8));
+      await t.f.select(t.B, 'exclude');                                                 // B is not read, so no row of B can be evidence
+      const b = bRecordOf(t);
+      breakRecord(b.record, variant);
+      roundTripFakeStore();
+      const stored = () => JSON.stringify(t.f.current().workingSourceVerification[b.key]), before = stored();
+      const look = async () => { const review = await openReview(t.f); return { ...state(t.f, t.dir), review: review.materializable === true ? 'OK' : 'blocked: ' + (review.message || review.error || '') }; };
+      const results = { first: await look(), confirmed: await confirmInAppOrder(t.f) };
+      await t.f.select(t.A, 'exclude');                                                 // the existing exit
+      results.afterExcludingA = await confirmInAppOrder(t.f);
+      results.bRecordUnchanged = stored() === before;
+      const association = 'Photoshop asset association is unresolved. Your files are preserved; this package is blocked.';
+      pinned(results, { first: { rows: ['Embedded-Layer.png DocA A B'], setAside: [], holds: ['psd-extraction-receipt-unverified Embedded-Layer.png'], review: 'blocked: ' + association },
+        confirmed: 'review blocked: ' + association, afterExcludingA: [], bRecordUnchanged: true });
+    }, { realMainPsd: true }));
+  }
+  // A structurally valid record whose selection revision does not match (its receipt is then invalid, so
+  // write-blocked): it is evidence for the other document's row, B is never verified again by the
+  // follow-up (no scan of it can publish), and B's own objects get rows from the pass as before. A record
+  // malformed in its outer fields with B included is the same for B, and is no evidence.
+  for (const variant of ['revision mismatch, B excluded', 'revision mismatch, B included', 'unknown status, B included']) {
+    baselineTest(`Photoshop outputs: a write-blocked document after the released takeover (${variant})`, { timeout: 300000 }, () => withEnv(async () => {
+      const { state } = recovery;
+      const t = await releasedTakeover('r29' + variant.replace(/[^a-z]/g, '').slice(0, 10));
+      await t.f.select(variant.endsWith('B excluded') ? t.B : t.K, 'exclude');
+      const b = bRecordOf(t);
+      if (variant.startsWith('revision')) b.record.selectionRevision = (Number.isSafeInteger(b.record.selectionRevision) ? b.record.selectionRevision : 0) + 7;
+      else breakRecord(b.record, 'unknown status and numeric attempt');
+      roundTripFakeStore();
+      const results = { bReceiptInvalid: metadataTestHooks.getWorkingSourceVerification(t.f.current(), b.bRow) === null };
+      const attempt = () => t.f.current().workingSourceVerification[b.key]?.attempt, firstAttempt = attempt();
+      const look = async () => { const review = await openReview(t.f); return { ...state(t.f, t.dir), review: review.materializable === true ? 'OK' : 'blocked: ' + (review.message || review.error || ''),
+        bRows: t.outputs(t.B).map(row => path.basename(row.path) + (row.psdResource ? ' resource' : ' receipt')) }; };
+      results.first = await look(); results.second = await look();
+      results.bNotScanned = attempt() === firstAttempt;
+      results.confirmed = await confirmInAppOrder(t.f);
+      if (variant.endsWith('B included')) { await t.f.select(t.B, 'exclude'); results.afterExcludingB = await confirmInAppOrder(t.f); }
+      pinned(results, ({
+        'revision mismatch, B excluded': { bReceiptInvalid: true, first: { rows: ['Embedded-Layer.png DocA A A'], setAside: ['B'], holds: [], review: 'OK', bRows: [] }, second: { rows: ['Embedded-Layer.png DocA A A'], setAside: ['B'], holds: [], review: 'OK', bRows: [] }, bNotScanned: true, confirmed: ['Embedded-Layer.png=A'] },
+        'revision mismatch, B included': { bReceiptInvalid: true, first: { rows: ['Embedded-Layer.png DocA A A', 'Embedded-Layer_1.png DocB B B'], setAside: ['B'], holds: [], review: 'blocked: Working-source verification is unresolved. Resolve it before packaging.', bRows: ['Embedded-Layer_1.png receipt'] }, second: { rows: ['Embedded-Layer.png DocA A A', 'Embedded-Layer_1.png DocB B B'], setAside: ['B'], holds: [], review: 'blocked: Working-source verification is unresolved. Resolve it before packaging.', bRows: ['Embedded-Layer_1.png receipt'] }, bNotScanned: true, confirmed: 'review blocked: Working-source verification is unresolved. Resolve it before packaging.', afterExcludingB: ['Embedded-Layer.png=A'] },
+        'unknown status, B included': { bReceiptInvalid: true, first: { rows: ['Embedded-Layer.png DocA A B', 'Embedded-Layer_1.png DocB B B'], setAside: [], holds: ['psd-extraction-receipt-unverified Embedded-Layer.png'], review: 'blocked: Photoshop asset association is unresolved. Your files are preserved; this package is blocked.', bRows: ['Embedded-Layer_1.png receipt'] }, second: { rows: ['Embedded-Layer.png DocA A A', 'Embedded-Layer_1.png DocB B B'], setAside: ['B'], holds: [], review: 'blocked: Working-source verification is unresolved. Resolve it before packaging.', bRows: ['Embedded-Layer_1.png receipt'] }, bNotScanned: true, confirmed: 'review blocked: Working-source verification is unresolved. Resolve it before packaging.', afterExcludingB: ['Embedded-Layer.png=A'] },
+      })[variant]);
+    }, { realMainPsd: true }));
+  }
+  // A write-blocked Add Files document in a selection project saved in place with a new object: the pass
+  // makes its row exactly as before this change (no verification scan of it can publish), and its existing
+  // stop shows unchanged. The recovery record is assigned in the store (no Photoshop handler creates one).
+  for (const variant of ['unknown status', 'revision mismatch', 'recovery record assigned']) {
+    baselineTest(`Photoshop outputs: a write-blocked document saved with a new object gets its row from the pass (${variant})`, { timeout: 300000 }, () => withEnv(async () => {
+      const { state } = recovery;
+      const tag = 'r30' + variant.replace(/[^a-z]/g, '').slice(0, 8), A = desk(`DocA-${tag}.psd`), K = desk(`Keep-${tag}.ai`), Z = desk(`Other-${tag}.ai`);
+      const f = await newProject('Write-blocked ' + tag, { before() { writeWorking('.psd', A, [], 611); writeWorking('.ai', K, []); writeWorking('.ai', Z, []); } });
+      await f.add(A); await f.add(K); await f.add(Z); await f.select(Z, 'exclude');
+      const p = f.current(), aRow = p.files.find(row => row.path === A), aKey = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(p, aRow);
+      const dir = path.dirname(p.files.find(row => row.source === 'psd-embedded').path);
+      if (variant === 'unknown status') breakRecord(p.workingSourceVerification[aKey], 'unknown status and numeric attempt');
+      if (variant === 'revision mismatch') p.workingSourceVerification[aKey].selectionRevision += 7;
+      if (variant === 'recovery record assigned') p.workingSourceRecovery = { version: 1, records: { [aKey]: { version: 1 } } };
+      roundTripFakeStore();
+      writeWorking('.psd', A, [], 644);                                                  // saved in place with a new embedded object
+      const look = async () => { const review = await openReview(f); return { ...state(f, dir), review: review.materializable === true ? 'OK' : 'blocked: ' + (review.message || review.error || '') }; };
+      const results = { first: await look(), second: await look(), confirmed: await confirmInAppOrder(f) };
+      // The existing exit; an active recovery record keeps its own recovery route (Exclude is refused).
+      if (variant !== 'recovery record assigned') { await f.select(A, 'exclude'); results.afterExcludingA = await confirmInAppOrder(f); }
+      pinned(results, ({
+        'unknown status': { first: { rows: ['Embedded-Layer.png DocA A A', 'Embedded-Layer_1.png DocA 5c9de92d 5c9de92d'], setAside: [], holds: [], review: 'blocked: Working-source verification is unresolved. Resolve it before packaging.' }, second: { rows: ['Embedded-Layer.png DocA A A', 'Embedded-Layer_1.png DocA 5c9de92d 5c9de92d'], setAside: [], holds: [], review: 'blocked: Working-source verification is unresolved. Resolve it before packaging.' }, confirmed: 'review blocked: Working-source verification is unresolved. Resolve it before packaging.', afterExcludingA: [] },
+        'revision mismatch': { first: { rows: ['Embedded-Layer.png DocA A A', 'Embedded-Layer_1.png DocA 5c9de92d 5c9de92d'], setAside: [], holds: [], review: 'blocked: Working-source verification is unresolved. Resolve it before packaging.' }, second: { rows: ['Embedded-Layer.png DocA A A', 'Embedded-Layer_1.png DocA 5c9de92d 5c9de92d'], setAside: [], holds: [], review: 'blocked: Working-source verification is unresolved. Resolve it before packaging.' }, confirmed: 'review blocked: Working-source verification is unresolved. Resolve it before packaging.', afterExcludingA: [] },
+        'recovery record assigned': { first: { rows: ['Embedded-Layer.png DocA A A', 'Embedded-Layer_1.png DocA 5c9de92d 5c9de92d'], setAside: [], holds: [], review: 'blocked: Working-source verification is unresolved. Resolve it before packaging.' }, second: { rows: ['Embedded-Layer.png DocA A A', 'Embedded-Layer_1.png DocA 5c9de92d 5c9de92d'], setAside: [], holds: [], review: 'blocked: Working-source verification is unresolved. Resolve it before packaging.' }, confirmed: 'review blocked: Working-source verification is unresolved. Resolve it before packaging.' },
+      })[variant]);
+    }, { realMainPsd: true }));
+  }
+  // The accessor and the evidence read share one structural predicate: for each record, the accessor
+  // returns a record exactly when the revision matches and the predicate holds, and the evidence read
+  // returns outputs exactly when the predicate holds and the record has an output list.
+  baselineTest('Photoshop outputs: the verification accessor and the output evidence share one structural check', () => {
+    const { isStructurallyValidWorkingSourceRecord: valid, getValidRecordedEmbeddedOutputs: outputsOf, getWorkingSourceVerification: accessor } = metadataTestHooks;
+    const fp = 'a'.repeat(64), out = { path: '/Users/synthetic/cache/Embedded-Layer.png', sourceDigest: fp, outputDigest: 'b'.repeat(64) };
+    const base = () => ({ version: 1, status: 'scanned', attempt: 'a1', selectionRevision: 0, requiredReferences: [], unresolved: [], sourceFingerprint: fp,
+      sourceIdentity: { dev: 1, ino: 2, size: 3, mtimeMs: 4, ctimeMs: 5 }, requiredEmbeddedOutputs: [out] });
+    const variants = {
+      valid: r => r, 'no outputs': r => { delete r.requiredEmbeddedOutputs; }, 'empty outputs': r => { r.requiredEmbeddedOutputs = []; },
+      pending: r => { r.status = 'pending'; r.sourceIdentity = null; }, stale: r => { r.status = 'stale'; },
+      'unknown status': r => { r.status = 'not-a-status'; }, 'numeric attempt': r => { r.attempt = 7; }, 'long attempt': r => { r.attempt = 'a'.repeat(65); },
+      'relative reference': r => { r.requiredReferences = [{ path: 'x.png' }]; }, 'no references': r => { delete r.requiredReferences; },
+      'unresolved not a list': r => { r.unresolved = {}; }, 'long unresolved reason': r => { r.unresolved = [{ reason: 'x'.repeat(129) }]; },
+      complete: r => { r.inventoryStatus = 'complete'; }, 'scanned without identity': r => { delete r.sourceIdentity; },
+      'scanned bad fingerprint': r => { r.sourceFingerprint = 'nope'; }, 'relative output': r => { r.requiredEmbeddedOutputs = [{ ...out, path: 'x.png' }]; },
+      'output of other bytes': r => { r.requiredEmbeddedOutputs = [{ ...out, sourceDigest: 'c'.repeat(64) }]; }, 'outputs not a list': r => { r.requiredEmbeddedOutputs = {}; },
+      'revision mismatch': r => { r.selectionRevision = 3; },
+    };
+    const results = {};
+    for (const [name, change] of Object.entries(variants)) {
+      const record = base(); change(record);
+      const file = { path: '/Users/synthetic/DocA.psd' }, project = { id: 'p', files: [file] };
+      const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(project, file);
+      project.workingSourceVerification = { [key]: record };
+      const got = accessor(project, file), structural = valid(record);
+      assert.equal(!!got, structural && record.selectionRevision === 0, name + ': accessor');
+      assert.equal(!!outputsOf(record), structural && Array.isArray(record.requiredEmbeddedOutputs), name + ': evidence');
+      results[name] = [structural, !!got, outputsOf(record)?.length ?? null];
+    }
+    for (const value of [null, undefined, 7, 'scanned', [], [base()]]) { assert.equal(valid(value), false); assert.equal(outputsOf(value), null); }
+    pinned(results, { valid: [true, true, 1], 'no outputs': [true, true, null], 'empty outputs': [true, true, 0], pending: [true, true, 1], stale: [true, true, 1], 'unknown status': [false, false, null], 'numeric attempt': [false, false, null], 'long attempt': [false, false, null], 'relative reference': [false, false, null], 'no references': [false, false, null], 'unresolved not a list': [false, false, null], 'long unresolved reason': [false, false, null], complete: [false, false, null], 'scanned without identity': [false, false, null], 'scanned bad fingerprint': [false, false, null], 'relative output': [false, false, null], 'output of other bytes': [false, false, null], 'outputs not a list': [false, false, null], 'revision mismatch': [true, false, 1] });
+  });
   // Verification has no size cap: an output larger than the 300 MB parse limit whose bytes match its
   // record stays available (a sparse file, so the test writes almost nothing to disk; the package
   // itself is not written).

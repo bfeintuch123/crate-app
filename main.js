@@ -3987,11 +3987,11 @@ function isWorkingSourceDiskIdentityCurrent(file, record) {
     .every(key => identity[key] === record.sourceIdentity[key]);
 }
 
-function getWorkingSourceVerification(project, file) {
-  const key = getAssetBaselineSourceRecoveryRouteKey(project, file);
-  const record = project?.workingSourceVerification?.[key];
-  const selection = getWorkingSourceSelection(project, file);
-  if (!record || record.selectionRevision !== selection.revision) return null;
+// The structural checks of a stored working-source verification record, apart
+// from its binding to the current selection revision: the accessor below and
+// the output evidence read by the pre-package pass both use exactly these.
+function isStructurallyValidWorkingSourceRecord(record) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return false;
   if (!['scanned', 'pending', 'failed', 'limited', 'incomplete', 'unavailable', 'stale', 'no-extractor'].includes(record.status) ||
       typeof record.attempt !== 'string' || record.attempt.length > 64 ||
       !Array.isArray(record.requiredReferences) || record.requiredReferences.length > 8192 ||
@@ -4002,7 +4002,7 @@ function getWorkingSourceVerification(project, file) {
       record.inventoryStatus === 'complete' ||
       (['scanned', 'no-extractor'].includes(record.status) &&
         (!/^[a-f0-9]{64}$/.test(record.sourceFingerprint || '') || !record.sourceIdentity ||
-          !['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'].every(key => Number.isFinite(record.sourceIdentity[key]))))) return null;
+          !['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'].every(key => Number.isFinite(record.sourceIdentity[key]))))) return false;
   // "scanned" proves ordinary-route parity on these bytes, never exhaustive
   // inventory certification. No provider can publish a "complete" verdict.
   // This optional domain is published only by a byte-validated PSD scan.
@@ -4013,7 +4013,16 @@ function getWorkingSourceVerification(project, file) {
           path.isAbsolute(output.path) && output.path.length <= 16384 &&
           /^[a-f0-9]{64}$/.test(output.sourceDigest || '') && output.sourceDigest === record.sourceFingerprint &&
           /^[a-f0-9]{64}$/.test(output.outputDigest || '')) ||
-        record.requiredEmbeddedOutputs.reduce((units, output) => units + output.path.length, 0) > 4 * 1024 * 1024)) return null;
+        record.requiredEmbeddedOutputs.reduce((units, output) => units + output.path.length, 0) > 4 * 1024 * 1024)) return false;
+  return true;
+}
+
+function getWorkingSourceVerification(project, file) {
+  const key = getAssetBaselineSourceRecoveryRouteKey(project, file);
+  const record = project?.workingSourceVerification?.[key];
+  const selection = getWorkingSourceSelection(project, file);
+  if (!record || record.selectionRevision !== selection.revision) return null;
+  if (!isStructurallyValidWorkingSourceRecord(record)) return null;
   // A concrete legacy PSD scan proves capture on these bytes, but its ordinary
   // extractor does not publish the PSD's declared dependency inventory. Once
   // selection is engaged, retain that receipt and its known obligations while
@@ -5916,11 +5925,14 @@ async function refreshWorkingSourceLocators(projectId, observedPaths = null, par
 }
 
 // Whether the follow-up verification after a pre-package pass scans this working
-// file: selected, in a project whose working files are verified before packaging
-// (a selection, or this file recovery-guarded), and included by membership.
+// file and can publish its result: selected, in a project whose working files are
+// verified before packaging (a selection, or this file recovery-guarded),
+// included by membership, and its receipt not write-blocked (a recovery record
+// or an invalid stored receipt stops that scan before it starts).
 function isOutputEvidenceVerificationTarget(project, file, membership = null) {
   const key = file && getAssetBaselineSourceRecoveryRouteKey(project, file);
   if (!key || getWorkingSourceSelection(project, file).state !== 'selected') return false;
+  if (isWorkingSourceReceiptWriteBlocked(project, file)) return false;
   if (!hasWorkingSourceSelectionState(project) && !getWorkingSourceRecoveryGuardKeys(project)?.has(key)) return false;
   return !!(membership || getWorkingSourceMembership(project)).facts.get(getTrackedFileDedupKey(file))?.included;
 }
@@ -11339,18 +11351,16 @@ function getChosenMissingPsdOutputs(project, psdFilePath, extractDir, isNamePres
 }
 
 // The required embedded outputs of a stored working-source verification record,
-// read raw and validated as getWorkingSourceVerification validates them; null
-// for a malformed record, which is then not used at all.
+// read raw: only a record that passes every structural check of
+// getWorkingSourceVerification gives any; any other record (malformed in any
+// field, not only in its output list) is not used at all, as evidence, as a
+// claim or as a reason to verify again. Every known status counts. The record's
+// selection revision is deliberately not compared: that revision binds a record
+// to the current selection for packaging authority, and says nothing about
+// whether a byte-validated scan wrote those bytes at that path.
 function getValidRecordedEmbeddedOutputs(record) {
-  const outputs = record && typeof record === 'object' ? record.requiredEmbeddedOutputs : undefined;
-  if (!Array.isArray(outputs) || outputs.length > 8192 || !/^[a-f0-9]{64}$/.test(record.sourceFingerprint || '')) return null;
-  let units = 0;
-  for (const output of outputs) {
-    if (!output || typeof output.path !== 'string' || !path.isAbsolute(output.path) || output.path.length > 16384 ||
-        output.sourceDigest !== record.sourceFingerprint || !/^[a-f0-9]{64}$/.test(output.outputDigest || '')) return null;
-    units += output.path.length;
-  }
-  return units > 4 * 1024 * 1024 ? null : outputs;
+  if (!isStructurallyValidWorkingSourceRecord(record) || !Array.isArray(record.requiredEmbeddedOutputs)) return null;
+  return record.requiredEmbeddedOutputs;
 }
 
 // Content digests of extracted Photoshop outputs read during extraction, keyed
@@ -16634,8 +16644,9 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       // verification) and its record is not current for the bytes just read, so
       // review waits for that scan; or (2) its record names a path another
       // document's row owns (the old collision) and the follow-up verification
-      // after this pass scans it. That scan makes the one row. Otherwise, and
-      // for existing rows, the pass works as before.
+      // after this pass scans it. That scan makes the one row. Neither holds
+      // while its receipt is write-blocked: no scan of it can publish then.
+      // Otherwise, and for existing rows, the pass works as before.
       let newRowsOwnedByVerification = null;
       const verificationOwnsNewRows = () => newRowsOwnedByVerification ??= (() => {
         if (options.scanOwnsNewWorkingOutputs !== true || !project?.workingSourceVerification) return false;
@@ -16644,6 +16655,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         const ownKey = ownRow && getAssetBaselineSourceRecoveryRouteKey(project, ownRow);
         const record = ownKey && Object.hasOwn(project.workingSourceVerification, ownKey) ? project.workingSourceVerification[ownKey] : null;
         if (!record || (!hasWorkingSourceSelectionState(project) && !getWorkingSourceRecoveryGuardKeys(project)?.has(ownKey))) return false;
+        if (isWorkingSourceReceiptWriteBlocked(project, ownRow)) return false;
         const membership = getWorkingSourceMembership(project);
         if (membership.facts.get(getTrackedFileDedupKey(ownRow))?.verificationRequired === true &&
             (!['scanned', 'no-extractor'].includes(record.status) || record.sourceFingerprint !== sourceDigest)) return true;
