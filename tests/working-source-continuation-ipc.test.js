@@ -1001,10 +1001,10 @@ function continuationCases() {
         const b = await recoveryRendererBridge(f);
         try {
           assert.match(b.text(b.row()), /Needs attention/);
-          if (mode === 'missing-A') assert.equal(b.button('Restore'), undefined);
+          if (mode === 'missing-A') assert.equal(b.button('Include'), undefined);
           b.renderer.oldToken = prior.token; b.read('state.packageReviewToken = oldToken');
           const start = b.calls.length;
-          assert.equal(await b.activate(action === 'exclude' ? 'Exclude' : 'Restore'), true);
+          assert.equal(await b.activate(action === 'exclude' ? 'Exclude' : 'Include'), true);
           assert.deepEqual(b.calls.slice(start, start + 3), ['selection', 'workspace', 'prepare']);
           const latest = (await callIpcRaw('projects:get-asset-workspace', f.id)).files.find(row => row.name === 'A.ai');
           assert.equal(latest.selectionRevision, a.selectionRevision + 1);
@@ -1102,7 +1102,7 @@ function continuationCases() {
         f.stored().workingSourceSelections[key].revision = -1;
       } else f.stored().files.push({ ...f.rows['A.ai'], fileId: 'duplicate-A' });
       const b = await recoveryRendererBridge(f);
-      try { assert.equal(b.button('Exclude'), undefined); assert.equal(b.button('Restore'), undefined); assert.equal(b.results.length, 0); }
+      try { assert.equal(b.button('Exclude'), undefined); assert.equal(b.button('Include'), undefined); assert.equal(b.results.length, 0); }
       finally { b.close(); }
     });
   }
