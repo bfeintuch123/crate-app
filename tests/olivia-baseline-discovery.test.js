@@ -8822,6 +8822,43 @@ function excludedSourceMembershipCases() {
       'refill then change': { rows: ['Embedded-Layer.png PlacedA 4bc8ff77 4bc8ff77', 'Embedded-Layer_1.png PlacedB B B', 'Embedded-Layer_2.png PlacedA 869b19a6 869b19a6'], setAside: [], holds: [], written: ['Embedded-Layer.png=4bc8ff77', 'Embedded-Layer_1.png=B', 'Embedded-Layer_2.png=869b19a6'] },
     });
   }, { realMainPsd: true }));
+  // The state an older build leaves after a cache loss, an edit and one more pass (as bc94955 leaves it):
+  // a stale row whose record names the old object and whose file holds the current one, plus a second row
+  // recording the current object. Every pass keeps both rows as they are (a record goes to at most one
+  // row), with no hold, and packages the same bytes.
+  for (const variant of ['one stale row', 'two stale rows', 'document changed again']) {
+    baselineTest(`Photoshop outputs: the older-build refill state keeps packaging on every pass (${variant})`, { timeout: 300000 }, () => withEnv(async () => {
+      const { state, packaged } = recovery;
+      const sha = data => require('crypto').createHash('sha256').update(data).digest('hex');
+      const t = await psdPlaced('r12' + variant[0] + variant.length), [a0] = t.outputs(t.A), dir = path.dirname(a0.path);
+      writeWorking('.psd', t.A, [], 645);                                              // the current object
+      const current = png(645), sourceDigest = sha(fs.readFileSync(t.A));
+      const stale = t.f.current().files.find(row => row.path === a0.path);
+      fs.writeFileSync(stale.path, current);                                           // refilled, record left on the old object
+      const extra = [];
+      if (variant === 'two stale rows') extra.push({ ...JSON.parse(JSON.stringify(stale)), fileId: stale.fileId + '-s2', path: path.join(dir, 'Embedded-Layer_3.png'), name: 'Embedded-Layer_3.png' });
+      const recorded = { ...JSON.parse(JSON.stringify(stale)), fileId: stale.fileId + '-r2', path: path.join(dir, 'Embedded-Layer_2.png'), name: 'Embedded-Layer_2.png',
+        psdExtractionReceipt: { version: 1, parentPath: t.A, sourceDigest, layerPath: null, linkedIndex: 0, originalName: 'Embedded-Layer.png', outputDigest: sha(current) } };
+      for (const row of [...extra, recorded]) { fs.writeFileSync(row.path, current); t.f.current().files.push(row); }
+      roundTripFakeStore();
+      if (variant === 'document changed again') writeWorking('.psd', t.A, [], 646);
+      const passes = [];
+      for (let pass = 0; pass < 3; pass++) {
+        await prePackage(t.f);
+        passes.push({ ...state(t.f, dir), written: embeddedOnly(await packaged(t.f)) });
+      }
+      assert.ok(passes.every(item => JSON.stringify(item) === JSON.stringify(passes[0])), 'every pass the same');
+      // Rows, files and written bytes as bc94955 gives for the same state (d9cd1fd held both rows from pass 2).
+      const d = '4bc8ff77', rows = ['Embedded-Layer.png PlacedA A ' + d, 'Embedded-Layer_1.png PlacedB B B', `Embedded-Layer_2.png PlacedA ${d} ${d}`];
+      const written = [`Embedded-Layer.png=${d}`, 'Embedded-Layer_1.png=B', `Embedded-Layer_2.png=${d}`];
+      assert.deepEqual(passes[0], {
+        'one stale row': { rows, setAside: [], holds: [], written },
+        'two stale rows': { rows: [...rows, 'Embedded-Layer_3.png PlacedA A ' + d], setAside: [], holds: [], written: [...written, `Embedded-Layer_3.png=${d}`] },
+        'document changed again': { rows: [...rows, 'Embedded-Layer_3.png PlacedA 869b19a6 869b19a6'], setAside: [], holds: [],
+          written: [...written, 'Embedded-Layer_3.png=869b19a6'] },
+      }[variant]);
+    }, { realMainPsd: true }));
+  }
   // Verification has no size cap: an output larger than the 300 MB parse limit whose bytes match its
   // record stays available (a sparse file, so the test writes almost nothing to disk; the package
   // itself is not written).

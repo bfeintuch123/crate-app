@@ -16423,6 +16423,12 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       // in memory, written only while the row is unchanged. Rows with a choice,
       // rows with a resource record and shared paths are never re-recorded.
       const rerecorded = new Set();
+      // A record is given to at most one row: never one another row of this
+      // file already carries exactly, nor one taken earlier in this extraction
+      // (two rows with one record would trip the existing ambiguity refusal).
+      // Two objects with the same name and bytes are two records.
+      const recordKey = receipt => JSON.stringify([receipt.sourceDigest, receipt.layerPath, receipt.linkedIndex, receipt.originalName, receipt.outputDigest]);
+      let claimedRecords = null;
       const rerecordRefilledRows = async onlyPaths => {
         let psdKey = null, choiceKeys = null;
         for (const row of priorEmbeddedRows) {
@@ -16439,11 +16445,22 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           let digest = null;
           try { digest = await readCachedPsdOutputDigest(row.path, isCurrent, directoryIdentity); }
           catch (_) { if (!isCurrent()) return false; continue; }
-          const record = candidates.find(item => item.outputDigest === digest);
+          if (!claimedRecords) {
+            claimedRecords = new Set();
+            for (const other of priorEmbeddedRows) {
+              const held = other.psdExtractionReceipt || other.psdResource;
+              if (held?.version === 1 && held.current !== false && typeof held.parentPath === 'string' &&
+                  normalizeTrackedFilePath(held.parentPath) === psdKey) claimedRecords.add(recordKey(held));
+            }
+          }
+          const nextFor = item => ({ version: 1, parentPath: psdFilePath, sourceDigest, layerPath: null,
+            linkedIndex: item.embeddedIndex, originalName: item.lf.name || '', outputDigest: item.outputDigest });
+          const record = candidates.find(item => item.outputDigest === digest && !claimedRecords.has(recordKey(nextFor(item))));
+          // Unclaimed: the row stays as it is; review accepts it through the row that carries the record.
           if (!record) continue;
-          const next = { version: 1, parentPath: psdFilePath, sourceDigest, layerPath: null,
-            linkedIndex: record.embeddedIndex, originalName: record.lf.name || '', outputDigest: record.outputDigest };
+          const next = nextFor(record);
           if (!rerecordPsdOutputRow(projectId, row, next, isCurrent)) continue;
+          claimedRecords.add(recordKey(next));
           rerecorded.add(row);
           row.psdExtractionReceipt = next;
           // It is now this save's own row for that object: no new row is made.
