@@ -20,6 +20,10 @@ const MAX_NAME_RECORDS = 4096;
 const MAX_FVAR_INSTANCES = 1024;
 const MAX_FONT_NAME_TEXT_LENGTH = 4000;
 const MAX_FONT_IDENTITY_TEXT_LENGTH = 255;
+// Licence evidence (name IDs 13 and 14) decoded per file, across every record
+// and face. Identical spans are judged once; past this budget the remaining
+// records are not decoded and the file asks for the per-font confirmation.
+const MAX_LICENCE_EVIDENCE_BYTES = 2 * 1024 * 1024;
 
 const FONTS_NOTE_FILENAME = 'Fonts in this package.txt';
 const OFL_TEXT_FILENAME = 'SIL Open Font License 1.1.txt';
@@ -66,22 +70,28 @@ function isFontTextTruncated(value, limit = MAX_FONT_NAME_TEXT_LENGTH) {
   return !!full && [...full].length > limit;
 }
 
-// A file counts as a font by the name it will be written under: trailing
-// spaces and dots are dropped by package name sanitizing and by macOS.
-// Classification only (the output name is never changed): compatibility
-// forms are folded (fullwidth ".ｏｔｆ"), invisible, format and control
-// characters are ignored wherever they sit (U+200B, U+FEFF, U+00AD, bidi
-// marks, variation selectors), and trailing spaces and dots are dropped.
-// Homoglyphs (Cyrillic "о") and font bytes under unrelated names are not
-// recognized; the gate is name-based by design.
+// A file counts as a font by its name, judged for classification only (the
+// output name is never changed). The leaf is folded by compatibility
+// decomposition (fullwidth ".ｏｔｆ"; a mark stays separate from its letter),
+// invisible, format and control characters are ignored wherever they sit
+// (U+200B, U+FEFF, U+00AD, bidi marks, variation selectors), and then a font
+// extension followed only by characters that are neither letters nor digits
+// counts: spaces, dots, U+2800 and other blank symbols, punctuation, symbols,
+// emoji, marks and private-use characters ("Hidden.otf~", "Hidden.otf⠀").
+// Not recognized, by design (the gate is name-based, with no content
+// sniffing): a letter or digit after the extension ("x.otf1", "x.otfa"),
+// homoglyph extensions (Cyrillic "о"), font bytes under unrelated names.
 const IGNORABLE_NAME_CHARS = /[\p{Default_Ignorable_Code_Point}\p{Cf}\p{Cc}]/gu;
+// Lower-cased first instead of the i flag: with /iu a negated class also
+// excludes characters whose case folding is a letter (U+0345 folds to iota).
+const GATED_FONT_NAME_PATTERN = /\.(?:otf|ttf|ttc|otc)[^\p{L}\p{N}]*$/u;
 function isGatedFontName(name) {
   if (typeof name !== 'string' || !name) return false;
   const leaf = path.posix.basename(name.replace(/\\/g, '/'))
-    .normalize('NFKC')
+    .normalize('NFKD')
     .replace(IGNORABLE_NAME_CHARS, '')
-    .replace(/[\p{White_Space}.]+$/u, '');
-  return GATED_FONT_EXTENSIONS.has(path.extname(leaf).toLowerCase());
+    .toLowerCase();
+  return GATED_FONT_NAME_PATTERN.test(leaf);
 }
 
 function cleanIdentityText(value) {
@@ -111,8 +121,36 @@ function nameRecordScore(platform, encoding, language) {
   return 0;
 }
 
-function readNameTable(buffer, table) {
-  if (!table) return new Map();
+// Licence records are decoded only from encodings Crate reads exactly.
+function licenceRecordDecoder(platform, encoding) {
+  if (platform === 0 || (platform === 3 && (encoding === 0 || encoding === 1 || encoding === 10))) return 'utf16';
+  if (platform === 1 && encoding === 0) return 'mac-roman';
+  return null;
+}
+
+// Safety evidence is separate from display: display uses one English record
+// per name ID, while permission needs every licence (13) and licence URL (14)
+// record, on every platform, encoding and language, to state the OFL. A
+// record that is unsupported, undecodable, empty, different or past the
+// evidence budget makes the face uncertain. Only the decision is kept, never
+// the untruncated text.
+function judgeLicenceRecord(buffer, evidence, nameId, platform, encoding, offset, length) {
+  const decoder = licenceRecordDecoder(platform, encoding);
+  if (!decoder || (decoder === 'utf16' && length % 2 !== 0)) return false;
+  const key = `${nameId}:${decoder}:${offset}:${length}`;
+  if (evidence.verdicts.has(key)) return evidence.verdicts.get(key);
+  evidence.bytes += length;
+  if (evidence.bytes > MAX_LICENCE_EVIDENCE_BYTES) return false;
+  const raw = buffer.subarray(offset, offset + length);
+  const text = cleanFontText(decoder === 'mac-roman' ? decodeMacRoman(raw) : decodeUtf16be(raw), Infinity);
+  const verdict = nameId === 13 ? isRecognizedOflLicence(text) : text !== null && isRecognizedOflUrl(text);
+  evidence.verdicts.set(key, verdict);
+  return verdict;
+}
+
+function readNameTable(buffer, table, evidence) {
+  const licence = { seen: false, recognized: true };
+  if (!table) return { names: new Map(), oflEvidence: false };
   needIn(buffer, table, table.offset, 6);
   const count = buffer.readUInt16BE(table.offset + 2);
   const storage = table.offset + buffer.readUInt16BE(table.offset + 4);
@@ -129,11 +167,18 @@ function readNameTable(buffer, table) {
     const offset = storage + buffer.readUInt16BE(base + 10);
     const score = nameRecordScore(platform, encoding, language);
     needIn(buffer, table, offset, length);
+    if (nameId === 13 || nameId === 14) {
+      if (nameId === 13) licence.seen = true;
+      if (licence.recognized && !judgeLicenceRecord(buffer, evidence, nameId, platform, encoding, offset, length)) licence.recognized = false;
+    }
     if (!score || (best.get(nameId)?.score || 0) >= score) continue;
     const raw = buffer.subarray(offset, offset + length);
     best.set(nameId, { score, text: platform === 1 ? decodeMacRoman(raw) : decodeUtf16be(raw) });
   }
-  return new Map([...best].map(([nameId, record]) => [nameId, record.text]));
+  return {
+    names: new Map([...best].map(([nameId, record]) => [nameId, record.text])),
+    oflEvidence: licence.seen && licence.recognized,
+  };
 }
 
 function readFvar(buffer, table, names) {
@@ -161,7 +206,7 @@ function readFvar(buffer, table, names) {
   return instances;
 }
 
-function readFaceAt(buffer, offset, index) {
+function readFaceAt(buffer, offset, index, evidence) {
   need(buffer, offset, 12);
   const signature = buffer.readUInt32BE(offset);
   if (signature !== 0x00010000 && signature !== 0x4f54544f && signature !== 0x74727565) {
@@ -177,9 +222,12 @@ function readFaceAt(buffer, offset, index) {
     const tableOffset = buffer.readUInt32BE(base + 8);
     const length = buffer.readUInt32BE(base + 12);
     need(buffer, tableOffset, length);
-    if (!tables.has(tag)) tables.set(tag, { offset: tableOffset, length });
+    // Table tags are unique in a valid font; a second copy of a table could
+    // say something different from the one another reader picks.
+    if (tables.has(tag)) throw new FontReadError('malformed');
+    tables.set(tag, { offset: tableOffset, length });
   }
-  const names = readNameTable(buffer, tables.get('name'));
+  const { names, oflEvidence } = readNameTable(buffer, tables.get('name'), evidence);
   const os2 = tables.get('OS/2');
   // A table too short to hold the embedding field cannot vouch for it.
   if (os2 && os2.length < 10) throw new FontReadError('malformed');
@@ -197,10 +245,9 @@ function readFaceAt(buffer, offset, index) {
     licence: cleanFontText(names.get(13)),
     licenceTruncated: isFontTextTruncated(names.get(13)),
     licenceUrl: cleanIdentityText(names.get(14)),
-    // Whole, untruncated licence evidence (bounded by the name record itself);
-    // permission is judged from these, never from the display text above.
-    licenceEvidence: cleanFontText(names.get(13), Infinity),
-    licenceUrlEvidence: cleanFontText(names.get(14), Infinity),
+    // Permission is judged from this decision over every licence record,
+    // never from the display text above.
+    oflEvidence,
     fsType,
     // OpenType OS/2 fsType bits 0-3: value 2 is "Restricted License embedding".
     restricted: fsType !== null && (fsType & 0x000f) === 0x0002,
@@ -212,16 +259,17 @@ function readFaceAt(buffer, offset, index) {
 function readFontFaces(buffer) {
   if (!Buffer.isBuffer(buffer) || buffer.length < 12) throw new FontReadError('malformed');
   if (buffer.length > MAX_FONT_FILE_BYTES) throw new FontReadError('too-large');
+  const evidence = { bytes: 0, verdicts: new Map() };
   try {
     if (buffer.toString('latin1', 0, 4) === 'ttcf') {
       const count = buffer.readUInt32BE(8);
       if (count === 0 || count > MAX_COLLECTION_FACES) throw new FontReadError('malformed');
       need(buffer, 12, count * 4);
       const faces = [];
-      for (let index = 0; index < count; index++) faces.push(readFaceAt(buffer, buffer.readUInt32BE(12 + index * 4), index));
+      for (let index = 0; index < count; index++) faces.push(readFaceAt(buffer, buffer.readUInt32BE(12 + index * 4), index, evidence));
       return { collection: true, faces };
     }
-    return { collection: false, faces: [readFaceAt(buffer, 0, 0)] };
+    return { collection: false, faces: [readFaceAt(buffer, 0, 0, evidence)] };
   } catch (error) {
     if (error instanceof FontReadError) throw error;
     throw new FontReadError('malformed');
@@ -290,8 +338,8 @@ const OFL_STATEMENT_HEADS = [
   'Licensed under the SIL Open Font License, Version 1.1',
 ];
 const OFL_STATEMENT_TAILS = [
-  `This license is available with a FAQ at: ${OFL_URL_PATTERN}\.?`,
-  `This license is copied below, and is also available with a FAQ at: ${OFL_URL_PATTERN}\.?`,
+  `This license is available with a FAQ at: ${OFL_URL_PATTERN}\\.?`,
+  `This license is copied below, and is also available with a FAQ at: ${OFL_URL_PATTERN}\\.?`,
   escapeRegExp('This Font Software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the SIL Open Font License for the specific language, permissions and limitations governing your use of this Font Software.'),
 ];
 const OFL_STATEMENT = new RegExp(`^(?:${OFL_STATEMENT_HEADS.map(escapeRegExp).join('|')})\\.?(?: (?:${OFL_STATEMENT_TAILS.join('|')}))?$`);
@@ -316,13 +364,12 @@ function detectOpenLicence(faces) {
   if (!Array.isArray(faces) || faces.length === 0) return null;
   const every = faces.every(face => {
     if (!face) return false;
-    // Faces read from a file carry untruncated evidence; plain objects (tests,
-    // callers) fall back to licence/licenceUrl but never when marked truncated.
-    const hasEvidence = typeof face.licenceEvidence === 'string' || face.licenceEvidence === null;
-    if (!hasEvidence && face.licenceTruncated === true) return false;
-    const licence = hasEvidence ? face.licenceEvidence : face.licence;
-    const url = face.licenceUrlEvidence !== undefined ? face.licenceUrlEvidence : face.licenceUrl;
-    return isRecognizedOflLicence(licence) && isRecognizedOflUrl(url);
+    // Faces read from a file carry the reader's decision over every licence
+    // record (oflEvidence). Plain descriptor objects (tests, callers) fall back
+    // to their single licence/licenceUrl, never when marked truncated.
+    if (typeof face.oflEvidence === 'boolean') return face.oflEvidence;
+    if (face.licenceTruncated === true) return false;
+    return isRecognizedOflLicence(face.licence) && isRecognizedOflUrl(face.licenceUrl);
   });
   return every ? 'ofl-1.1' : null;
 }

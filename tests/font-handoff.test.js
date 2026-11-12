@@ -490,3 +490,208 @@ test('round 4: invisible, format and compatibility characters do not hide a font
   const ordinary = ['Brand.bin', 'Brand.otf.png', 'Brand.png​', 'x.otfx', 'x.woff2', 'x.оtf', 'otf', 'Brand'];
   for (const name of ordinary) assert.equal(isGatedFontName(name), false, JSON.stringify(name));
 });
+
+// Round 5 (authorized by Bryant): every licence record is safety evidence, and
+// a font extension followed only by non-letter, non-digit characters is a font.
+// Display keeps choosing one English record; permission never comes from it.
+const { utf16be } = require('./font-fixtures');
+const restrictive = 'Commercial font. Do not redistribute.';
+const oflFace = names => readFontFaces(buildFont({ names })).faces;
+const roundFiveGate = (faces, extra = {}) => evaluateFontGate({ file: { state: 'present' }, readError: null, faces,
+  location: { excludedReason: null }, intent: 'explicit', choice: null, sha256: 'a'.repeat(64), confirmation: null, conflict: false, ...extra });
+
+function rawNameTable(records, storage) {
+  const header = Buffer.alloc(6 + records.length * 12);
+  header.writeUInt16BE(records.length, 2);
+  header.writeUInt16BE(header.length, 4);
+  records.forEach((record, index) => {
+    const base = 6 + index * 12;
+    header.writeUInt16BE(record.platform, base);
+    header.writeUInt16BE(record.encoding, base + 2);
+    header.writeUInt16BE(record.language, base + 4);
+    header.writeUInt16BE(record.id, base + 6);
+    header.writeUInt16BE(record.length, base + 8);
+    header.writeUInt16BE(record.offset, base + 10);
+  });
+  return Buffer.concat([header, storage]);
+}
+const identityRecords = (storageStart = 0) => {
+  const ps = utf16be('Raw-Regular');
+  return { storage: ps, records: [{ platform: 3, encoding: 1, language: 0x0409, id: 6, offset: storageStart, length: ps.length }] };
+};
+
+test('round 5: Fable counterexamples - a disagreeing secondary licence record asks for the confirmation', () => {
+  // R1: Windows English OFL statement, Macintosh English record says otherwise.
+  const mixed = oflFace([...englishNames({ licence: OFL_STATEMENT }), nameRecord(13, restrictive, 1, 0, 0)]);
+  assert.equal(mixed[0].licence, OFL_STATEMENT, 'display still shows the English Windows record');
+  assert.equal(detectOpenLicence(mixed), null);
+  assert.deepEqual(roundFiveGate(mixed), { outcome: 'needs-confirmation', reason: 'licence-unknown', basis: null });
+  // R3: Windows English OFL statement, German Windows record says otherwise.
+  const german = oflFace([...englishNames({ licence: OFL_STATEMENT }), nameRecord(13, 'Nicht weitergeben.', 3, 1, 0x0407)]);
+  assert.equal(detectOpenLicence(german), null);
+  assert.equal(roundFiveGate(german).outcome, 'needs-confirmation');
+  // The P5 shape used through IPC.
+  const split = oflFace([...englishNames({ family: 'Split', style: 'Regular', postscriptName: 'Split-Regular', licence: OFL_STATEMENT }),
+    nameRecord(13, restrictive, 1, 0, 0)]);
+  assert.equal(detectOpenLicence(split), null);
+});
+
+test('round 5: every platform, encoding and language record is judged; agreeing records still count as open licence', () => {
+  const allAgree = oflFace([...englishNames({ licence: OFL_STATEMENT, licenceUrl: 'https://openfontlicense.org' }),
+    nameRecord(13, OFL_STATEMENT, 1, 0, 0), nameRecord(14, 'https://openfontlicense.org', 1, 0, 0),
+    nameRecord(13, OFL_STATEMENT, 3, 1, 0x0407), nameRecord(13, OFL_STATEMENT, 3, 10, 0x0411),
+    nameRecord(13, OFL_STATEMENT, 0, 3, 0), nameRecord(13, OFL_STATEMENT, 1, 0, 2)]);
+  assert.equal(detectOpenLicence(allAgree), 'ofl-1.1');
+  assert.equal(roundFiveGate(allAgree).basis, 'open-licence');
+  // Macintosh-only OFL statement still counts.
+  assert.equal(detectOpenLicence(oflFace([...englishNames({}), nameRecord(13, OFL_STATEMENT, 1, 0, 0)])), 'ofl-1.1');
+  // A disagreeing record on any platform or language, for the licence or its URL, asks.
+  const disagreeing = [
+    nameRecord(13, restrictive, 0, 3, 0),
+    nameRecord(13, restrictive, 3, 0, 0x0409),
+    nameRecord(13, restrictive, 3, 10, 0x0409),
+    nameRecord(13, restrictive, 3, 1, 0x8000),
+    nameRecord(13, `${OFL_STATEMENT} Trial.`, 1, 0, 0),
+    nameRecord(13, 'Lizenziert unter der SIL Open Font License, Version 1.1.', 3, 1, 0x0407),
+    nameRecord(14, 'https://foundry.example/eula', 1, 0, 0),
+    nameRecord(14, 'https://foundry.example/eula', 3, 1, 0x0407),
+    nameRecord(13, '', 1, 0, 0),
+  ];
+  for (const extra of disagreeing) {
+    const faces = oflFace([...englishNames({ licence: OFL_STATEMENT }), extra]);
+    assert.equal(detectOpenLicence(faces), null, JSON.stringify(extra));
+    assert.equal(roundFiveGate(faces).outcome, 'needs-confirmation', JSON.stringify(extra));
+  }
+  // Order does not matter: the disagreeing record listed first.
+  assert.equal(detectOpenLicence(oflFace([nameRecord(13, restrictive, 1, 0, 0), ...englishNames({ licence: OFL_STATEMENT })])), null);
+});
+
+test('round 5: unsupported, undecodable and odd-length licence records ask for the confirmation', () => {
+  const unsupported = [
+    { id: 13, platform: 3, encoding: 2, language: 0x0411, data: Buffer.from([0x82, 0xa0, 0x82, 0xa2]) },
+    { id: 13, platform: 3, encoding: 3, language: 0x0804, data: Buffer.from('OFL', 'latin1') },
+    { id: 13, platform: 1, encoding: 1, language: 11, data: Buffer.from([0x82, 0xa0]) },
+    { id: 13, platform: 2, encoding: 0, language: 0, data: Buffer.from('OFL', 'latin1') },
+    { id: 13, platform: 4, encoding: 0, language: 0, data: Buffer.from('OFL', 'latin1') },
+    { id: 13, platform: 3, encoding: 1, language: 0x0409, data: Buffer.concat([utf16be(OFL_STATEMENT), Buffer.from([0x41])]) },
+    { id: 14, platform: 3, encoding: 5, language: 0x0412, data: Buffer.from('x', 'latin1') },
+    { id: 14, platform: 3, encoding: 1, language: 0x0407, data: Buffer.from([0x00]) },
+  ];
+  for (const extra of unsupported) {
+    const faces = oflFace([...englishNames({ licence: OFL_STATEMENT }), { text: '', ...extra }]);
+    assert.equal(faces[0].postscriptName, 'BrandSans-Regular', 'identity is unaffected');
+    assert.equal(detectOpenLicence(faces), null, JSON.stringify({ ...extra, data: extra.data.toString('hex') }));
+  }
+});
+
+test('round 5: an OFL claim in only one face of a collection is not enough', () => {
+  const collection = readFontFaces(buildCollection([
+    { names: englishNames({ licence: OFL_STATEMENT }) },
+    { names: [...englishNames({ postscriptName: 'B-Two', licence: OFL_STATEMENT }), nameRecord(13, restrictive, 1, 0, 0)] },
+  ])).faces;
+  assert.equal(detectOpenLicence(collection), null);
+});
+
+test('round 5: restricted, Adobe and system exclusions still win over agreeing OFL records', () => {
+  const ofl = [...englishNames({ licence: OFL_STATEMENT }), nameRecord(13, OFL_STATEMENT, 1, 0, 0)];
+  const restricted = readFontFaces(buildFont({ fsType: 2, names: ofl })).faces;
+  const confirmation = { sha256: 'a'.repeat(64), wordingVersion: FONT_CONFIRMATION_WORDING_VERSION };
+  assert.equal(roundFiveGate(restricted, { confirmation }).reason, 'restricted');
+  assert.equal(roundFiveGate(oflFace(ofl), { location: { excludedReason: 'adobe-fonts' } }).reason, 'adobe-fonts');
+  assert.equal(roundFiveGate(oflFace(ofl), { location: { excludedReason: 'system' } }).reason, 'system');
+});
+
+test('round 5: licence evidence work and memory stay bounded on duplicate and huge records', () => {
+  // 4,000 licence records sharing one OFL span are judged once and still agree.
+  const statement = utf16be(OFL_STATEMENT);
+  const identity = identityRecords(statement.length);
+  const shared = Array.from({ length: 4000 }, (_, index) => ({ platform: 3, encoding: 1, language: 0x0400 + (index % 200), id: 13, offset: 0, length: statement.length }));
+  const sharedFont = buildFont({ nameTable: rawNameTable([...shared, ...identity.records], Buffer.concat([statement, identity.storage])) });
+  let started = Date.now();
+  const sharedFaces = readFontFaces(sharedFont).faces;
+  assert.equal(detectOpenLicence(sharedFaces), 'ofl-1.1');
+  assert.ok(Date.now() - started < 5000, 'shared spans are not decoded 4,000 times');
+  // 4,000 distinct overlapping ~64 KB spans: the evidence budget runs out and the font asks.
+  const identity2 = identityRecords(0);
+  const big = Buffer.alloc(65534 + 4000 * 2, 0x41);
+  const overlapping = Array.from({ length: 4000 }, (_, index) => ({ platform: 3, encoding: 1, language: 0x0409, id: 13,
+    offset: identity2.storage.length + index * 2, length: 65534 - (index % 2) * 2 }));
+  started = Date.now();
+  const hugeFaces = readFontFaces(buildFont({ nameTable: rawNameTable([...identity2.records, ...overlapping], Buffer.concat([identity2.storage, big])) })).faces;
+  assert.equal(detectOpenLicence(hugeFaces), null);
+  assert.ok(Date.now() - started < 5000, 'huge licence tables are cut off by the evidence budget');
+  // Parsed faces keep no untruncated licence text: only bounded display text and a decision.
+  for (const face of [...sharedFaces, ...hugeFaces]) {
+    for (const [key, value] of Object.entries(face)) {
+      if (typeof value === 'string') assert.ok([...value].length <= 4000, `${key} is bounded`);
+    }
+    assert.equal(Object.hasOwn(face, 'licenceEvidence'), false);
+    assert.equal(Object.hasOwn(face, 'licenceUrlEvidence'), false);
+  }
+});
+
+test('round 5: duplicate name or OS/2 tables are malformed, never read as the friendlier copy', () => {
+  for (const tag of ['name', 'OS/2']) {
+    const extra = tag === 'name'
+      ? ['name', Buffer.from(require('./font-fixtures').buildNameTable([...englishNames({ licence: OFL_STATEMENT })]))]
+      : ['OS/2', (() => { const table = Buffer.alloc(78); table.writeUInt16BE(4, 0); table.writeUInt16BE(2, 8); return table; })()];
+    const font = buildFont({ names: englishNames({ licence: OFL_STATEMENT }), extraTables: [extra] });
+    assert.throws(() => readFontFaces(font), error => error instanceof FontReadError && error.code === 'malformed', tag);
+  }
+});
+
+test('round 5: the FAQ address inside a statement must be exactly a known OFL address (regex escape)', () => {
+  const grant = 'This Font Software is licensed under the SIL Open Font License, Version 1.1.';
+  for (const tail of ['https://scripts.sil.org/OFLX', 'https://openfontlicense.org/x', 'https://openfontlicense.orgx', 'https://scripts.sil.org/OFL!']) {
+    assert.equal(detectOpenLicence([{ licence: `${grant} This license is available with a FAQ at: ${tail}`, licenceUrl: null }]), null, tail);
+    assert.equal(detectOpenLicence([{ licence: `${grant} This license is copied below, and is also available with a FAQ at: ${tail}`, licenceUrl: null }]), null, tail);
+  }
+  for (const tail of ['https://scripts.sil.org/OFL', 'https://scripts.sil.org/OFL.', 'https://openfontlicense.org/', 'http://openfontlicense.org.']) {
+    assert.equal(detectOpenLicence([{ licence: `${grant} This license is available with a FAQ at: ${tail}`, licenceUrl: null }]), 'ofl-1.1', tail);
+  }
+});
+
+test('round 5: Fable counterexamples - a font extension followed only by non-letters, non-digits is a font', () => {
+  const { isGatedFontName } = fontHandoff;
+  const suffixes = ['\u2800', '\u2800\u2800', '\u3164', '\uffa0', '\u115f', '\ue000', '\ufffc', '\u0301', '\u0307', '\u{1f512}', '~', '_', '-',
+    ':', '!', '#', '()', '\u2026', '\u2605', '\u00b7', '\u2028', '\u0085', ' ~', '\u2800.', '\u200b\u2800 '];
+  for (const suffix of suffixes) {
+    for (const ext of ['.otf', '.TTF', '.ttc', '.Otc']) {
+      const name = `Hidden${ext}${suffix}`;
+      assert.equal(isGatedFontName(name), true, JSON.stringify(name));
+    }
+  }
+  // Documented boundary: a letter or digit after the extension, other formats, ordinary files.
+  const ordinary = ['Hidden.otfa', 'Hidden.otf1', 'Hidden.otf(1)', 'Hidden.otf\u0663', 'Hidden.otf\u00aa', 'Hidden.otf.png', 'Photo.png\u2800',
+    'Photo.png~', 'x.woff2\u2800', 'notes.txt\u{1f512}', 'Brand.bin', 'Hidden.ot\u0301f', 'Hidden.\u043etf\u2800'];
+  for (const name of ordinary) assert.equal(isGatedFontName(name), false, JSON.stringify(name));
+});
+
+test('round 5 property: no single trailing character outside letters and digits hides a font extension; none turns an ordinary file into a font', () => {
+  const { isGatedFontName } = fontHandoff;
+  const letterOrDigit = /[\p{L}\p{N}]/u;
+  let checked = 0;
+  for (let cp = 0; cp <= 0x10ffff; cp++) {
+    if (cp >= 0xd800 && cp <= 0xdfff) continue;
+    const ch = String.fromCodePoint(cp);
+    assert.equal(isGatedFontName(`Photo.png${ch}`), false, `Photo.png + U+${cp.toString(16)}`);
+    if (!letterOrDigit.test(ch.normalize('NFKD'))) {
+      assert.equal(isGatedFontName(`Hidden.otf${ch}`), true, `Hidden.otf + U+${cp.toString(16)}`);
+      checked++;
+    }
+  }
+  assert.ok(checked > 100000, `checked ${checked} suffix characters`);
+  // Ignorable or format characters inside the extension or before its dot do not hide it either.
+  const ignorable = [];
+  for (let cp = 0; cp <= 0x10ffff; cp++) {
+    if (cp >= 0xd800 && cp <= 0xdfff) continue;
+    const ch = String.fromCodePoint(cp);
+    if (/[\p{Default_Ignorable_Code_Point}\p{Cf}\p{Cc}]/u.test(ch)) ignorable.push(ch);
+  }
+  for (const ch of ignorable) {
+    for (let at = 0; at <= 4; at++) {
+      const name = `Hidden${'.otf'.slice(0, at)}${ch}${'.otf'.slice(at)}`;
+      assert.equal(isGatedFontName(name), true, JSON.stringify(name));
+    }
+  }
+});

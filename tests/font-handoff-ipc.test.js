@@ -16,7 +16,7 @@ compiled._compile(harness + '\n(' + cases.toString() + ')();', harnessPath);
 
 function cases() {
   const crypto = require('node:crypto');
-  const { buildFont, buildCollection, englishNames, OFL_STATEMENT } = require('./font-fixtures');
+  const { buildFont, buildCollection, englishNames, nameRecord, OFL_STATEMENT } = require('./font-fixtures');
   const sha = buffer => crypto.createHash('sha256').update(buffer).digest('hex');
 
   let registryRows = [];
@@ -744,6 +744,73 @@ function cases() {
     assert.equal(row(after, 'Spoof.otf').outcome, 'needs-confirmation');
     out = await packageNow(f, after);
     assert.deepEqual(listTree(out.result.folderPath).filter(item => item.endsWith('.otf')), ['Fonts/Trial.otf']);
+  });
+
+  fontTest('round 5: restricted fonts behind a blank symbol or other non-letter after the extension are gated and never copied; output names unchanged', async () => {
+    const f = await fixture('Blank suffix');
+    const hidden = path.join(f.dir, 'Hidden.otf⠀');
+    const lock = path.join(f.dir, 'Lock.ttf\u{1f512}');
+    for (const [file, ps] of [[hidden, 'Hidden-Regular'], [lock, 'Lock-Regular']]) {
+      writeFont(file, { fsType: 2, names: englishNames({ family: ps.split('-')[0], style: 'Regular', postscriptName: ps }) });
+    }
+    const open = path.join(f.dir, 'Open.otf~');
+    const openBytes = writeFont(open, { names: englishNames({ family: 'Open', style: 'Regular', postscriptName: 'Open-Regular', licence: OFL_STATEMENT }) });
+    const photo = path.join(f.dir, 'Photo.png⠀');
+    fs.writeFileSync(photo, createSyntheticPngBytes());
+    manualDialogFor([hidden, lock, open, photo]);
+    await callIpcRaw('projects:add-files', f.project.id);
+    await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include');
+    const reviewResult = await review(f);
+    assert.equal(row(reviewResult, 'Hidden.otf⠀').reason, 'restricted');
+    assert.equal(row(reviewResult, 'Lock.ttf\u{1f512}').reason, 'restricted');
+    for (const name of ['Hidden.otf⠀', 'Lock.ttf\u{1f512}']) {
+      const target = row(reviewResult, name);
+      assert.equal((await callIpcRaw('fonts:set-row-choice', f.project.id, target.key, 'include')).success, true);
+      const confirm = await callIpcRaw('fonts:confirm-licence', f.project.id, target.key, { confirmed: true, sha256: target.sha256 });
+      assert.notEqual(confirm.success, true, `${name}: a restricted font cannot be confirmed`);
+    }
+    const again = await review(f);
+    assert.ok(!again.files.some(item => /Hidden|Lock|Open/.test(item.name)), 'fonts are not ordinary outputs');
+    assert.ok(again.files.some(item => item.name === 'Photo.png⠀'), 'an ordinary file with the same suffix stays ordinary');
+    const { result } = await packageNow(f, again);
+    const tree = listTree(result.folderPath);
+    assert.ok(!tree.some(item => /Hidden|Lock/.test(item)), tree.join(', '));
+    assert.ok(tree.includes('Fonts/Open.otf~'), 'output name unchanged, in the Fonts folder: ' + tree.join(', '));
+    assert.deepEqual(fs.readFileSync(path.join(result.folderPath, 'Fonts', 'Open.otf~')), openBytes);
+    assert.ok(tree.some(item => item.endsWith('Photo.png⠀')), 'ordinary asset still copied');
+  });
+
+  fontTest('round 5: a disagreeing secondary licence record (Fable P5) asks for the confirmation, through Add font files and installed fonts', async () => {
+    const f = await fixture('Split licence');
+    const split = path.join(f.dir, 'Split.otf');
+    writeFont(split, { names: [...englishNames({ family: 'Split', style: 'Regular', postscriptName: 'Split-Regular', licence: OFL_STATEMENT }),
+      nameRecord(13, 'Commercial font. Do not redistribute.', 1, 0, 0)] });
+    const bold = path.join(fontsDir(), 'BrandSans-Bold.otf');
+    const boldBytes = writeFont(bold, { names: [...englishNames({ family: 'Brand Sans', style: 'Bold', postscriptName: 'BrandSans-Bold', licence: OFL_STATEMENT }),
+      nameRecord(13, 'Nicht weitergeben.', 3, 1, 0x0407)] });
+    registerInstalled(bold, 'Bold');
+    manualDialogFor([split]);
+    await callIpcRaw('fonts:add-files', f.project.id);
+    assert.equal((await callIpcRaw('fonts:add-installed', f.project.id, { families: ['Brand Sans'] })).added, 1);
+    const before = await review(f);
+    for (const name of ['Split.otf', 'BrandSans-Bold.otf']) {
+      assert.equal(row(before, name).outcome, 'needs-confirmation', name);
+      assert.equal(row(before, name).reason, 'licence-unknown', name);
+    }
+    let out = await packageNow(f, before);
+    assert.deepEqual(listTree(out.result.folderPath).filter(item => item.endsWith('.otf')), []);
+    const firstNote = fs.readFileSync(path.join(out.result.folderPath, 'Fonts', 'Fonts in this package.txt'), 'utf8');
+    assert.doesNotMatch(firstNote, /Open Font License/, 'no OFL claim for a font whose records disagree');
+    assert.equal(fs.existsSync(path.join(out.result.folderPath, 'Fonts', 'SIL Open Font License 1.1.txt')), false);
+    fs.rmSync(out.result.folderPath, { recursive: true, force: true });
+    const target = row(before, 'BrandSans-Bold.otf');
+    assert.equal((await callIpcRaw('fonts:confirm-licence', f.project.id, target.key, { confirmed: true, sha256: target.sha256 })).success, true);
+    const after = await review(f);
+    assert.equal(row(after, 'BrandSans-Bold.otf').basis, 'confirmed');
+    assert.equal(row(after, 'Split.otf').outcome, 'needs-confirmation');
+    out = await packageNow(f, after);
+    assert.deepEqual(listTree(out.result.folderPath).filter(item => item.endsWith('.otf')), ['Fonts/BrandSans-Bold.otf']);
+    assert.deepEqual(fs.readFileSync(path.join(out.result.folderPath, 'Fonts', 'BrandSans-Bold.otf')), boldBytes);
   });
 
   fontTest('registry failure reports unavailable and leaves packaging untouched', async () => {

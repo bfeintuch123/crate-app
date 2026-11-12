@@ -155,6 +155,47 @@ test('round 4: Quick Package never copies a linked font hidden behind an invisib
   assert.deepEqual((idmlResult.fontsNotIncluded || []).map(item => item.name), ['Hidden.otf​']);
 });
 
+test('round 5: Quick Package never copies a restricted font whose extension is followed by a blank symbol or other non-letter; ordinary files still copy', async t => {
+  const w = workspace(t);
+  const braille = path.join(w.root, 'Brand Kit', 'Hidden.otf⠀');
+  const lock = path.join(w.root, 'Brand Kit', 'Lock.TTF\u{1f512}');
+  const tilde = path.join(w.root, 'Brand Kit', 'Backup.ttc~');
+  for (const file of [braille, lock, tilde]) fs.writeFileSync(file, buildFont({ fsType: 2 }));
+  const photo = path.join(w.root, 'Brand Kit', 'Photo.png⠀');
+  fs.writeFileSync(photo, Buffer.alloc(900, 3));
+  const digit = path.join(w.root, 'Brand Kit', 'Notes.otf1');
+  fs.writeFileSync(digit, Buffer.alloc(300, 4));
+  const fonts = [braille, lock, tilde];
+  const linkedFile = (file, id) => ({ id, name: path.basename(file), childDocumentID: '',
+    linkedFile: { fileSize: 800, name: path.basename(file), fullPath: file, originalPath: file, relativePath: '' } });
+  const psd = path.join(w.root, 'Comp.psd');
+  const ids = ['11111111-1111-4111-8111-111111111111', '77777777-7777-4777-8777-777777777777', '88888888-8888-4888-8888-888888888888',
+    '99999999-9999-4999-8999-999999999999', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'];
+  fs.writeFileSync(psd, ag.writePsdBuffer({ width: 1, height: 1, linkedFiles: [w.image, ...fonts, photo, digit].map((file, index) => linkedFile(file, ids[index])) }));
+  for (const flat of [false, true]) {
+    const out = path.join(w.root, `out-psd-${flat}`); fs.mkdirSync(out);
+    const result = await packageMasterFile(psd, out, { flat });
+    const copied = listOutput(out);
+    assert.ok(!copied.some(file => /Hidden|Lock|Backup/.test(file)), copied.join(', '));
+    assert.ok(copied.some(file => file.endsWith('Photo.png⠀')), copied.join(', '));
+    assert.ok(copied.some(file => file.endsWith('Notes.otf1')), 'a digit after the extension is an ordinary file by the stated rule');
+    assert.deepEqual((result.fontsNotIncluded || []).map(item => item.name).sort(), fonts.map(file => path.basename(file)).sort());
+  }
+  const idmlLinks = [w.image, ...fonts].map(file => `<Link LinkResourceURI="file://${encodeURI(file)}"/>`).join('');
+  const idml = zip(w.root, 'Layout.idml', { 'Spreads/Spread_1.xml': `<Spread>${idmlLinks}</Spread>` });
+  const out = path.join(w.root, 'out-idml'); fs.mkdirSync(out);
+  const idmlResult = await packageMasterFile(idml, out);
+  assert.ok(!listOutput(out).some(file => /Hidden|Lock|Backup/.test(file)), listOutput(out).join(', '));
+  assert.deepEqual((idmlResult.fontsNotIncluded || []).map(item => item.name).sort(), fonts.map(file => path.basename(file)).sort());
+  // A PowerPoint deck linking the disguised font is refused before anything is written.
+  const deck = zip(w.root, 'Deck.pptx', {
+    'ppt/slides/_rels/slide1.xml.rels': `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="file://${encodeURI(braille)}" TargetMode="External"/></Relationships>`,
+  });
+  const deckOut = path.join(w.root, 'out-deck'); fs.mkdirSync(deckOut);
+  await assert.rejects(packageMasterFile(deck, deckOut), /font file/i);
+  assert.deepEqual(fs.readdirSync(deckOut), []);
+});
+
 test('PPTX: an external link to a font file fails closed with an explanation and writes nothing', async t => {
   const w = workspace(t);
   const rel = (id, type, target) => `<Relationship Id="${id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/${type}" Target="file://${target}" TargetMode="External"/>`;

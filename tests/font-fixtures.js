@@ -39,7 +39,9 @@ function buildNameTable(records) {
   const strings = [];
   let storageLength = 0;
   const encoded = records.map(record => {
-    const data = record.platform === 1 ? Buffer.from(record.text, 'latin1') : utf16be(record.text);
+    // `data` lets a test place raw bytes (unsupported encodings, odd lengths).
+    const data = Buffer.isBuffer(record.data) ? record.data
+      : record.platform === 1 ? Buffer.from(record.text, 'latin1') : utf16be(record.text);
     const entry = { ...record, data, offset: storageLength };
     storageLength += data.length;
     strings.push(data);
@@ -90,8 +92,9 @@ function buildFvarTable({ axisCount = 1, instances = [] }) {
 }
 
 // Returns a function (baseOffset) => Buffer so faces can be placed in a collection.
-function sfntBuilder({ signature = 'OTTO', names = englishNames(), fsType = 0, fvar = null, os2 = true, extraTables = [] } = {}) {
-  const tables = [['name', buildNameTable(names)]];
+// `nameTable` replaces the generated name table with raw bytes.
+function sfntBuilder({ signature = 'OTTO', names = englishNames(), nameTable = null, fsType = 0, fvar = null, os2 = true, extraTables = [] } = {}) {
+  const tables = [['name', Buffer.isBuffer(nameTable) ? nameTable : buildNameTable(names)]];
   if (os2) tables.push(['OS/2', buildOs2Table(fsType)]);
   if (fvar) tables.push(['fvar', buildFvarTable(fvar)]);
   tables.push(...extraTables);
@@ -147,4 +150,6 @@ module.exports = {
   buildFont,
   englishNames,
   nameRecord,
+  buildNameTable,
+  utf16be,
 };
