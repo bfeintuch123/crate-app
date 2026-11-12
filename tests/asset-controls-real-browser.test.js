@@ -10,6 +10,9 @@ const assert = require('node:assert/strict');
 const path = require('node:path');
 const { findBrowser, launch } = require('./asset-controls-cdp-helper');
 
+const fs = require('node:fs');
+const os = require('node:os');
+const childProcess = require('node:child_process');
 const browser = findBrowser();
 const rendererDir = path.join(__dirname, '..', 'renderer');
 const skip = browser ? false : 'Chrome/Chromium unavailable: rendered checks NOT RUN';
@@ -469,4 +472,31 @@ test('remembered-record [+]: disabled across a refresh while held, refused accep
     assert.deepEqual(await page.evaluate(recordButtons), [['Include Beta.png', false]], 'still Excluded with a usable [+]');
     assert.equal(await page.evaluate("window.__button('Exclude Gamma.png').disabled"), false);
   });
+});
+
+// Runs without Chrome: a browser path that exists but cannot be executed must
+// fail the launch cleanly, leaving no fixture directory and no browser process.
+test('a browser that cannot start fails the launch cleanly: no crash, no leftover fixture directory, no process', { timeout: 30000 }, async () => {
+  const holder = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-nonexec-browser-'));
+  const fake = path.join(holder, 'not-a-browser');
+  fs.writeFileSync(fake, 'synthetic, not executable');
+  fs.chmodSync(fake, 0o644);
+  const fixtureDirs = () => fs.readdirSync(os.tmpdir()).filter(name => name.startsWith('crate-asset-controls-')).sort();
+  const before = fixtureDirs();
+  try {
+    const unhandled = [];
+    const onError = error => unhandled.push(error);
+    process.on('uncaughtException', onError);
+    try {
+      await assert.rejects(launch({ browser: fake, rendererDir, bootstrapSource: '' }), error => {
+        assert.match(String(error.code || error.message), /EACCES|ENOENT|EPERM|browser exited/);
+        return true;
+      });
+      await new Promise(resolve => setTimeout(resolve, 200));
+    } finally { process.off('uncaughtException', onError); }
+    assert.deepEqual(unhandled, [], 'no unhandled child-process error');
+    assert.deepEqual(fixtureDirs(), before, 'no crate-asset-controls-* directory is left behind');
+    const running = childProcess.spawnSync('/usr/bin/pgrep', ['-f', fake], { encoding: 'utf8' });
+    assert.equal(running.stdout.trim(), '', 'no browser process is left');
+  } finally { fs.rmSync(holder, { recursive: true, force: true }); }
 });

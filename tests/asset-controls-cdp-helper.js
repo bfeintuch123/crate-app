@@ -36,53 +36,78 @@ function productionPage(rendererDir, bootstrapSource) {
 
 async function launch({ browser, rendererDir, bootstrapSource, width = 1100, height = 760 }) {
   const pinned = process.env.CRATE_UI_TEST_BROWSER_PIN === '1' && browser === process.env.CRATE_UI_TEST_BROWSER;
-  if (pinned) ciChrome.verifyIdentity(browser);
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-asset-controls-'));
-  const page = path.join(directory, 'fixture.html');
-  fs.writeFileSync(page, productionPage(rendererDir, bootstrapSource));
-  const child = childProcess.spawn(browser, [
-    '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
-    '--disable-background-networking', '--disable-component-update', '--allow-file-access-from-files',
-    '--hide-scrollbars', '--force-device-scale-factor=1',
-    `--user-data-dir=${path.join(directory, 'profile')}`, `--window-size=${width},${height}`,
-    '--remote-debugging-pipe', new URL('file://' + page).href,
-  ], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
-  let nextId = 0, buffer = '', exited = false;
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  let directory = null, child = null, nextId = 0, buffer = '', exited = false, failure = null, closed = false;
   const pending = new Map();
-  child.on('exit', () => {
-    exited = true;
-    for (const { reject } of pending.values()) reject(new Error('browser exited'));
+  const rejectPending = error => {
+    for (const { reject } of pending.values()) reject(error);
     pending.clear();
-  });
-  child.stdio[4].on('data', chunk => {
-    buffer += chunk.toString('utf8');
-    let end;
-    while ((end = buffer.indexOf('\0')) !== -1) {
-      const message = JSON.parse(buffer.slice(0, end));
-      buffer = buffer.slice(end + 1);
-      const waiter = message.id !== undefined && pending.get(message.id);
-      if (!waiter) continue;
-      pending.delete(message.id);
-      if (message.error) waiter.reject(new Error(`${waiter.method}: ${message.error.message}`));
-      else waiter.resolve(message.result);
+  };
+  const stop = error => {
+    if (exited) return;
+    exited = true;
+    failure ||= error;
+    rejectPending(failure || new Error('browser exited'));
+  };
+  // Ends the browser process group (if one started) and always removes the
+  // fixture directory, even when the pinned identity check after the run throws.
+  async function close() {
+    if (closed) return;
+    closed = true;
+    try {
+      if (child && !exited) {
+        try { await Promise.race([send('Browser.close'), sleep(3000)]); } catch (_) {}
+        const deadline = Date.now() + 5000;
+        while (!exited && Date.now() < deadline) await sleep(50);
+      }
+      if (child && Number.isInteger(child.pid) && !exited) {
+        try { process.kill(-child.pid, 'SIGKILL'); } catch (_) {}
+        await sleep(200);
+      }
+      for (const stream of child ? [child.stdio[3], child.stdio[4]] : []) stream?.destroy();
+      if (pinned) ciChrome.verifyIdentity(browser);
+    } finally {
+      if (directory) fs.rmSync(directory, { recursive: true, force: true });
     }
-  });
+  }
   const send = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
-    if (exited) { reject(new Error('browser exited')); return; }
+    if (exited || !child) { reject(failure || new Error('browser exited')); return; }
     const id = ++nextId;
     pending.set(id, { resolve, reject, method });
-    child.stdio[3].write(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }) + '\0');
+    child.stdio[3].write(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }) + '\0', error => {
+      if (error) stop(error);
+    });
   });
-  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-  async function close() {
-    try { await Promise.race([send('Browser.close'), sleep(3000)]); } catch (_) {}
-    const deadline = Date.now() + 5000;
-    while (!exited && Date.now() < deadline) await sleep(50);
-    if (!exited) { try { process.kill(-child.pid, 'SIGKILL'); } catch (_) {} await sleep(200); }
-    if (pinned) ciChrome.verifyIdentity(browser);
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
   try {
+    if (pinned) ciChrome.verifyIdentity(browser);
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-asset-controls-'));
+    const page = path.join(directory, 'fixture.html');
+    fs.writeFileSync(page, productionPage(rendererDir, bootstrapSource));
+    child = childProcess.spawn(browser, [
+      '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
+      '--disable-background-networking', '--disable-component-update', '--allow-file-access-from-files',
+      '--hide-scrollbars', '--force-device-scale-factor=1',
+      `--user-data-dir=${path.join(directory, 'profile')}`, `--window-size=${width},${height}`,
+      '--remote-debugging-pipe', new URL('file://' + page).href,
+    ], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
+    // A failed spawn (for example EACCES) is reported asynchronously; handle it
+    // and any pipe error so the test fails cleanly instead of crashing Node.
+    child.on('error', error => stop(error));
+    child.on('exit', () => stop(null));
+    for (const stream of [child.stdio[3], child.stdio[4]]) stream?.on('error', error => stop(error));
+    child.stdio[4]?.on('data', chunk => {
+      buffer += chunk.toString('utf8');
+      let end;
+      while ((end = buffer.indexOf('\0')) !== -1) {
+        const message = JSON.parse(buffer.slice(0, end));
+        buffer = buffer.slice(end + 1);
+        const waiter = message.id !== undefined && pending.get(message.id);
+        if (!waiter) continue;
+        pending.delete(message.id);
+        if (message.error) waiter.reject(new Error(`${waiter.method}: ${message.error.message}`));
+        else waiter.resolve(message.result);
+      }
+    });
     let target;
     for (let attempt = 0; attempt < 100 && !target; attempt += 1) {
       const { targetInfos } = await send('Target.getTargets');
@@ -129,7 +154,8 @@ async function launch({ browser, rendererDir, bootstrapSource, width = 1100, hei
     }
     return { evaluate, press, clickAt, moveAway, screenshot, setViewport, close, sleep };
   } catch (error) {
-    await close();
+    try { await close(); }
+    catch (cleanupError) { error.message += `; cleanup: ${cleanupError.message}`; }
     throw error;
   }
 }
