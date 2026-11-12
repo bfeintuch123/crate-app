@@ -8477,4 +8477,367 @@ function excludedSourceMembershipCases() {
       wf: { addScan: 'ok', rows: ['Embedded-Layer.png'], oldRowBytes: 'missing', newRowBytes: null, newRowChoice: null },
     });
   }, { realMainPsd: true }));
+  // ---- Damaged projects: an older build could leave a Photoshop output row whose cached file holds
+  // another document's bytes. The state is assigned here (document B's row and file are removed and
+  // B's bytes are written into A's cached file); it is not produced by this build.
+  const recovery = (() => {
+    const sha = data => require('crypto').createHash('sha256').update(data).digest('hex');
+    const dA = sha(png(611)), dB = sha(png(622));
+    const label = digest => digest === dA ? 'A' : digest === dB ? 'B' : digest === 'missing' ? 'missing' : String(digest).slice(0, 8);
+    const onDisk = file => { try { return sha(fs.readFileSync(file)); } catch (_) { return 'missing'; } };
+    const tieOf = row => row.psdExtractionReceipt || row.psdResource || {};
+    const embedded = f => [...f.current().files, ...(f.current().pendingFiles || [])].filter(row => row.source === 'psd-embedded');
+    const setAside = dir => fs.readdirSync(dir).filter(name => name.startsWith('.crate-set-aside-')).sort();
+    // Each row as "file parent recorded on-disk"; the set-aside files by content; the holds.
+    const state = (f, dir) => ({
+      rows: embedded(f).map(row => [path.basename(row.path), path.basename(tieOf(row).parentPath || '?').replace(/-[^-]*\.psd$/, ''),
+        label(tieOf(row).outputDigest), label(onDisk(row.path))].join(' ')).sort(),
+      setAside: setAside(dir).map(name => label(onDisk(path.join(dir, name)))),
+      holds: (f.current().workingSourceRelationshipHolds || []).map(hold => hold.reason + ' ' + path.basename(hold.sourcePath)) });
+    const damage = (t, bytes = png(622)) => {
+      const [a] = t.outputs(t.A), [b] = t.outputs(t.B);
+      if (b) { fs.rmSync(b.path, { force: true }); t.f.current().files = t.f.current().files.filter(row => row !== b); }
+      fs.writeFileSync(a.path, bytes);
+      roundTripFakeStore();
+      return a;
+    };
+    // The package, each written file by name and content.
+    const packaged = async f => {
+      const review = await f.review();
+      if (review.materializable !== true) return 'blocked: ' + (review.message || review.error || '');
+      const out = desk('out-' + f.id.slice(-6));
+      const result = await callIpcRaw('projects:package', f.id, out, review.token);
+      assert.equal(result.success, true, result.error);
+      const files = walk(result.folderPath).filter(file => path.basename(file) !== '.DS_Store' && !/\.(json|txt|md)$/.test(file));
+      const names = files.map(file => path.basename(file).replace(/-[^-]*(\.(psd|ai))$/, '$1') + '=' + (/\.png$/.test(file) ? label(onDisk(file)) : 'doc')).sort();
+      fs.rmSync(result.folderPath, { recursive: true, force: true });
+      return names;
+    };
+    const choiceOf = (f, row) => {
+      const stored = f.current().files.find(item => item.path === row.path) || {};
+      return { path: stored.path, fileId: stored.fileId, tie: JSON.stringify(tieOf(stored)), include: stored.individualContentInclude || null,
+        exclude: stored.individualContentExclusion || null, accepted: stored.acceptedPending === true,
+        key: (f.current().excludedAssetKeys || []).includes(stored.fileId) || (f.current().excludedAssetKeys || []).includes(stored.path) };
+    };
+    // Documents A and B added directly with Add Files (their outputs come from the Add Files route),
+    // optionally both linking one external image.
+    const addedDocs = async (tag, { link = false } = {}) => {
+      const A = desk(`DocA-${tag}.psd`), B = desk(`DocB-${tag}.psd`), ext = link ? desk(`Shared-${tag}.png`) : null;
+      const f = await newProject('Documents ' + tag, { before() {
+        if (ext) fs.writeFileSync(ext, png(655));
+        writeWorking('.psd', A, ext ? [ext] : [], 611); writeWorking('.psd', B, ext ? [ext] : [], 622);
+      } });
+      await f.add(A); await f.add(B);
+      const outputs = parent => f.current().files.filter(row => row.source === 'psd-embedded' && tieOf(row).parentPath === parent);
+      assert.equal(outputs(A).length, 1); assert.equal(outputs(B).length, 1);
+      // The shared link: its row count and whether its bytes are untouched.
+      const linkFact = () => [f.current().files.filter(row => row.path === ext).length, onDisk(ext) === sha(png(655))];
+      return { f, A, B, ext, outputs, linkFact };
+    };
+    return { dA, dB, onDisk, state, damage, packaged, choiceOf, setAside, addedDocs, label, sha655: sha(png(655)) };
+  })();
+  // Placed documents in separate working files: WorkA places A, WorkB places B.
+  const psdPair = async tag => {
+    const WA = desk(`WorkA-${tag}.ai`), WB = desk(`WorkB-${tag}.ai`), A = desk(`PlacedA-${tag}.psd`), B = desk(`PlacedB-${tag}.psd`);
+    const f = await newProject('PSD pair ' + tag, { before() {
+      writeWorking('.psd', A, [], 611); writeWorking('.psd', B, [], 622); writeWorking('.ai', WA, [A]); writeWorking('.ai', WB, [B]);
+    } });
+    for (const file of [WA, WB]) await f.add(file);
+    await prePackage(f);
+    const outputs = parent => f.current().files.filter(row => row.source === 'psd-embedded' && row.psdExtractionReceipt?.parentPath === parent);
+    const toggleRow = async row => assert.ok(Array.isArray(await callIpcRaw('projects:remove-file', f.id, metadataTestHooks.createProjectFileVisualIdentity(f.id, row))));
+    assert.equal(outputs(A).length, 1); assert.equal(outputs(B).length, 1);
+    return { f, WA, WB, A, B, outputs, toggleRow };
+  };
+  const pinned = (results, expected) => assert.deepEqual(results, expected);
+  const embeddedOnly = written => Array.isArray(written) ? written.filter(name => name.startsWith('Embedded-Layer')) : written;
+  // Pre-package reads of the two placed documents, in order.
+  const psdReadOrder = async (t, work) => {
+    const order = [], original = fs.promises.readFile;
+    fs.promises.readFile = async function (file, ...rest) { if (file === t.A || file === t.B) order.push(file === t.A ? 'A' : 'B'); return original.call(this, file, ...rest); };
+    try { await work(); } finally { fs.promises.readFile = original; }
+    return order.filter((item, index) => order.indexOf(item) === index).join('');
+  };
+  // Damage from an older build (A's row holds B's bytes, B's row gone), A unchanged: the first pass
+  // refuses and gives B its row again; from then on B's record explains the wrong bytes, and the next
+  // pass rebuilds A's file from A, keeping the other bytes as a set-aside file. Either read order.
+  for (const [choice, bFirst] of [['none', false], ['include', false], ['exclude', false], ['accept', false], ['none', true]]) {
+    const label = choice + (bFirst ? ', B read first' : '');
+    baselineTest(`Photoshop outputs: a cached file holding another document's bytes is rebuilt from its own document (${label})`, { timeout: 300000 }, () => withEnv(async () => {
+      const { state, damage, packaged, choiceOf, setAside } = recovery;
+      const t = await psdPlaced('r1' + choice[0] + (bFirst ? 'b' : 'a'));
+      const [a0] = t.outputs(t.A), dir = path.dirname(a0.path), at = () => t.outputs(t.A).find(row => row.path === a0.path);
+      if (choice === 'include' || choice === 'exclude') await t.toggleRow(a0);
+      if (choice === 'include') await t.toggleRow(at());
+      if (choice === 'accept') at().acceptedPending = true;
+      roundTripFakeStore();
+      const chosen = choiceOf(t.f, a0);
+      damage(t);
+      if (bFirst) { const files = t.f.current().files, bRow = files.find(row => row.path === t.B); t.f.current().files = [bRow, ...files.filter(row => row !== bRow)]; roundTripFakeStore(); }
+      const results = { order: await psdReadOrder(t, () => prePackage(t.f)), first: state(t.f, dir), firstWritten: embeddedOnly(await packaged(t.f)) };
+      await prePackage(t.f);
+      results.second = state(t.f, dir); results.secondWritten = embeddedOnly(await packaged(t.f));
+      results.setAsideName = setAside(dir).every(name => /^\.crate-set-aside-[0-9a-f]{32}\.png$/.test(name));
+      results.choiceUnchanged = JSON.stringify(choiceOf(t.f, a0)) === JSON.stringify(chosen);
+      const first = setAside(dir);
+      await prePackage(t.f);
+      results.thirdUnchanged = JSON.stringify(state(t.f, dir)) === JSON.stringify(results.second) && JSON.stringify(setAside(dir)) === JSON.stringify(first);
+      if (choice === 'none' && !bFirst) {                                                // the same damage again: one pass, a second set-aside file
+        fs.writeFileSync(a0.path, png(622));                                            // B's row is still there this time
+        await prePackage(t.f);
+        results.again = state(t.f, dir); results.bothKept = first.every(name => setAside(dir).includes(name)) && setAside(dir).length === 2;
+      }
+      const repaired = { rows: ['Embedded-Layer.png PlacedA A A', 'Embedded-Layer_1.png PlacedB B B'], setAside: ['B'], holds: [] };
+      pinned(results, {
+        order: bFirst ? 'BA' : 'AB',
+        first: { rows: ['Embedded-Layer.png PlacedA A B', 'Embedded-Layer_1.png PlacedB B B'], setAside: [], holds: ['psd-extraction-receipt-unverified Embedded-Layer.png'] },
+        firstWritten: choice === 'exclude' ? ['Embedded-Layer_1.png=B'] : 'blocked: Photoshop asset association is unresolved. Your files are preserved; this package is blocked.',
+        second: repaired, secondWritten: choice === 'exclude' ? ['Embedded-Layer_1.png=B'] : ['Embedded-Layer.png=A', 'Embedded-Layer_1.png=B'],
+        setAsideName: true, choiceUnchanged: true, thirdUnchanged: true,
+        ...(choice === 'none' && !bFirst ? { again: { ...repaired, setAside: ['B', 'B'] }, bothKept: true } : {}) });
+    }, { realMainPsd: true }));
+  }
+  baselineTest('Photoshop outputs: a damaged row of a document added with Add Files is rebuilt the same way; a shared link is untouched', { timeout: 300000 }, () => withEnv(async () => {
+    const { state, damage, packaged } = recovery;
+    const t = await recovery.addedDocs('r4', { link: true }), [a0] = t.outputs(t.A), dir = path.dirname(a0.path);
+    const results = { linkBefore: t.linkFact() };
+    damage(t);
+    await prePackage(t.f); results.first = state(t.f, dir);
+    await prePackage(t.f); results.second = state(t.f, dir);
+    results.linkAfter = t.linkFact();
+    results.written = (await packaged(t.f)).filter(name => /^(Embedded-Layer|Shared)/.test(name));
+    pinned(results, { linkBefore: [1, true],
+      first: { rows: ['Embedded-Layer.png DocA A B', 'Embedded-Layer_1.png DocB B B'], setAside: [], holds: ['psd-extraction-receipt-unverified Embedded-Layer.png'] },
+      second: { rows: ['Embedded-Layer.png DocA A A', 'Embedded-Layer_1.png DocB B B'], setAside: ['B'], holds: [] },
+      linkAfter: [1, true], written: ['Embedded-Layer.png=A', 'Embedded-Layer_1.png=B', 'Shared-r4.png=' + recovery.label(recovery.sha655)] });
+  }, { realMainPsd: true }));
+  // A placed document excluded per asset is still read before packaging (as before), so its damaged
+  // row is rebuilt too; the row stays excluded and is not written.
+  baselineTest('Photoshop outputs: a damaged row of an excluded placed document is rebuilt and stays unwritten', { timeout: 300000 }, () => withEnv(async () => {
+    const { state, damage, packaged } = recovery;
+    const t = await psdPlaced('r5'), [a0] = t.outputs(t.A), dir = path.dirname(a0.path);
+    await t.f.select(t.W, 'exclude'); await t.f.toggle(path.basename(t.A));
+    damage(t);
+    const results = { read: await readsOf(t.A, () => prePackage(t.f)) > 0 };
+    await prePackage(t.f);
+    results.second = state(t.f, dir); results.written = embeddedOnly(await packaged(t.f));
+    pinned(results, { read: true, second: { rows: ['Embedded-Layer.png PlacedA A A', 'Embedded-Layer_1.png PlacedB B B'], setAside: ['B'], holds: [] },
+      written: ['Embedded-Layer_1.png=B'] });
+  }, { realMainPsd: true }));
+  // An older row of the same object (the document saved again with that object unchanged), damaged:
+  // examined through its cached digest and rebuilt in place once B's row records the wrong bytes; the
+  // save's object keeps its own row, as before. With or without an earlier hold.
+  for (const held of [true, false]) {
+    baselineTest(`Photoshop outputs: an older row of the same object is rebuilt after its document is saved again (${held ? 'hold from an earlier pass' : 'no hold'})`, { timeout: 300000 }, () => withEnv(async () => {
+      const { state, damage, packaged } = recovery;
+      const t = await psdPlaced('r2' + (held ? 'h' : 'n')), extra = desk(`ExtraLink-r2${held ? 'h' : 'n'}.png`);
+      fs.writeFileSync(extra, png(697));
+      const [a0] = t.outputs(t.A), dir = path.dirname(a0.path);
+      damage(t);
+      if (held) t.f.current().workingSourceRelationshipHolds = [{ reason: 'psd-extraction-receipt-unverified', sourcePath: a0.path }];
+      roundTripFakeStore();
+      writeWorking('.psd', t.A, [extra], 611);                                        // the same object in a changed file
+      await prePackage(t.f);
+      const results = { first: state(t.f, dir), firstWritten: embeddedOnly(await packaged(t.f)) };
+      await prePackage(t.f);
+      results.second = state(t.f, dir); results.secondWritten = embeddedOnly(await packaged(t.f));
+      results.recordUnchanged = t.outputs(t.A).find(row => row.path === a0.path).psdExtractionReceipt.sourceDigest === a0.psdExtractionReceipt.sourceDigest;
+      pinned(results, held ? { first: { rows: ['Embedded-Layer.png PlacedA A B', 'Embedded-Layer_1.png PlacedA A A', 'Embedded-Layer_2.png PlacedB B B'], setAside: [], holds: ['psd-extraction-receipt-unverified Embedded-Layer.png'] }, firstWritten: 'blocked: Photoshop asset association is unresolved. Your files are preserved; this package is blocked.', second: { rows: ['Embedded-Layer.png PlacedA A A', 'Embedded-Layer_1.png PlacedA A A', 'Embedded-Layer_2.png PlacedB B B'], setAside: ['B'], holds: [] }, secondWritten: ['Embedded-Layer.png=A', 'Embedded-Layer_1.png=A', 'Embedded-Layer_2.png=B'], recordUnchanged: true }
+        : { first: { rows: ['Embedded-Layer.png PlacedA A B', 'Embedded-Layer_1.png PlacedA A A', 'Embedded-Layer_2.png PlacedB B B'], setAside: [], holds: [] }, firstWritten: 'blocked: Some files are unavailable. Resolve them before packaging.', second: { rows: ['Embedded-Layer.png PlacedA A A', 'Embedded-Layer_1.png PlacedA A A', 'Embedded-Layer_2.png PlacedB B B'], setAside: ['B'], holds: [] }, secondWritten: ['Embedded-Layer.png=A', 'Embedded-Layer_1.png=A', 'Embedded-Layer_2.png=B'], recordUnchanged: true });
+    }, { realMainPsd: true }));
+  }
+  // The damaged row's own document changed or unreadable, the other document included, excluded,
+  // removed or unreadable: nothing wrong is written; no other document is needed to stop it.
+  for (const aState of ['changed', 'unreadable']) for (const bState of ['included', 'excluded', 'removed', 'unreadable']) {
+    baselineTest(`Photoshop outputs: a row holding another document's bytes is never written when its document is ${aState} (other document ${bState})`, { timeout: 300000 }, () => withEnv(async () => {
+      const { state, damage, packaged } = recovery;
+      const t = await psdPair('r7' + aState[0] + bState.slice(0, 2)), [a0] = t.outputs(t.A), dir = path.dirname(a0.path);
+      damage(t);
+      if (bState === 'excluded') await t.f.select(t.WB, 'exclude');
+      if (bState === 'removed') {                                                        // B leaves the project; its file stays on disk
+        writeWorking('.ai', t.WB, []); await verifyScan(t.f, t.WB);
+        t.f.current().files = t.f.current().files.filter(row => row.path !== t.B); roundTripFakeStore();
+      }
+      if (bState === 'unreadable') fs.chmodSync(t.B, 0o000);
+      if (aState === 'changed') writeWorking('.psd', t.A, [], 644);
+      if (aState === 'unreadable') fs.chmodSync(t.A, 0o000);
+      try { await prePackage(t.f); } finally { for (const file of [t.A, t.B]) if (fs.existsSync(file)) fs.chmodSync(file, 0o644); }
+      const results = { after: state(t.f, dir), written: embeddedOnly(await packaged(t.f)) };
+      assert.ok(!(Array.isArray(results.written) && results.written.includes('Embedded-Layer.png=B')), 'B\'s bytes are never written under A\'s row');
+      // The owner's existing exit: exclude the damaged row.
+      const row = t.outputs(t.A).find(item => item.path === a0.path);
+      if (row) { await t.toggleRow(row); results.afterExclude = embeddedOnly(await packaged(t.f)); }
+      // Excluding the row also excludes a row that shares its exclusion key (existing behaviour).
+      pinned(results, ({
+        'changed/included': { after: { rows: ['Embedded-Layer.png PlacedA A B', 'Embedded-Layer_1.png PlacedA 5c9de92d 5c9de92d', 'Embedded-Layer_2.png PlacedB B B'], setAside: [], holds: [] }, written: 'blocked: Some files are unavailable. Resolve them before packaging.', afterExclude: ['Embedded-Layer_1.png=5c9de92d'] },
+        'changed/excluded': { after: { rows: ['Embedded-Layer.png PlacedA A B', 'Embedded-Layer_1.png PlacedA 5c9de92d 5c9de92d'], setAside: [], holds: [] }, written: 'blocked: Some files are unavailable. Resolve them before packaging.', afterExclude: ['Embedded-Layer_1.png=5c9de92d'] },
+        'changed/removed': { after: { rows: ['Embedded-Layer.png PlacedA A B', 'Embedded-Layer_1.png PlacedA 5c9de92d 5c9de92d'], setAside: [], holds: [] }, written: 'blocked: Some files are unavailable. Resolve them before packaging.', afterExclude: ['Embedded-Layer_1.png=5c9de92d'] },
+        'changed/unreadable': { after: { rows: ['Embedded-Layer.png PlacedA A B', 'Embedded-Layer_1.png PlacedA 5c9de92d 5c9de92d'], setAside: [], holds: [] }, written: 'blocked: Some files are unavailable. Resolve them before packaging.', afterExclude: ['Embedded-Layer_1.png=5c9de92d'] },
+        'unreadable/included': { after: { rows: ['Embedded-Layer.png PlacedA A B', 'Embedded-Layer_1.png PlacedB B B'], setAside: [], holds: [] }, written: 'blocked: Some files are unavailable. Resolve them before packaging.', afterExclude: [] },
+        'unreadable/excluded': { after: { rows: ['Embedded-Layer.png PlacedA A B'], setAside: [], holds: [] }, written: 'blocked: Some files are unavailable. Resolve them before packaging.', afterExclude: [] },
+        'unreadable/removed': { after: { rows: ['Embedded-Layer.png PlacedA A B'], setAside: [], holds: [] }, written: 'blocked: Some files are unavailable. Resolve them before packaging.', afterExclude: [] },
+        'unreadable/unreadable': { after: { rows: ['Embedded-Layer.png PlacedA A B'], setAside: [], holds: [] }, written: 'blocked: Some files are unavailable. Resolve them before packaging.', afterExclude: [] },
+      })[`${aState}/${bState}`]);
+    }, { realMainPsd: true }));
+  }
+  // A row with an individual choice whose file holds a later save's bytes (an older build could leave
+  // it): never written under that choice.
+  baselineTest('Photoshop outputs: a chosen row holding a later save\'s bytes is not written under its choice', { timeout: 300000 }, () => withEnv(async () => {
+    const { state, packaged } = recovery;
+    const t = await psdPlaced('r10'), [a0] = t.outputs(t.A), dir = path.dirname(a0.path);
+    await t.toggleRow(a0); await t.toggleRow(t.outputs(t.A).find(row => row.path === a0.path));   // Include
+    fs.writeFileSync(a0.path, png(645)); writeWorking('.psd', t.A, [], 645); roundTripFakeStore();
+    await prePackage(t.f);
+    const results = { after: state(t.f, dir), written: embeddedOnly(await packaged(t.f)) };
+    assert.ok(!(Array.isArray(results.written) && results.written.includes('Embedded-Layer.png=4bc8ff77')), 'not written under the Include');
+    await t.toggleRow(t.outputs(t.A).find(row => row.path === a0.path));
+    results.afterExclude = embeddedOnly(await packaged(t.f));
+    pinned(results, { after: { rows: ['Embedded-Layer.png PlacedA A 4bc8ff77', 'Embedded-Layer_1.png PlacedB B B', 'Embedded-Layer_2.png PlacedA 4bc8ff77 4bc8ff77'], setAside: [], holds: [] }, written: 'blocked: Some files are unavailable. Resolve them before packaging.', afterExclude: ['Embedded-Layer_1.png=B'] });
+  }, { realMainPsd: true }));
+  // The ordinary refill of a row without a choice (cached file lost, the document saved with a changed
+  // object) packages on the very pass that refilled it, after a store reload, and, for a row with an
+  // extraction receipt, after a restart; the refilled row is then this save's own row.
+  for (const kind of ['Add Files document', 'placed document']) {
+    baselineTest(`Photoshop outputs: an ordinary refill packages on the pass that refilled it (${kind})`, { timeout: 300000 }, () => withEnv(async () => {
+      const { state, packaged } = recovery;
+      const sha = data => require('crypto').createHash('sha256').update(data).digest('hex');
+      const dNew = sha(png(645)).slice(0, 8);
+      let f, A, rowsOfA;
+      if (kind === 'placed document') {
+        const t = await psdPlaced('r9p'); f = t.f; A = t.A; rowsOfA = () => t.outputs(t.A);
+      } else {
+        A = desk('DocA-r9a.psd');
+        f = await newProject('Refill r9a', { before() { writeWorking('.psd', A, [], 611); } });
+        await f.add(A);
+        rowsOfA = () => f.current().files.filter(row => row.source === 'psd-embedded' && (row.psdExtractionReceipt || row.psdResource || {}).parentPath === A);
+      }
+      const [a0] = rowsOfA(), dir = path.dirname(a0.path), embedded = list => list.filter(name => name.startsWith('Embedded-Layer'));
+      fs.rmSync(a0.path);
+      writeWorking('.psd', A, [], 645);
+      await prePackage(f);
+      const refilled = state(f, dir).rows.filter(row => row.includes(kind === 'placed document' ? 'PlacedA' : 'DocA'));
+      const results = { refilled, samePass: embedded(await packaged(f)) };
+      roundTripFakeStore();
+      results.afterReload = embedded(await packaged(f));
+      metadataTestHooks.forgetPsdOutputSessionMemory();                                   // a restart
+      results.afterRestartNoPass = await packaged(f);
+      if (Array.isArray(results.afterRestartNoPass)) results.afterRestartNoPass = embedded(results.afterRestartNoPass);
+      await prePackage(f);
+      results.afterRestartAndPass = embedded(await packaged(f));
+      results.rowsAfterAnotherPass = state(f, dir).rows.filter(row => row.includes(kind === 'placed document' ? 'PlacedA' : 'DocA'));
+      // Written bytes equal bc94955's at every step, with two differences: a placed document's refilled
+      // row takes the new record, so a later pass makes no duplicate row (bc94955 adds
+      // Embedded-Layer_2.png); and an Add Files row (resource record, not re-recorded) is unavailable in a
+      // review after a restart until a pre-package pass gives it its sibling (bc94955 packages it).
+      assert.deepEqual(results, kind === 'placed document' ? {
+        refilled: [`Embedded-Layer.png PlacedA ${dNew} ${dNew}`],
+        samePass: [`Embedded-Layer.png=${dNew}`, 'Embedded-Layer_1.png=B'], afterReload: [`Embedded-Layer.png=${dNew}`, 'Embedded-Layer_1.png=B'],
+        afterRestartNoPass: [`Embedded-Layer.png=${dNew}`, 'Embedded-Layer_1.png=B'], afterRestartAndPass: [`Embedded-Layer.png=${dNew}`, 'Embedded-Layer_1.png=B'],
+        rowsAfterAnotherPass: [`Embedded-Layer.png PlacedA ${dNew} ${dNew}`],
+      } : {
+        refilled: [`Embedded-Layer.png DocA A ${dNew}`],
+        samePass: [`Embedded-Layer.png=${dNew}`], afterReload: [`Embedded-Layer.png=${dNew}`],
+        afterRestartNoPass: 'blocked: Some files are unavailable. Resolve them before packaging.',
+        afterRestartAndPass: [`Embedded-Layer.png=${dNew}`, `Embedded-Layer_1.png=${dNew}`],
+        rowsAfterAnotherPass: [`Embedded-Layer.png DocA A ${dNew}`, `Embedded-Layer_1.png DocA ${dNew} ${dNew}`],
+      });
+    }, { realMainPsd: true }));
+  }
+  // Reads of files in the extraction folder while `work` runs.
+  const cacheReads = async (dir, work) => {
+    let count = 0;
+    const wrap = (owner, name) => { const original = owner[name];
+      owner[name] = function (file, ...rest) { if (typeof file === 'string' && path.dirname(file) === dir) count++; return original.call(this, file, ...rest); };
+      return () => { owner[name] = original; }; };
+    const restore = [wrap(fs, 'readFileSync'), wrap(fs, 'readFile'), wrap(fs, 'openSync'), wrap(fs, 'open'), wrap(fs, 'createReadStream'),
+      wrap(fs.promises, 'readFile'), wrap(fs.promises, 'open')];
+    try { await work(); } finally { restore.forEach(undo => undo()); }
+    return count;
+  };
+  // Where nothing can be verified or nothing is wrong, nothing changes: each outcome equals bc94955's
+  // except 'shared path', whose second row is dropped by the existing pre-package merge on the first pass
+  // (rowsAtPath), so the second pass rebuilds the then unambiguous row (bc94955 keeps refusing).
+  baselineTest('Photoshop outputs: states with nothing to rebuild are left as they were', { timeout: 600000 }, () => withEnv(async () => {
+    const { state, damage, packaged } = recovery;
+    const results = {};
+    for (const variant of ['document missing', 'file missing', 'symbolic link', 'shared path', 'edited in place']) {
+      const t = await psdPlaced('r3' + variant.replace(/[^a-z]/g, '').slice(0, 8));
+      const [a0] = t.outputs(t.A), dir = path.dirname(a0.path);
+      if (variant === 'edited in place') fs.writeFileSync(a0.path, Buffer.alloc(fs.statSync(a0.path).size, 120)); else damage(t);
+      if (variant === 'document missing') fs.rmSync(t.A);
+      if (variant === 'file missing') fs.rmSync(a0.path);
+      if (variant === 'symbolic link') { const other = desk('Other-r3.png'); fs.writeFileSync(other, png(622)); fs.rmSync(a0.path); fs.symlinkSync(other, a0.path); }
+      if (variant === 'shared path') { (t.f.current().pendingFiles ||= []).push({ ...a0, fileId: a0.fileId + '-second' }); roundTripFakeStore(); }
+      await prePackage(t.f);
+      const rowsAtPath = [...t.f.current().files, ...(t.f.current().pendingFiles || [])].filter(row => row.path === a0.path).length;
+      await prePackage(t.f);
+      results[variant] = { ...state(t.f, dir), written: embeddedOnly(await packaged(t.f)), ...(variant === 'shared path' ? { rowsAtPath } : {}) };
+      await callIpcRaw('projects:delete', t.f.id);
+    }
+    {
+      const t = await recovery.addedDocs('r3wx'), [a0] = t.outputs(t.A), dir = path.dirname(a0.path);
+      damage(t);
+      await t.f.select(t.A, 'exclude');
+      const reads = await readsOf(t.A, () => prePackage(t.f));
+      results['working-file Exclude'] = { ...state(t.f, dir), documentRead: reads > 0, written: embeddedOnly(await packaged(t.f)) };
+      await callIpcRaw('projects:delete', t.f.id);
+    }
+    pinned(results, {
+      'document missing': { rows: ['Embedded-Layer.png PlacedA A B', 'Embedded-Layer_1.png PlacedB B B'], setAside: [], holds: [], written: 'blocked: Some files are unavailable. Resolve them before packaging.' },
+      'file missing': { rows: ['Embedded-Layer.png PlacedA A A', 'Embedded-Layer_1.png PlacedB B B'], setAside: [], holds: [], written: ['Embedded-Layer.png=A', 'Embedded-Layer_1.png=B'] },
+      'symbolic link': { rows: ['Embedded-Layer.png PlacedA A B', 'Embedded-Layer_1.png PlacedB B B'], setAside: [], holds: ['psd-extraction-receipt-unverified Embedded-Layer.png'], written: 'blocked: Photoshop asset association is unresolved. Your files are preserved; this package is blocked.' },
+      'shared path': { rows: ['Embedded-Layer.png PlacedA A A', 'Embedded-Layer_1.png PlacedB B B'], setAside: ['B'], holds: [], written: ['Embedded-Layer.png=A', 'Embedded-Layer_1.png=B'], rowsAtPath: 1 },
+      'edited in place': { rows: ['Embedded-Layer.png PlacedA A e7e87894', 'Embedded-Layer_1.png PlacedB B B'], setAside: [], holds: ['psd-extraction-receipt-unverified Embedded-Layer.png'], written: 'blocked: Photoshop asset association is unresolved. Your files are preserved; this package is blocked.' },
+      'working-file Exclude': { rows: ['Embedded-Layer.png DocA A B', 'Embedded-Layer_1.png DocB B B'], setAside: [], holds: [], documentRead: false, written: ['Embedded-Layer_1.png=B'] },
+    });
+  }, { realMainPsd: true }));
+  // Healthy projects: nothing is renamed and the package is the same as on bc94955; the one difference
+  // is that a refilled row takes the record of what was refilled ('refill then change').
+  baselineTest('Photoshop outputs: healthy projects are unchanged by verification and recovery', { timeout: 600000 }, () => withEnv(async () => {
+    const { state, packaged } = recovery;
+    const results = {};
+    for (const variant of ['two documents', 'one document', 'shared link', 'identical bytes', 'refill then change']) {
+      const tag = 'r6' + variant.replace(/[^a-z]/g, '').slice(0, 8);
+      let t;
+      if (variant === 'one document') {
+        const W = desk(`Work-${tag}.ai`), A = desk(`PlacedA-${tag}.psd`);
+        const f = await newProject('PSD ' + tag, { before() { writeWorking('.psd', A, [], 611); writeWorking('.ai', W, [A]); } });
+        await f.add(W); await prePackage(f);
+        t = { f, A, outputs: parent => f.current().files.filter(row => row.source === 'psd-embedded' && row.psdExtractionReceipt?.parentPath === parent) };
+      } else if (variant === 'shared link') t = await recovery.addedDocs(tag, { link: true });
+      else t = await psdPlaced(tag, { sameBytes: variant === 'identical bytes' });
+      const [a0] = t.outputs(t.A), dir = path.dirname(a0.path);
+      if (variant === 'refill then change') { fs.rmSync(a0.path); writeWorking('.psd', t.A, [], 645); await prePackage(t.f); writeWorking('.psd', t.A, [], 646); }
+      await prePackage(t.f);
+      results[variant] = { ...state(t.f, dir), written: await packaged(t.f) };
+      if (t.ext) results[variant].sharedLink = t.linkFact();
+      if (Array.isArray(results[variant].written)) results[variant].written = results[variant].written.filter(name => /^(Embedded-Layer|Shared)/.test(name));
+      await callIpcRaw('projects:delete', t.f.id);
+    }
+    pinned(results, {
+      'two documents': { rows: ['Embedded-Layer.png PlacedA A A', 'Embedded-Layer_1.png PlacedB B B'], setAside: [], holds: [], written: ['Embedded-Layer.png=A', 'Embedded-Layer_1.png=B'] },
+      'one document': { rows: ['Embedded-Layer.png PlacedA A A'], setAside: [], holds: [], written: ['Embedded-Layer.png=A'] },
+      'shared link': { rows: ['Embedded-Layer.png DocA A A', 'Embedded-Layer_1.png DocB B B'], setAside: [], holds: [], written: ['Embedded-Layer.png=A', 'Embedded-Layer_1.png=B', 'Shared-r6sharedli.png=e1034b16'], sharedLink: [1, true] },
+      'identical bytes': { rows: ['Embedded-Layer.png PlacedA A A', 'Embedded-Layer_1.png PlacedB A A'], setAside: [], holds: [], written: ['Embedded-Layer.png=A', 'Embedded-Layer_1.png=A'] },
+      'refill then change': { rows: ['Embedded-Layer.png PlacedA 4bc8ff77 4bc8ff77', 'Embedded-Layer_1.png PlacedB B B', 'Embedded-Layer_2.png PlacedA 869b19a6 869b19a6'], setAside: [], holds: [], written: ['Embedded-Layer.png=4bc8ff77', 'Embedded-Layer_1.png=B', 'Embedded-Layer_2.png=869b19a6'] },
+    });
+  }, { realMainPsd: true }));
+  // Package review reads each extracted output once per file state: first review, a second review and a
+  // review after another pre-package pass, for 1, 10 and 100 outputs (bc94955 reads none at review).
+  baselineTest('Photoshop outputs: package review reads each extracted output once per file state', { timeout: 600000 }, () => withEnv(async () => {
+    const results = {};
+    for (const count of [1, 10, 100]) {
+      const W = desk(`Work-rd${count}.ai`), docs = Array.from({ length: count }, (_, i) => desk(`Doc${i}-rd${count}.psd`));
+      const f = await newProject('Reads ' + count, { before() { docs.forEach((doc, i) => writeWorking('.psd', doc, [], 1000 + i)); writeWorking('.ai', W, docs); } });
+      await f.add(W); await prePackage(f);
+      const rows = f.current().files.filter(row => row.source === 'psd-embedded');
+      const dir = path.dirname(rows[0].path), review = () => callIpcRaw('projects:prepare-package-review', f.id, desk('out-' + f.id.slice(-6)));
+      const first = await cacheReads(dir, review), second = await cacheReads(dir, review);
+      await prePackage(f);
+      const afterPass = await cacheReads(dir, review);
+      results[count] = { rows: rows.length, first, second, afterPass };
+      await callIpcRaw('projects:delete', f.id);
+    }
+    pinned(results, { '1': { rows: 1, first: 1, second: 0, afterPass: 0 }, '10': { rows: 10, first: 10, second: 0, afterPass: 0 }, '100': { rows: 100, first: 100, second: 0, afterPass: 0 } });
+  }, { realMainPsd: true }));
 }

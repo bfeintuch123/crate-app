@@ -11300,6 +11300,55 @@ function getChosenMissingPsdOutputs(project, psdFilePath, extractDir, isNamePres
   return { chosen, otherParentNames };
 }
 
+// Content digests of extracted Photoshop outputs read during extraction, keyed
+// by path and file identity (device, inode, size, mtime and ctime): a file is
+// read once per state. Nothing is stored in the project.
+const psdOutputContentDigests = new Map();
+async function readCachedPsdOutputDigest(filePath, isCurrent, directoryIdentity) {
+  const found = fs.lstatSync(filePath);
+  if (found.isSymbolicLink() || !found.isFile() || found.nlink !== 1) return null;
+  const known = psdOutputContentDigests.get(JSON.stringify([filePath, psdBaselineFileIdentity(found)]));
+  if (known) return known;
+  const snapshot = await readPsdBaselineSnapshot(filePath, isCurrent, directoryIdentity);
+  if (psdOutputContentDigests.size >= 8192) psdOutputContentDigests.delete(psdOutputContentDigests.keys().next().value);
+  psdOutputContentDigests.set(JSON.stringify([filePath, snapshot.identity]), snapshot.digest);
+  return snapshot.digest;
+}
+
+// What this app session itself wrote while extracting a document: exact path ->
+// "parent path\ndigest" entries, compared as stored strings (a differently
+// spelled path simply does not match). Process-local, never stored; package
+// review accepts it only for a row without an individual choice of that same
+// document.
+const psdOutputsWrittenThisSession = new Map();
+function notePsdOutputWritten(filePath, parentPath, digest) {
+  if (!psdOutputsWrittenThisSession.has(filePath)) {
+    if (psdOutputsWrittenThisSession.size >= 8192) psdOutputsWrittenThisSession.delete(psdOutputsWrittenThisSession.keys().next().value);
+    psdOutputsWrittenThisSession.set(filePath, new Set());
+  }
+  psdOutputsWrittenThisSession.get(filePath).add(parentPath + '\n' + digest);
+}
+
+// Replaces one unchanged row's extraction record (an existing field) after its
+// cached file was verified to hold the new record's bytes.
+function rerecordPsdOutputRow(projectId, prior, next, isCurrent) {
+  const snapshot = JSON.stringify(prior);
+  let changed = false;
+  mutateProject(projectId, project => {
+    if (!isCurrent()) return false;
+    const row = [...(project.files || []), ...(project.pendingFiles || [])].find(item => JSON.stringify(item) === snapshot);
+    if (!row) return false;
+    row.psdExtractionReceipt = next;
+    changed = true;
+    return true;
+  });
+  if (changed) {
+    invalidatePackageReviewForProject(projectId);
+    sendToRenderer('project:updated', { projectId });
+  }
+  return changed;
+}
+
 function promoteEmbeddedPsdStage(stage, extractDir, usedNames, assertCurrentAndOwned) {
   for (let attempt = 0; attempt < 1024; attempt++) {
     assertCurrentAndOwned();
@@ -16306,7 +16355,11 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         return getChosenMissingPsdOutputs(getProjects().find(project => project.id === projectId), psdFilePath, extractDir,
           name => (listing ??= listNames()).has(name));
       };
-      return discoveredPaths.concat(workerResult.transaction.promote(reservation));
+      const promoted = workerResult.transaction.promote(reservation);
+      for (const output of promoted) if (output.source === 'psd-embedded' && typeof output.outputDigest === 'string') {
+        notePsdOutputWritten(output.filePath, psdFilePath, output.outputDigest);
+      }
+      return discoveredPaths.concat(promoted);
     }
 
     // Extract embedded files from psd.linkedFiles
@@ -16361,7 +16414,65 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           if (chosen.outputDigest !== outputDigest || chosen.originalName !== (lf.name || '')) continue;
           chosenMissing.delete(name); chosenName = chosen.name; break;
         }
-        embeddedRecords.push({ lf, embeddedIndex, outputDigest, matches, chosenName });
+        embeddedRecords.push({ lf, embeddedIndex, outputDigest, matches, chosenName, byteLength: data.length });
+      }
+      // Rows of this file without an individual choice whose cached file holds
+      // one of this file's current objects (same original name) while their
+      // record names other bytes, the state an ordinary refill leaves now or left
+      // under an older build, take that object's record: verified from the bytes
+      // in memory, written only while the row is unchanged. Rows with a choice,
+      // rows with a resource record and shared paths are never re-recorded.
+      const rerecorded = new Set();
+      const rerecordRefilledRows = async onlyPaths => {
+        let psdKey = null, choiceKeys = null;
+        for (const row of priorEmbeddedRows) {
+          const receipt = row.psdExtractionReceipt;
+          if (rerecorded.has(row) || !receipt || row.psdResource || receipt.version !== 1 || receipt.current === false ||
+              receipt.layerPath !== null || !isDirectCacheChild(extractDir, row.path) ||
+              (onlyPaths && !onlyPaths.has(normalizeTrackedFilePath(row.path)))) continue;
+          const candidates = embeddedRecords.filter(record => !record.repairOnly &&
+            (record.lf.name || '') === receipt.originalName && record.outputDigest !== receipt.outputDigest);
+          if (!candidates.length ||
+              normalizeTrackedFilePath(receipt.parentPath) !== (psdKey ??= normalizeTrackedFilePath(psdFilePath)) ||
+              hasIndividualAssetChoice(project, row, choiceKeys ??= new Set(project.excludedAssetKeys || [])) ||
+              priorEmbeddedRows.filter(other => normalizeTrackedFilePath(other.path) === normalizeTrackedFilePath(row.path)).length !== 1) continue;
+          let digest = null;
+          try { digest = await readCachedPsdOutputDigest(row.path, isCurrent, directoryIdentity); }
+          catch (_) { if (!isCurrent()) return false; continue; }
+          const record = candidates.find(item => item.outputDigest === digest);
+          if (!record) continue;
+          const next = { version: 1, parentPath: psdFilePath, sourceDigest, layerPath: null,
+            linkedIndex: record.embeddedIndex, originalName: record.lf.name || '', outputDigest: record.outputDigest };
+          if (!rerecordPsdOutputRow(projectId, row, next, isCurrent)) continue;
+          rerecorded.add(row);
+          row.psdExtractionReceipt = next;
+          // It is now this save's own row for that object: no new row is made.
+          if (!record.matches.length && !record.chosenName) record.matches = [row];
+        }
+        return isCurrent();
+      };
+      if (!options.onOwnedPsdOutputs && priorEmbeddedRows.length && !await rerecordRefilledRows(null)) return [];
+      // A row of this file whose recorded bytes (digest and original name) are
+      // still in it, but not from this exact save, is examined too: if its cached
+      // file does not hold its recorded bytes (one read per file state), the
+      // rebuild below may restore it. Its record is not changed and this save's
+      // object keeps its own row.
+      if (!options.onOwnedPsdOutputs && priorEmbeddedRows.length) {
+        const examined = new Set(embeddedRecords.flatMap(record => record.matches));
+        let psdKey = null;
+        for (const record of [...embeddedRecords]) for (const row of priorEmbeddedRows) {
+          const receipt = row.psdExtractionReceipt || row.psdResource;
+          if (examined.has(row) || receipt?.version !== 1 || receipt.current === false || receipt.layerPath !== null ||
+              receipt.outputDigest !== record.outputDigest || receipt.originalName !== (record.lf.name || '') ||
+              !isDirectCacheChild(extractDir, row.path) ||
+              normalizeTrackedFilePath(receipt.parentPath) !== (psdKey ??= normalizeTrackedFilePath(psdFilePath))) continue;
+          examined.add(row);
+          let digest = null;
+          try { digest = await readCachedPsdOutputDigest(row.path, isCurrent, directoryIdentity); }
+          catch (_) { if (!isCurrent()) return []; continue; }
+          if (digest === null || digest === receipt.outputDigest) continue;
+          embeddedRecords.push({ ...record, matches: [row], chosenName: null, repairOnly: true });
+        }
       }
       let repairSource = null;
       const assertRepairSource = () => {
@@ -16369,8 +16480,41 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
             fs.realpathSync(psdFilePath) !== repairSource.realPath) throw new Error('asset_baseline_source_changed');
         assertPsdBaselineSnapshot(repairSource);
       };
+      // A row's cached file that holds another document's recorded bytes is set
+      // aside once this file is verified as the repair source: an exclusive link
+      // to a name no output or row can have (output names never start with a
+      // dot), then the row's name is removed. The bytes are never deleted or
+      // overwritten. Any other wrong bytes keep the existing refusal. True only
+      // when the row's path is then free.
+      const setAsideWrongOutput = async (row, outputDigest) => {
+        try {
+          const key = normalizeTrackedFilePath(row.path), rows = [...(project?.files || []), ...(project?.pendingFiles || [])];
+          if (!isDirectCacheChild(extractDir, row.path) ||
+              [...pendingPsdRepairs].some(stage => normalizeTrackedFilePath(stage.extractPath) === key) ||
+              rows.filter(other => normalizeTrackedFilePath(other.path) === key).length !== 1) return false;
+          const found = fs.lstatSync(row.path);
+          if (found.isSymbolicLink() || !found.isFile() || found.nlink !== 1) return false;
+          const digest = (await readPsdBaselineSnapshot(row.path, isCurrent, directoryIdentity)).digest;
+          const parentKey = normalizeTrackedFilePath(psdFilePath);
+          if (digest === outputDigest || !rows.some(other => {
+            const receipt = other.psdExtractionReceipt || other.psdResource;
+            return other !== row && receipt?.outputDigest === digest && typeof receipt.parentPath === 'string' &&
+              normalizeTrackedFilePath(receipt.parentPath) !== parentKey;
+          })) return false;
+          repairSource ||= await readPsdBaselineSnapshot(fs.realpathSync(psdFilePath), isCurrent);
+          assertRepairSource();
+          assertCacheDirectoryIdentity(directoryIdentity, 'psd-extract-directory');
+          const asidePath = path.join(extractDir, `.crate-set-aside-${crypto.randomBytes(16).toString('hex')}${path.extname(row.path)}`);
+          fs.linkSync(row.path, asidePath);
+          const kept = fs.lstatSync(asidePath), current = fs.lstatSync(row.path);
+          if (kept.dev !== found.dev || kept.ino !== found.ino || current.dev !== found.dev || current.ino !== found.ino ||
+              current.size !== found.size || current.mtimeMs !== found.mtimeMs) return false;
+          fs.unlinkSync(row.path);
+          return true;
+        } catch (_) { return false; }
+      };
       let baselineEmbeddedOrdinal = 0;
-      for (const { lf, embeddedIndex, outputDigest, matches, chosenName } of embeddedRecords) {
+      for (const { lf, embeddedIndex, outputDigest, matches, chosenName, repairOnly } of embeddedRecords) {
         if (!isCurrent()) return [];
         const data = Buffer.from(lf.data);
         const psdExtractionReceipt = { version: 1, parentPath: psdFilePath, sourceDigest,
@@ -16390,7 +16534,11 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
               assertPsdBaselineSnapshot(snapshot);
             } catch (error) {
               if (!isCurrent()) return [];
-              if (error.code === 'ENOENT' && matches.length === 1 && isDirectCacheChild(extractDir, matches[0].path)) {
+              const freed = error.code !== 'ENOENT' && matches.length === 1 && await setAsideWrongOutput(matches[0], outputDigest);
+              if (!isCurrent()) return [];
+              // An examined row that is missing, linked, shared or unverified is left as it was.
+              if (repairOnly && !freed) continue;
+              if ((error.code === 'ENOENT' || freed) && matches.length === 1 && isDirectCacheChild(extractDir, matches[0].path)) {
                 try {
                   assertCacheDirectoryIdentity(directoryIdentity, 'psd-extract-directory');
                   repairSource ||= await readPsdBaselineSnapshot(fs.realpathSync(psdFilePath), isCurrent);
@@ -16408,6 +16556,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
               }
             }
             if (!restoreTargets) {
+              if (repairOnly) continue;
               if (![...pendingPsdRepairs].some(stage =>
                 normalizeTrackedFilePath(stage.extractPath) === normalizeTrackedFilePath(matches[0].path))) {
                 updatePsdExtractionReceiptHolds(projectId, targets, false, isCurrent);
@@ -16432,6 +16581,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           outputDigest,
           psdExtractionReceipt,
           restoreTargets,
+          repairOnly: repairOnly === true,
           repairSourceSnapshot: restoreTargets ? repairSource : null,
           byteLength: data.length,
           identity: null,
@@ -16482,6 +16632,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         if (finalStat.isSymbolicLink() || !finalStat.isFile() || finalStat.dev !== staged.identity.dev || finalStat.ino !== staged.identity.ino) {
           throw cacheSafetyError('psd-extract-file', 'changed');
         }
+        notePsdOutputWritten(staged.extractPath, psdFilePath, staged.outputDigest);
         if (staged.restoreTargets) {
           if (!isAddFilesSourceIdentityCurrent(finalStat, staged.repairWriteIdentity)) throw new Error('asset_baseline_psd_output_changed');
           staged.repairFinalIdentity = psdBaselineFileIdentity(finalStat);
@@ -16497,7 +16648,8 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           // Keep the prior refusal until this caller accepts the repaired
           // member. Extraction success alone does not retire cleanup ownership.
         }
-        discoveredPaths.push({
+        // A rebuilt older row is not a discovery of this save; that object has its own stage.
+        if (!staged.repairOnly) discoveredPaths.push({
           filePath: staged.extractPath,
           source: 'psd-embedded',
           embeddedOriginalName: staged.embeddedOriginalName,
@@ -16513,6 +16665,14 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           updatePsdExtractionReceiptHolds(projectId, staged.restoreTargets, true, isCurrent);
           options.onOrdinaryScanFailure?.();
         }
+      }
+      // An ordinary refill just wrote this file's current object at an existing
+      // row's path: that row takes the record of what was written, read back.
+      if (!options.onOwnedPsdOutputs && priorEmbeddedRows.length) {
+        const refilled = new Set(invocationFiles.filter(stage => stage.committed && !stage.restoreTargets)
+          .map(stage => normalizeTrackedFilePath(stage.extractPath)));
+        if (refilled.size && priorEmbeddedRows.some(row => refilled.has(normalizeTrackedFilePath(row.path))) &&
+            !await rerecordRefilledRows(refilled)) return [];
       }
     }
 
@@ -22668,6 +22828,20 @@ function getPackageSelectionInputSignature(project, reviewedSemantics = false) {
   }
 }
 
+// Content digests of extracted Photoshop outputs, keyed by path and the review's
+// stat fingerprint (device, inode, size, mtime and ctime in nanoseconds): any
+// change to a file changes its key, so a repeat review hashes nothing.
+const verifiedPsdOutputDigests = new Map();
+function getReviewedPsdOutputDigest(filePath, fingerprint) {
+  const key = JSON.stringify([filePath, fingerprint]);
+  if (verifiedPsdOutputDigests.has(key)) return verifiedPsdOutputDigests.get(key);
+  const value = getStablePackageReviewSourceContentFingerprint(filePath, fingerprint, MAX_PARSE_FILE_SIZE);
+  const digest = value.slice(value.lastIndexOf(':') + 1);
+  if (verifiedPsdOutputDigests.size >= 8192) verifiedPsdOutputDigests.delete(verifiedPsdOutputDigests.keys().next().value);
+  verifiedPsdOutputDigests.set(key, digest);
+  return digest;
+}
+
 function getUnsatisfiedWorkingPsdOutputEntries(project, membership, files, entries = null) {
   const unavailable = new Set(), digestByEntry = new Map();
   const selectionEngaged = hasWorkingSourceSelectionState(project);
@@ -22687,15 +22861,53 @@ function getUnsatisfiedWorkingPsdOutputEntries(project, membership, files, entri
           // Cache failures too: shared producer obligations cannot retry this
           // same physical output within one fresh projection.
           digestByEntry.set(index, null);
-          const fingerprint = getStablePackageReviewSourceContentFingerprint(files[index].path,
-            entries ? entries[index].sourceFingerprint : getPackageReviewSourceFingerprint(files[index].path), MAX_PARSE_FILE_SIZE);
-          digestByEntry.set(index, fingerprint.slice(fingerprint.lastIndexOf(':') + 1));
+          digestByEntry.set(index, getReviewedPsdOutputDigest(files[index].path,
+            entries ? entries[index].sourceFingerprint : getPackageReviewSourceFingerprint(files[index].path)));
         }
         if (digestByEntry.get(index) !== output.outputDigest) unavailable.add(index);
       } catch (_) { unavailable.add(index); }
     }
   }
   return unavailable;
+}
+
+// Package review only: an extracted Photoshop output with a current record is
+// written only with bytes that belong to it. A row with an individual choice:
+// exactly its own recorded bytes. A row without one: its own recorded bytes or
+// those another current row of the same document records (what an ordinary
+// refill leaves), or what this session itself wrote there from that document.
+// Any other bytes, whoever wrote them, leave it unavailable;
+// nothing is changed. The package step runs this again and copies only a file
+// whose stat fingerprint is still the one verified here.
+function getMismatchedPsdOutputEntries(project, files, entries) {
+  const mismatched = new Set();
+  let siblings = null, choiceKeys = null;
+  const currentRecord = row => {
+    const receipt = row?.source === 'psd-embedded' ? row.psdExtractionReceipt || row.psdResource : null;
+    return receipt?.version === 1 && receipt.current !== false && typeof receipt.parentPath === 'string' &&
+      /^[a-f0-9]{64}$/.test(receipt.outputDigest || '') ? receipt : null;
+  };
+  files.forEach((file, index) => {
+    const receipt = currentRecord(file);
+    if (!receipt) return;
+    let digest = null;
+    try { digest = getReviewedPsdOutputDigest(file.path, entries[index].sourceFingerprint); } catch (_) { mismatched.add(index); return; }
+    if (digest === receipt.outputDigest) return;
+    if (hasIndividualAssetChoice(project, file, choiceKeys ??= new Set(project.excludedAssetKeys || []))) { mismatched.add(index); return; }
+    if (!siblings) {
+      siblings = new Map();
+      for (const row of [...(project.files || []), ...(project.pendingFiles || [])]) {
+        const record = currentRecord(row);
+        if (!record) continue;
+        const key = normalizeTrackedFilePath(record.parentPath);
+        if (!siblings.has(key)) siblings.set(key, []);
+        siblings.get(key).push([row, record.outputDigest]);
+      }
+    }
+    if (psdOutputsWrittenThisSession.get(file.path)?.has(receipt.parentPath + '\n' + digest)) return;
+    if (!(siblings.get(normalizeTrackedFilePath(receipt.parentPath)) || []).some(([row, recorded]) => recorded === digest && row.path !== file.path)) mismatched.add(index);
+  });
+  return mismatched;
 }
 
 async function buildCanonicalPackageReviewManifest(projectId) {
@@ -22756,6 +22968,7 @@ async function buildCanonicalPackageReviewManifest(projectId) {
       };
     }
     const unavailableOutputs = getUnsatisfiedWorkingPsdOutputEntries(currentProject, membership, files, entries);
+    for (const index of getMismatchedPsdOutputEntries(currentProject, files, entries)) unavailableOutputs.add(index);
     if (unavailableOutputs.size > 0) return {
       project: currentProject, files, entries,
       entryStatuses: entryStatuses.map((status, index) => unavailableOutputs.has(index) ? 'unavailable' : status),
