@@ -3868,3 +3868,13 @@ body {
   color: var(--gray-700);
 }
 .package-review-font-choice .package-review-font-row-actions { margin-top: 6px; }
+
+/* Quick Package: why fonts were left out (must wrap, never truncate). */
+.v2-result-font-note {
+  margin: 4px 0 6px;
+  color: var(--gray-500);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}

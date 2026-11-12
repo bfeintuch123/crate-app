@@ -7020,7 +7020,7 @@ function showV2Results(result) {
   if (skippedFonts.length > 0) {
     missingEl.insertAdjacentHTML('beforeend', `
       <div class="v2-result-missing-header">Fonts not included</div>
-      <div class="v2-result-missing-item">Quick Package doesn't include font files. Use a Crate project and Package Review to add fonts.</div>
+      <p class="v2-result-font-note">Quick Package doesn't include font files. Use a Crate project and Package Review to add fonts.</p>
       <div class="v2-result-missing-list">
         ${skippedFonts.map(font => `<div class="v2-result-missing-item">${escapeHtml(String(font?.name || 'Font file'))}</div>`).join('')}
       </div>
