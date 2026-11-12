@@ -793,7 +793,8 @@ test('round 6: ordinary OFL copyright, trademark and description text is still r
   ];
   for (const copyright of copyrights) {
     const faces = oflFace([...oflNames({ copyright }), nameRecord(7, 'Brand Sans is a trademark of Synthetic Foundry.'),
-      nameRecord(10, 'Brand Sans is a humanist face. It is not a display face, and it is free for commercial use under the OFL.'),
+      // Round 7: free prose descriptions are uncertain; designer credits still pass.
+      nameRecord(10, 'Designed by Synthetic Foundry design team.'),
       nameRecord(0, copyright, 1, 0, 0)]);
     assert.equal(detectOpenLicence(faces), 'ofl-1.1', copyright);
     assert.equal(roundFiveGate(faces).basis, 'open-licence', copyright);
@@ -809,4 +810,121 @@ test('round 6: earlier cases keep their outcomes', () => {
   assert.equal(readFontFaces(buildFont({ fsType: 2, names: oflNames() })).faces[0].restricted, true, 'fsType 2');
   const collection = readFontFaces(buildCollection([{ names: oflNames() }, { names: oflNames({ postscriptName: 'B-Two', copyright: ASTRA_ID0 }) }])).faces;
   assert.equal(detectOpenLicence(collection), null, 'one face of a collection with a restrictive copyright');
+});
+
+// Round 7 (Bryant authorized one more targeted correction): a bounded,
+// conservative classifier for the notices that sit beside an OFL statement.
+// Copyright, trademark and description records must each match a small set
+// of known notice forms, with no licensing or instruction words, after
+// separators become spaces. Anything else is uncertain and asks for the
+// per-file confirmation; nothing here can become an exclusion or a pass for
+// a restricted, Adobe or system font.
+const withNotice = (records, base = {}) => oflFace([...oflNames(base), ...records]);
+
+test('round 7: Astra d3dd2e3 findings - lowercase or adjacent sentences after a copyright line are judged', () => {
+  for (const copyright of ['Copyright 2026 Synthetic Foundry. sharing is disallowed.', 'Copyright 2026 Synthetic Foundry.Sharing is disallowed.',
+    'Copyright 2026 Synthetic Foundry.sharing is disallowed.', 'Copyright 2026 Synthetic Foundry; sharing is disallowed',
+    'Copyright 2026 Synthetic Foundry! Sharing is disallowed', 'Copyright 2026 Synthetic Foundry? keep it in-house']) {
+    assert.equal(detectOpenLicence(withNotice([], { copyright })), null, copyright);
+  }
+});
+
+test('round 7: Astra d3dd2e3 findings - separators keep word boundaries; invisible and compatibility characters do not hide wording', () => {
+  const separators = ['\t', ' ', ' ', '\u000b', '\u000c', '\u0085', ' ', ' ', '　', '​', '⁠', '­', '﻿', '\r\n'];
+  for (const sep of separators) {
+    for (const [id, text] of [[10, `Do${sep}not share this font`], [0, `Copyright 2026 Synthetic Foundry. Do${sep}not share.`],
+      [7, `Brand Sans is a trademark of Synthetic Foundry and may${sep}not be shared.`]]) {
+      assert.equal(detectOpenLicence(withNotice([nameRecord(id, text)])), null, JSON.stringify([id, text]));
+    }
+  }
+  // Wording split inside a word by invisible or soft-hyphen characters, and fullwidth letters.
+  for (const text of ['Redis­tribution prohibited.', 'Sha​ring disallowed.', 'ｎｏｔ for sharing', 'Dis⁠allowed.']) {
+    assert.equal(detectOpenLicence(withNotice([nameRecord(10, text)])), null, JSON.stringify(text));
+  }
+});
+
+test('round 7: the writer probe and close variants in a copyright-shaped line ask for the confirmation', () => {
+  const copyrights = [
+    'Copyright 2026 Synthetic Foundry Sharing Disallowed',
+    'Copyright 2026 Synthetic Foundry, sharing disallowed',
+    'Copyright 2026 Synthetic Foundry Internal Use Only',
+    'Copyright 2026 Synthetic Foundry, Keep This File To Yourself',
+    'Copyright 2026 Synthetic Foundry (see https://foundry.example/eula)',
+    'Copyright 2026 Synthetic Foundry. Unauthorised copying prohibited.',
+    'Copyright 2026 Synthetic Foundry Licensed To Brand Co',
+    'Copyright 2026 Synthetic Foundry For Your Eyes Оnly',
+    'Copyright 2026 Synthetic Foundry Shаring Disаllowed',
+    'Copyright 2026 Synthetic Foundry No Redistribution',
+    'Copyright 2026 Synthetic Foundry Not Shareable',
+    '© 2026 Synthetic Foundry - Do Not Distribute',
+    'Copyright 2026 Synthetic Foundry. Rights Reserved For Brand Co Staff.',
+  ];
+  for (const copyright of copyrights) {
+    assert.equal(detectOpenLicence(withNotice([], { copyright })), null, copyright);
+    assert.equal(roundFiveGate(withNotice([], { copyright })).outcome, 'needs-confirmation', copyright);
+  }
+});
+
+test('round 7: trademark records must be trademark statements without licensing wording', () => {
+  const cases = [
+    'Brand Sans is a trademark of Synthetic Foundry. Not for redistribution.',
+    'Brand Sans is a trademark of Synthetic Foundry. Keep internal.',
+    'Brand Sans is a trademark of Synthetic Foundry, used under licence.',
+    'Brand Sans by Synthetic Foundry',
+    'Trademark notice: sharing requires permission.',
+  ];
+  for (const text of cases) assert.equal(detectOpenLicence(withNotice([nameRecord(7, text)])), null, text);
+});
+
+test('round 7: descriptions other than designer credits, and licensing words in other name records, are uncertain', () => {
+  const descriptions = ['Keep this file to yourself.', 'Brand Sans is a humanist face for headlines.', 'Designed by Synthetic Foundry. Trial version.',
+    'Designed by Synthetic Foundry for Brand Co staff only.'];
+  for (const text of descriptions) assert.equal(detectOpenLicence(withNotice([nameRecord(10, text)])), null, text);
+  const others = [
+    nameRecord(8, 'Synthetic Foundry (trial)'),
+    nameRecord(9, 'Jane Doe - not for distribution'),
+    nameRecord(11, 'https://foundry.example/eula'),
+    nameRecord(12, 'https://foundry.example/licensing/terms'),
+  ];
+  for (const record of others) assert.equal(detectOpenLicence(withNotice([record])), null, JSON.stringify(record));
+  for (const [family, style, ps] of [['Brand Sans Trial', 'Regular', 'BrandSansTrial-Regular'], ['Brand Sans', 'Demo', 'BrandSans-Demo'],
+    ['Brand Sans Personal Use', 'Regular', 'BrandSansPersonalUse-Regular']]) {
+    assert.equal(detectOpenLicence(oflFace(oflNames({ family, style, postscriptName: ps }))), null, family + ' ' + style);
+  }
+});
+
+test('round 7: mixed, translated or unreadable notice records stay uncertain', () => {
+  const cases = [
+    nameRecord(0, 'Urheberrecht 2026 Synthetic Foundry.', 3, 1, 0x0407),
+    nameRecord(7, 'Brand Sans ist eine Marke von Synthetic Foundry.', 3, 1, 0x0407),
+    nameRecord(10, 'Entworfen von Synthetic Foundry.', 1, 0, 2),
+    { id: 0, platform: 3, encoding: 2, language: 0x0411, text: '', data: Buffer.from([0x82, 0xa0]) },
+    { id: 7, platform: 1, encoding: 1, language: 11, text: '', data: Buffer.from([0x82, 0xa0]) },
+    { id: 10, platform: 3, encoding: 1, language: 0x0409, text: '', data: Buffer.from([0x00, 0x41, 0x00]) },
+  ];
+  for (const record of cases) assert.equal(detectOpenLicence(withNotice([record])), null, JSON.stringify({ ...record, data: undefined }));
+});
+
+test('round 7: real OFL notice forms still auto-include (forms from OFL fonts bundled in apps on this Mac)', () => {
+  const notices = [
+    ['Copyright 2016 The Inter Project Authors (https://github.com/rsms/inter)', 'Inter UI and Inter is a trademark of rsms.', null],
+    ['Copyright 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono)', 'JetBrains Mono is a trademark of JetBrains s.r.o.', null],
+    ['Copyright 2020 The Open Sans Project Authors (https://github.com/googlefonts/opensans)', 'Open Sans is a trademark of Google and may be registered in certain jurisdictions.', null],
+    ['Copyright 2011 The Roboto Project Authors (https://github.com/googlefonts/roboto-classic)', 'Roboto is a trademark of Google.', null],
+    ['Copyright 2025 The Google Sans Code Project Authors (github.com/googlefonts/googlesans-code)', '“Google”, “Google Sans” and “Google Sans Code” are trademarks of Google LLC.', null],
+    ['Copyright (c) 2017, Ek Type. All rights reserved.', null, 'Designed by Ek Type & Mukund Gokhale'],
+    ['Copyright 2017-2019 Google LLC. All Rights Reserved.', 'Noto is a trademark of Google LLC', 'Data unhinted. Designed by Monotype design team.'],
+    ['Copyright 2001-2021 The STIX Fonts Project Authors (https://github.com/stipub/stixfonts)', 'STIX Fonts and STIX Two are trademarks of The Institute of Electrical and Electronics Engineers, Inc.', null],
+    ['Copyright 2018 Google Inc. All Rights Reserved.', 'Noto is a trademark of Google Inc.', 'Designed by Mark Jamra, Neil Patel.'],
+    ['Copyright (c) 2010, Jane Doe (jane@example.com), with Reserved Font Name "Brand Sans".', null, null],
+  ];
+  for (const [copyright, trademark, description] of notices) {
+    const records = [nameRecord(0, copyright, 1, 0, 0)];
+    if (trademark) records.push(nameRecord(7, trademark), nameRecord(7, trademark, 1, 0, 0));
+    if (description) records.push(nameRecord(10, description));
+    records.push(nameRecord(8, 'Synthetic Foundry'), nameRecord(9, 'Jane Doe'), nameRecord(11, 'https://foundry.example'), nameRecord(12, 'https://janedoe.example'));
+    const faces = withNotice(records, { copyright });
+    assert.equal(detectOpenLicence(faces), 'ofl-1.1', copyright);
+    assert.equal(roundFiveGate(faces).basis, 'open-licence', copyright);
+  }
 });

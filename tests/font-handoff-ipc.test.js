@@ -852,6 +852,32 @@ function cases() {
     assert.deepEqual(fs.readFileSync(path.join(out.result.folderPath, 'Fonts', 'Conflict.otf')), conflictBytes);
   });
 
+  fontTest('round 7: a lowercase sentence after a copyright line and a TAB-separated restriction ask for the confirmation (Astra d3dd2e3)', async () => {
+    const f = await fixture('Round seven');
+    const cases = [
+      ['Lowercase.otf', { copyright: 'Copyright 2026 Synthetic Foundry. sharing is disallowed.' }, []],
+      ['Tabbed.otf', {}, [nameRecord(10, 'Do\tnot share this font')]],
+      ['Probe.otf', { copyright: 'Copyright 2026 Synthetic Foundry Sharing Disallowed' }, []],
+    ];
+    for (const [file, extra, records] of cases) {
+      const family = file.replace('.otf', '');
+      writeFont(path.join(f.dir, file), { names: [...englishNames({ family, style: 'Regular', postscriptName: `${family}-Regular`,
+        licence: OFL_STATEMENT, licenceUrl: 'https://openfontlicense.org', ...extra }), ...records] });
+    }
+    const open = path.join(f.dir, 'Open.otf');
+    const openBytes = writeFont(open, { names: [...englishNames({ family: 'Open', style: 'Regular', postscriptName: 'Open-Regular',
+      licence: OFL_STATEMENT, licenceUrl: 'https://openfontlicense.org', copyright: 'Copyright 2020 The Open Project Authors (https://github.com/example/open)' }),
+      nameRecord(7, 'Open is a trademark of Synthetic Foundry.'), nameRecord(10, 'Designed by Synthetic Foundry.')] });
+    manualDialogFor([...cases.map(([file]) => path.join(f.dir, file)), open]);
+    await callIpcRaw('fonts:add-files', f.project.id);
+    const reviewResult = await review(f);
+    for (const [file] of cases) assert.equal(row(reviewResult, file).outcome, 'needs-confirmation', file);
+    assert.equal(row(reviewResult, 'Open.otf').basis, 'open-licence');
+    const { result } = await packageNow(f, reviewResult);
+    assert.deepEqual(listTree(result.folderPath).filter(item => item.endsWith('.otf')), ['Fonts/Open.otf']);
+    assert.deepEqual(fs.readFileSync(path.join(result.folderPath, 'Fonts', 'Open.otf')), openBytes);
+  });
+
   fontTest('registry failure reports unavailable and leaves packaging untouched', async () => {
     const f = await fixture();
     registryFailure = true;

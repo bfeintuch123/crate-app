@@ -128,49 +128,96 @@ function licenceRecordDecoder(platform, encoding) {
   return null;
 }
 
-// Wording that restricts sharing, used on the copyright (0), trademark (7)
-// and description (10) records. English only; the description uses the
-// narrow list because prose often says "not" or "no".
-const RESTRICTION_WORDING = /redistribut|prohibit|forbid|\bdo not (?:share|distribute|copy|redistribute|sell|give)|\bdon['\u2019]t (?:share|distribute|copy|redistribute|sell|give)|\bmay not\b|\bmust not\b|\bcannot\b|\bnot (?:be )?(?:licen[cs]ed|permitted|allowed|granted|for (?:sale|sharing|distribution|redistribution|resale))|\bcommercial (?:font|licen[cs]e|use only)|\bproprietary\b|\beula\b|\btrial\b|\bdemo\b|\bpersonal use\b|\bevaluation\b|\bpurchase|licen[cs]e (?:is )?(?:required|needed)|without (?:a |the )?(?:licen[cs]e|permission)/i;
-const NEGATION_WORDING = /\bnot\b|n['\u2019]t\b|\bno\b|\bnever\b|\bonly\b|\bexcept\b|\brequire|\bpermission\b|\brestrict|\bcommercial\b/i;
-const COPYRIGHT_SENTENCE = /^(?:copyright\b|\u00a9|\(c\)|all rights reserved|portions? copyright\b|digitized data copyright\b|font data copyright\b|(?:with )?reserved font names?\b)/i;
+// Notices beside an OFL statement are judged by a bounded classifier, not by
+// trying to understand free text. Each copyright (0), trademark (7) and
+// description (10) record must be made only of a few known notice forms, and
+// every notice-like record (0, 7, 8, 9, 10, 11, 12) must contain none of a
+// closed list of licensing and instruction words. Anything else is uncertain
+// and asks for the per-file confirmation. Separators and invisible
+// characters become spaces before judging (TAB, U+2028 and NBSP keep word
+// boundaries), and text is also judged with invisible characters removed,
+// so neither form can hide wording. A word mixing Latin with Cyrillic or
+// Greek letters is uncertain. English only: other-language notices do not
+// match the known forms and so ask for the confirmation.
+const LICENSING_WORDS = new RegExp(`\\b(?:${[
+  'shar(?:e|es|ed|ing|eable|able)', 're?distribut\\w*', '(?:sub|un)?licen[cs]\\w*', 'permi(?:t|ts|tted|tting|ssion|ssions|ssible)',
+  '(?:dis)?allow\\w*', '(?:un)?authori[sz]\\w*', 'prohibit\\w*', 'forbid\\w*', 'restrict\\w*', 'private\\w*', 'internal\\w*', 'in-house',
+  'confidential\\w*', 'proprietary', 'exclusiv\\w*', 'only', 'not', 'no', 'never', 'none', 'nor', 'without', 'except\\w*', 'unless',
+  'trial\\w*', 'demo\\w*', 'evaluat\\w*', '(?:non)?commercial\\w*', 'personal\\w*', 'paid', 'pay\\w*', 'purchas\\w*', 'buy\\w*', 'bought',
+  'sell\\w*', 'sold', 'sales?', 'resale\\w*', 'rent\\w*', 'leas(?:e|ed|es|ing)', 'lend\\w*', 'transfer\\w*', 'giv(?:e|es|en|ing)', 'gave',
+  'send\\w*', 'sent', 'cop(?:y|ies|ied|ying)', 'duplicat\\w*', 'reproduc\\w*', 'embed\\w*', 'install\\w*', 'eula', 'terms?', 'condition\\w*',
+  'agreement\\w*', 'contract\\w*', '(?:il)?legal\\w*', 'infring\\w*', 'owner\\w*', 'requir\\w*', 'must', 'shall', 'cannot', 'may', 'you',
+  'your\\w*', 'keep\\w*', 'kept', 'please', 'do', 'does', 'did', 'done', 'us(?:e|es|ed|ing|age|er|ers)', 'access\\w*', 'grant\\w*',
+  'rights?', 'staff', 'employees?', 'clients?', 'customers?', 'watermark\\w*', 'warrant\\w*', 'liab\\w*',
+].join('|')})\\b|n['\\u2019]t\\b`, 'i');
+// Exact phrases that real OFL notices use and that are not terms.
+const ALLOWED_NOTICE_PHRASES = /\ball rights reserved\b|\b(?:with )?reserved font names?\b|\band may be registered in certain jurisdictions\b/gi;
+const MIXED_SCRIPT_WORD = /(?=\S*\p{Script=Latin})(?=\S*[\p{Script=Cyrillic}\p{Script=Greek}])\S+/u;
+const CORPORATE_SUFFIX_PIECE = /^(?:inc|ltd|llc|gmbh|co|corp|plc|ag|ab|bv|b\.v|nv|sa|s\.a|sas|srl|s\.r\.l|s\.r\.o|pty|kk|oy|as)$/i;
+const COPYRIGHT_PIECE = /^(?:(?:(?:portions|digitized data|font data) )?(?:copyright\b|©|\(c\))|all rights reserved$|(?:with )?reserved font names?\b)/i;
+const TRADEMARK_PIECE = /\b(?:is|are) (?:a |an |the )?(?:registered )?trademarks? (?:of|owned by)\b/i;
+const CREDIT_VERB = '(?:designed|created|drawn|developed|produced|engineered|hinted|mastered|digiti[sz]ed)';
+const DESCRIPTION_PIECE = new RegExp(`^(?:data (?:un)?hinted|${CREDIT_VERB}(?:,? and ${CREDIT_VERB})* by .+)$`, 'i');
+const NAME_WARNING_WORDS = /\b(?:trial|demo|evaluation|personal|unlicen[cs]ed|watermark(?:ed)?)\b/i;
+const NOTICE_NAME_IDS = new Set([0, 7, 8, 9, 10, 11, 12]);
+const FONT_NAME_IDS = new Set([1, 2, 4, 16, 17, 18, 21, 22]);
 
-// A copyright record counts only when every sentence is a copyright notice
-// and nothing restricts or negates: other sentences are not checked as terms,
-// so they make the face uncertain.
-function isPlainCopyrightNotice(text) {
-  const squashed = squashLicenceText(text);
-  if (RESTRICTION_WORDING.test(squashed) || NEGATION_WORDING.test(squashed)) return false;
-  return squashed.split(/(?<=[.;!?])\s+(?=[\p{Lu}\u00a9(])/u).every(sentence => COPYRIGHT_SENTENCE.test(sentence));
+function noticeTextForms(raw) {
+  const folded = raw.normalize('NFKC');
+  const squash = text => text.replace(/\s+/g, ' ').trim();
+  const spaced = squash(folded.replace(/[\p{Cc}\p{Cf}\p{Z}]/gu, ' '));
+  const joined = squash(folded.replace(/\p{Cf}/gu, '').replace(/[\p{Cc}\p{Z}]/gu, ' '));
+  return spaced === joined ? [spaced] : [spaced, joined];
+}
+
+// Sentence pieces: split after . ; ! ? when a space or a capital letter follows,
+// so "Foundry. sharing" and "Foundry.Sharing" are separate pieces while
+// "github.com" and "s.r.o" stay whole.
+function noticePieces(text) {
+  return text.split(/(?<=[.;!?])(?=\s|\p{Lu})/u).map(piece => piece.trim().replace(/[.;!?]+$/u, '').trim()).filter(Boolean);
+}
+
+function isKnownNoticeText(nameId, text) {
+  if (!text) return true;
+  if (MIXED_SCRIPT_WORD.test(text)) return false;
+  if (LICENSING_WORDS.test(text.replace(ALLOWED_NOTICE_PHRASES, ' '))) return false;
+  const pieces = noticePieces(text);
+  const fits = pattern => pieces.every(piece => pattern.test(piece) || CORPORATE_SUFFIX_PIECE.test(piece));
+  if (nameId === 0) return fits(COPYRIGHT_PIECE);
+  if (nameId === 7) return fits(TRADEMARK_PIECE);
+  if (nameId === 10) return fits(DESCRIPTION_PIECE);
+  return true;
 }
 
 // Safety evidence is separate from display: display uses one English record
 // per name ID, while automatic inclusion needs every licence (13) and licence
 // URL (14) record, on every platform, encoding and language, to state the
-// OFL, and every copyright (0), trademark (7) and description (10) record to
-// be free of restriction wording. A record that is unsupported, undecodable,
-// different or past the evidence budget makes the face uncertain. Only the
-// decision is kept, never the untruncated text.
-const EVIDENCE_NAME_IDS = new Set([0, 7, 10, 13, 14]);
-function judgeEvidenceText(nameId, text) {
-  if (nameId === 13) return isRecognizedOflLicence(text);
-  if (nameId === 14) return text !== null && isRecognizedOflUrl(text);
-  if (text === null) return true;
-  if (nameId === 0) return isPlainCopyrightNotice(text);
-  const squashed = squashLicenceText(text);
-  if (nameId === 7) return !RESTRICTION_WORDING.test(squashed) && !NEGATION_WORDING.test(squashed);
-  return !RESTRICTION_WORDING.test(squashed);
+// OFL, every notice record to pass the classifier above, and no font name to
+// say trial, demo or similar. A licence or notice record that is
+// unsupported, undecodable or past the evidence budget makes the face
+// uncertain; an unreadable font-name record is only display text and is
+// skipped. Only the decision is kept, never the untruncated text.
+const EVIDENCE_NAME_IDS = new Set([13, 14, ...NOTICE_NAME_IDS, ...FONT_NAME_IDS]);
+function judgeEvidenceText(nameId, raw) {
+  if (nameId === 13) return isRecognizedOflLicence(cleanFontText(raw, Infinity));
+  if (nameId === 14) {
+    const text = cleanFontText(raw, Infinity);
+    return text !== null && isRecognizedOflUrl(text);
+  }
+  const forms = noticeTextForms(raw);
+  if (FONT_NAME_IDS.has(nameId)) return forms.every(text => !NAME_WARNING_WORDS.test(text) && !MIXED_SCRIPT_WORD.test(text));
+  return forms.every(text => isKnownNoticeText(nameId, text));
 }
 
 function judgeLicenceRecord(buffer, evidence, nameId, platform, encoding, offset, length) {
   const decoder = licenceRecordDecoder(platform, encoding);
-  if (!decoder || (decoder === 'utf16' && length % 2 !== 0)) return false;
+  if (!decoder || (decoder === 'utf16' && length % 2 !== 0)) return FONT_NAME_IDS.has(nameId);
   const key = `${nameId}:${decoder}:${offset}:${length}`;
   if (evidence.verdicts.has(key)) return evidence.verdicts.get(key);
   evidence.bytes += length;
   if (evidence.bytes > MAX_LICENCE_EVIDENCE_BYTES) return false;
   const raw = buffer.subarray(offset, offset + length);
-  const verdict = judgeEvidenceText(nameId, cleanFontText(decoder === 'mac-roman' ? decodeMacRoman(raw) : decodeUtf16be(raw), Infinity));
+  const verdict = judgeEvidenceText(nameId, decoder === 'mac-roman' ? decodeMacRoman(raw) : decodeUtf16be(raw));
   evidence.verdicts.set(key, verdict);
   return verdict;
 }
