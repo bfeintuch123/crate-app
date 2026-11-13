@@ -724,6 +724,58 @@ async function tabInReview(page, label, limit = 60) {
   }
   return false;
 }
+const reviewsPrepared = page => page.evaluate('window.__bridge.reviews');
+// Settled: the refresh after the action prepared a new review and rendered it
+// (its result message is shown), the font controls are enabled again, nothing
+// is in flight, animations are finished and focus has stopped moving across
+// several animation frames. Bounded; never a fixed sleep alone.
+async function settleReview(page, reviewsBefore, expectedMessage) {
+  const settled = await page.evaluate(`(async () => {
+    const frame = () => new Promise(resolve => requestAnimationFrame(() => resolve()));
+    const deadline = Date.now() + 5000;
+    let last = null, stable = 0;
+    while (Date.now() < deadline) {
+      const message = document.querySelector('#modal-package-review-message');
+      const controls = [...document.querySelectorAll('#package-review-font-list button, #package-review-font-list input')];
+      const ready = window.__bridge.reviews > ${reviewsBefore} && window.__bridge.inflight === 0 && message &&
+        message.textContent === ${json(expectedMessage)} && controls.length > 0 && controls.every(control => !control.disabled);
+      if (!ready) { stable = 0; last = null; await new Promise(resolve => setTimeout(resolve, 20)); continue; }
+      document.getAnimations().forEach(animation => animation.finish());
+      await frame();
+      await frame();
+      stable = document.activeElement === last ? stable + 1 : 0;
+      last = document.activeElement;
+      if (stable >= 3) return true;
+    }
+    return false;
+  })()`);
+  assert.equal(settled, true, `the Package Review refresh settles (${expectedMessage})`);
+}
+// The documented focus order after a refresh, focusPackageReviewDialog
+// (renderer/app.js): a shown, non-empty result message takes focus; otherwise
+// Back (or Cancel) when enabled; otherwise the first focusable control, then
+// the dialog. showPackageModal also focuses the message when it shows one.
+// Back is accepted here only when no message is shown; no other control is.
+async function assertSettledFocus(page, expectedMessage) {
+  const observed = await page.evaluate(`(() => {
+    const message = document.querySelector('#modal-package-review-message'), focused = document.activeElement;
+    return { active: window.__label(focused), inDialog: !!focused && document.querySelector('#modal-package').contains(focused),
+      messageShown: !message.classList.contains('hidden') && !message.classList.contains('is-empty') && message.getClientRects().length > 0,
+      messageClass: message.className, text: message.textContent,
+      semantics: [message.getAttribute('role'), message.getAttribute('aria-live'), message.tabIndex] };
+  })()`);
+  const where = json(observed);
+  assert.notEqual(observed.active, 'BODY', `focus is never on <body>: ${where}`);
+  assert.equal(observed.inDialog, true, `focus stays inside Package Review: ${where}`);
+  assert.deepEqual(observed.semantics, ['status', 'polite', -1], where);
+  if (observed.messageShown) {
+    assert.equal(observed.text, expectedMessage, where);
+    assert.equal(observed.active, 'modal-package-review-message', `a shown result message takes focus (focusPackageReviewDialog): ${where}`);
+  } else {
+    assert.equal(observed.active, 'btn-back-package', `with no message shown, Back takes focus: ${where}`);
+  }
+  return observed;
+}
 
 test('Package Review font rows: keyboard Exclude, Include and licence confirmation; one call per press; disabled in flight; visible at 1100x760', { skip, timeout: 60000 }, async () => {
   await withPage({ width: 1100, height: 760 }, async page => {
@@ -756,50 +808,57 @@ test('Package Review font rows: keyboard Exclude, Include and licence confirmati
     assert.equal(await fontStatus(page, 'Brand-Regular.otf'), 'Included · Fonts folder');
     assert.equal(await fontStatus(page, 'Found-Regular.otf'), 'Not included');
     const focusAfter = [];
+    let reviewsBefore;
 
     // Exclude by Enter: exactly one call; the row reads Excluded and offers Include.
     assert.equal(await tabInReview(page, 'Exclude Brand-Regular.otf'), true);
+    reviewsBefore = await reviewsPrepared(page);
     await pressOnce(page, 'Enter', ['setFontRowChoice', fontKeys.brand, 'remove']);
+    await settleReview(page, reviewsBefore, 'Font excluded.');
     assert.equal(await reviewMessage(page), 'Font excluded.');
     assert.equal(await fontStatus(page, 'Brand-Regular.otf'), 'Excluded');
     assert.ok(await page.evaluate("!!window.__button('Include Brand-Regular.otf') && !window.__button('Exclude Brand-Regular.otf')"));
-    focusAfter.push(await active(page));
+    focusAfter.push(await assertSettledFocus(page, 'Font excluded.'));
 
     // Include by Space on the found font: it needs its confirmation, so it is still not included.
     assert.equal(await tabInReview(page, 'Include Found-Regular.otf'), true);
+    reviewsBefore = await reviewsPrepared(page);
     await pressOnce(page, 'Space', ['setFontRowChoice', fontKeys.found, 'include']);
+    await settleReview(page, reviewsBefore, 'Font updated.');
     assert.equal(await fontStatus(page, 'Found-Regular.otf'), 'Needs your confirmation');
     assert.equal(await page.evaluate("document.querySelector('#package-review-fonts-summary').textContent.startsWith('0 font files will be included.')"), true);
-    focusAfter.push(await active(page));
+    focusAfter.push(await assertSettledFocus(page, 'Font updated.'));
 
     // The licence checkbox by Space: exactly one confirmation, then included.
     const box = `package-review-font-confirm-${fontKeys.found}`;
     assert.equal(await tabInReview(page, box), true);
     assert.equal(await page.evaluate(`document.getElementById(${json(box)}).checked`), false);
+    reviewsBefore = await reviewsPrepared(page);
     await pressOnce(page, 'Space', ['confirmFontLicence', fontKeys.found, '2'.repeat(64), true]);
+    await settleReview(page, reviewsBefore, 'Font confirmed.');
     assert.equal(await reviewMessage(page), 'Font confirmed.');
     assert.equal(await fontStatus(page, 'Found-Regular.otf'), 'Included · Fonts folder');
-    focusAfter.push(await active(page));
+    focusAfter.push(await assertSettledFocus(page, 'Font confirmed.'));
 
     // In flight: every font control is disabled, and a double click makes one call.
     await page.evaluate('window.__bridge.holdNext()');
     const before = (await calls(page)).length;
+    reviewsBefore = await reviewsPrepared(page);
     await click(page, 'Exclude Found-Regular.otf', 2);
     await page.sleep(100);
     assert.equal(await page.evaluate("[...document.querySelectorAll('#package-review-fonts button, #package-review-fonts input')].every(control => control.disabled)"), true,
       'font controls are disabled while the action is in flight');
+    assert.equal(await active(page), 'btn-back-package', 'while the action is in flight, focus waits on Back (runPackageReviewFontAction)');
     await page.evaluate('window.__bridge.hold = null; window.__bridge.release()');
     await idle(page);
+    await settleReview(page, reviewsBefore, 'Font excluded.');
     assert.deepEqual((await calls(page)).slice(before), [['setFontRowChoice', fontKeys.found, 'remove']], 'one call for a double click');
     assert.equal(await fontStatus(page, 'Found-Regular.otf'), 'Excluded');
     assert.deepEqual(await page.evaluate("[...document.querySelectorAll('#package-review-font-list button, #package-review-font-list input, #btn-add-installed-fonts, #btn-add-font-files')].filter(control => control.disabled).map(control => control.getAttribute('aria-label') || control.id)"), [],
       'the font rows and the add buttons are enabled again');
-    focusAfter.push(await active(page));
-    // After each action Package Review refreshes and its existing focus rule
-    // (focusPackageReviewDialog) moves focus to the status message that
-    // announces the result: inside the dialog, never <body>.
-    assert.deepEqual(focusAfter, Array(4).fill('modal-package-review-message'), json(focusAfter));
-    assert.deepEqual(await page.evaluate("(element => [element.getAttribute('role'), element.getAttribute('aria-live'), element.tabIndex])(document.querySelector('#modal-package-review-message'))"),
-      ['status', 'polite', -1]);
+    focusAfter.push(await assertSettledFocus(page, 'Font excluded.'));
+    // Every action here shows a result message, so after settling each one
+    // must have focused it.
+    assert.deepEqual(focusAfter.map(item => [item.active, item.messageShown]), Array(4).fill(['modal-package-review-message', true]), json(focusAfter));
   });
 });
