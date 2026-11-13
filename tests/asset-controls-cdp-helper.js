@@ -152,7 +152,11 @@ async function launch({ browser, rendererDir, bootstrapSource, width = 1100, hei
     async function setViewport(nextWidth, nextHeight) {
       await call('Emulation.setDeviceMetricsOverride', { width: nextWidth, height: nextHeight, deviceScaleFactor: 1, mobile: false });
     }
-    return { evaluate, press, clickAt, moveAway, screenshot, setViewport, close, sleep };
+    // Matches CI's macOS runner, which reports prefers-reduced-motion: reduce.
+    async function emulateReducedMotion(enabled) {
+      await call('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: enabled ? 'reduce' : 'no-preference' }] });
+    }
+    return { evaluate, press, clickAt, moveAway, screenshot, setViewport, emulateReducedMotion, close, sleep };
   } catch (error) {
     try { await close(); }
     catch (cleanupError) { error.message += `; cleanup: ${cleanupError.message}`; }

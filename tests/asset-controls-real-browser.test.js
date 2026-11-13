@@ -190,9 +190,16 @@ async function tabTo(page, label, limit = 120, visited = null) {
   return false;
 }
 
-test('rendered [+]/[x]: always visible 22px box in a 28px target, no hover title, no clipping or overflow, visible focus ring', { skip, timeout: 60000 }, async () => {
-  for (const [width, height] of [[1100, 760], [1440, 900]]) {
+// CI's macOS runner reports prefers-reduced-motion: reduce, where Crate's
+// 0.01ms transitions make a same-task style read return the transition's start
+// value. Settle every running animation before measuring the final style.
+const settleStyles = "document.getAnimations().forEach(animation => animation.finish())";
+
+test('rendered [+]/[x]: always visible 22px box in a 28px target, no hover title, no clipping or overflow, visible focus ring', { skip, timeout: 90000 }, async () => {
+  for (const [width, height, reducedMotion] of [[1100, 760, false], [1440, 900, false], [1100, 760, true], [1440, 900, true]]) {
     await withPage({ width, height }, async page => {
+      await page.emulateReducedMotion(reducedMotion);
+      assert.equal(await page.evaluate("matchMedia('(prefers-reduced-motion: reduce)').matches"), reducedMotion);
       await start(page, ['Alpha.png', 'Beta.png']);
       await page.moveAway();
       // Make one remembered exclusion so the Excluded-record [+] is measured too.
@@ -201,6 +208,7 @@ test('rendered [+]/[x]: always visible 22px box in a 28px target, no hover title
       for (const review of [true, false]) {
         await page.evaluate(review ? 'openAssetReviewWorkspace()' : 'closeAssetReviewWorkspace()');
         await page.sleep(150);
+        await page.evaluate(settleStyles);
         const metrics = await page.evaluate(`(() => {
           const visible = element => element.getClientRects().length > 0 && !element.closest('.hidden, .filtered-out');
           const buttons = Array.from(document.querySelectorAll('.row-icon-button')).filter(visible);
@@ -229,7 +237,7 @@ test('rendered [+]/[x]: always visible 22px box in a 28px target, no hover title
             }),
           };
         })()`);
-        const where = `${width}x${height} ${review ? 'review' : 'dashboard'}: ${json(metrics)}`;
+        const where = `${width}x${height} ${reducedMotion ? 'reduced motion ' : ''}${review ? 'review' : 'dashboard'}: ${json(metrics)}`;
         assert.ok(metrics.checks.length > 0, where);
         assert.ok(metrics.pageOverflow <= 0, `no horizontal page overflow ${where}`);
         for (const check of metrics.checks) {
@@ -255,9 +263,10 @@ test('rendered [+]/[x]: always visible 22px box in a 28px target, no hover title
       // A keyboard-focused control shows the 2px black ring at 2px offset on its visible box.
       await page.evaluate('openAssetReviewWorkspace()');
       assert.equal(await tabTo(page, 'Exclude Alpha.png'), true, 'Tab reaches the [x]');
+      await page.evaluate(settleStyles);
       const ring = await page.evaluate(`(() => { const box = document.activeElement.querySelector('.row-icon-box'), style = getComputedStyle(box);
         return [style.outlineStyle, style.outlineWidth, style.outlineColor, style.outlineOffset, document.activeElement.matches(':focus-visible')]; })()`);
-      assert.deepEqual(ring, ['solid', '2px', 'rgb(17, 17, 17)', '2px', true]);
+      assert.deepEqual(ring, ['solid', '2px', 'rgb(17, 17, 17)', '2px', true], `${width}x${height}${reducedMotion ? ' reduced motion' : ''}`);
     });
   }
 });
