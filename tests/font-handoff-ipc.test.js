@@ -1869,6 +1869,43 @@ function cases() {
     assert.deepEqual([font.outcome, font.reason, font.canInclude], ['not-included', 'found', true]);
   });
 
+  // Astra's re-check of 5088337: a stored exclusion key alone is not
+  // Excluded. A font kept as required by a working file stays Included through
+  // Exclude All Existing, so Include All Existing restores nothing for it.
+  fontTest('N5: Include All Existing keeps the font-row Exclude of a font a working file keeps Included as required', async () => {
+    const f = await poppinsFixture('Required Existing font');
+    const source = path.join(f.dir, 'Working.ai');
+    writeSyntheticAiFile(source, f.poppins);
+    await addExistingAsset(f, f.poppins);
+    const other = path.join(f.dir, 'Other.png');
+    fs.writeFileSync(other, createSyntheticPngBytes());
+    await addExistingAsset(f, other);
+    storedProject(f).files.push({ path: source, name: 'Working.ai', ext: '.ai', source: 'manual-browse', projectRole: 'source', addedAt: Date.now() });
+    const operation = metadataTestHooks.captureProjectOperation(f.project.id);
+    try {
+      await metadataTestHooks.runScanOnOpen(f.project.id, source, operation.activationToken, operation,
+        { allowPausedBaseline: true, verifySelectedSource: true, establishBaseline: false });
+    } finally { operation.close(); }
+    // Exclude and restore the working file, so working-file membership is engaged.
+    for (const action of ['exclude', 'restore']) {
+      const sourceRow = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(file => file.name === 'Working.ai');
+      assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, sourceRow.visualIdentity,
+        { action, expectedRevision: sourceRow.selectionRevision })).success, true);
+    }
+    const key = (await fontRowNamed(f)).key;
+    await rowChoice(f, key, 'remove');
+    await existingDecision(f, 'skip');
+    const files = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files;
+    const font = files.find(file => file.name === 'Poppins-Regular.ttf');
+    assert.equal(files.find(file => file.name === 'Other.png').included, false, 'another Existing asset is Excluded, so Include All Existing is available');
+    assert.deepEqual([font.included, font.includedAsDependency], [true, true], 'the font stays Included as required');
+    assert.ok(storedProject(f).excludedAssetKeys.includes(f.poppins), 'it still carries a stored exclusion key');
+    await existingDecision(f, 'include');
+    assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(file => file.name === 'Other.png').included, true, 'the batch brought the other asset back');
+    assert.equal(storedProject(f).fontHandoff?.choices[key], 'remove', 'an already-Included required font keeps its specific font-row Exclude');
+    assert.deepEqual([(await fontRowNamed(f)).outcome, (await fontRowNamed(f)).reason], ['not-included', 'removed']);
+  });
+
   fontTest('N5: the batch font-row clearing resolves no paths without font handoff data or without a font among the paths', async () => {
     const f = await poppinsFixture('Batch clearing fast path');
     await addExistingAsset(f, f.poppins);

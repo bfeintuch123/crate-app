@@ -7500,6 +7500,14 @@ function isAssetReviewFileExcluded(project, file) {
   return !!(fingerprint && fingerprint !== file.individualContentInclude && excluded.has(fingerprint));
 }
 
+// Whether the package leaves this row out, by the same test as
+// selectProjectFilesForPackagingSnapshot: its working-source fact is not
+// included, or it is excluded for review and not kept as a required dependency.
+function isAssetEffectivelyExcluded(project, membership, file) {
+  const fact = membership?.facts.get(getTrackedFileDedupKey(file));
+  return (!!fact && !fact.included) || (isAssetReviewFileExcluded(project, file) && !fact?.includedAsDependency);
+}
+
 function getProjectAssetBaselineSourceKeys(project, startedAt) {
   const membership = hasWorkingSourceSelectionState(project) ? getWorkingSourceMembership(project) : null;
   const sourceKeys = new Set();
@@ -8038,10 +8046,21 @@ function setProjectExistingAssetsDecision(projectId, decision) {
     const excludedKeys = new Set(project.excludedAssetKeys || []);
     // Include brings back Existing assets this batch moves from Excluded to
     // Included; like [+] on one row, that also clears each one's own font-row
-    // Exclude. Assets that were already Included keep their font-row choice.
-    const restoredPaths = decision === 'include' && project.fontHandoff !== undefined
-      ? existingAssets.filter(file => excludedKeys.has(getAssetReviewExclusionKey(file))).map(file => file.path)
-      : null;
+    // Exclude. Excluded and Included are the package's own membership,
+    // measured before and after the batch, so an asset that was already
+    // Included (for example kept as required) keeps its font-row choice. Only
+    // with font handoff data and an Existing font in the batch is it measured.
+    const fontCandidates = decision === 'include' && project.fontHandoff !== undefined
+      ? existingAssets.filter(file => typeof file?.path === 'string' && isGatedFontPath(file.path))
+      : [];
+    let fontsExcludedBefore = null;
+    if (fontCandidates.length) {
+      const membership = getWorkingSourceMembership(project);
+      fontsExcludedBefore = new Set(fontCandidates
+        .filter(file => isAssetEffectivelyExcluded(project, membership, file))
+        .map(getTrackedFileDedupKey)
+        .filter(Boolean));
+    }
     for (const key of existingAssetKeys) {
       if (decision === 'skip') excludedKeys.add(key);
       else excludedKeys.delete(key);
@@ -8099,11 +8118,14 @@ function setProjectExistingAssetsDecision(projectId, decision) {
         if (count > MAX_EXISTING_INCLUDE_EPISODE_OWNERS) {
           file.existingIncludeEpisode = { version: 1, ownersDigest: getExistingIncludeEpisodeDigest(owners), ownerCount: count };
         } else if (count > 0) file.existingIncludeEpisode = { version: 1, owners };
-        // A withheld asset this Include keeps is brought back too.
-        if (restoredPaths && count > 0) restoredPaths.push(file.path);
       }
     }
-    if (restoredPaths) clearFontRowExclusionChoices(project, restoredPaths);
+    if (fontsExcludedBefore?.size) {
+      const membership = getWorkingSourceMembership(project);
+      const restored = (project.files || []).filter(file => typeof file?.path === 'string' && isGatedFontPath(file.path) &&
+        fontsExcludedBefore.has(getTrackedFileDedupKey(file)) && !isAssetEffectivelyExcluded(project, membership, file));
+      clearFontRowExclusionChoices(project, restored.map(file => file.path));
+    }
     return { success: true };
   });
 
