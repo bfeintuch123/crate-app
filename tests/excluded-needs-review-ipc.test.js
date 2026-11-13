@@ -6,7 +6,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const Module = require('node:module');
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const harnessPath = path.join(__dirname, 'provenance-dual-write.test.js');
 let harness = fs.readFileSync(harnessPath, 'utf8');
 function replaceOnce(before, after) {

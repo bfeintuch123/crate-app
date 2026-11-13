@@ -6,7 +6,7 @@
 // activation, focus after a row leaves, disabled state while an action is in
 // flight, and the always-visible square controls at the desktop sizes.
 const test = require('node:test');
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const path = require('node:path');
 const { findBrowser, launch, withBrowserPage } = require('./asset-controls-cdp-helper');
 
