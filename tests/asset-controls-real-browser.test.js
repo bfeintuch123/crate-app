@@ -841,6 +841,9 @@ test('Package Review font rows: keyboard Exclude, Include and licence confirmati
     focusAfter.push(await assertSettledFocus(page, 'Font confirmed.'));
 
     // In flight: every font control is disabled, and a double click makes one call.
+    // (Focus is not checked mid-flight here: the second mousedown lands on the
+    // now-disabled control, so Chromium moves focus to the dialog itself,
+    // index.html #modal-package tabindex=-1. The keyboard step below checks it.)
     await page.evaluate('window.__bridge.holdNext()');
     const before = (await calls(page)).length;
     reviewsBefore = await reviewsPrepared(page);
@@ -848,7 +851,6 @@ test('Package Review font rows: keyboard Exclude, Include and licence confirmati
     await page.sleep(100);
     assert.equal(await page.evaluate("[...document.querySelectorAll('#package-review-fonts button, #package-review-fonts input')].every(control => control.disabled)"), true,
       'font controls are disabled while the action is in flight');
-    assert.equal(await active(page), 'btn-back-package', 'while the action is in flight, focus waits on Back (runPackageReviewFontAction)');
     await page.evaluate('window.__bridge.hold = null; window.__bridge.release()');
     await idle(page);
     await settleReview(page, reviewsBefore, 'Font excluded.');
@@ -857,8 +859,23 @@ test('Package Review font rows: keyboard Exclude, Include and licence confirmati
     assert.deepEqual(await page.evaluate("[...document.querySelectorAll('#package-review-font-list button, #package-review-font-list input, #btn-add-installed-fonts, #btn-add-font-files')].filter(control => control.disabled).map(control => control.getAttribute('aria-label') || control.id)"), [],
       'the font rows and the add buttons are enabled again');
     focusAfter.push(await assertSettledFocus(page, 'Font excluded.'));
+
+    // One held keyboard action: while it is in flight, focus waits on Back
+    // (runPackageReviewFontAction); after the refresh settles, the contract above.
+    assert.equal(await tabInReview(page, 'Include Brand-Regular.otf'), true);
+    await page.evaluate('window.__bridge.holdNext()');
+    const beforeHeld = (await calls(page)).length;
+    reviewsBefore = await reviewsPrepared(page);
+    await page.press('Enter');
+    await page.sleep(100);
+    assert.equal(await active(page), 'btn-back-package', 'while the action is in flight, focus waits on Back');
+    await page.evaluate('window.__bridge.hold = null; window.__bridge.release()');
+    await idle(page);
+    await settleReview(page, reviewsBefore, 'Font updated.');
+    assert.deepEqual((await calls(page)).slice(beforeHeld), [['setFontRowChoice', fontKeys.brand, 'include']], 'one call for one press');
+    focusAfter.push(await assertSettledFocus(page, 'Font updated.'));
     // Every action here shows a result message, so after settling each one
     // must have focused it.
-    assert.deepEqual(focusAfter.map(item => [item.active, item.messageShown]), Array(4).fill(['modal-package-review-message', true]), json(focusAfter));
+    assert.deepEqual(focusAfter.map(item => [item.active, item.messageShown]), Array(5).fill(['modal-package-review-message', true]), json(focusAfter));
   });
 });
