@@ -6,7 +6,7 @@
 // stricter 31.0.2+ layer/mask bounds as controlled failures.
 
 const test = require('node:test');
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');

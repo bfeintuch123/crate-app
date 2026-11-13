@@ -4,7 +4,7 @@
 // filesystem. No Electron, private config, producer apps, dependency acquisition,
 // or standalone persistence framework is loaded by this suite.
 const test = require('node:test');
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');

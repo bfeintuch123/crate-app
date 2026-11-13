@@ -2,7 +2,7 @@
 // Execute the complete production renderer with the existing modeled DOM and
 // deferred bridge responses. This is not installed-app or visual acceptance.
 const test = require('node:test');
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');

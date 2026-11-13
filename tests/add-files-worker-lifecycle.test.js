@@ -1,6 +1,6 @@
 'use strict';
 
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const path = require('node:path');

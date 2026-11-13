@@ -1,7 +1,7 @@
 'use strict';
 // Focused production-handler controls; modeled metadata/native boundaries,
 // actual detached Conf storage and unchanged production/test deadlines.
-const fs=require('node:fs'),path=require('node:path'),Module=require('node:module'),assert=require('node:assert/strict');
+const fs=require('node:fs'),path=require('node:path'),Module=require('node:module'),assert=require('./bounded-assert');
 const existing=fs.readFileSync(path.join(__dirname,'pre-package-recent-yield.test.js'),'utf8');
 const boundary=existing.indexOf('function cases(){');
 const fixtureStart=existing.indexOf('  async function fixture(count){',boundary);

@@ -4,7 +4,7 @@
 // real Figma URL/scope parsing helpers are reused.
 
 const test = require('node:test');
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const Module = require('module');
 const crypto = require('crypto');
 const { EventEmitter } = require('events');

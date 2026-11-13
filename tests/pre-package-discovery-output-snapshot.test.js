@@ -2,7 +2,7 @@
 // Complete source IPC harness; native metadata/Electron are doubles. The store
 // adapter returns detached JSON data. No claim of native or real-Conf timing.
 const fs = require('node:fs'), path = require('node:path'), Module = require('node:module');
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const root = process.env.CRATE_DISCOVERY_SOURCE_ROOT || path.resolve(__dirname, '..');
 const entry = path.join(root, 'tests/provenance-dual-write.test.js');
 let source = fs.readFileSync(entry, 'utf8');

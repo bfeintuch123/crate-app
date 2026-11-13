@@ -2,7 +2,7 @@
 // Broad pre-package discovery against the complete production handler, actual
 // Conf 10 store reads and generated synthetic files only. OS metadata, ps and
 // lsof are modeled. The production 8 s discovery deadline is never changed.
-const fs = require('node:fs'), path = require('node:path'), Module = require('node:module'), assert = require('node:assert/strict');
+const fs = require('node:fs'), path = require('node:path'), Module = require('node:module'), assert = require('./bounded-assert');
 const root = process.env.CRATE_DIAGNOSTIC_SOURCE_ROOT || path.resolve(__dirname, '..');
 assert.ok(root && path.isAbsolute(root));
 const entry = path.join(root, 'tests/provenance-dual-write.test.js');

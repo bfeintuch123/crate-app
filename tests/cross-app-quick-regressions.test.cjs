@@ -1,7 +1,7 @@
 'use strict';
 // Fail-first regressions: expected to fail against current source. Do not turn
 // these into characterization assertions; fix implementation before integration.
-const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),zlib=require('node:zlib'),cp=require('node:child_process');
+const test=require('node:test'),assert=require('./bounded-assert'),fs=require('node:fs'),path=require('node:path'),zlib=require('node:zlib'),cp=require('node:child_process');
 const {createRequire}=require('node:module');const source=process.env.CRATE_SOURCE||[path.resolve(__dirname,'..'),path.resolve(__dirname,'../../packaging-repair/source')].find(root=>fs.existsSync(path.join(root,'parsers/index.js')));assert.ok(source,'Run inside source/tests or supply CRATE_SOURCE'); const req=createRequire(path.join(source,'package.json'));const r=req('./parsers'),ag=req('ag-psd');
 function w(t){const root=fs.mkdtempSync(path.join(__dirname,'gap-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));const asset=path.join(root,'A&B.png');fs.writeFileSync(asset,Buffer.alloc(800,7));return{root,asset};}
 function zip(root,name,entries){const staging=path.join(root,'zip');fs.mkdirSync(staging);for(const [n,b]of Object.entries(entries)){const p=path.join(staging,n);fs.mkdirSync(path.dirname(p),{recursive:true});fs.writeFileSync(p,b);}const p=path.join(root,name);cp.execFileSync('/usr/bin/zip',['-q','-r',p,'.'],{cwd:staging});return p;}

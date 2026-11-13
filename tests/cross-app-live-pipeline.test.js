@@ -2,7 +2,7 @@
 // Standalone proposal. All creative files/ZIP reads and PSD parsing are real.
 // Electron, store, native app collectors, utility-process transport are modeled
 // by the existing provenance harness. No parser-result replacement is used.
-const fs = require('node:fs'), path = require('node:path'), Module = require('node:module'), assert = require('node:assert/strict');
+const fs = require('node:fs'), path = require('node:path'), Module = require('node:module'), assert = require('./bounded-assert');
 const sourceRoot = process.env.CRATE_COVERAGE_SOURCE_ROOT || path.resolve(__dirname, '..');
 const harnessPath = path.join(sourceRoot, 'tests/provenance-dual-write.test.js');
 let harness = fs.readFileSync(harnessPath, 'utf8');

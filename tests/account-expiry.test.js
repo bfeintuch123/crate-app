@@ -1,4 +1,4 @@
-const {test}=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
+const {test}=require('node:test'),assert=require('./bounded-assert'),fs=require('node:fs'),vm=require('node:vm');
 const root=require('node:path').resolve(__dirname,'..');
 const { CALLBACK } = require(root+'/account-config');
 function gate(){let resolve;const promise=new Promise(r=>resolve=r);return{resolve,promise};}

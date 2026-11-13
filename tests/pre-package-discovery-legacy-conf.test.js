@@ -1,7 +1,7 @@
 'use strict';
 // Actual Conf from initial store construction through fresh-process restart.
 // Electron and OS metadata remain source-harness doubles. No frozen clock.
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');

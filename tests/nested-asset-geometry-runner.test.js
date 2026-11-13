@@ -1,6 +1,6 @@
 'use strict';
 const test = require('node:test');
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const { EXPECTED_TEST_COUNT, validateGeometryResult, runGeometry } = require('../scripts/run-nested-asset-geometry');
 
 const summary = (changes = {}) => Object.entries({

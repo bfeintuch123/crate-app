@@ -6,7 +6,7 @@
 // does; Quick Package uses the real parser classes. Every fixture is
 // synthetic, and every archive is built with the system zip tool.
 
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
