@@ -512,41 +512,75 @@ test('a browser that cannot start fails the launch cleanly: no crash, no leftove
 // Light, no Chrome: a harmless test-owned node process stands in for the browser.
 const ownedFixtureDirs = () => fs.readdirSync(os.tmpdir()).filter(name => name.startsWith('crate-asset-controls-')).sort();
 const processRunning = marker => childProcess.spawnSync('/usr/bin/pgrep', ['-f', marker], { encoding: 'utf8' }).stdout.trim() !== '';
+// The test owns these stand-in processes, so it always ends them itself: even
+// when the helper under test (or an assertion) fails, nothing is left running.
+// Only the exact owned process group is signalled; ESRCH means already gone.
+function trackChild(child) {
+  const tracked = { child, done: false };
+  tracked.exit = new Promise(resolve => child.once('exit', () => { tracked.done = true; resolve(); }));
+  return tracked;
+}
+async function terminateTracked(tracked, kill = process.kill) {
+  if (!tracked || tracked.done || !Number.isInteger(tracked.child.pid) || tracked.child.pid <= 0) return;
+  try { kill.call(process, -tracked.child.pid, 'SIGKILL'); }
+  catch (error) { if (error.code !== 'ESRCH') throw error; }
+  let timer;
+  await Promise.race([tracked.exit, new Promise(resolve => { timer = setTimeout(resolve, 5000); })]);
+  clearTimeout(timer);
+  if (!tracked.done) throw new Error(`test-owned process group ${tracked.child.pid} did not exit after SIGKILL`);
+}
+// The body's failure stays primary; a fallback-cleanup failure is attached to it.
+function keepPrimary(primary, cleanupError) {
+  if (!cleanupError) return primary;
+  if (!primary) return cleanupError;
+  return new AggregateError([primary, cleanupError], `${primary.message}; cleanup also failed: ${cleanupError.message}`, { cause: primary });
+}
+async function withOwnedCleanup(run, cleanup) {
+  let failure = null;
+  try { return await run(); }
+  catch (error) { failure = error; throw error; }
+  finally {
+    let cleanupError = null;
+    try { await cleanup(); } catch (error) { cleanupError = error; }
+    if (cleanupError) throw keepPrimary(failure, cleanupError);
+  }
+}
 function withStubbedBrowser(marker, run) {
   const originalSpawn = childProcess.spawn, originalKill = process.kill;
   const signals = [];
   let owned = null;
   childProcess.spawn = (_browser, _args, options) => {
-    owned = originalSpawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', marker], options);
+    const child = originalSpawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', marker], options);
+    owned = trackChild(child);
     // The startup CDP request is pending when the transport fails.
-    owned.once('spawn', () => setTimeout(() => owned.stdio[4].emit('error', Object.assign(new Error('synthetic pipe failure'), { code: 'EIO' })), 50));
-    return owned;
+    child.once('spawn', () => setTimeout(() => child.stdio[4].emit('error', Object.assign(new Error('synthetic pipe failure'), { code: 'EIO' })), 50));
+    return child;
   };
   process.kill = function (pid, signal) { signals.push([pid, signal]); return originalKill.call(process, pid, signal); };
-  const restore = () => { childProcess.spawn = originalSpawn; process.kill = originalKill; };
-  return Promise.resolve().then(() => run(() => owned, signals)).finally(restore);
+  return withOwnedCleanup(() => run(() => owned?.child || null, signals), async () => {
+    childProcess.spawn = originalSpawn;
+    process.kill = originalKill;
+    await terminateTracked(owned, originalKill);
+  });
 }
 
 test('a transport error during a pending request ends only the owned browser group and removes the fixture', { timeout: 30000 }, async () => {
   const ownedMarker = `crate-owned-transport-${process.pid}-${Date.now()}`;
   const bystanderMarker = `crate-bystander-${process.pid}-${Date.now()}`;
   const before = ownedFixtureDirs();
-  const bystander = childProcess.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', bystanderMarker], { detached: true, stdio: 'ignore' });
-  const bystanderExit = new Promise(resolve => bystander.once('exit', resolve));
-  try {
+  const bystander = trackChild(childProcess.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', bystanderMarker], { detached: true, stdio: 'ignore' }));
+  await withOwnedCleanup(async () => {
     await withStubbedBrowser(ownedMarker, async (owned, signals) => {
       await assert.rejects(launch({ browser: process.execPath, rendererDir, bootstrapSource: '' }), /synthetic pipe failure/);
       assert.ok(owned()?.pid > 0, 'the stub process was spawned');
       assert.ok(signals.length >= 1, 'the owned group was terminated');
       assert.ok(signals.every(([pid, signal]) => pid === -owned().pid && signal === 'SIGKILL'), `only the owned group is signalled: ${JSON.stringify(signals)}`);
+      // Checked before the fixture's own fallback cleanup can end the process.
+      assert.equal(processRunning(ownedMarker), false, 'the helper ended the owned browser process');
     });
     assert.deepEqual(ownedFixtureDirs(), before, 'the fixture directory is removed');
-    assert.equal(processRunning(ownedMarker), false, 'the owned browser process is gone');
     assert.equal(processRunning(bystanderMarker), true, 'an unrelated process is untouched');
-  } finally {
-    try { process.kill(-bystander.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-    await bystanderExit;
-  }
+  }, () => terminateTracked(bystander));
 });
 
 test('run and cleanup both failing: the original failure stays primary and every cleanup failure is reported', { timeout: 30000 }, async () => {
@@ -585,12 +619,30 @@ test('run and cleanup both failing: the original failure stays primary and every
         assert.ok(error.errors.some(item => item.message === 'synthetic removal failure'), 'the removal failure is reported');
         return true;
       });
+      // Checked before the fixture's own fallback cleanup can end the process.
+      assert.equal(processRunning(marker), false, 'the helper ended the owned browser process even though removal failed');
     });
   } finally {
     fs.rmSync = originalRm;
     for (const name of ownedFixtureDirs().filter(name => !before.includes(name))) fs.rmSync(path.join(os.tmpdir(), name), { recursive: true, force: true });
   }
   assert.equal(removalFailures, 1);
-  assert.equal(processRunning(marker), false, 'the owned browser process is gone even when removal fails');
+  assert.equal(processRunning(marker), false, 'no owned process remains');
   assert.deepEqual(ownedFixtureDirs(), before);
+});
+
+test('the test fixture keeps a failing body primary when its own fallback cleanup also fails', async () => {
+  const body = new Error('body assertion failure');
+  const fallback = new Error('fallback cleanup failure');
+  await assert.rejects(withOwnedCleanup(async () => { throw body; }, async () => { throw fallback; }), error => {
+    assert.ok(error instanceof AggregateError);
+    assert.equal(error.errors[0], body);
+    assert.equal(error.errors[1], fallback);
+    assert.equal(error.cause, body);
+    assert.ok(error.message.startsWith('body assertion failure'));
+    return true;
+  });
+  await assert.rejects(withOwnedCleanup(async () => 'ok', async () => { throw fallback; }), error => error === fallback);
+  assert.equal(await withOwnedCleanup(async () => 'ok', async () => {}), 'ok');
+  await assert.rejects(withOwnedCleanup(async () => { throw body; }, async () => {}), error => error === body);
 });
