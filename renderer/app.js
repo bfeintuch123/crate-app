@@ -5598,6 +5598,343 @@ function renderSourceContinuationChoices(project, review, lease) {
   region.appendChild(status);
 }
 
+// Package Review: Fonts. Main owns every decision; this only presents rows and
+// sends one font's action at a time. There is no select-all for fonts.
+const FONT_ORIGIN_LABELS = {
+  installed: 'Installed on this Mac',
+  'added-file': 'Font file you added',
+  'project-file': 'Added to the project',
+  found: 'Found while watching',
+};
+const FONT_STATUS_LABELS = {
+  included: 'Included',
+  'needs-confirmation': 'Needs your confirmation',
+  'not-included': 'Not included',
+  excluded: 'Can\'t be included',
+  unavailable: 'Unavailable',
+};
+const FONT_ACTION_ERRORS = {
+  font_registry_unavailable: 'Crate couldn\'t check installed fonts. Try again.',
+  font_changed: 'This font file changed. Review it again.',
+  font_not_eligible: 'This font can\'t be included.',
+  font_choice_expired: 'That choice expired. Add the font again.',
+  font_limit_reached: 'Too many fonts are added to this project.',
+  font_picker_open: 'A font file picker is already open.',
+  font_operation_stale: 'The project changed while Crate was checking fonts. Try again.',
+  package_in_flight: 'Packaging is in progress. Try again when it finishes.',
+};
+let packageReviewFontState = { projectId: null, families: [], selected: new Set(), choices: [] };
+
+function canRefreshPackageReviewFrom(reviewSessionId, reviewProjectId, reviewSelectionEpoch) {
+  return reviewSessionId === packageReviewModalSessionId &&
+    reviewProjectId === state.selectedProjectId &&
+    reviewSelectionEpoch === projectSelectionEpoch &&
+    (!reviewSessionId || isCurrentModalLease('modal-package', reviewSessionId));
+}
+
+async function runPackageReviewFontAction(action, describeResult) {
+  const reviewSessionId = packageReviewModalSessionId;
+  const projectId = state.selectedProjectId;
+  const reviewSelectionEpoch = projectSelectionEpoch;
+  if (!projectId || packageReviewConfirmationInFlight) return;
+  const controls = [...document.querySelectorAll('#package-review-fonts button, #package-review-fonts input')];
+  controls.forEach(control => { control.disabled = true; });
+  const returnControl = $('#btn-back-package');
+  if (returnControl && !returnControl.disabled) returnControl.focus({ preventScroll: true });
+  state.packageReviewToken = null;
+  const confirmButton = $('#btn-confirm-package');
+  if (confirmButton) confirmButton.disabled = true;
+  let message = '';
+  let failed = false;
+  try {
+    const result = await action(projectId);
+    if (result?.error) {
+      failed = true;
+      message = FONT_ACTION_ERRORS[result.error] || 'Crate couldn\'t update fonts. Try again.';
+    } else {
+      message = describeResult ? describeResult(result) : 'Fonts updated.';
+    }
+  } catch (error) {
+    logRendererError('Font update failed', error);
+    failed = true;
+    message = 'Crate couldn\'t update fonts. Try again.';
+  }
+  if (canRefreshPackageReviewFrom(reviewSessionId, projectId, reviewSelectionEpoch)) {
+    await showPackageModal(failed
+      ? { message, runPreScan: false, outputPath: state.packageOutputPath || undefined }
+      : { successMessage: message, runPreScan: false, outputPath: state.packageOutputPath || undefined });
+  } else {
+    controls.forEach(control => { control.disabled = false; });
+  }
+}
+
+function describeInstalledFontAddResult(result) {
+  const parts = [];
+  parts.push(result.added === 1 ? 'Added 1 font.' : `Added ${result.added || 0} fonts.`);
+  if (result.refused?.length) parts.push(`${result.refused.length} can't be included.`);
+  if (result.unconfirmed?.length) parts.push(`${result.unconfirmed.length} couldn't be confirmed in their installed files.`);
+  if (result.notStored) parts.push(`${result.notStored} couldn't be added because this project has too many fonts.`);
+  if (result.choices?.length) parts.push('Choose which copy to use below.');
+  return parts.join(' ');
+}
+
+function renderPackageReviewFontPicker() {
+  const list = $('#package-review-font-picker-list');
+  const search = $('#package-review-font-search');
+  const addButton = $('#btn-font-picker-add');
+  if (!list) return;
+  const query = (search?.value || '').trim().toLowerCase();
+  list.innerHTML = '';
+  const families = packageReviewFontState.families
+    .filter(item => !query || item.family.toLowerCase().includes(query)).slice(0, 300);
+  if (!families.length) {
+    const empty = document.createElement('p');
+    empty.className = 'package-review-font-family-note';
+    empty.textContent = packageReviewFontState.families.length ? 'No installed fonts match.' : 'No installed fonts found.';
+    list.appendChild(empty);
+  }
+  families.forEach((item, index) => {
+    const id = `package-review-font-family-${index}`;
+    const wrap = document.createElement('div');
+    wrap.className = `package-review-font-family${item.status === 'excluded' ? ' is-excluded' : ''}`;
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.id = id;
+    box.disabled = item.status === 'excluded';
+    box.checked = !box.disabled && packageReviewFontState.selected.has(item.family);
+    box.addEventListener('change', () => {
+      if (box.checked) packageReviewFontState.selected.add(item.family);
+      else packageReviewFontState.selected.delete(item.family);
+      if (addButton) addButton.disabled = packageReviewFontState.selected.size === 0;
+    });
+    const label = document.createElement('label');
+    label.htmlFor = id;
+    label.textContent = item.family;
+    const note = document.createElement('div');
+    note.className = 'package-review-font-family-note';
+    note.textContent = item.status === 'excluded' ? item.reasonText : (item.styles || []).join(', ');
+    wrap.append(box, label, note);
+    list.appendChild(wrap);
+  });
+  if (addButton) addButton.disabled = packageReviewFontState.selected.size === 0;
+}
+
+async function openPackageReviewFontPicker() {
+  const picker = $('#package-review-font-picker');
+  const opener = $('#btn-add-installed-fonts');
+  const projectId = state.selectedProjectId;
+  if (!picker || !projectId) return;
+  if (!picker.classList.contains('hidden')) {
+    closePackageReviewFontPicker();
+    return;
+  }
+  const summary = $('#package-review-fonts-summary');
+  if (opener) opener.disabled = true;
+  let result;
+  try {
+    result = await window.crate.listInstalledFonts(projectId);
+  } catch (error) {
+    logRendererError('Installed font listing failed', error);
+    result = { error: 'font_registry_unavailable' };
+  } finally {
+    if (opener) opener.disabled = false;
+  }
+  if (projectId !== state.selectedProjectId) return;
+  if (result?.error || !Array.isArray(result?.families)) {
+    if (summary) summary.textContent = FONT_ACTION_ERRORS[result?.error] || FONT_ACTION_ERRORS.font_registry_unavailable;
+    return;
+  }
+  packageReviewFontState = { ...packageReviewFontState, projectId, families: result.families, selected: new Set() };
+  picker.classList.remove('hidden');
+  opener?.setAttribute('aria-expanded', 'true');
+  const search = $('#package-review-font-search');
+  if (search) search.value = '';
+  renderPackageReviewFontPicker();
+  search?.focus({ preventScroll: true });
+}
+
+function closePackageReviewFontPicker() {
+  $('#package-review-font-picker')?.classList.add('hidden');
+  $('#btn-add-installed-fonts')?.setAttribute('aria-expanded', 'false');
+  packageReviewFontState.selected = new Set();
+}
+
+function renderPackageReviewFontChoices(projectId) {
+  const region = $('#package-review-font-choices');
+  if (!region) return;
+  region.innerHTML = '';
+  const choices = packageReviewFontState.projectId === projectId ? packageReviewFontState.choices : [];
+  region.classList.toggle('hidden', choices.length === 0);
+  for (const choice of choices) {
+    const wrap = document.createElement('div');
+    wrap.className = 'package-review-font-choice';
+    const title = document.createElement('div');
+    title.textContent = `More than one installed file provides ${choice.label}. Choose the one to package.`;
+    const actions = document.createElement('div');
+    actions.className = 'package-review-font-row-actions';
+    for (const option of choice.options || []) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'package-review-font-action';
+      button.textContent = [option.fileName, option.version, option.location].filter(Boolean).join(' · ');
+      button.addEventListener('click', () => runPackageReviewFontAction(async id => {
+        const result = await window.crate.chooseInstalledFontCopy(id, option.id);
+        if (!result?.error) {
+          packageReviewFontState.choices = packageReviewFontState.choices.filter(item => item !== choice);
+        }
+        return result;
+      }, () => 'Font added.'));
+      actions.appendChild(button);
+    }
+    wrap.append(title, actions);
+    region.appendChild(wrap);
+  }
+}
+
+function getFontRowSummaryLine(row) {
+  const version = row.faces?.[0]?.version;
+  return [row.fileName, version, FONT_ORIGIN_LABELS[row.origin] || ''].filter(Boolean).join(' · ');
+}
+
+function createPackageReviewFontRow(row, projectId) {
+  const item = document.createElement('li');
+  item.className = 'package-review-font-row';
+  const title = document.createElement('div');
+  title.className = 'package-review-font-row-title';
+  const name = document.createElement('span');
+  name.className = 'package-review-font-name';
+  name.textContent = row.label || row.fileName;
+  const status = document.createElement('span');
+  status.className = `package-review-font-status is-${row.outcome}`;
+  status.textContent = row.outcome === 'included' && row.packageFolder
+    ? `Included · ${row.packageFolder === 'Package root' ? 'Package root' : `${row.packageFolder} folder`}`
+    : (FONT_STATUS_LABELS[row.outcome] || 'Not included');
+  title.append(name, status);
+  item.appendChild(title);
+  const meta = document.createElement('div');
+  meta.className = 'package-review-font-meta';
+  meta.textContent = getFontRowSummaryLine(row);
+  item.appendChild(meta);
+  if (row.collection || row.variable || (row.faces || []).length > 1) {
+    const contents = document.createElement('div');
+    contents.className = 'package-review-font-contents';
+    contents.textContent = `${row.collection ? 'Collection. ' : ''}Contains: ${row.contents}`;
+    item.appendChild(contents);
+  }
+  if (row.basis === 'verified-release') {
+    const basis = document.createElement('div');
+    basis.className = 'package-review-font-reason';
+    basis.textContent = 'This exact file matches an open-licence font release on Crate\'s verified list. Its published licence file is added beside it.';
+    item.appendChild(basis);
+  }
+  if (row.reasonText && row.outcome !== 'included') {
+    const reason = document.createElement('div');
+    reason.className = 'package-review-font-reason';
+    reason.textContent = row.reasonText;
+    item.appendChild(reason);
+  }
+  if (row.canConfirm && row.statement && row.sha256) {
+    const id = `package-review-font-confirm-${row.key}`;
+    const confirm = document.createElement('div');
+    confirm.className = 'package-review-font-confirm';
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.id = id;
+    box.checked = row.confirmed === true;
+    const label = document.createElement('label');
+    label.htmlFor = id;
+    label.textContent = row.statement;
+    const note = document.createElement('div');
+    note.className = 'package-review-font-confirm-note';
+    note.textContent = 'This records your statement for this exact file. Crate doesn\'t check licences. If the file changes, confirm again.';
+    box.addEventListener('change', () => runPackageReviewFontAction(
+      id => window.crate.confirmFontLicence(id, row.key, row.sha256, box.checked),
+      () => (box.checked ? 'Font confirmed.' : 'Confirmation removed.')));
+    confirm.append(box, label, note);
+    item.appendChild(confirm);
+  }
+  const actions = document.createElement('div');
+  actions.className = 'package-review-font-row-actions';
+  if (row.canInclude) {
+    const include = document.createElement('button');
+    include.type = 'button';
+    include.className = 'package-review-font-action';
+    include.textContent = 'Include';
+    include.setAttribute('aria-label', `Include ${row.fileName}`);
+    include.addEventListener('click', () => runPackageReviewFontAction(id => window.crate.setFontRowChoice(id, row.key, 'include'), () => 'Font updated.'));
+    actions.appendChild(include);
+  }
+  if (row.canRemove) {
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'package-review-font-action';
+    remove.textContent = 'Remove';
+    remove.setAttribute('aria-label', `Remove ${row.fileName}`);
+    remove.addEventListener('click', () => runPackageReviewFontAction(id => window.crate.setFontRowChoice(id, row.key, 'remove'), () => 'Font removed.'));
+    actions.appendChild(remove);
+  }
+  if (actions.childElementCount) item.appendChild(actions);
+  return item;
+}
+
+function renderPackageReviewFonts(project, review) {
+  const section = $('#package-review-fonts');
+  if (!section) return;
+  const fonts = review?.fonts && Array.isArray(review.fonts.rows) ? review.fonts : { rows: [], includedCount: 0, notIncludedCount: 0 };
+  const canEdit = review?.materializable !== false && typeof review?.token === 'string';
+  section.classList.toggle('hidden', !canEdit && fonts.rows.length === 0);
+  if (packageReviewFontState.projectId !== project.id) {
+    packageReviewFontState = { projectId: project.id, families: [], selected: new Set(), choices: [] };
+  }
+  closePackageReviewFontPicker();
+  const summary = $('#package-review-fonts-summary');
+  if (summary) {
+    if (!fonts.rows.length) {
+      summary.textContent = 'No fonts added. Crate doesn\'t check which fonts your documents use.';
+    } else {
+      const included = fonts.includedCount || 0;
+      const notIncluded = fonts.notIncludedCount || 0;
+      summary.textContent = `${included} font file${included === 1 ? '' : 's'} will be included. ` +
+        `${notIncluded} ${notIncluded === 1 ? 'is' : 'are'} not included. Crate doesn't check which fonts your documents use.` +
+        (fonts.noteWritten ? ' A note in the package lists the included fonts and the fonts you added that couldn\'t be included.' : '');
+    }
+  }
+  ['#btn-add-installed-fonts', '#btn-add-font-files'].forEach(selector => {
+    const button = $(selector);
+    if (button) button.disabled = !canEdit;
+  });
+  const list = $('#package-review-font-list');
+  if (list) {
+    list.innerHTML = '';
+    fonts.rows.forEach(row => list.appendChild(createPackageReviewFontRow(row, project.id)));
+  }
+  renderPackageReviewFontChoices(project.id);
+}
+
+function bindPackageReviewFontControls() {
+  $('#btn-add-installed-fonts')?.addEventListener('click', () => { openPackageReviewFontPicker(); });
+  $('#btn-font-picker-cancel')?.addEventListener('click', () => {
+    closePackageReviewFontPicker();
+    $('#btn-add-installed-fonts')?.focus({ preventScroll: true });
+  });
+  $('#package-review-font-search')?.addEventListener('input', () => renderPackageReviewFontPicker());
+  $('#btn-font-picker-add')?.addEventListener('click', () => {
+    const families = [...packageReviewFontState.selected];
+    if (!families.length) return;
+    runPackageReviewFontAction(async id => {
+      const result = await window.crate.addInstalledFonts(id, families);
+      if (!result?.error) packageReviewFontState.choices = result.choices || [];
+      return result;
+    }, describeInstalledFontAddResult);
+  });
+  $('#btn-add-font-files')?.addEventListener('click', () => runPackageReviewFontAction(
+    id => window.crate.addFontFiles(id),
+    result => (result.canceled ? '' : [
+      result.added === 1 ? 'Added 1 font file.' : `Added ${result.added || 0} font files.`,
+      result.notStored ? `${result.notStored} couldn't be added because this project has too many fonts.` : '',
+    ].filter(Boolean).join(' '))));
+}
+
 function renderPackageReview(project, review, message = '', suppliedLease = null) {
   if (!project?.id || review?.projectId !== project.id) return false;
   const lease = suppliedLease || claimModalLease('modal-package');
@@ -5666,6 +6003,7 @@ function renderPackageReview(project, review, message = '', suppliedLease = null
   const presentedReviewFiles = reviewFiles;
   packageReviewContents = { project, files: reviewFiles, expanded: false, lease };
   renderPackageReviewContents();
+  renderPackageReviewFonts(project, review);
 
   const total = $('#package-review-total');
   if (total) total.textContent = `${reviewFiles.length} visual asset${reviewFiles.length === 1 ? '' : 's'}`;
@@ -6383,6 +6721,8 @@ function setupEventListeners() {
     updatePackageOutputLayoutMode(event.target.checked, { refreshReview: true });
   });
 
+  bindPackageReviewFontControls();
+
   // Clear all projects
   $('#btn-clear-all').addEventListener('click', () => {
     if (state.projects.length === 0) return;
@@ -7018,6 +7358,17 @@ function showV2Results(result) {
     `;
   } else {
     missingEl.innerHTML = '';
+  }
+  // Quick Package never copies font files (no review step for the font gate).
+  const skippedFonts = Array.isArray(result.fontsNotIncluded) ? result.fontsNotIncluded : [];
+  if (skippedFonts.length > 0) {
+    missingEl.insertAdjacentHTML('beforeend', `
+      <div class="v2-result-missing-header">Fonts not included</div>
+      <p class="v2-result-font-note">Quick Package doesn't include font files. Use a Crate project and Package Review to add fonts.</p>
+      <div class="v2-result-missing-list">
+        ${skippedFonts.map(font => `<div class="v2-result-missing-item">${escapeHtml(String(font?.name || 'Font file'))}</div>`).join('')}
+      </div>
+    `);
   }
 
   $('#modal-v2-results').classList.remove('hidden');

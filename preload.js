@@ -52,6 +52,12 @@ contextBridge.exposeInMainWorld('crate', {
     ? ipcRenderer.invoke('projects:prepare-package-review', id)
     : ipcRenderer.invoke('projects:prepare-package-review', id, outputPath),
   packageProject: (id, outputPath, reviewToken) => ipcRenderer.invoke('projects:package', id, outputPath, reviewToken),
+  listInstalledFonts: (projectId) => ipcRenderer.invoke('fonts:list-installed', projectId),
+  addInstalledFonts: (projectId, families) => ipcRenderer.invoke('fonts:add-installed', projectId, { families }),
+  chooseInstalledFontCopy: (projectId, offerId) => ipcRenderer.invoke('fonts:choose-installed-copy', projectId, offerId),
+  addFontFiles: (projectId) => ipcRenderer.invoke('fonts:add-files', projectId),
+  setFontRowChoice: (projectId, rowKey, choice) => ipcRenderer.invoke('fonts:set-row-choice', projectId, rowKey, choice),
+  confirmFontLicence: (projectId, rowKey, sha256, confirmed) => ipcRenderer.invoke('fonts:confirm-licence', projectId, rowKey, { sha256, confirmed }),
   selectOutputFolder: () => ipcRenderer.invoke('projects:select-output'),
   deleteProject: (id) => ipcRenderer.invoke('projects:delete', id),
   deleteAllProjects: () => ipcRenderer.invoke('projects:delete-all'),
