@@ -1478,4 +1478,58 @@ function cases() {
     assert.equal((storedProject(other).excludedAssetKeys || []).includes(shared.poppins), false);
     await assertIncludedAndPackaged(other);
   });
+
+  // Astra re-check of 645b450: opaque exclusion keys and the recipient note.
+  function packagedNote(result) {
+    const notePath = path.join(result.folderPath, 'Fonts', 'Fonts in this package.txt');
+    return fs.existsSync(notePath) ? fs.readFileSync(notePath, 'utf8') : '';
+  }
+
+  fontTest('asset exclusion by an opaque fileId key: a remembered record keeps the picked font out (real package)', async () => {
+    const f = await poppinsFixture('Opaque key exclusion');
+    await pickPoppins(f);
+    storedProject(f).pendingFiles = [{ ...makePendingFile(f.poppins, 'lastused-scan'), fileId: 'opaque-poppins-file' }];
+    assert.ok(Array.isArray(await callIpcRaw('projects:reject-pending', f.project.id, f.poppins)));
+    assert.deepEqual(storedProject(f).excludedAssetKeys, ['opaque-poppins-file'], 'the exclusion key is the opaque fileId');
+    assert.deepEqual((await callIpcRaw('projects:get-asset-workspace', f.project.id)).excludedPendingFiles.map(file => file.name), ['Poppins-Regular.ttf']);
+    await assertExcludedAndUnpackaged(f);
+  });
+
+  fontTest('the recipient note never names an asset-excluded font whose final reason is restricted', async () => {
+    const f = await poppinsFixture('Note restricted');
+    const restricted = path.join(f.dir, 'Restricted-Regular.otf');
+    writeFont(restricted, { fsType: 0x0002, names: englishNames({ family: 'Restricted', style: 'Regular', postscriptName: 'Restricted-Regular' }) });
+    manualDialogFor([f.poppins, restricted]);
+    assert.equal((await callIpcRaw('fonts:add-files', f.project.id)).added, 2);
+    storedProject(f).pendingFiles = [makePendingFile(restricted, 'lastused-scan')];
+    assert.ok(Array.isArray(await callIpcRaw('projects:reject-pending', f.project.id, restricted)));
+    let reviewResult = await review(f);
+    assert.equal(row(reviewResult, 'Restricted-Regular.otf').reason, 'restricted', 'the earlier gate reason still applies');
+    let { result } = await packageNow(f, reviewResult);
+    assert.equal(result.success, true, JSON.stringify(result));
+    let note = packagedNote(result);
+    assert.match(note, /Poppins/, 'the note exists and names the included font');
+    assert.doesNotMatch(note, /Restricted/, 'the excluded restricted font is not named');
+  });
+
+  fontTest('the recipient note never names an asset-excluded font whose file has gone missing', async () => {
+    let reviewResult, result, note;
+    const g = await poppinsFixture('Note missing');
+    const other = path.join(g.dir, 'Brand-Bold.otf');
+    writeFont(other, brand('Bold'));
+    await pickPoppins(g);
+    manualDialogFor([other]);
+    await callIpcRaw('fonts:add-files', g.project.id);
+    const brandRow = row(await review(g), 'Brand-Bold.otf');
+    assert.equal((await callIpcRaw('fonts:confirm-licence', g.project.id, brandRow.key, { confirmed: true, sha256: brandRow.sha256 })).success, true);
+    await excludeFromNeedsReview(g);
+    fs.rmSync(g.poppins);
+    reviewResult = await review(g);
+    assert.equal(row(reviewResult, 'Poppins-Regular.ttf').reason, 'missing');
+    ({ result } = await packageNow(g, reviewResult));
+    assert.equal(result.success, true, JSON.stringify(result));
+    note = packagedNote(result);
+    assert.match(note, /BrandSans-Bold|Brand Sans/, 'the note exists and names the included font');
+    assert.doesNotMatch(note, /Poppins/, 'the excluded missing font is not named');
+  });
 }

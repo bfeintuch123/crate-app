@@ -23144,8 +23144,11 @@ function isFontPathAssetExcluded(project, sourcePath) {
   const target = normalizeTrackedFilePath(sourcePath);
   if (!target) return false;
   if (keys.some(key => typeof key === 'string' && path.isAbsolute(key) && normalizeTrackedFilePath(key) === target)) return true;
+  // Opaque keys (for example a fileId) are resolved through every row that
+  // carries one, including validated remembered Needs Review records; a
+  // malformed record list reads as empty.
   const keySet = new Set(keys);
-  return [...(project.files || []), ...(project.pendingFiles || [])].some(file => (
+  return [...(project.files || []), ...(project.pendingFiles || []), ...readExcludedPendingRecords(project).records].some(file => (
     keySet.has(getAssetReviewExclusionKey(file)) && normalizeTrackedFilePath(file?.path) === target
   ));
 }
@@ -23246,7 +23249,9 @@ function getFontRowLabel(row) {
 // else the gate says about them; the sender's choice decides, not the reason.
 function isFontRowOmittedFromNote(row) {
   const { choice, intent } = row.gateInput;
-  return row.gate.reason === 'duplicate' || row.gate.reason === 'asset-excluded' || choice === 'remove' ||
+  // An asset-excluded file is the sender's own exclusion, whatever the gate's
+  // final reason (for example restricted or missing): never name it.
+  return row.gate.reason === 'duplicate' || row.gateInput.assetExcluded === true || choice === 'remove' ||
     (intent !== 'explicit' && choice !== 'include');
 }
 
