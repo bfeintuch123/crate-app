@@ -9451,3 +9451,52 @@ test('every changed message is exact: Existing batch toasts, batch reasons, and 
     assert.deepEqual([plus.dataset.rowAction, plus.disabled], ['include', false]);
   }
 });
+
+test('a row action never takes focus back from a control the person moved to while it was running', async () => {
+  // Pending row [+]: held accept; the person moves to Search; focus stays there.
+  const gate = createDeferred();
+  const fixture = await loadPendingBatchFixture({ id: 'row-focus-moved', beforeAccept: () => gate.promise });
+  const include = pendingRowButtons(pendingRowNamed(fixture, 'Needs_2.png')).include;
+  include.focus();
+  include.click();
+  await new Promise(resolve => setImmediate(resolve));
+  const search = fixture.elements['asset-review-search'];
+  search.focus();
+  gate.resolve();
+  await settleRendererActions(fixture.renderer);
+  assert.equal(fixture.elements['toast-message'].textContent, 'Needs_2.png included');
+  assert.equal(fixture.document.activeElement, search, 'focus stays on Search');
+
+  // Included asset [x]: held toggle; the person moves to Search; focus stays there.
+  const { document, elements } = createInteractiveRendererDom();
+  const added = { name: 'Texture.png', ext: '.png', assetOrigin: 'added', projectRole: 'asset', protectedSource: false,
+    excluded: false, visualIdentity: 'texture-identity', visualRevision: 'texture-revision' };
+  const project = { id: 'asset-focus-moved', name: 'Asset row', type: 'branding', status: 'watching', files: [added], pendingFiles: [],
+    excludedAssetKeys: [], assetBaseline: { status: 'included', decision: 'include' } };
+  let current = cloneTestValue(project);
+  const toggle = createDeferred();
+  const renderer = loadRendererHelpers(document, { crate: {
+    removeFile: async () => { await toggle.promise; current = { ...current, files: [{ ...current.files[0], excluded: true }] }; },
+    getProjects: async () => [cloneTestValue(current)],
+    getAssetWorkspace: async () => ({ projectId: project.id, files: cloneTestValue(current.files), pendingFiles: [] }),
+  } });
+  renderer.testProject = project;
+  vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+  renderer.renderAssetWorkspace(project, {}, project.files);
+  const exclude = elements['added-assets-list'].children[0].children.find(child => child.tagName === 'BUTTON');
+  exclude.focus();
+  exclude.click();
+  await new Promise(resolve => setImmediate(resolve));
+  elements['asset-review-search'].focus();
+  toggle.resolve();
+  await settleRendererActions(renderer);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(elements['toast-message'].textContent, 'Texture.png excluded');
+  assert.equal(document.activeElement, elements['asset-review-search'], 'focus stays on Search');
+
+  // Control: when focus was simply lost, it still moves to the next row's same button.
+  const lost = await loadPendingBatchFixture({ id: 'row-focus-lost' });
+  pendingRowButtons(pendingRowNamed(lost, 'Needs_2.png')).include.click();
+  await settleRendererActions(lost.renderer);
+  assert.equal(lost.document.activeElement, pendingRowButtons(pendingRowNamed(lost, 'Needs_3.png')).include);
+});

@@ -2944,6 +2944,7 @@ function captureRowActionFocus(button, kind) {
   const virtualIndex = Number.parseInt(row?.dataset?.assetIndex, 10);
   return {
     kind,
+    button: button || null,
     key: row?.dataset?.renderKey || null,
     index: Number.isFinite(virtualIndex) ? virtualIndex : siblings.indexOf(row),
     listId: list?.id || null,
@@ -2964,6 +2965,10 @@ function resolveRowActionFocusList(snapshot) {
 
 function restoreRowActionFocus(snapshot) {
   if (!snapshot || !snapshot.key || hasModalInteraction()) return null;
+  // Never take focus back from a control the person moved to while the action
+  // was running; restore only when focus was lost or is still on the button.
+  const current = document.activeElement;
+  if (current && current !== document.body && current !== snapshot.button && current.isConnected) return null;
   const usable = element => !!element && element.isConnected && !element.disabled &&
     !element.closest?.('.hidden, .filtered-out');
   const list = resolveRowActionFocusList(snapshot);
