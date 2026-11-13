@@ -412,6 +412,9 @@ function evaluateFontGate(input) {
     return gateResult('excluded', 'unnamed');
   }
   if (input.identityConfirmed === false) return gateResult('excluded', 'unconfirmed');
+  // The designer excluded this file as an asset; a later explicit inclusion
+  // clears that exclusion before the gate runs again.
+  if (input.assetExcluded === true) return gateResult('not-included', 'asset-excluded');
   if (input.choice === 'remove') return gateResult('not-included', 'removed');
   if (input.intent !== 'explicit' && input.choice !== 'include') return gateResult('not-included', 'found');
   if (input.conflict) return gateResult('not-included', 'conflict');
@@ -433,9 +436,10 @@ const FONT_REASON_TEXT = Object.freeze({
   malformed: 'Crate couldn\'t read this font file.',
   missing: 'The font file is no longer where Crate found it.',
   unreadable: 'Crate couldn\'t open this font file.',
-  removed: 'You removed it from this package.',
+  removed: 'You excluded it from this package.',
+  'asset-excluded': 'You excluded this file from the package. Include it to add it back.',
   found: 'Found while the project was watched. Crate can\'t tell whether this project uses it.',
-  conflict: 'Another font file here has the same font name with different contents. Remove one of them.',
+  conflict: 'Another font file here has the same font name with different contents. Exclude one of them.',
   'licence-unknown': 'Crate can\'t tell whether this font\'s licence allows sharing it. Confirm below to include it.',
   duplicate: 'Same file as another font in this package. It is copied once.',
   embedded: 'Stored inside a Photoshop file. Crate can\'t check it, so it isn\'t packaged.',

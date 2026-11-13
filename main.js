@@ -23105,6 +23105,9 @@ function collectFontCandidates(project, files) {
       groups.set(key, group);
     }
     group.origins.add(origin);
+    // Package files already went through asset selection, including the
+    // required-dependency rules; only Package Review font picks bypass it.
+    if (extra.fromPackageFiles) group.fromPackageFiles = true;
     if (Number.isFinite(extra.addedAt)) group.addedAt = Math.min(group.addedAt, extra.addedAt);
     if (extra.postscriptName) group.requested.add(extra.postscriptName);
   };
@@ -23120,7 +23123,7 @@ function collectFontCandidates(project, files) {
       return;
     }
     if (isGatedFontFile(file) && typeof file.path === 'string') {
-      add(file.path, isExplicitUserCapturedFile(file) ? 'project-file' : 'found', { addedAt: file.addedAt });
+      add(file.path, isExplicitUserCapturedFile(file) ? 'project-file' : 'found', { addedAt: file.addedAt, fromPackageFiles: true });
     }
   });
   for (const selection of handoff.installed) {
@@ -23130,13 +23133,54 @@ function collectFontCandidates(project, files) {
   return { handoff, groups: [...groups.values()] };
 }
 
+// Asset decisions apply to fonts too: a file the designer excluded (from Needs
+// Review, Exclude All or an Included row) stays out of the package even if it
+// was picked earlier in Package Review. Path keys are compared canonically.
+// This runs only for Package Review and packaging, never on store reads.
+function isFontPathAssetExcluded(project, sourcePath) {
+  const keys = Array.isArray(project?.excludedAssetKeys) ? project.excludedAssetKeys : [];
+  if (!keys.length || typeof sourcePath !== 'string' || !sourcePath) return false;
+  if (isAssetReviewFileExcluded(project, { path: sourcePath, name: path.basename(sourcePath), ext: path.extname(sourcePath).toLowerCase() })) return true;
+  const target = normalizeTrackedFilePath(sourcePath);
+  if (!target) return false;
+  if (keys.some(key => typeof key === 'string' && path.isAbsolute(key) && normalizeTrackedFilePath(key) === target)) return true;
+  const keySet = new Set(keys);
+  return [...(project.files || []), ...(project.pendingFiles || [])].some(file => (
+    keySet.has(getAssetReviewExclusionKey(file)) && normalizeTrackedFilePath(file?.path) === target
+  ));
+}
+
+// The latest explicit inclusion wins: picking a font file again, or Include on
+// its font row, clears that file's asset exclusion the same way + Add Files
+// does, and retires its remembered Needs Review record (and its own key).
+function includeExplicitlyChosenFontFile(project, sourcePath) {
+  const target = normalizeTrackedFilePath(sourcePath);
+  if (!target) return false;
+  const released = releaseExcludedPendingRecords(project, { path: sourcePath });
+  const keys = Array.isArray(project.excludedAssetKeys) ? project.excludedAssetKeys : [];
+  const remove = new Set([sourcePath]);
+  for (const file of [...(project.files || []), ...(project.pendingFiles || [])]) {
+    if (normalizeTrackedFilePath(file?.path) !== target) continue;
+    const key = getAssetReviewExclusionKey(file);
+    if (key) remove.add(key);
+    if ((project.files || []).includes(file)) delete file.individualContentExclusion;
+  }
+  for (const key of keys) {
+    if (typeof key === 'string' && path.isAbsolute(key) && normalizeTrackedFilePath(key) === target) remove.add(key);
+  }
+  const kept = keys.filter(key => !remove.has(key));
+  if (kept.length !== keys.length) project.excludedAssetKeys = kept;
+  return released || kept.length !== keys.length;
+}
+
 function getFontRowOrigin(group) {
   return FONT_ORIGIN_PRIORITY.find(origin => group.origins.has(origin)) || 'found';
 }
 
-function getFontGateInput(group, inspected, handoff, homeDir) {
+function getFontGateInput(group, inspected, handoff, homeDir, assetExcluded = false) {
   return {
     embedded: group.embedded === true,
+    assetExcluded: assetExcluded === true,
     file: { state: inspected.fingerprint.state },
     readError: inspected.readError,
     faces: inspected.parsed?.faces || [],
@@ -23162,7 +23206,8 @@ function evaluateFontHandoff(project, files) {
     const inspected = group.embedded
       ? { sourcePath: null, fingerprint: { state: 'virtual' }, realPath: null, sha256: null, parsed: null, readError: null }
       : inspectFontFile(group.sourcePath);
-    const gateInput = getFontGateInput(group, inspected, handoff, homeDir);
+    const assetExcluded = !group.embedded && !group.fromPackageFiles && isFontPathAssetExcluded(project, group.sourcePath);
+    const gateInput = getFontGateInput(group, inspected, handoff, homeDir, assetExcluded);
     return { group, inspected, gateInput, gate: fontHandoff.evaluateFontGate({ ...gateInput, conflict: false }) };
   });
   const live = rows.filter(row => row.gate.outcome === 'included' || row.gate.outcome === 'needs-confirmation');
@@ -23201,7 +23246,8 @@ function getFontRowLabel(row) {
 // else the gate says about them; the sender's choice decides, not the reason.
 function isFontRowOmittedFromNote(row) {
   const { choice, intent } = row.gateInput;
-  return row.gate.reason === 'duplicate' || choice === 'remove' || (intent !== 'explicit' && choice !== 'include');
+  return row.gate.reason === 'duplicate' || row.gate.reason === 'asset-excluded' || choice === 'remove' ||
+    (intent !== 'explicit' && choice !== 'include');
 }
 
 function getFontNoteModel(fontReview, inputs, licenceOutputs) {
@@ -23250,6 +23296,7 @@ function planFontOutputs(fontReview, layoutMode, outputAllocator) {
     inputs.push({
       rowKey: row.group.key,
       sourcePath: row.group.sourcePath,
+      selectedInPackageReview: row.group.fromPackageFiles !== true,
       sourceFingerprint: row.inspected.fingerprint,
       sha256: row.inspected.sha256,
       basis: row.gate.basis,
@@ -23369,9 +23416,10 @@ function presentFontReview(fontReview, plan) {
         ? fontHandoff.getFontConfirmationStatement(faces, fileName) : null,
       statementVersion: fontHandoff.FONT_CONFIRMATION_WORDING_VERSION,
       confirmed: fontHandoff.isCurrentConfirmation(row.gateInput.confirmation, row.inspected.sha256),
-      canConfirm: !excluded && reason !== 'removed' && reason !== 'conflict' && basis !== 'verified-release' && faces.length > 0,
-      canRemove: row.gateInput.choice !== 'remove',
-      canInclude: reason === 'found' || reason === 'removed',
+      canConfirm: !excluded && reason !== 'removed' && reason !== 'asset-excluded' && reason !== 'conflict' &&
+        basis !== 'verified-release' && faces.length > 0,
+      canRemove: row.gateInput.choice !== 'remove' && reason !== 'asset-excluded',
+      canInclude: reason === 'found' || reason === 'removed' || reason === 'asset-excluded',
       packageFolder: inputKeys.has(row.group.key) ? getFontFolderLabel(plan) : null,
     };
   });
@@ -23544,6 +23592,7 @@ function storeInstalledFontSelections(projectId, selections, fence) {
       handoff.installed.push({ ...selection, addedAt: Date.now() });
       const key = getFontRowKey(selection.path);
       if (key && handoff.choices[key] === 'remove') delete handoff.choices[key];
+      includeExplicitlyChosenFontFile(project, selection.path);
       stored++;
     }
     writeProjectFontHandoff(project, handoff);
@@ -23659,6 +23708,8 @@ function setFontRowChoice(projectId, rowKey, choice) {
     const group = getProjectFontCandidateGroup(project, rowKey);
     if (!group) return { error: 'font_not_found' };
     if (choice === 'include' && group.embedded) return { error: 'font_not_eligible' };
+    // Include on the font row is the latest explicit choice for this file.
+    if (choice === 'include' && group.sourcePath) includeExplicitlyChosenFontFile(project, group.sourcePath);
     const handoff = readProjectFontHandoff(project);
     if (choice === 'remove') {
       handoff.installed = handoff.installed.filter(item => getFontRowKey(item.path) !== rowKey);
@@ -23734,6 +23785,8 @@ function addFontFilePaths(projectId, filePaths) {
       const key = getFontRowKey(filePath);
       if (!key) continue;
       if (handoff.choices[key] === 'remove') delete handoff.choices[key];
+      // Picking the file again is the latest explicit choice: it is included.
+      includeExplicitlyChosenFontFile(project, filePath);
       const existing = handoff.files.find(item => getFontRowKey(item.path) === key);
       if (existing) {
         // The same real file was added through a link: keep the file itself.
@@ -26546,6 +26599,10 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
         const staleFontResult = await abortStalePackage(); if (staleFontResult) return staleFontResult;
         const allocatedOutputName = outputAllocator.reserveGroupedOutputName(input.rawName, 'fonts');
         if (allocatedOutputName !== input.outputName || getOutputRelativePath(allocatedOutputName) !== input.relativePath) {
+          throw new PackageReviewChangedError();
+        }
+        if (input.selectedInPackageReview !== false &&
+            isFontPathAssetExcluded(getProjects().find(project => project.id === id), input.sourcePath)) {
           throw new PackageReviewChangedError();
         }
         const { buffer, mode } = readGatedFontForPackaging(input, layoutMode);

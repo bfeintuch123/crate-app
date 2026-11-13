@@ -1369,4 +1369,113 @@ function cases() {
     const { result } = await packageNow(f);
     assert.deepEqual(listTree(result.folderPath), ['PNG/Logo.png']);
   });
+
+  // --- Asset exclusion and font picks: the latest explicit choice wins ---
+  const storedProject = f => storeInstance.data.projects.find(item => item.id === f.project.id);
+  async function pickPoppins(f) {
+    manualDialogFor([f.poppins]);
+    const added = await callIpcRaw('fonts:add-files', f.project.id);
+    assert.equal(added.success, true, JSON.stringify(added));
+  }
+  // Crate finds the same file while watching and the designer presses [x] on it in Needs Review.
+  async function excludeFromNeedsReview(f) {
+    storedProject(f).pendingFiles = [makePendingFile(f.poppins, 'lastused-scan')];
+    const rejected = await callIpcRaw('projects:reject-pending', f.project.id, f.poppins);
+    assert.ok(Array.isArray(rejected), JSON.stringify(rejected));
+    const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+    assert.deepEqual(workspace.excludedPendingFiles.map(file => file.name), ['Poppins-Regular.ttf']);
+    assert.ok(storedProject(f).excludedAssetKeys.includes(f.poppins));
+  }
+  async function poppinsFixture(name) {
+    const f = await fixture(name);
+    f.poppins = path.join(f.dir, 'Poppins-Regular.ttf');
+    f.bytes = writePoppins(f.poppins);
+    return f;
+  }
+  async function assertExcludedAndUnpackaged(f) {
+    const reviewResult = await review(f);
+    const font = row(reviewResult, 'Poppins-Regular.ttf');
+    assert.deepEqual([font.outcome, font.reason, font.canInclude, font.canRemove], ['not-included', 'asset-excluded', true, false]);
+    assert.equal(font.reasonText, 'You excluded this file from the package. Include it to add it back.');
+    const { result } = await packageNow(f, reviewResult);
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.deepEqual(listTree(result.folderPath), ['PNG/Logo.png'], 'the excluded font is not packaged or named to recipients');
+    fs.rmSync(result.folderPath, { recursive: true, force: true });
+  }
+  async function assertIncludedAndPackaged(f) {
+    const reviewResult = await review(f);
+    assert.equal(row(reviewResult, 'Poppins-Regular.ttf').outcome, 'included');
+    const { result } = await packageNow(f, reviewResult);
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.deepEqual(fs.readFileSync(path.join(result.folderPath, 'Fonts', 'Poppins-Regular.ttf')), f.bytes);
+    fs.rmSync(result.folderPath, { recursive: true, force: true });
+  }
+  async function assertExclusionCleared(f) {
+    const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+    assert.deepEqual(workspace.excludedPendingFiles, [], 'the Excluded record is retired');
+    assert.equal((storedProject(f).excludedAssetKeys || []).includes(f.poppins), false, 'its exclusion key is cleared');
+  }
+
+  fontTest('asset exclusion: a picked font excluded in Needs Review is not packaged and shows as Excluded (real package)', async () => {
+    const f = await poppinsFixture('Picked then excluded');
+    await pickPoppins(f);
+    assert.equal(row(await review(f), 'Poppins-Regular.ttf').outcome, 'included');
+    await excludeFromNeedsReview(f);
+    await assertExcludedAndUnpackaged(f);
+  });
+
+  fontTest('asset exclusion: a later font pick includes the file again and clears its Excluded record and key', async () => {
+    const f = await poppinsFixture('Excluded then picked');
+    await excludeFromNeedsReview(f);
+    await pickPoppins(f);
+    await assertExclusionCleared(f);
+    await assertIncludedAndPackaged(f);
+  });
+
+  fontTest('asset exclusion: [+] from Excluded includes the picked font through accept, as before', async () => {
+    const f = await poppinsFixture('Excluded then plus');
+    await pickPoppins(f);
+    await excludeFromNeedsReview(f);
+    const target = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).excludedPendingFiles[0].visualIdentity;
+    assert.ok(await callIpcRaw('projects:accept-pending', f.project.id, target));
+    await assertExclusionCleared(f);
+    assert.ok(storedProject(f).files.some(file => file.path === f.poppins), 'accepted into the project');
+    await assertIncludedAndPackaged(f);
+  });
+
+  fontTest('asset exclusion: + Add Files of the excluded font includes it, as before', async () => {
+    const f = await poppinsFixture('Excluded then add files');
+    await pickPoppins(f);
+    await excludeFromNeedsReview(f);
+    manualDialogFor([f.poppins]);
+    await callIpcRaw('projects:add-files', f.project.id);
+    await assertExclusionCleared(f);
+    await assertIncludedAndPackaged(f);
+  });
+
+  fontTest('asset exclusion: Include on the Package Review font row includes it and clears the Excluded record and key', async () => {
+    const f = await poppinsFixture('Excluded then row include');
+    await pickPoppins(f);
+    await excludeFromNeedsReview(f);
+    const font = row(await review(f), 'Poppins-Regular.ttf');
+    assert.equal(font.reason, 'asset-excluded');
+    assert.equal((await callIpcRaw('fonts:set-row-choice', f.project.id, font.key, 'include')).success, true);
+    await assertExclusionCleared(f);
+    await assertIncludedAndPackaged(f);
+  });
+
+  fontTest('asset exclusion stays in its own project: another project picking the same file still packages it', async () => {
+    const shared = await poppinsFixture('Exclusion owner');
+    await pickPoppins(shared);
+    const other = { project: await createProject('Other project'), dir: shared.dir, poppins: shared.poppins, bytes: shared.bytes };
+    await callIpcRaw('projects:pause', other.project.id);
+    other.out = fs.mkdtempSync(path.join(TEST_HOME, 'Desktop', 'other-out-'));
+    manualDialogFor([shared.image]);
+    await callIpcRaw('projects:add-files', other.project.id);
+    await pickPoppins(other);
+    await excludeFromNeedsReview(shared);
+    await assertExcludedAndUnpackaged(shared);
+    assert.equal((storedProject(other).excludedAssetKeys || []).includes(shared.poppins), false);
+    await assertIncludedAndPackaged(other);
+  });
 }

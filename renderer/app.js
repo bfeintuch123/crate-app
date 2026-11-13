@@ -5806,9 +5806,11 @@ function createPackageReviewFontRow(row, projectId) {
   name.textContent = row.label || row.fileName;
   const status = document.createElement('span');
   status.className = `package-review-font-status is-${row.outcome}`;
+  // A font the designer excluded (on its row or as an asset) reads Excluded.
   status.textContent = row.outcome === 'included' && row.packageFolder
     ? `Included · ${row.packageFolder === 'Package root' ? 'Package root' : `${row.packageFolder} folder`}`
-    : (FONT_STATUS_LABELS[row.outcome] || 'Not included');
+    : (row.reason === 'removed' || row.reason === 'asset-excluded'
+      ? 'Excluded' : FONT_STATUS_LABELS[row.outcome] || 'Not included');
   title.append(name, status);
   item.appendChild(title);
   const meta = document.createElement('div');
@@ -5868,9 +5870,10 @@ function createPackageReviewFontRow(row, projectId) {
     const remove = document.createElement('button');
     remove.type = 'button';
     remove.className = 'package-review-font-action';
-    remove.textContent = 'Remove';
-    remove.setAttribute('aria-label', `Remove ${row.fileName}`);
-    remove.addEventListener('click', () => runPackageReviewFontAction(id => window.crate.setFontRowChoice(id, row.key, 'remove'), () => 'Font removed.'));
+    // Package decision wording: Exclude (the internal choice stays 'remove').
+    remove.textContent = 'Exclude';
+    remove.setAttribute('aria-label', `Exclude ${row.fileName}`);
+    remove.addEventListener('click', () => runPackageReviewFontAction(id => window.crate.setFontRowChoice(id, row.key, 'remove'), () => 'Font excluded.'));
     actions.appendChild(remove);
   }
   if (actions.childElementCount) item.appendChild(actions);

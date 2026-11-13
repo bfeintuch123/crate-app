@@ -9500,3 +9500,51 @@ test('a row action never takes focus back from a control the person moved to whi
   await settleRendererActions(lost.renderer);
   assert.equal(lost.document.activeElement, pendingRowButtons(pendingRowNamed(lost, 'Needs_3.png')).include);
 });
+
+test('Package Review font rows say Exclude for the package decision, and an excluded font reads Excluded', async () => {
+  const { document } = createInteractiveRendererDom();
+  // The shared element stub predates Element.append and childElementCount, which font rows use.
+  const createElement = document.createElement;
+  document.createElement = tagName => {
+    const element = createElement(tagName);
+    element.append = (...nodes) => nodes.forEach(node => element.appendChild(node));
+    Object.defineProperty(element, 'childElementCount', { get: () => element.children.length });
+    return element;
+  };
+  const choices = [];
+  const renderer = loadRendererHelpers(document, { crate: {
+    setFontRowChoice: async (...args) => { choices.push(args); return { success: true }; },
+  } });
+  vm.runInContext(`
+    state.selectedProjectId = 'font-project';
+    canRefreshPackageReviewFrom = () => true;
+    showPackageModal = async options => { globalThis.lastPackageModal = options; return true; };
+  `, renderer);
+  const base = { key: 'a'.repeat(32), fileName: 'Poppins-Regular.ttf', label: 'Poppins Regular', faces: [], origin: 'added-file' };
+  const buttons = item => {
+    const found = [];
+    const walk = node => { for (const child of node.children || []) { if (child.tagName === 'BUTTON') found.push(child); walk(child); } };
+    walk(item);
+    return found;
+  };
+  const status = item => item.children[0].children[1].textContent;
+
+  const included = renderer.createPackageReviewFontRow({ ...base, outcome: 'included', canRemove: true, canInclude: false }, 'font-project');
+  const [exclude] = buttons(included);
+  assert.equal(exclude.textContent, 'Exclude');
+  assert.equal(exclude.getAttribute('aria-label'), 'Exclude Poppins-Regular.ttf');
+  assert.equal(buttons(included).some(button => /Remove/.test(button.textContent + button.getAttribute('aria-label'))), false);
+  exclude.click();
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(choices, [['font-project', base.key, 'remove']], 'the internal choice is unchanged');
+  assert.equal(vm.runInContext('globalThis.lastPackageModal.successMessage', renderer), 'Font excluded.');
+
+  for (const reason of ['removed', 'asset-excluded']) {
+    const excluded = renderer.createPackageReviewFontRow({ ...base, outcome: 'not-included', reason, reasonText: 'x', canRemove: false, canInclude: true }, 'font-project');
+    assert.equal(status(excluded), 'Excluded', reason);
+    assert.deepEqual(buttons(excluded).map(button => [button.textContent, button.getAttribute('aria-label')]), [['Include', 'Include Poppins-Regular.ttf']]);
+  }
+  const found = renderer.createPackageReviewFontRow({ ...base, outcome: 'not-included', reason: 'found', canRemove: true, canInclude: true }, 'font-project');
+  assert.equal(status(found), 'Not included', 'a found-only font keeps its existing status');
+});
