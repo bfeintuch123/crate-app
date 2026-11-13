@@ -9,10 +9,12 @@ let harness = fs.readFileSync(harnessPath, 'utf8');
 if (harness.split("const test = require('node:test');").length !== 2) throw Error('harness drift');
 harness = harness.replace("const test = require('node:test');", "const fontTest=require('node:test'); const test=new Proxy(fontTest,{apply(){}});");
 harness = harness.replace("fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual-write-home-'))", "fs.mkdtempSync(path.join(path.dirname(MAIN_UNDER_TEST_ROOT), 'font-handoff-ipc-home-'))");
-// Test hook: run the exclusion-clearing step of a font pick on the stored project.
+// Test hooks: run the exclusion-clearing step of a font pick, and the batch
+// font-row clearing of Include All Existing, on the stored project.
 if (harness.split('  captureProjectOperation,\n  runScanOnOpen').length !== 2) throw Error('harness hook drift');
 harness = harness.replace('  captureProjectOperation,\n  runScanOnOpen',
-  '  includeExplicitlyChosenFontFileForTest(projectId, filePath) { return includeExplicitlyChosenFontFile(getProjects().find(item => item.id === projectId), filePath); },\n  captureProjectOperation,\n  runScanOnOpen');
+  '  includeExplicitlyChosenFontFileForTest(projectId, filePath) { return includeExplicitlyChosenFontFile(getProjects().find(item => item.id === projectId), filePath); },\n' +
+  '  clearFontRowExclusionChoicesForTest(projectId, filePaths) { return clearFontRowExclusionChoices(getProjects().find(item => item.id === projectId), filePaths); },\n  captureProjectOperation,\n  runScanOnOpen');
 const compiled = new Module(harnessPath, module);
 compiled.filename = harnessPath;
 compiled.paths = Module._nodeModulePaths(path.dirname(harnessPath));
@@ -1719,5 +1721,177 @@ function cases() {
     const slow = count(() => metadataTestHooks.includeExplicitlyChosenFontFileForTest(f.project.id, f.poppins));
     assert.equal(slow.result, true);
     assert.deepEqual(storedProject(f).excludedAssetKeys, ['other-key'], 'with an exclusion the result is unchanged');
+  });
+
+  // --- N5 (Fable's final review of 3e3aa13): Include All Existing ---
+  // An Existing asset as the first baseline scan leaves it, accepted by the
+  // first Include All Existing.
+  async function addExistingAsset(f, filePath) {
+    const project = storedProject(f);
+    project.assetBaseline = { schemaVersion: 1, status: 'decision-required', decision: null, establishedAt: null };
+    project.pendingFiles = [...(project.pendingFiles || []), { ...makePendingFile(filePath, 'lastused-scan'), assetOrigin: 'existing', projectRole: 'asset' }];
+    assert.equal((await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include')).success, true);
+    assert.ok(storedProject(f).files.some(file => file.path === filePath && file.assetOrigin === 'existing'));
+  }
+  const writeFound = filePath => writeFont(filePath, { names: englishNames({ family: 'Found', style: 'Regular', postscriptName: 'Found-Regular' }) });
+  const existingDecision = async (f, decision) => assert.equal((await callIpcRaw('projects:set-existing-assets-decision', f.project.id, decision)).success, true);
+  const rowChoice = async (f, key, choice) => assert.equal((await callIpcRaw('fonts:set-row-choice', f.project.id, key, choice)).success, true);
+  const packagedNames = async f => {
+    const { result } = await packageNow(f);
+    assert.equal(result.success, true, JSON.stringify(result));
+    const names = listTree(result.folderPath);
+    fs.rmSync(result.folderPath, { recursive: true, force: true });
+    return names;
+  };
+
+  fontTest('N5: Exclude All then Include All Existing clears the font-row Exclude of each restored font; the font still needs its own Include and confirmation', async () => {
+    const f = await poppinsFixture('Include All Existing restores');
+    const found = path.join(f.dir, 'Found-Regular.otf');
+    writeFound(found);
+    await addExistingAsset(f, f.poppins);
+    await addExistingAsset(f, found);
+    await pickPoppins(f);
+    const poppinsKey = (await fontRowNamed(f)).key;
+    const foundRow = await fontRowNamed(f, 'Found-Regular.otf');
+    await rowChoice(f, foundRow.key, 'include');
+    const unconfirmed = await fontRowNamed(f, 'Found-Regular.otf');
+    assert.equal((await callIpcRaw('fonts:confirm-licence', f.project.id, unconfirmed.key, { confirmed: true, sha256: unconfirmed.sha256 })).success, true);
+    assert.equal((await fontRowNamed(f, 'Found-Regular.otf')).outcome, 'included');
+    for (const key of [poppinsKey, foundRow.key]) await rowChoice(f, key, 'remove');
+    assert.equal(storedProject(f).fontHandoff.confirmations[foundRow.key], undefined, 'the font-row Exclude withdrew the confirmation (#327)');
+
+    await existingDecision(f, 'skip');
+    await existingDecision(f, 'include');
+    const assets = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files;
+    for (const name of ['Poppins-Regular.ttf', 'Found-Regular.otf']) assert.equal(assets.find(file => file.name === name).included, true, name);
+    for (const key of [poppinsKey, foundRow.key]) assert.equal(storedProject(f).fontHandoff?.choices[key], undefined, 'the font-row Exclude is cleared');
+    for (const name of ['Poppins-Regular.ttf', 'Found-Regular.otf']) {
+      const font = await fontRowNamed(f, name);
+      assert.deepEqual([font.outcome, font.reason, font.canInclude], ['not-included', 'found', true], name);
+    }
+    assert.deepEqual(await packagedNames(f), ['PNG/Logo.png'], 'neither font is packaged without its own Include');
+
+    // The withdrawn pick and confirmation are not restored: each font needs its own Include, and Found its confirmation.
+    await rowChoice(f, poppinsKey, 'include');
+    await rowChoice(f, foundRow.key, 'include');
+    const needsConfirmation = await fontRowNamed(f, 'Found-Regular.otf');
+    assert.equal(needsConfirmation.outcome, 'needs-confirmation');
+    assert.ok(!(await packagedNames(f)).some(name => name.endsWith('Found-Regular.otf')), 'not packaged before its confirmation');
+    assert.equal((await callIpcRaw('fonts:confirm-licence', f.project.id, needsConfirmation.key, { confirmed: true, sha256: needsConfirmation.sha256 })).success, true);
+    const names = await packagedNames(f);
+    for (const name of ['Poppins-Regular.ttf', 'Found-Regular.otf']) assert.ok(names.some(item => item.endsWith(name)), `${name} packaged after its own Include: ${names}`);
+  });
+
+  fontTest('N5: Include All Existing keeps the font-row Exclude of a font whose asset was already Included', async () => {
+    const f = await poppinsFixture('Include All Existing keeps');
+    const other = path.join(f.dir, 'Other.png');
+    fs.writeFileSync(other, createSyntheticPngBytes());
+    await addExistingAsset(f, f.poppins);
+    await addExistingAsset(f, other);
+    await pickPoppins(f);
+    const key = (await fontRowNamed(f)).key;
+    await rowChoice(f, key, 'remove');
+    // Another Existing asset is Excluded, so Include All Existing is available.
+    await callIpcRaw('projects:remove-file', f.project.id, other);
+    assert.ok(storedProject(f).excludedAssetKeys.includes(other));
+    await existingDecision(f, 'include');
+    assert.ok(!storedProject(f).excludedAssetKeys.includes(other), 'the batch brought the other asset back');
+    assert.equal(storedProject(f).fontHandoff.choices[key], 'remove', 'the specific font-row Exclude stays');
+    assert.deepEqual([(await fontRowNamed(f)).outcome, (await fontRowNamed(f)).reason], ['not-included', 'removed']);
+    assert.ok(!(await packagedNames(f)).some(name => name.endsWith('Poppins-Regular.ttf')));
+  });
+
+  fontTest('N5: Include All Existing leaves other fonts, confirmations and other projects untouched; Exclude All Existing never changes font choices', async () => {
+    const f = await poppinsFixture('Include All Existing scope');
+    const found = path.join(f.dir, 'Found-Regular.otf');
+    writeFound(found);
+    await addExistingAsset(f, f.poppins);
+    await addExistingAsset(f, found);
+    const added = path.join(f.dir, 'Brand-Bold.otf');
+    writeFont(added, brand('Bold'));
+    manualDialogFor([added]);
+    await callIpcRaw('projects:add-files', f.project.id);
+    const poppinsKey = (await fontRowNamed(f)).key;
+    const foundRow = await fontRowNamed(f, 'Found-Regular.otf');
+    const addedKey = (await fontRowNamed(f, 'Brand-Bold.otf')).key;
+    await rowChoice(f, poppinsKey, 'remove');
+    await rowChoice(f, addedKey, 'remove');
+    await rowChoice(f, foundRow.key, 'include');
+    const unconfirmed = await fontRowNamed(f, 'Found-Regular.otf');
+    assert.equal((await callIpcRaw('fonts:confirm-licence', f.project.id, unconfirmed.key, { confirmed: true, sha256: unconfirmed.sha256 })).success, true);
+
+    // A second project in the same home (fixture() would reset the first one).
+    const g = { project: await createProject('Another project'), dir: fs.mkdtempSync(path.join(TEST_HOME, 'Desktop', 'fonts-')) };
+    g.out = path.join(g.dir, 'out');
+    fs.mkdirSync(g.out);
+    await callIpcRaw('projects:pause', g.project.id);
+    const elsewhere = path.join(g.dir, 'Poppins-Regular.ttf');
+    writePoppins(elsewhere);
+    await addExistingAsset(g, elsewhere);
+    await rowChoice(g, (await fontRowNamed(g)).key, 'remove');
+    const otherProject = structuredClone(storedProject(g).fontHandoff);
+
+    const before = structuredClone(storedProject(f).fontHandoff);
+    await existingDecision(f, 'skip');
+    assert.deepEqual(storedProject(f).fontHandoff, before, 'Exclude All Existing never changes font choices or confirmations');
+    await existingDecision(f, 'include');
+    const after = storedProject(f).fontHandoff;
+    assert.equal(after.choices[poppinsKey], undefined, 'the restored font is cleared');
+    assert.equal(after.choices[addedKey], 'remove', 'an Added font is not part of the batch');
+    assert.equal(after.choices[foundRow.key], 'include', 'another font\'s choice stays');
+    assert.deepEqual(after.confirmations, before.confirmations, 'confirmations stay');
+    assert.equal((await fontRowNamed(f, 'Found-Regular.otf')).outcome, 'included');
+    assert.deepEqual(storedProject(g).fontHandoff, otherProject, 'another project is untouched');
+  });
+
+  fontTest('N5: Include All Existing that keeps a font withheld by its excluded working file clears its font-row Exclude', async () => {
+    const f = await poppinsFixture('Include All Existing withheld');
+    const source = path.join(f.dir, 'Working.ai');
+    writeSyntheticAiFile(source, 'synthetic');
+    const project = storedProject(f);
+    project.assetBaseline = { schemaVersion: 1, status: 'included', decision: 'include', establishedAt: Date.now() };
+    project.files.push(
+      { path: source, name: 'Working.ai', ext: '.ai', source: 'manual-browse', addedAt: Date.now() },
+      { path: f.poppins, name: 'Poppins-Regular.ttf', ext: '.ttf', source: 'indd-linked', projectRole: 'asset', assetOrigin: 'existing', dependencyOwners: [source], addedAt: Date.now() });
+    const key = (await fontRowNamed(f)).key;
+    await rowChoice(f, key, 'remove');
+    const sourceRow = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(file => file.name === 'Working.ai');
+    assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, sourceRow.visualIdentity,
+      { action: 'exclude', expectedRevision: sourceRow.selectionRevision })).success, true);
+    const withheld = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(file => file.name === 'Poppins-Regular.ttf');
+    assert.deepEqual([withheld.excludedSourceOnly, withheld.included], [true, false]);
+    assert.ok(!(storedProject(f).excludedAssetKeys || []).includes(f.poppins), 'withheld, not excluded by key');
+    await existingDecision(f, 'include');
+    const kept = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(file => file.name === 'Poppins-Regular.ttf');
+    assert.equal(kept.included, true, 'Include All Existing keeps it');
+    assert.equal(storedProject(f).fontHandoff?.choices[key], undefined, 'the font-row Exclude is cleared');
+    const font = await fontRowNamed(f);
+    assert.deepEqual([font.outcome, font.reason, font.canInclude], ['not-included', 'found', true]);
+  });
+
+  fontTest('N5: the batch font-row clearing resolves no paths without font handoff data or without a font among the paths', async () => {
+    const f = await poppinsFixture('Batch clearing fast path');
+    await addExistingAsset(f, f.poppins);
+    const count = run => {
+      const original = fs.realpathSync.native;
+      let calls = 0;
+      fs.realpathSync.native = function (...args) { calls += 1; return original.apply(this, args); };
+      try { const result = run(); return { calls, result }; } finally { fs.realpathSync.native = original; }
+    };
+    assert.equal(storedProject(f).fontHandoff, undefined);
+    assert.deepEqual(count(() => metadataTestHooks.clearFontRowExclusionChoicesForTest(f.project.id, [f.poppins, f.image])), { calls: 0, result: 0 }, 'no font handoff: no path work');
+    await rowChoice(f, (await fontRowNamed(f)).key, 'remove');
+    assert.deepEqual(count(() => metadataTestHooks.clearFontRowExclusionChoicesForTest(f.project.id, [f.image])), { calls: 0, result: 0 }, 'no font among the paths: no path work');
+    const cleared = count(() => metadataTestHooks.clearFontRowExclusionChoicesForTest(f.project.id, [f.image, f.poppins]));
+    assert.equal(cleared.result, 1);
+    assert.equal(cleared.calls, 1, 'one path resolved for the one font');
+    // Without font handoff data, Include All Existing writes none.
+    const g = await fixture('No font data');
+    const png = path.join(g.dir, 'Old.png');
+    fs.writeFileSync(png, createSyntheticPngBytes());
+    await addExistingAsset(g, png);
+    await existingDecision(g, 'skip');
+    await existingDecision(g, 'include');
+    assert.equal(storedProject(g).fontHandoff, undefined);
   });
 }

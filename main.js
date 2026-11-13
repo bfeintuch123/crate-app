@@ -8036,6 +8036,12 @@ function setProjectExistingAssetsDecision(projectId, decision) {
         .filter(Boolean)
     );
     const excludedKeys = new Set(project.excludedAssetKeys || []);
+    // Include brings back Existing assets this batch moves from Excluded to
+    // Included; like [+] on one row, that also clears each one's own font-row
+    // Exclude. Assets that were already Included keep their font-row choice.
+    const restoredPaths = decision === 'include' && project.fontHandoff !== undefined
+      ? existingAssets.filter(file => excludedKeys.has(getAssetReviewExclusionKey(file))).map(file => file.path)
+      : null;
     for (const key of existingAssetKeys) {
       if (decision === 'skip') excludedKeys.add(key);
       else excludedKeys.delete(key);
@@ -8093,8 +8099,11 @@ function setProjectExistingAssetsDecision(projectId, decision) {
         if (count > MAX_EXISTING_INCLUDE_EPISODE_OWNERS) {
           file.existingIncludeEpisode = { version: 1, ownersDigest: getExistingIncludeEpisodeDigest(owners), ownerCount: count };
         } else if (count > 0) file.existingIncludeEpisode = { version: 1, owners };
+        // A withheld asset this Include keeps is brought back too.
+        if (restoredPaths && count > 0) restoredPaths.push(file.path);
       }
     }
+    if (restoredPaths) clearFontRowExclusionChoices(project, restoredPaths);
     return { success: true };
   });
 
@@ -23190,14 +23199,28 @@ function includeExplicitlyChosenFontFile(project, sourcePath) {
 // clears that file's own font-row Exclude. Other rows' choices and
 // confirmations are untouched.
 function clearFontRowExclusionChoice(project, filePath) {
-  if (!project || project.fontHandoff === undefined || typeof filePath !== 'string' || !isGatedFontPath(filePath)) return false;
-  const key = getFontRowKey(filePath);
-  if (!key) return false;
-  const handoff = readProjectFontHandoff(project);
-  if (handoff.choices[key] !== 'remove') return false;
-  delete handoff.choices[key];
-  writeProjectFontHandoff(project, handoff);
-  return true;
+  return clearFontRowExclusionChoices(project, [filePath]) > 0;
+}
+
+// The same clearing for several files at once (Include All Existing), reading
+// and writing the font handoff at most once. Without font handoff data, or
+// without a gated font among the paths, no path is resolved.
+function clearFontRowExclusionChoices(project, filePaths) {
+  if (!project || project.fontHandoff === undefined) return 0;
+  const fontPaths = (filePaths || []).filter(filePath => typeof filePath === 'string' && isGatedFontPath(filePath));
+  if (!fontPaths.length) return 0;
+  let handoff = null;
+  let cleared = 0;
+  for (const filePath of fontPaths) {
+    const key = getFontRowKey(filePath);
+    if (!key) continue;
+    handoff ||= readProjectFontHandoff(project);
+    if (handoff.choices[key] !== 'remove') continue;
+    delete handoff.choices[key];
+    cleared += 1;
+  }
+  if (cleared) writeProjectFontHandoff(project, handoff);
+  return cleared;
 }
 
 function getFontRowOrigin(group) {

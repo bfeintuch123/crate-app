@@ -38,6 +38,13 @@ function bootstrap() {
     ];
     B.pending = [...pendingNames.map(name => pendingRow(name)), pendingRow('Saved.png', 'needs-save')];
     B.records = [];
+    // Package Review fonts: one picked font that is included, and one found
+    // font that needs the designer's Include and licence confirmation.
+    B.fonts = [
+      { key: 'a'.repeat(32), fileName: 'Brand-Regular.otf', family: 'Brand', picked: true, needsConfirmation: false, choice: null, confirmed: false, sha256: '1'.repeat(64) },
+      { key: 'b'.repeat(32), fileName: 'Found-Regular.otf', family: 'Found', picked: false, needsConfirmation: true, choice: null, confirmed: false, sha256: '2'.repeat(64) },
+    ];
+    B.reviews = 0;
   };
   B.holdNext = () => { B.hold = new Promise(resolve => { B.release = resolve; }); };
   B.holdNextRemove = () => { B.holdRemove = new Promise(resolve => { B.releaseRemove = resolve; }); };
@@ -56,6 +63,36 @@ function bootstrap() {
     const index = list.findIndex(file => file.visualIdentity === target || file.path === target);
     return index === -1 ? null : list.splice(index, 1)[0];
   };
+  // A small stand-in for the main process font gate (#327): the font-row
+  // Exclude withdraws the pick and the confirmation; a found font needs its own
+  // Include, and an unconfirmed licence its confirmation, before it is included.
+  const FONT_REASONS = {
+    removed: 'You excluded it from this package.',
+    'licence-unknown': 'Crate can\'t tell whether this font\'s licence allows sharing it. Confirm below to include it.',
+    found: 'Found while the project was watched. Crate can\'t tell whether this project uses it.',
+  };
+  const fontRow = font => {
+    const wanted = font.choice !== 'remove' && (font.picked || font.choice === 'include');
+    const [outcome, reason] = font.choice === 'remove' ? ['not-included', 'removed']
+      : wanted && (!font.needsConfirmation || font.confirmed) ? ['included', null]
+        : wanted ? ['needs-confirmation', 'licence-unknown'] : ['not-included', 'found'];
+    const label = font.family + ' Regular';
+    return { key: font.key, fileName: font.fileName, label, collection: false, variable: false, contents: label,
+      faces: [{ family: font.family, style: 'Regular', postscriptName: font.family + '-Regular', version: '1.000', variable: false, instanceCount: 0 }],
+      origin: font.picked ? 'added-file' : 'found', outcome, reason, reasonText: reason ? FONT_REASONS[reason] : '', basis: null,
+      sha256: font.sha256, confirmed: font.confirmed, statementVersion: 'synthetic',
+      statement: font.needsConfirmation ? `My licence for this font file, ${font.fileName}, which contains ${label}, allows me to give it to the people receiving this package.` : null,
+      canConfirm: font.needsConfirmation && reason !== 'removed', canRemove: reason !== 'removed',
+      canInclude: outcome === 'not-included', packageFolder: outcome === 'included' ? 'Fonts' : null };
+  };
+  B.review = () => {
+    const rows = B.fonts.map(fontRow);
+    B.reviews += 1;
+    return { projectId: 'synthetic-controls', token: 'synthetic-review-' + B.reviews, materializable: true, files: [], planSummary: {},
+      workingFileChoices: { version: 1, choices: [] },
+      fonts: { rows, includedCount: rows.filter(row => row.outcome === 'included').length, notIncludedCount: rows.filter(row => row.outcome !== 'included').length } };
+  };
+  const fontByKey = key => B.fonts.find(font => font.key === key);
   window.crate = {
     getProjects: async () => [B.project()],
     getFileVisual: async () => ({ kind: 'fallback' }),
@@ -95,6 +132,25 @@ function bootstrap() {
       if (file) { file.excluded = !file.excluded; file.included = !file.excluded; }
       return clone(B.files);
     },
+    preparePackageReview: async () => B.review(),
+    setFontRowChoice: async (projectId, key, choice) => {
+      B.calls.push(['setFontRowChoice', key, choice]);
+      await gate();
+      const font = fontByKey(key);
+      if (!font) return { error: 'font_not_found' };
+      font.choice = choice;
+      if (choice === 'remove') { font.picked = false; font.confirmed = false; }
+      return { success: true };
+    },
+    confirmFontLicence: async (projectId, key, sha256, confirmed) => {
+      B.calls.push(['confirmFontLicence', key, sha256, confirmed]);
+      await gate();
+      const font = fontByKey(key);
+      if (!font || font.sha256 !== sha256) return { error: 'font_changed' };
+      font.confirmed = confirmed === true;
+      return { success: true };
+    },
+    packageProject: async () => { B.calls.push(['packageProject']); return { success: false, error: 'synthetic_no_package' }; },
   };
   // The production listener wiring (init() itself is not run: it loads the account and IPC).
   let wired = false;
@@ -645,4 +701,105 @@ test('the test fixture keeps a failing body primary when its own fallback cleanu
   await assert.rejects(withOwnedCleanup(async () => 'ok', async () => { throw fallback; }), error => error === fallback);
   assert.equal(await withOwnedCleanup(async () => 'ok', async () => {}), 'ok');
   await assert.rejects(withOwnedCleanup(async () => { throw body; }, async () => {}), error => error === body);
+});
+
+// Package Review font rows (#327, worded Exclude/Include in this PR), opened
+// through the production renderer path with real keyboard and mouse input.
+const fontKeys = { brand: 'a'.repeat(32), found: 'b'.repeat(32) };
+const fontStatus = (page, fileName) => page.evaluate(`(() => {
+  const row = [...document.querySelectorAll('#package-review-font-list .package-review-font-row')]
+    .find(item => item.querySelector('.package-review-font-meta')?.textContent.startsWith(${json(fileName)}));
+  return row ? row.querySelector('.package-review-font-status').textContent : null;
+})()`);
+const reviewMessage = page => page.evaluate("document.querySelector('#modal-package-review-message')?.textContent || ''");
+// Tab inside Package Review from its Back button until the label has focus.
+async function tabInReview(page, label, limit = 60) {
+  await page.evaluate("document.querySelector('#btn-back-package').focus()");
+  for (let step = 0; step < limit; step += 1) {
+    await page.press('Tab');
+    await page.sleep(30);
+    const current = await active(page);
+    assert.notEqual(current, 'BODY', `Tab never drops focus to <body> in Package Review (step ${step})`);
+    if (current === label) return true;
+  }
+  return false;
+}
+
+test('Package Review font rows: keyboard Exclude, Include and licence confirmation; one call per press; disabled in flight; visible at 1100x760', { skip, timeout: 60000 }, async () => {
+  await withPage({ width: 1100, height: 760 }, async page => {
+    await start(page, []);
+    assert.equal(await page.evaluate('showPackageModal({ runPreScan: false })'), true, 'Package Review opens through the renderer');
+    await idle(page);
+    await page.evaluate(settleStyles);
+    const layout = await page.evaluate(`(() => {
+      const modal = document.querySelector('#modal-package');
+      const controls = [...document.querySelectorAll('#package-review-font-list button, #package-review-font-list input')];
+      return { open: !modal.classList.contains('hidden'), pageOverflow: document.documentElement.scrollWidth - innerWidth,
+        controls: controls.map(control => {
+          control.scrollIntoView({ block: 'center' });
+          const r = control.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2, hit = document.elementFromPoint(x, y);
+          const label = control.getAttribute('aria-label') || document.querySelector('label[for="' + control.id + '"]')?.textContent || '';
+          return { label, visible: control.getClientRects().length > 0 && getComputedStyle(control).visibility === 'visible',
+            opacity: getComputedStyle(control).opacity, inViewport: r.left >= 0 && r.right <= innerWidth && r.top >= 0 && r.bottom <= innerHeight,
+            receivesPointer: !!hit && (hit === control || control.contains(hit) || hit.htmlFor === control.id), size: [Math.round(r.width), Math.round(r.height)] };
+        }) };
+    })()`);
+    assert.equal(layout.open, true);
+    assert.ok(layout.pageOverflow <= 0, json(layout));
+    assert.deepEqual(layout.controls.map(control => control.label), ['Exclude Brand-Regular.otf',
+      'My licence for this font file, Found-Regular.otf, which contains Found Regular, allows me to give it to the people receiving this package.',
+      'Include Found-Regular.otf', 'Exclude Found-Regular.otf'], 'accessible names');
+    for (const control of layout.controls) {
+      assert.ok(control.visible && control.opacity === '1' && control.inViewport && control.receivesPointer, `visible and reachable at 1100x760: ${json(control)}`);
+      assert.ok(control.size[0] > 0 && control.size[1] > 0, json(control));
+    }
+    assert.equal(await fontStatus(page, 'Brand-Regular.otf'), 'Included · Fonts folder');
+    assert.equal(await fontStatus(page, 'Found-Regular.otf'), 'Not included');
+    const focusAfter = [];
+
+    // Exclude by Enter: exactly one call; the row reads Excluded and offers Include.
+    assert.equal(await tabInReview(page, 'Exclude Brand-Regular.otf'), true);
+    await pressOnce(page, 'Enter', ['setFontRowChoice', fontKeys.brand, 'remove']);
+    assert.equal(await reviewMessage(page), 'Font excluded.');
+    assert.equal(await fontStatus(page, 'Brand-Regular.otf'), 'Excluded');
+    assert.ok(await page.evaluate("!!window.__button('Include Brand-Regular.otf') && !window.__button('Exclude Brand-Regular.otf')"));
+    focusAfter.push(await active(page));
+
+    // Include by Space on the found font: it needs its confirmation, so it is still not included.
+    assert.equal(await tabInReview(page, 'Include Found-Regular.otf'), true);
+    await pressOnce(page, 'Space', ['setFontRowChoice', fontKeys.found, 'include']);
+    assert.equal(await fontStatus(page, 'Found-Regular.otf'), 'Needs your confirmation');
+    assert.equal(await page.evaluate("document.querySelector('#package-review-fonts-summary').textContent.startsWith('0 font files will be included.')"), true);
+    focusAfter.push(await active(page));
+
+    // The licence checkbox by Space: exactly one confirmation, then included.
+    const box = `package-review-font-confirm-${fontKeys.found}`;
+    assert.equal(await tabInReview(page, box), true);
+    assert.equal(await page.evaluate(`document.getElementById(${json(box)}).checked`), false);
+    await pressOnce(page, 'Space', ['confirmFontLicence', fontKeys.found, '2'.repeat(64), true]);
+    assert.equal(await reviewMessage(page), 'Font confirmed.');
+    assert.equal(await fontStatus(page, 'Found-Regular.otf'), 'Included · Fonts folder');
+    focusAfter.push(await active(page));
+
+    // In flight: every font control is disabled, and a double click makes one call.
+    await page.evaluate('window.__bridge.holdNext()');
+    const before = (await calls(page)).length;
+    await click(page, 'Exclude Found-Regular.otf', 2);
+    await page.sleep(100);
+    assert.equal(await page.evaluate("[...document.querySelectorAll('#package-review-fonts button, #package-review-fonts input')].every(control => control.disabled)"), true,
+      'font controls are disabled while the action is in flight');
+    await page.evaluate('window.__bridge.hold = null; window.__bridge.release()');
+    await idle(page);
+    assert.deepEqual((await calls(page)).slice(before), [['setFontRowChoice', fontKeys.found, 'remove']], 'one call for a double click');
+    assert.equal(await fontStatus(page, 'Found-Regular.otf'), 'Excluded');
+    assert.deepEqual(await page.evaluate("[...document.querySelectorAll('#package-review-font-list button, #package-review-font-list input, #btn-add-installed-fonts, #btn-add-font-files')].filter(control => control.disabled).map(control => control.getAttribute('aria-label') || control.id)"), [],
+      'the font rows and the add buttons are enabled again');
+    focusAfter.push(await active(page));
+    // After each action Package Review refreshes and its existing focus rule
+    // (focusPackageReviewDialog) moves focus to the status message that
+    // announces the result: inside the dialog, never <body>.
+    assert.deepEqual(focusAfter, Array(4).fill('modal-package-review-message'), json(focusAfter));
+    assert.deepEqual(await page.evaluate("(element => [element.getAttribute('role'), element.getAttribute('aria-live'), element.tabIndex])(document.querySelector('#modal-package-review-message'))"),
+      ['status', 'polite', -1]);
+  });
 });
