@@ -1664,6 +1664,41 @@ function cases() {
     }
   });
 
+  // Astra re-check of 8bb31ab: the same Include also applies to an asset
+  // withheld only because its owning working file was excluded.
+  fontTest('F2: Include on a font withheld by its excluded working file clears its font-row Exclude', async () => {
+    const f = await poppinsFixture('Withheld font row exclude');
+    const source = path.join(f.dir, 'Working.ai');
+    writeSyntheticAiFile(source, 'synthetic');
+    storedProject(f).files.push(
+      { path: source, name: 'Working.ai', ext: '.ai', source: 'manual-browse', addedAt: Date.now() },
+      { path: f.poppins, name: 'Poppins-Regular.ttf', ext: '.ttf', source: 'indd-linked', projectRole: 'asset', dependencyOwners: [source], addedAt: Date.now() });
+    const unpicked = await fontRowNamed(f);
+    await pickPoppins(f);
+    const key = (await fontRowNamed(f)).key;
+    assert.equal((await callIpcRaw('fonts:set-row-choice', f.project.id, key, 'remove')).success, true);
+    assert.equal((await fontRowNamed(f)).reason, 'removed');
+    const sourceRow = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(file => file.name === 'Working.ai');
+    assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, sourceRow.visualIdentity,
+      { action: 'exclude', expectedRevision: sourceRow.selectionRevision })).success, true);
+    const before = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(file => file.name === 'Poppins-Regular.ttf');
+    assert.equal(before.excludedSourceOnly, true);
+    assert.equal(before.included, false);
+    assert.ok(!(storedProject(f).excludedAssetKeys || []).includes(f.poppins), 'withheld, not excluded by key');
+    await callIpcRaw('projects:remove-file', f.project.id, f.poppins);
+    const after = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(file => file.name === 'Poppins-Regular.ttf');
+    assert.equal(after.excluded, false);
+    assert.equal(after.included, true);
+    assert.equal(storedProject(f).fontHandoff?.choices[key], undefined, 'the font-row Exclude is cleared');
+    // The font-row Exclude also withdrew the pick (#327), so the row returns to
+    // its state before the pick: this fixture's font was found while watching,
+    // and its font-row Include stays available.
+    const cleared = await fontRowNamed(f);
+    assert.notEqual(cleared.reason, 'removed');
+    assert.deepEqual([cleared.outcome, cleared.reason, cleared.canInclude], [unpicked.outcome, unpicked.reason, unpicked.canInclude]);
+    assert.deepEqual([unpicked.outcome, unpicked.reason, unpicked.canInclude], ['not-included', 'found', true]);
+  });
+
   fontTest('F3: the clearing step of a font pick resolves no paths when nothing is excluded, and still clears when something is', async () => {
     const f = await poppinsFixture('Font pick fast path');
     const folder = path.join(f.dir, 'Many');

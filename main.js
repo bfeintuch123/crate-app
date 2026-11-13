@@ -20761,9 +20761,9 @@ registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileI
             priorExclusions.delete(exclusionKey);
             delete removedFile.individualContentExclusion;
             if (fingerprint) removedFile.individualContentInclude = fingerprint;
-            clearFontRowExclusionChoice(project, removedFile.path);
           }
           if (fact?.excludedSourceOnly === true) removedFile.keptAfterSourceExclusion = true;
+          clearFontRowExclusionChoice(project, removedFile.path);
         } else {
           priorExclusions.add(exclusionKey);
           delete removedFile.individualContentInclude;
