@@ -143,6 +143,17 @@ async function scenario(config) {
         return c.left >= bounds.left - 1 && c.right <= bounds.right + 1;
       });
     });
+    // Asset [+]/[x]: always visible without hover, a 22px box in a 28px button, no hover title.
+    const iconControls = () => cards().filter(row => row.querySelector('.row-icon-button')).slice(0, 6).map(row => {
+      const button = row.querySelector('.row-icon-button'), box = button.querySelector('.row-icon-box');
+      const b = rect(button), x = rect(box), r = rect(row);
+      return getComputedStyle(button).opacity === '1' && getComputedStyle(box).opacity === '1'
+        && getComputedStyle(button).visibility === 'visible'
+        && Math.abs(b.right - b.left - 28) < 0.5 && Math.abs(b.height - 28) < 0.5
+        && Math.abs(x.right - x.left - 22) < 0.5 && Math.abs(x.height - 22) < 0.5
+        && b.left >= r.left - 1 && b.right <= r.right + 1 && b.top >= r.top - 1 && b.bottom <= r.bottom + 1
+        && !button.hasAttribute('title') && /^(Include|Exclude) /.test(button.getAttribute('aria-label') || '');
+    });
     const settle = () => new Promise(resolve => setTimeout(resolve, 100));
     await settle();
     const parentBounds = rect(selected);
@@ -154,6 +165,7 @@ async function scenario(config) {
       viewport: { width: innerWidth, height: innerHeight }, parentBounds, nestedBounds,
       sourceGap: excludedBounds.top - parentBounds.bottom,
       initialCardCount: cards().length, requiredControlsFit: controlsFit(), originItemsFit: originsFit(),
+      iconControls: iconControls(),
       // Virtual overscan may lie outside the scroll viewport; its visible
       // intersection must remain inside the source. Inspect row content too.
       contained: initial.filter(r => !nestedBounds || r.top < nestedBounds.bottom && r.bottom > nestedBounds.top)
@@ -172,7 +184,7 @@ async function scenario(config) {
       sourceSelected: selected.classList.contains('is-selected-source'),
       sourceExcluded: excluded.classList.contains('is-excluded'),
     };
-    const restore = Array.from(excluded.querySelectorAll('button')).find(element => element.textContent === 'Restore');
+    const restore = Array.from(excluded.querySelectorAll('button')).find(element => element.textContent === 'Include');
     restore.scrollIntoView({ block: 'center' });
     const restoreBounds = rect(restore);
     const hit = document.elementFromPoint(
@@ -236,6 +248,9 @@ for (const review of [false, true]) {
           const detail = JSON.stringify(result);
           t.diagnostic(detail);
           assert.ok(result.sourceGap >= 7, detail);
+          // Ordinary nested assets carry the square [x]; every measured one must be visible as specified.
+          if (!required && count > 0) assert.ok(result.iconControls.length > 0, 'iconControls present: ' + detail);
+          assert.ok(result.iconControls.every(Boolean), 'iconControls: ' + detail);
           for (const invariant of ['contained', 'rowHeights', 'contentFits', 'cardNonOverlap', 'restoreHit', 'restoreFocus', 'sourceSelected', 'sourceExcluded', 'requiredControlsFit', 'originItemsFit']) {
             assert.ok(result[invariant], invariant + ': ' + detail);
           }

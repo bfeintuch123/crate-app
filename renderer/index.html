@@ -571,6 +571,17 @@
       justify-self: end;
     }
 
+    /* Needs Review keeps one action column, so badges align with or without [+] [x]. */
+    .asset-review-workspace .missing-asset-grid .pending-file {
+      grid-template-columns: 36px minmax(0, 1fr) auto 58px;
+    }
+
+    .asset-review-workspace .missing-asset-grid .pending-row-actions {
+      grid-column: 4;
+      grid-row: 1;
+      justify-self: end;
+    }
+
     .asset-review-workspace .asset-card-grid .asset-file-row.is-selected,
     .asset-review-workspace .missing-asset-grid .pending-file.is-selected {
       background: #f4f0ed;
@@ -815,8 +826,8 @@
               <div class="asset-review-toolbar" id="asset-review-batch-controls">
                 <p id="asset-review-batch-reason" class="asset-review-guidance hidden" role="status" aria-live="polite"></p>
                 <div class="asset-panel-actions" aria-label="Review Before Packaging controls">
-                  <button type="button" class="asset-batch-button primary" id="btn-include-all-existing" aria-label="Add all assets needing review" aria-describedby="asset-review-batch-reason">Add All</button>
-                  <button type="button" class="asset-batch-button" id="btn-skip-all-existing" aria-label="Skip all assets needing review" aria-describedby="asset-review-batch-reason">Skip All</button>
+                  <button type="button" class="asset-batch-button primary" id="btn-include-all-existing" aria-label="Include 0 assets" aria-describedby="asset-review-batch-reason">Include All (0)</button>
+                  <button type="button" class="asset-batch-button" id="btn-skip-all-existing" aria-label="Exclude 0 assets" aria-describedby="asset-review-batch-reason">Exclude All (0)</button>
                 </div>
               </div>
               <div id="existing-batch-slot"></div>
@@ -1008,7 +1019,7 @@
           <div class="existing-assets-modal-count" id="existing-assets-modal-count"></div>
           <div class="existing-assets-modal-list" id="existing-assets-modal-list" role="list"></div>
           <div class="modal-actions">
-            <button class="modal-btn-secondary" id="btn-skip-existing-assets">Skip existing assets</button>
+            <button class="modal-btn-secondary" id="btn-skip-existing-assets">Exclude existing assets</button>
             <button class="modal-btn-primary" id="btn-include-existing-assets">Include existing assets</button>
           </div>
         </div>

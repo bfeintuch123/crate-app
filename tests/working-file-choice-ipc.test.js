@@ -526,7 +526,8 @@ function cases() {
       assert.equal(buttons.some(item => item.textContent === 'Remove'), false);
       const button = buttons.find(item => item.textContent === action); assert.ok(button, ui.text(row));
       button.click(); assert.equal(await completion, true);
-      assert.equal(calls.at(-1)[2].action, action.toLowerCase());
+      // The visible label is Include; the internal working-source action stays 'restore'.
+      assert.equal(calls.at(-1)[2].action, action === 'Include' ? 'restore' : action.toLowerCase());
       assert.equal(calls.at(-1)[1], file.visualIdentity);
     }
     await click('Exclude');
@@ -548,7 +549,7 @@ function cases() {
     assert.equal(shared.included, true);
     assert.deepEqual(shared.currentWorkingSources.map(item => item.name).sort(), ['A.ai', 'C.ai', 'D.ai', 'Other.ai']);
     const review = await callIpcRaw('projects:prepare-package-review', f.id); assert.ok(review.token, JSON.stringify(review));
-    await click('Restore');
+    await click('Include');
     ws = await f.workspace();
     assert.equal(ws.workingFileChoices.recoveryRequired, false);
     assert.equal(ws.workingFileChoices.remaining, 1);

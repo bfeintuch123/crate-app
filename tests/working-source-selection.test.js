@@ -142,6 +142,9 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
     inferProjectFileRole: file => file?.projectRole,
     getAssetReviewExclusionKey: file => file?.path,
     getAssetReviewContentFingerprint: () => null,
+    // These fixtures have no font handoff data, so the production helper would
+    // return immediately; F2's real behavior is covered by font-handoff-ipc.
+    clearFontRowExclusionChoice: () => false,
     console: { log() {} },
   });
   vm.runInContext(

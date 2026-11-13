@@ -2654,7 +2654,7 @@ function baselineCases() {
       assert.equal(review.materializable, false);
       assert.equal(review.token, undefined);
       assert.equal(review.totalFiles, 0);
-      assert.equal(review.message, 'No files are selected for packaging.');
+      assert.equal(review.message, 'No files are included in the package.');
       assert.equal(fs.existsSync(f.paths[0].source), true);
       assert.equal((await f.current()).files.length, 1);
     } finally { await f.cleanup(); }
@@ -7182,7 +7182,7 @@ function excludedSourceMembershipCases() {
     await refreshFromDocuments(a.f, [{ path: a.docs[0], current: false, links: [a.X] }, { path: a.docs[1], current: true, links: [a.X] }]);
     assert.equal(where(a.f, a.X), 'pending');
     const refused = await a.f.review();
-    assert.equal(refused.materializable, false); assert.equal(refused.message, 'No files are selected for packaging.');
+    assert.equal(refused.materializable, false); assert.equal(refused.message, 'No files are included in the package.');
     const b = await inddProject('Both included', ['MixedW.indd', 'MixedK.indd']);
     await refreshFromDocuments(b.f, [{ path: b.docs[0], current: false, links: [b.X] }, { path: b.docs[1], current: true, links: [b.X] }]);
     assert.equal(where(b.f, b.X), 'files');
@@ -7224,7 +7224,7 @@ function excludedSourceMembershipCases() {
       assert.equal((t.f.current().files.find(row => row.path === t.X) || t.f.current().pendingFiles.find(row => row.path === t.X)).dependencyOwners.length, 3);
       const review = await t.f.review();
       if (expected === 'files') assert.deepEqual(await t.f.written(review), ['Mixed.png', path.basename(t.docs[included])], label);
-      else { assert.equal(review.materializable, false, label); assert.equal(review.message, 'No files are selected for packaging.'); }
+      else { assert.equal(review.materializable, false, label); assert.equal(review.message, 'No files are included in the package.'); }
     }
     // Existing row: X is already a row through K; an excluded W reports it later.
     const e = await inddProject('Existing', ['MixedW.indd', 'MixedK.indd']);
@@ -7603,7 +7603,7 @@ function excludedSourceMembershipCases() {
     baselineTest(`accepted trade-off b (${route}): the per-asset Exclude removes the retained stale asset; Include brings it back`, { timeout: 120000 }, () => withEnv(async () => {
       const s = await staleOwner(route);
       const labels = await rendererButtonsFor(s.f, s.name);
-      assert.ok(labels.includes(`Exclude ${s.name} from this project`), 'the production renderer offers Exclude: ' + JSON.stringify(labels));
+      assert.ok(labels.includes(`Exclude ${s.name}`), 'the production renderer offers Exclude: ' + JSON.stringify(labels));
       await s.f.toggle(s.name);
       let fact = await s.f.fact(s.name);
       assert.deepEqual([fact.included, fact.excluded], [false, true]);
@@ -7628,7 +7628,7 @@ function excludedSourceMembershipCases() {
     assert.equal(fact.includedAsDependency, true);
     const labels = await rendererButtonsFor(f, f.names.newLink);
     assert.ok(labels.some(label => label.startsWith(`Why ${f.names.newLink} is required`)), 'the renderer shows Required asset, not Exclude: ' + JSON.stringify(labels));
-    assert.equal(labels.includes(`Exclude ${f.names.newLink} from this project`), false);
+    assert.equal(labels.includes(`Exclude ${f.names.newLink}`), false);
     await f.toggle(f.names.newLink);                                                                  // the IPC still records an Exclude
     fact = await f.fact(f.names.newLink);
     assert.deepEqual([fact.excluded, fact.included, fact.includedAsDependency], [true, true, true]);
@@ -7664,7 +7664,7 @@ function excludedSourceMembershipCases() {
     assert.deepEqual(written, ['Keep-d.ai', 'KeepSide-d.png', 'LaterNested.png', 'Nested.png', 'Placed.ai']);
     // The per-asset Exclude removes the placed document and what only it links.
     const labels = await rendererButtonsFor(f, 'Placed.ai');
-    assert.ok(labels.includes('Exclude Placed.ai from this project'), JSON.stringify(labels));
+    assert.ok(labels.includes('Exclude Placed.ai'), JSON.stringify(labels));
     await f.toggle('Placed.ai');
     for (const name of ['Nested.png', 'LaterNested.png']) {
       const fact = await f.fact(name);

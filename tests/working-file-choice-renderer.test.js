@@ -241,7 +241,7 @@ test('picker approved decision is in B row on both surfaces; authoritative repla
       assert.deepEqual(Array.from(rows,row=>row.dataset.renderKey),['visual:B','visual:C','visual:A']);
       assert.ok(rows[0].classList.contains('is-selected-source'));assert.ok(rows[2].matches('.is-excluded'));
       assert.equal(rows[2].classList.contains('is-selected-source'),false);
-      assert.ok(choiceTree(rows[2]).some(el=>el.tagName==='BUTTON'&&el.textContent==='Restore'));
+      assert.ok(choiceTree(rows[2]).some(el=>el.tagName==='BUTTON'&&el.textContent==='Include'));
       assert.ok(rows[0].querySelector('.working-source-assets'));
       assert.equal(choiceButtons(rows[0]).length,0);
     }

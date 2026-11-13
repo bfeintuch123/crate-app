@@ -537,7 +537,7 @@ test('v14 recovery displays blocked status, dependency obligation, labeled contr
   vm.runInContext("state.packageReviewToken = 'old-token'", f.renderer);
   button.focus(); const pending = f.activate('Exclude');
   assert.equal(button.disabled, true); assert.equal(f.document.activeElement.getAttribute('role'), 'status');
-  assert.equal(await f.activate('Restore'), false); assert.equal(f.calls.length, 1);
+  assert.equal(await f.activate('Include'), false); assert.equal(f.calls.length, 1);
   assert.deepEqual(clone(f.calls[0]), [f.project.id, 'owned-source', { action: 'exclude', expectedRevision: 3 }]);
   assert.equal(await f.renderer.showPackageModal({ runPreScan: false }), false);
   gate.resolve({ success: false, error: 'working_source_selection_stale' }); await pending;
@@ -556,8 +556,8 @@ for (const [name, change] of [
 
 test('v14 missing A only offers the projected Exclude; duplicate identity and foreign workspace offer no action', async () => {
   const f = await recoverySetup({ selectionRecovery: { version: 1, reason: 'continuation-identity-changed', expectedRevision: 3, actions: ['exclude'] } });
-  assert.ok(buttonFor(f.recoveryRow(), 'Exclude')); assert.equal(buttonFor(f.recoveryRow(), 'Restore'), undefined);
-  assert.match(getElementTreeText(f.recoveryRow()), /Verify the saved file to restore/);
+  assert.ok(buttonFor(f.recoveryRow(), 'Exclude')); assert.equal(buttonFor(f.recoveryRow(), 'Include'), undefined);
+  assert.match(getElementTreeText(f.recoveryRow()), /Verify the saved file to include it/);
   f.workspace.pendingFiles.push(clone(f.row)); await f.renderer.renderFiles();
   assert.equal(buttonFor(f.recoveryRow(), 'Exclude'), undefined);
   f.workspace.projectId = 'foreign'; await f.renderer.renderFiles();
@@ -1424,3 +1424,17 @@ for (const surface of ['working-assets-list', 'project-file-list']) {
     });
   }
 }
+
+test('recovery Include says "Including the working-file role…", sends the unchanged restore action and refuses a second press', async () => {
+  const f = await recoverySetup();
+  const row = f.recoveryRow(), include = buttonFor(row, 'Include'), gate = deferred();
+  assert.match(include.getAttribute('aria-label'), /^Include Original\.ai as a working file$/);
+  f.crate.setWorkingSourceSelection = async (...args) => { f.calls.push(args); return gate.promise; };
+  const pending = f.activate('Include');
+  assert.match(getElementTreeText(row), /Including the working-file role…/);
+  assert.equal(include.disabled, true);
+  assert.equal(await f.activate('Include'), false, 'a second press is ignored');
+  assert.equal(f.calls.length, 1);
+  assert.deepEqual(clone(f.calls[0]), [f.project.id, 'owned-source', { action: 'restore', expectedRevision: 3 }]);
+  gate.resolve({ success: false, error: 'working_source_selection_stale' }); await pending;
+});

@@ -4908,6 +4908,7 @@ test('Existing Assets native notice is once-only, private, background-only and c
     const notification = nativeNotifications.at(-1);
     assert.equal(notification.shown, 1);
     assert.equal(notification.options.title, 'Crate — Existing assets found');
+    assert.equal(notification.options.body, 'Choose whether to include or exclude existing assets. Click to review in Crate.');
     assert.doesNotMatch(JSON.stringify(notification.options), /Private project|FIG22|Initial 0|https:/);
     nextFigmaScanResult = existingDecisionSnapshot(3);
     await callIpc('figma:scan-project', project.id);

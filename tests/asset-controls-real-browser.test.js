@@ -1,0 +1,884 @@
+'use strict';
+
+// Real Chrome, real production markup/styles/renderer, real keyboard and mouse
+// input over CDP. Only the IPC bridge is synthetic (in-page, stateful), so these
+// checks prove what the browser does with the buttons: Tab order, Enter/Space
+// activation, focus after a row leaves, disabled state while an action is in
+// flight, and the always-visible square controls at the desktop sizes.
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+const { findBrowser, launch, withBrowserPage } = require('./asset-controls-cdp-helper');
+
+const fs = require('node:fs');
+const os = require('node:os');
+const childProcess = require('node:child_process');
+const browser = findBrowser();
+const rendererDir = path.join(__dirname, '..', 'renderer');
+const skip = browser ? false : 'Chrome/Chromium unavailable: rendered checks NOT RUN';
+
+// Serialized into the page. Renderer globals (state, renderFiles, ...) come from app.js.
+function bootstrap() {
+  const B = window.__bridge = { calls: [], hold: null, release: null, holdRemove: null, releaseRemove: null, fail: null, inflight: 0 };
+  const clone = value => JSON.parse(JSON.stringify(value));
+  const id = name => 'id-' + name;
+  const pendingRow = (name, captureState = 'pending') => ({ path: '/synthetic/' + name, name, ext: '.png', captureState,
+    captureEvidence: { appFamily: 'indesign' }, visualIdentity: id(name) });
+  const asset = (name, extra = {}) => ({ name, path: '/synthetic/' + name, ext: '.png', projectRole: 'asset', assetOrigin: 'added',
+    included: true, excluded: false, visualIdentity: id(name), visualRevision: 'v1', ...extra });
+  B.reset = pendingNames => {
+    Object.assign(B, { calls: [], hold: null, release: null, holdRemove: null, releaseRemove: null, fail: null, inflight: 0 });
+    B.files = [
+      { name: 'Brochure.indd', path: '/synthetic/Brochure.indd', ext: '.indd', projectRole: 'source', protectedSource: true,
+        sourceSelection: 'selected', selectionRevision: 1, included: true, verificationStatus: 'scanned', verificationRequired: true,
+        visualIdentity: 'source-brochure', visualRevision: 'v1', appFamily: 'indesign' },
+      asset('Placed.png', { currentWorkingSources: [{ identity: 'source-brochure', name: 'Brochure.indd' }] }),
+      asset('Standalone.png'),
+      asset('Excluded.png', { assetOrigin: 'existing', included: false, excluded: true }),
+    ];
+    B.pending = [...pendingNames.map(name => pendingRow(name)), pendingRow('Saved.png', 'needs-save')];
+    B.records = [];
+    // Package Review fonts: one picked font that is included, and one found
+    // font that needs the designer's Include and licence confirmation.
+    B.fonts = [
+      { key: 'a'.repeat(32), fileName: 'Brand-Regular.otf', family: 'Brand', picked: true, needsConfirmation: false, choice: null, confirmed: false, sha256: '1'.repeat(64) },
+      { key: 'b'.repeat(32), fileName: 'Found-Regular.otf', family: 'Found', picked: false, needsConfirmation: true, choice: null, confirmed: false, sha256: '2'.repeat(64) },
+    ];
+    B.reviews = 0;
+  };
+  B.holdNext = () => { B.hold = new Promise(resolve => { B.release = resolve; }); };
+  B.holdNextRemove = () => { B.holdRemove = new Promise(resolve => { B.releaseRemove = resolve; }); };
+  const gate = async () => {
+    B.inflight += 1;
+    try {
+      if (B.hold) await B.hold;
+      if (B.fail) { const message = B.fail; B.fail = null; throw new Error(message); }
+    } finally { B.inflight -= 1; }
+  };
+  B.project = () => ({ id: 'synthetic-controls', name: 'Synthetic', type: 'branding', status: 'paused',
+    files: clone(B.files), pendingFiles: clone(B.pending),
+    excludedAssetKeys: [...B.records, ...B.files.filter(file => file.excluded)].map(file => file.path),
+    assetBaseline: { status: 'included', decision: 'include' } });
+  const take = (list, target) => {
+    const index = list.findIndex(file => file.visualIdentity === target || file.path === target);
+    return index === -1 ? null : list.splice(index, 1)[0];
+  };
+  // A small stand-in for the main process font gate (#327): the font-row
+  // Exclude withdraws the pick and the confirmation; a found font needs its own
+  // Include, and an unconfirmed licence its confirmation, before it is included.
+  const FONT_REASONS = {
+    removed: 'You excluded it from this package.',
+    'licence-unknown': 'Crate can\'t tell whether this font\'s licence allows sharing it. Confirm below to include it.',
+    found: 'Found while the project was watched. Crate can\'t tell whether this project uses it.',
+  };
+  const fontRow = font => {
+    const wanted = font.choice !== 'remove' && (font.picked || font.choice === 'include');
+    const [outcome, reason] = font.choice === 'remove' ? ['not-included', 'removed']
+      : wanted && (!font.needsConfirmation || font.confirmed) ? ['included', null]
+        : wanted ? ['needs-confirmation', 'licence-unknown'] : ['not-included', 'found'];
+    const label = font.family + ' Regular';
+    return { key: font.key, fileName: font.fileName, label, collection: false, variable: false, contents: label,
+      faces: [{ family: font.family, style: 'Regular', postscriptName: font.family + '-Regular', version: '1.000', variable: false, instanceCount: 0 }],
+      origin: font.picked ? 'added-file' : 'found', outcome, reason, reasonText: reason ? FONT_REASONS[reason] : '', basis: null,
+      sha256: font.sha256, confirmed: font.confirmed, statementVersion: 'synthetic',
+      statement: font.needsConfirmation ? `My licence for this font file, ${font.fileName}, which contains ${label}, allows me to give it to the people receiving this package.` : null,
+      canConfirm: font.needsConfirmation && reason !== 'removed', canRemove: reason !== 'removed',
+      canInclude: outcome === 'not-included', packageFolder: outcome === 'included' ? 'Fonts' : null };
+  };
+  B.review = () => {
+    const rows = B.fonts.map(fontRow);
+    B.reviews += 1;
+    return { projectId: 'synthetic-controls', token: 'synthetic-review-' + B.reviews, materializable: true, files: [], planSummary: {},
+      workingFileChoices: { version: 1, choices: [] },
+      fonts: { rows, includedCount: rows.filter(row => row.outcome === 'included').length, notIncludedCount: rows.filter(row => row.outcome !== 'included').length } };
+  };
+  const fontByKey = key => B.fonts.find(font => font.key === key);
+  window.crate = {
+    getProjects: async () => [B.project()],
+    getFileVisual: async () => ({ kind: 'fallback' }),
+    getAssetWorkspace: async projectId => ({
+      projectId,
+      files: clone(B.files),
+      pendingFiles: B.pending.map((file, sourceIndex) => ({ name: file.name, ext: file.ext, visualIdentity: file.visualIdentity,
+        visualRevision: 'v1', sourceIndex })),
+      excludedPendingFiles: B.records.map(file => ({ name: file.name, ext: file.ext, assetOrigin: 'added', projectRole: 'asset',
+        protectedSource: false, included: false, excluded: true, excludedPending: true, visualIdentity: file.visualIdentity, visualRevision: null })),
+      workingFileChoices: { version: 1, choices: [] },
+      semanticCounts: { includedAssets: B.files.filter(file => file.projectRole === 'asset' && file.included).length,
+        selectedWorkingSources: 1, excludedWorkingSources: 0, invalidWorkingSources: 0,
+        excludedAssets: B.files.filter(file => file.excluded).length },
+    }),
+    acceptPending: async (projectId, target) => {
+      B.calls.push(['acceptPending', target]);
+      await gate();
+      if (B.refuseAccept) { B.refuseAccept = false; return null; }
+      const row = take(B.pending, target) || take(B.records, target);
+      if (!row) return null;
+      B.files.push(asset(row.name));
+      return { files: clone(B.files), pendingFiles: clone(B.pending) };
+    },
+    rejectPending: async (projectId, target) => {
+      B.calls.push(['rejectPending', target]);
+      await gate();
+      const row = take(B.pending, target);
+      if (row) B.records.push(row);
+      return clone(B.pending);
+    },
+    removeFile: async (projectId, identity) => {
+      B.calls.push(['removeFile', identity]);
+      B.inflight += 1;
+      try { if (B.holdRemove) await B.holdRemove; } finally { B.inflight -= 1; }
+      const file = B.files.find(item => item.visualIdentity === identity);
+      if (file) { file.excluded = !file.excluded; file.included = !file.excluded; }
+      return clone(B.files);
+    },
+    preparePackageReview: async () => B.review(),
+    setFontRowChoice: async (projectId, key, choice) => {
+      B.calls.push(['setFontRowChoice', key, choice]);
+      await gate();
+      const font = fontByKey(key);
+      if (!font) return { error: 'font_not_found' };
+      font.choice = choice;
+      if (choice === 'remove') { font.picked = false; font.confirmed = false; }
+      return { success: true };
+    },
+    confirmFontLicence: async (projectId, key, sha256, confirmed) => {
+      B.calls.push(['confirmFontLicence', key, sha256, confirmed]);
+      await gate();
+      const font = fontByKey(key);
+      if (!font || font.sha256 !== sha256) return { error: 'font_changed' };
+      font.confirmed = confirmed === true;
+      return { success: true };
+    },
+    packageProject: async () => { B.calls.push(['packageProject']); return { success: false, error: 'synthetic_no_package' }; },
+  };
+  // The production listener wiring (init() itself is not run: it loads the account and IPC).
+  let wired = false;
+  window.__start = async pendingNames => {
+    if (!wired) { setupEventListeners(); wired = true; }
+    B.reset(pendingNames);
+    accountStatus = { revision: 1, state: 'signed_in', canUseWorkspace: true, identity: { id: 'synthetic' }, message: '' };
+    renderAccount();
+    document.querySelector('#tab-projects').classList.remove('active');
+    document.querySelector('#tab-current-project').classList.add('active');
+    state.projects = [B.project()];
+    state.selectedProjectId = 'synthetic-controls';
+    await renderFiles();
+    openAssetReviewWorkspace();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    return true;
+  };
+  window.__idle = async () => {
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      if (B.inflight === 0 && rendererActionsInFlight.size === 0 && !B.hold && !B.holdRemove) {
+        await new Promise(resolve => setTimeout(resolve, 150));
+        if (B.inflight === 0 && rendererActionsInFlight.size === 0) return true;
+      }
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    return false;
+  };
+  window.__label = element => !element ? null : element === document.body ? 'BODY'
+    : (element.getAttribute('aria-label') || element.id || element.tagName);
+  window.__button = label => Array.from(document.querySelectorAll('button')).find(button => button.getAttribute('aria-label') === label) || null;
+  window.__centerOf = selector => {
+    const element = document.querySelector(selector);
+    if (!element) return null;
+    element.scrollIntoView({ block: 'center' });
+    const rect = element.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, hit: true };
+  };
+  window.__center = label => {
+    const button = window.__button(label);
+    if (!button) return null;
+    button.scrollIntoView({ block: 'center' });
+    const rect = button.getBoundingClientRect();
+    const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
+    const hit = document.elementFromPoint(x, y);
+    return { x, y, hit: !!hit && (hit === button || button.contains(hit)) };
+  };
+}
+
+const json = value => JSON.stringify(value);
+function withPage(options, run) {
+  return withBrowserPage({ browser, rendererDir, bootstrapSource: `(${bootstrap.toString()})();`, ...options }, run);
+}
+async function start(page, names) {
+  assert.equal(await page.evaluate(`window.__start(${json(names)})`), true);
+}
+const active = page => page.evaluate('window.__label(document.activeElement)');
+const idle = async page => assert.equal(await page.evaluate('window.__idle()'), true, 'actions settle');
+const toast = page => page.evaluate("document.querySelector('#toast-message')?.textContent || ''");
+const calls = page => page.evaluate('window.__bridge.calls');
+// Press a key on the focused control and require exactly one bridge call, the expected one.
+async function pressOnce(page, key, expected) {
+  const before = (await calls(page)).length;
+  await page.press(key);
+  await idle(page);
+  const after = await calls(page);
+  assert.deepEqual(after.slice(before), [expected], `exactly one call for ${key}`);
+}
+async function clickSelector(page, selector) {
+  const point = await page.evaluate(`window.__centerOf(${json(selector)})`);
+  assert.ok(point, selector);
+  await page.clickAt(point.x, point.y);
+  await page.sleep(100);
+}
+async function click(page, label, count = 1) {
+  const point = await page.evaluate(`window.__center(${json(label)})`);
+  assert.ok(point, `button ${label} is mounted`);
+  assert.ok(point.hit, `button ${label} receives the pointer`);
+  await page.clickAt(point.x, point.y, 1);
+  if (count === 2) await page.clickAt(point.x, point.y, 2);
+}
+// Tab at a human pace: a virtual list re-mounts rows on the scroll that focus causes.
+async function tabTo(page, label, limit = 120, visited = null) {
+  await page.evaluate("document.querySelector('#asset-review-search').focus()");
+  for (let step = 0; step < limit; step += 1) {
+    await page.press('Tab');
+    await page.sleep(40);
+    const current = await active(page);
+    visited?.add(current);
+    assert.notEqual(current, 'BODY', `Tab never drops focus to <body> (step ${step}, after ${json([...(visited || [])].slice(-3))})`);
+    if (current === label) return true;
+  }
+  return false;
+}
+
+// CI's macOS runner reports prefers-reduced-motion: reduce, where Crate's
+// 0.01ms transitions make a same-task style read return the transition's start
+// value. Settle every running animation before measuring the final style.
+const settleStyles = "document.getAnimations().forEach(animation => animation.finish())";
+
+test('rendered [+]/[x]: always visible 22px box in a 28px target, no hover title, no clipping or overflow, visible focus ring', { skip, timeout: 90000 }, async () => {
+  for (const [width, height, reducedMotion] of [[1100, 760, false], [1440, 900, false], [1100, 760, true], [1440, 900, true]]) {
+    await withPage({ width, height }, async page => {
+      await page.emulateReducedMotion(reducedMotion);
+      assert.equal(await page.evaluate("matchMedia('(prefers-reduced-motion: reduce)').matches"), reducedMotion);
+      await start(page, ['Alpha.png', 'Beta.png']);
+      await page.moveAway();
+      // Make one remembered exclusion so the Excluded-record [+] is measured too.
+      await page.evaluate("window.crate.rejectPending('synthetic-controls', 'id-Beta.png').then(async () => { state.projects = await window.crate.getProjects(); await renderFiles(); })");
+      await idle(page);
+      for (const review of [true, false]) {
+        await page.evaluate(review ? 'openAssetReviewWorkspace()' : 'closeAssetReviewWorkspace()');
+        await page.sleep(150);
+        await page.evaluate(settleStyles);
+        const metrics = await page.evaluate(`(() => {
+          const visible = element => element.getClientRects().length > 0 && !element.closest('.hidden, .filtered-out');
+          const buttons = Array.from(document.querySelectorAll('.row-icon-button')).filter(visible);
+          const rect = element => element.getBoundingClientRect();
+          return {
+            labels: buttons.map(button => button.getAttribute('aria-label')),
+            cardGrid: buttons.some(button => button.closest('.asset-card-grid')),
+            virtual: buttons.some(button => button.closest('.asset-virtual-list')),
+            pageOverflow: document.documentElement.scrollWidth - innerWidth,
+            checks: buttons.map(button => {
+              const box = button.querySelector('.row-icon-box'), b = rect(button), x = rect(box);
+              const row = button.closest('[data-render-key]') || button.parentElement, r = rect(row);
+              const list = row.parentElement;
+              return {
+                label: button.getAttribute('aria-label'),
+                opacity: [getComputedStyle(button).opacity, getComputedStyle(box).opacity],
+                visibility: getComputedStyle(button).visibility,
+                target: [Math.round(b.width * 10) / 10, Math.round(b.height * 10) / 10],
+                box: [Math.round(x.width * 10) / 10, Math.round(x.height * 10) / 10],
+                insideRow: b.left >= r.left - 1 && b.right <= r.right + 1 && b.top >= r.top - 1 && b.bottom <= r.bottom + 1,
+                rowOverflow: row.scrollWidth - row.clientWidth,
+                listOverflow: list ? list.scrollWidth - list.clientWidth : 0,
+                title: button.hasAttribute('title'),
+                position: getComputedStyle(button).position,
+              };
+            }),
+          };
+        })()`);
+        const where = `${width}x${height} ${reducedMotion ? 'reduced motion ' : ''}${review ? 'review' : 'dashboard'}: ${json(metrics)}`;
+        assert.ok(metrics.checks.length > 0, where);
+        assert.ok(metrics.pageOverflow <= 0, `no horizontal page overflow ${where}`);
+        for (const check of metrics.checks) {
+          assert.deepEqual(check.opacity, ['1', '1'], `opacity 1 without hover ${where}`);
+          assert.equal(check.visibility, 'visible', where);
+          assert.deepEqual(check.target, [28, 28], `28px target ${where}`);
+          assert.deepEqual(check.box, [22, 22], `22px box ${where}`);
+          assert.ok(check.insideRow, `no clipping ${where}`);
+          assert.ok(check.rowOverflow <= 1 && check.listOverflow <= 1, `no overflow ${where}`);
+          assert.equal(check.title, false, `no hover title ${where}`);
+          // The legacy absolutely positioned card-grid rule is overridden in every rendered layout.
+          assert.equal(check.position, 'static', `in-flow control ${where}`);
+        }
+        if (review) {
+          assert.ok(metrics.virtual, `virtual-list layout measured ${where}`);
+          for (const label of ['Include Alpha.png', 'Exclude Alpha.png', 'Exclude Placed.png', 'Exclude Standalone.png', 'Include Excluded.png', 'Include Beta.png']) {
+            assert.ok(metrics.labels.includes(label), `${label} ${where}`);
+          }
+        } else {
+          assert.ok(metrics.cardGrid, `card-grid layout measured ${where}`);
+        }
+      }
+      // A keyboard-focused control shows the 2px black ring at 2px offset on its visible box.
+      await page.evaluate('openAssetReviewWorkspace()');
+      assert.equal(await tabTo(page, 'Exclude Alpha.png'), true, 'Tab reaches the [x]');
+      await page.evaluate(settleStyles);
+      const ring = await page.evaluate(`(() => { const box = document.activeElement.querySelector('.row-icon-box'), style = getComputedStyle(box);
+        return [style.outlineStyle, style.outlineWidth, style.outlineColor, style.outlineOffset, document.activeElement.matches(':focus-visible')]; })()`);
+      assert.deepEqual(ring, ['solid', '2px', 'rgb(17, 17, 17)', '2px', true], `${width}x${height}${reducedMotion ? ' reduced motion' : ''}`);
+    });
+  }
+});
+
+test('keyboard: Tab reaches every [+], [x] and batch button; Enter and Space press them; focus moves to the next row, then the heading, never <body>', { skip, timeout: 60000 }, async () => {
+  await withPage({}, async page => {
+    await start(page, ['Alpha.png', 'Beta.png', 'Gamma.png']);
+    await page.evaluate("document.querySelector('#asset-review-search').focus()");
+    const reached = new Set();
+    for (let step = 0; step < 120; step += 1) {
+      await page.press('Tab');
+      reached.add(await active(page));
+    }
+    for (const label of ['Include 3 assets', 'Exclude 3 assets', 'Include Alpha.png', 'Exclude Alpha.png', 'Include Beta.png', 'Exclude Beta.png',
+      'Include Gamma.png', 'Exclude Gamma.png', 'Exclude Placed.png', 'Exclude Standalone.png', 'Include Excluded.png']) {
+      assert.ok(reached.has(label), `Tab reaches ${label}: ${json([...reached])}`);
+    }
+    assert.equal(await page.evaluate("window.__button('Include Saved.png') || window.__button('Exclude Saved.png')"), null, 'Needs Save rows have no buttons');
+
+    assert.equal(await tabTo(page, 'Exclude Alpha.png'), true);
+    await pressOnce(page, 'Enter', ['rejectPending', 'id-Alpha.png']);
+    assert.equal(await toast(page), 'Alpha.png excluded');
+    assert.equal(await active(page), 'Exclude Beta.png', 'focus moves to the same button on the next row');
+
+    await pressOnce(page, 'Space', ['rejectPending', 'id-Beta.png']);
+    assert.equal(await active(page), 'Exclude Gamma.png');
+
+    await pressOnce(page, 'Enter', ['rejectPending', 'id-Gamma.png']);
+    assert.equal(await active(page), 'pending-header', 'no rows with [x] left: focus moves to the Needs Review title');
+    assert.notEqual(await active(page), 'BODY');
+
+    // Remembered exclusion [+] in the Added list: Space includes it through accept and focus stays on that row's new [x].
+    assert.equal(await tabTo(page, 'Include Alpha.png'), true);
+    await pressOnce(page, 'Space', ['acceptPending', 'id-Alpha.png']);
+    assert.equal(await toast(page), 'Alpha.png included');
+    assert.equal(await active(page), 'Exclude Alpha.png');
+
+    // Included asset [x] by Enter: focus moves to the same row's [+].
+    assert.equal(await tabTo(page, 'Exclude Standalone.png'), true);
+    await pressOnce(page, 'Enter', ['removeFile', 'id-Standalone.png']);
+    assert.equal(await active(page), 'Include Standalone.png');
+    assert.equal(await toast(page), 'Standalone.png excluded');
+
+    // Excluded asset [+] by Space: one toggle, focus moves to the same row's [x].
+    assert.equal(await tabTo(page, 'Include Excluded.png'), true);
+    await pressOnce(page, 'Space', ['removeFile', 'id-Excluded.png']);
+    assert.equal(await active(page), 'Exclude Excluded.png');
+    assert.equal(await toast(page), 'Excluded.png included');
+
+    // Batch buttons by keyboard: Exclude All (N) by Enter, then the hidden-at-0 state.
+    await page.evaluate(`(async () => {
+      window.__bridge.pending.unshift(...['Delta.png', 'Epsilon.png'].map(name => ({ path: '/synthetic/' + name, name, ext: '.png',
+        captureState: 'pending', captureEvidence: { appFamily: 'indesign' }, visualIdentity: 'id-' + name })));
+      state.projects = await window.crate.getProjects(); await renderFiles();
+    })()`);
+    assert.equal(await tabTo(page, 'Exclude 2 assets'), true);
+    const beforeBatch = (await calls(page)).length;
+    await page.press('Enter');
+    await idle(page);
+    assert.deepEqual((await calls(page)).slice(beforeBatch), [['rejectPending', 'id-Delta.png'], ['rejectPending', 'id-Epsilon.png']],
+      'one press runs the batch once over exactly its rows');
+    assert.equal(await toast(page), '2 assets excluded');
+    assert.deepEqual(await page.evaluate("['#btn-include-all-existing', '#btn-skip-all-existing'].map(id => document.querySelector(id).classList.contains('hidden'))"), [true, true]);
+    assert.equal(await active(page), 'pending-header', 'the batch button hid itself at 0: focus moves to the Needs Review title, not <body>');
+  });
+});
+
+test('in flight: row, record and batch controls are disabled, double clicks are ignored, and all re-enable after success or failure', { skip, timeout: 60000 }, async () => {
+  await withPage({}, async page => {
+    await start(page, ['Alpha.png', 'Beta.png', 'Gamma.png', 'Delta.png', 'Epsilon.png']);
+    await click(page, 'Exclude Alpha.png'); await idle(page);
+    await click(page, 'Exclude Beta.png'); await idle(page);
+    const controls = `(() => ({
+      rows: Array.from(document.querySelectorAll('.pending-row-action')).filter(button => button.getClientRects().length).map(button => [button.getAttribute('aria-label'), button.disabled]),
+      batch: ['#btn-include-all-existing', '#btn-skip-all-existing'].map(id => { const button = document.querySelector(id);
+        return [button.textContent, button.disabled, button.getAttribute('aria-busy'), button.classList.contains('hidden')]; }),
+    }))()`;
+
+    // Include a remembered exclusion while the bridge is held.
+    await page.evaluate('window.__bridge.holdNext()');
+    await click(page, 'Include Alpha.png');
+    await page.sleep(100);
+    let held = await page.evaluate(controls);
+    assert.ok(held.rows.length >= 7, json(held));
+    assert.ok(held.rows.every(([, disabled]) => disabled), `every row and record control is disabled: ${json(held)}`);
+    assert.ok(held.batch.every(([, disabled]) => disabled), json(held));
+    await click(page, 'Exclude Gamma.png', 2);
+    await click(page, 'Include Beta.png', 2);
+    await page.press('Enter');
+    assert.deepEqual(await page.evaluate('window.__bridge.calls.slice(2)'), [['acceptPending', 'id-Alpha.png']], 'nothing else is submitted');
+    await page.evaluate('(() => { const release = window.__bridge.release; window.__bridge.hold = null; release(); })()');
+    await idle(page);
+    let after = await page.evaluate(controls);
+    assert.ok(after.rows.every(([, disabled]) => !disabled), `re-enabled after success: ${json(after)}`);
+    assert.equal(await toast(page), 'Alpha.png included');
+
+    // A failing row decision re-enables everything and keeps the row.
+    await page.evaluate("window.__bridge.fail = 'synthetic failure'");
+    await click(page, 'Exclude Gamma.png');
+    await idle(page);
+    assert.equal(await toast(page), 'Crate could not exclude Gamma.png. Try again.');
+    after = await page.evaluate(controls);
+    assert.ok(after.rows.some(([label]) => label === 'Exclude Gamma.png'), json(after));
+    assert.ok(after.rows.every(([, disabled]) => !disabled), `re-enabled after failure: ${json(after)}`);
+    assert.ok(after.batch.every(([, disabled, , hidden]) => !disabled && !hidden), json(after));
+
+    // Include All (3) while held: one request at a time, every control disabled and busy, double click ignored.
+    const before = (await page.evaluate('window.__bridge.calls')).length;
+    await page.evaluate('window.__bridge.holdNext()');
+    await click(page, 'Include 3 assets', 2);
+    await page.sleep(100);
+    held = await page.evaluate(controls);
+    assert.ok(held.rows.every(([, disabled]) => disabled), json(held));
+    assert.deepEqual(held.batch.map(([, disabled, busy]) => [disabled, busy]), [[true, 'true'], [true, 'true']], json(held));
+    assert.equal((await page.evaluate('window.__bridge.calls')).length, before + 1, 'the double click starts one batch');
+    await page.evaluate('(() => { const release = window.__bridge.release; window.__bridge.hold = null; release(); })()');
+    await idle(page);
+    assert.equal(await toast(page), '3 assets included');
+    assert.deepEqual((await page.evaluate('window.__bridge.calls')).slice(before).map(([action]) => action), ['acceptPending', 'acceptPending', 'acceptPending']);
+    after = await page.evaluate(controls);
+    assert.ok(after.batch.every(([, , , hidden]) => hidden), `hidden at 0: ${json(after)}`);
+    assert.ok(after.rows.every(([, disabled]) => !disabled), json(after));
+
+    // Included asset [x] while held: disabled, a double click sends one toggle, then the new [+] is usable.
+    const removes = (await page.evaluate('window.__bridge.calls')).filter(([action]) => action === 'removeFile').length;
+    await page.evaluate('window.__bridge.holdNextRemove()');
+    await click(page, 'Exclude Standalone.png');
+    await page.sleep(100);
+    assert.equal(await page.evaluate("window.__button('Exclude Standalone.png').disabled"), true);
+    await click(page, 'Exclude Standalone.png', 2);
+    assert.equal((await page.evaluate('window.__bridge.calls')).filter(([action]) => action === 'removeFile').length, removes + 1);
+    await page.evaluate('(() => { const release = window.__bridge.releaseRemove; window.__bridge.holdRemove = null; release(); })()');
+    await idle(page);
+    assert.equal(await toast(page), 'Standalone.png excluded');
+    assert.equal(await page.evaluate("window.__button('Include Standalone.png').disabled"), false);
+  });
+});
+
+test('virtual list boundary and filtered views: one call per key, focus follows to the next row, the filtered last row and remembered rows fall back to a heading', { skip, timeout: 120000 }, async () => {
+  await withPage({}, async page => {
+    const names = Array.from({ length: 40 }, (_, index) => `Asset_${String(index + 1).padStart(2, '0')}.png`);
+    await start(page, names);
+    const mounted = await page.evaluate("document.querySelectorAll('#pending-file-list .pending-file').length");
+    assert.ok(mounted < 41, `the 40-row list is virtualized (${mounted} rows mounted)`);
+    // Tab reaches every row's [+] and [x] across the virtual mount boundary, never dropping to <body>.
+    const visited = new Set();
+    assert.equal(await tabTo(page, 'Exclude Asset_40.png', 200, visited), true);
+    for (const name of names) {
+      assert.ok(visited.has('Include ' + name) && visited.has('Exclude ' + name), `Tab reaches both buttons of ${name}`);
+    }
+    // Deep in the list, each Enter removes exactly one row and focus follows to the next row.
+    assert.equal(await tabTo(page, 'Exclude Asset_30.png', 200), true);
+    for (const next of ['Asset_31.png', 'Asset_32.png', 'Asset_33.png']) {
+      const current = await active(page);
+      await pressOnce(page, 'Enter', ['rejectPending', 'id-' + current.replace('Exclude ', '')]);
+      assert.equal(await active(page), 'Exclude ' + next);
+      assert.equal(await page.evaluate(`(() => { const list = document.querySelector('#pending-file-list').getBoundingClientRect();
+        const box = document.activeElement.getBoundingClientRect(); return box.top >= list.top - 1 && box.bottom <= list.bottom + 1; })()`), true,
+        'the focused next-row button is inside the list viewport');
+    }
+    // The last row of the list: no next row, so focus moves to the title.
+    assert.equal(await tabTo(page, 'Exclude Asset_40.png', 260), true);
+    await pressOnce(page, 'Enter', ['rejectPending', 'id-Asset_40.png']);
+    assert.equal(await active(page), 'pending-header');
+
+    // Needs Review filter: exclude down to the last decidable row; the title keeps focus, never <body>.
+    await page.evaluate("window.__start(['One.png', 'Two.png'])");
+    await clickSelector(page, '[data-asset-filter="missing"]');
+    assert.equal(await tabTo(page, 'Exclude One.png'), true);
+    await pressOnce(page, 'Space', ['rejectPending', 'id-One.png']);
+    assert.equal(await active(page), 'Exclude Two.png');
+    await pressOnce(page, 'Enter', ['rejectPending', 'id-Two.png']);
+    assert.equal(await active(page), 'pending-header');
+
+    // Excluded filter: remembered rows leave the filtered list one by one; the last falls back to the page title.
+    await clickSelector(page, '[data-asset-filter="excluded"]');
+    assert.equal(await tabTo(page, 'Include One.png'), true);
+    await pressOnce(page, 'Space', ['acceptPending', 'id-One.png']);
+    assert.equal(await active(page), 'Include Two.png', 'the next remembered row keeps focus in the Excluded view');
+    await pressOnce(page, 'Enter', ['acceptPending', 'id-Two.png']);
+    assert.notEqual(await active(page), 'BODY');
+    assert.ok(['added-assets-heading', 'asset-review-heading'].includes(await active(page)), await active(page));
+  });
+});
+
+test('remembered-record [+]: disabled across a refresh while held, refused accept re-enables it with the exact message', { skip, timeout: 60000 }, async () => {
+  await withPage({}, async page => {
+    await start(page, ['Alpha.png', 'Beta.png', 'Gamma.png']);
+    await click(page, 'Exclude Alpha.png'); await idle(page);
+    await click(page, 'Exclude Beta.png'); await idle(page);
+    const recordButtons = "Array.from(document.querySelectorAll('#added-assets-list .row-action-include.pending-row-action')).map(button => [button.getAttribute('aria-label'), button.disabled])";
+    await page.evaluate('window.__bridge.holdNext()');
+    await click(page, 'Include Alpha.png');
+    await page.sleep(100);
+    // A refresh while the action is held rebuilds rows; the rebuilt [+] buttons are still disabled.
+    await page.evaluate('renderFiles()');
+    await page.sleep(150);
+    let state = await page.evaluate(recordButtons);
+    assert.ok(state.length >= 2 && state.every(([, disabled]) => disabled), json(state));
+    assert.equal(await page.evaluate("window.__button('Exclude Gamma.png').disabled"), true);
+    await page.evaluate('(() => { const release = window.__bridge.release; window.__bridge.hold = null; release(); })()');
+    await idle(page);
+    state = await page.evaluate(recordButtons);
+    assert.deepEqual(state, [['Include Beta.png', false]]);
+
+    await page.evaluate('window.__bridge.refuseAccept = true');
+    const before = (await calls(page)).length;
+    await click(page, 'Include Beta.png');
+    await idle(page);
+    assert.deepEqual((await calls(page)).slice(before), [['acceptPending', 'id-Beta.png']]);
+    assert.equal(await toast(page), 'Crate could not include Beta.png. Try again.');
+    assert.deepEqual(await page.evaluate(recordButtons), [['Include Beta.png', false]], 'still Excluded with a usable [+]');
+    assert.equal(await page.evaluate("window.__button('Exclude Gamma.png').disabled"), false);
+  });
+});
+
+// Runs without Chrome: a browser path that exists but cannot be executed must
+// fail the launch cleanly, leaving no fixture directory and no browser process.
+test('a browser that cannot start fails the launch cleanly: no crash, no leftover fixture directory, no process', { timeout: 30000 }, async () => {
+  const holder = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-nonexec-browser-'));
+  const fake = path.join(holder, 'not-a-browser');
+  fs.writeFileSync(fake, 'synthetic, not executable');
+  fs.chmodSync(fake, 0o644);
+  const fixtureDirs = () => fs.readdirSync(os.tmpdir()).filter(name => name.startsWith('crate-asset-controls-')).sort();
+  const before = fixtureDirs();
+  try {
+    const unhandled = [];
+    const onError = error => unhandled.push(error);
+    process.on('uncaughtException', onError);
+    try {
+      await assert.rejects(launch({ browser: fake, rendererDir, bootstrapSource: '' }), error => {
+        assert.match(String(error.code || error.message), /EACCES|ENOENT|EPERM|browser exited/);
+        return true;
+      });
+      await new Promise(resolve => setTimeout(resolve, 200));
+    } finally { process.off('uncaughtException', onError); }
+    assert.deepEqual(unhandled, [], 'no unhandled child-process error');
+    assert.deepEqual(fixtureDirs(), before, 'no crate-asset-controls-* directory is left behind');
+    const running = childProcess.spawnSync('/usr/bin/pgrep', ['-f', fake], { encoding: 'utf8' });
+    assert.equal(running.stdout.trim(), '', 'no browser process is left');
+  } finally { fs.rmSync(holder, { recursive: true, force: true }); }
+});
+
+// Light, no Chrome: a harmless test-owned node process stands in for the browser.
+const ownedFixtureDirs = () => fs.readdirSync(os.tmpdir()).filter(name => name.startsWith('crate-asset-controls-')).sort();
+const processRunning = marker => childProcess.spawnSync('/usr/bin/pgrep', ['-f', marker], { encoding: 'utf8' }).stdout.trim() !== '';
+// The test owns these stand-in processes, so it always ends them itself: even
+// when the helper under test (or an assertion) fails, nothing is left running.
+// Only the exact owned process group is signalled; ESRCH means already gone.
+function trackChild(child) {
+  const tracked = { child, done: false };
+  tracked.exit = new Promise(resolve => child.once('exit', () => { tracked.done = true; resolve(); }));
+  return tracked;
+}
+async function terminateTracked(tracked, kill = process.kill) {
+  if (!tracked || tracked.done || !Number.isInteger(tracked.child.pid) || tracked.child.pid <= 0) return;
+  try { kill.call(process, -tracked.child.pid, 'SIGKILL'); }
+  catch (error) { if (error.code !== 'ESRCH') throw error; }
+  let timer;
+  await Promise.race([tracked.exit, new Promise(resolve => { timer = setTimeout(resolve, 5000); })]);
+  clearTimeout(timer);
+  if (!tracked.done) throw new Error(`test-owned process group ${tracked.child.pid} did not exit after SIGKILL`);
+}
+// The body's failure stays primary; a fallback-cleanup failure is attached to it.
+function keepPrimary(primary, cleanupError) {
+  if (!cleanupError) return primary;
+  if (!primary) return cleanupError;
+  return new AggregateError([primary, cleanupError], `${primary.message}; cleanup also failed: ${cleanupError.message}`, { cause: primary });
+}
+async function withOwnedCleanup(run, cleanup) {
+  let failure = null;
+  try { return await run(); }
+  catch (error) { failure = error; throw error; }
+  finally {
+    let cleanupError = null;
+    try { await cleanup(); } catch (error) { cleanupError = error; }
+    if (cleanupError) throw keepPrimary(failure, cleanupError);
+  }
+}
+function withStubbedBrowser(marker, run) {
+  const originalSpawn = childProcess.spawn, originalKill = process.kill;
+  const signals = [];
+  let owned = null;
+  childProcess.spawn = (_browser, _args, options) => {
+    const child = originalSpawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', marker], options);
+    owned = trackChild(child);
+    // The startup CDP request is pending when the transport fails.
+    child.once('spawn', () => setTimeout(() => child.stdio[4].emit('error', Object.assign(new Error('synthetic pipe failure'), { code: 'EIO' })), 50));
+    return child;
+  };
+  process.kill = function (pid, signal) { signals.push([pid, signal]); return originalKill.call(process, pid, signal); };
+  return withOwnedCleanup(() => run(() => owned?.child || null, signals), async () => {
+    childProcess.spawn = originalSpawn;
+    process.kill = originalKill;
+    await terminateTracked(owned, originalKill);
+  });
+}
+
+test('a transport error during a pending request ends only the owned browser group and removes the fixture', { timeout: 30000 }, async () => {
+  const ownedMarker = `crate-owned-transport-${process.pid}-${Date.now()}`;
+  const bystanderMarker = `crate-bystander-${process.pid}-${Date.now()}`;
+  const before = ownedFixtureDirs();
+  const bystander = trackChild(childProcess.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', bystanderMarker], { detached: true, stdio: 'ignore' }));
+  await withOwnedCleanup(async () => {
+    await withStubbedBrowser(ownedMarker, async (owned, signals) => {
+      await assert.rejects(launch({ browser: process.execPath, rendererDir, bootstrapSource: '' }), /synthetic pipe failure/);
+      assert.ok(owned()?.pid > 0, 'the stub process was spawned');
+      assert.ok(signals.length >= 1, 'the owned group was terminated');
+      assert.ok(signals.every(([pid, signal]) => pid === -owned().pid && signal === 'SIGKILL'), `only the owned group is signalled: ${JSON.stringify(signals)}`);
+      // Checked before the fixture's own fallback cleanup can end the process.
+      assert.equal(processRunning(ownedMarker), false, 'the helper ended the owned browser process');
+    });
+    assert.deepEqual(ownedFixtureDirs(), before, 'the fixture directory is removed');
+    assert.equal(processRunning(bystanderMarker), true, 'an unrelated process is untouched');
+  }, () => terminateTracked(bystander));
+});
+
+test('run and cleanup both failing: the original failure stays primary and every cleanup failure is reported', { timeout: 30000 }, async () => {
+  // withBrowserPage: a failing test body and a failing close.
+  const original = new Error('original assertion failure');
+  const cleanup = new Error('post-run identity failure');
+  await assert.rejects(withBrowserPage({}, async () => { throw original; }, async () => ({ close: async () => { throw cleanup; } })), error => {
+    assert.ok(error instanceof AggregateError, String(error));
+    assert.equal(error.errors[0], original);
+    assert.equal(error.cause, original);
+    assert.ok(error.errors.includes(cleanup));
+    assert.ok(error.message.startsWith('original assertion failure'), error.message);
+    return true;
+  });
+  // A passing body with a failing close still fails, with the cleanup error itself.
+  await assert.rejects(withBrowserPage({}, async () => 'ok', async () => ({ close: async () => { throw cleanup; } })), error => error === cleanup);
+
+  // launch: a startup transport failure and a fixture removal failure.
+  const marker = `crate-owned-dual-${process.pid}-${Date.now()}`;
+  const before = ownedFixtureDirs();
+  const originalRm = fs.rmSync;
+  let removalFailures = 0;
+  fs.rmSync = function (target, ...rest) {
+    if (String(target).includes(`${path.sep}crate-asset-controls-`) && removalFailures === 0) {
+      removalFailures += 1;
+      throw Object.assign(new Error('synthetic removal failure'), { code: 'EBUSY' });
+    }
+    return originalRm.call(fs, target, ...rest);
+  };
+  try {
+    await withStubbedBrowser(marker, async () => {
+      await assert.rejects(launch({ browser: process.execPath, rendererDir, bootstrapSource: '' }), error => {
+        assert.ok(error instanceof AggregateError, String(error));
+        assert.equal(error.errors[0].message, 'synthetic pipe failure', 'the startup failure stays primary');
+        assert.equal(error.cause, error.errors[0]);
+        assert.ok(error.errors.some(item => item.message === 'synthetic removal failure'), 'the removal failure is reported');
+        return true;
+      });
+      // Checked before the fixture's own fallback cleanup can end the process.
+      assert.equal(processRunning(marker), false, 'the helper ended the owned browser process even though removal failed');
+    });
+  } finally {
+    fs.rmSync = originalRm;
+    for (const name of ownedFixtureDirs().filter(name => !before.includes(name))) fs.rmSync(path.join(os.tmpdir(), name), { recursive: true, force: true });
+  }
+  assert.equal(removalFailures, 1);
+  assert.equal(processRunning(marker), false, 'no owned process remains');
+  assert.deepEqual(ownedFixtureDirs(), before);
+});
+
+test('the test fixture keeps a failing body primary when its own fallback cleanup also fails', async () => {
+  const body = new Error('body assertion failure');
+  const fallback = new Error('fallback cleanup failure');
+  await assert.rejects(withOwnedCleanup(async () => { throw body; }, async () => { throw fallback; }), error => {
+    assert.ok(error instanceof AggregateError);
+    assert.equal(error.errors[0], body);
+    assert.equal(error.errors[1], fallback);
+    assert.equal(error.cause, body);
+    assert.ok(error.message.startsWith('body assertion failure'));
+    return true;
+  });
+  await assert.rejects(withOwnedCleanup(async () => 'ok', async () => { throw fallback; }), error => error === fallback);
+  assert.equal(await withOwnedCleanup(async () => 'ok', async () => {}), 'ok');
+  await assert.rejects(withOwnedCleanup(async () => { throw body; }, async () => {}), error => error === body);
+});
+
+// Package Review font rows (#327, worded Exclude/Include in this PR), opened
+// through the production renderer path with real keyboard and mouse input.
+const fontKeys = { brand: 'a'.repeat(32), found: 'b'.repeat(32) };
+const fontStatus = (page, fileName) => page.evaluate(`(() => {
+  const row = [...document.querySelectorAll('#package-review-font-list .package-review-font-row')]
+    .find(item => item.querySelector('.package-review-font-meta')?.textContent.startsWith(${json(fileName)}));
+  return row ? row.querySelector('.package-review-font-status').textContent : null;
+})()`);
+const reviewMessage = page => page.evaluate("document.querySelector('#modal-package-review-message')?.textContent || ''");
+// Tab inside Package Review from its Back button until the label has focus.
+async function tabInReview(page, label, limit = 60) {
+  await page.evaluate("document.querySelector('#btn-back-package').focus()");
+  for (let step = 0; step < limit; step += 1) {
+    await page.press('Tab');
+    await page.sleep(30);
+    const current = await active(page);
+    assert.notEqual(current, 'BODY', `Tab never drops focus to <body> in Package Review (step ${step})`);
+    if (current === label) return true;
+  }
+  return false;
+}
+const reviewsPrepared = page => page.evaluate('window.__bridge.reviews');
+// Settled: the refresh after the action prepared a new review and rendered it
+// (its result message is shown), the font controls are enabled again, nothing
+// is in flight, animations are finished and focus has stopped moving across
+// several animation frames. Bounded; never a fixed sleep alone.
+async function settleReview(page, reviewsBefore, expectedMessage) {
+  const settled = await page.evaluate(`(async () => {
+    const frame = () => new Promise(resolve => requestAnimationFrame(() => resolve()));
+    const deadline = Date.now() + 5000;
+    let last = null, stable = 0;
+    while (Date.now() < deadline) {
+      const message = document.querySelector('#modal-package-review-message');
+      const controls = [...document.querySelectorAll('#package-review-font-list button, #package-review-font-list input')];
+      const ready = window.__bridge.reviews > ${reviewsBefore} && window.__bridge.inflight === 0 && message &&
+        message.textContent === ${json(expectedMessage)} && controls.length > 0 && controls.every(control => !control.disabled);
+      if (!ready) { stable = 0; last = null; await new Promise(resolve => setTimeout(resolve, 20)); continue; }
+      document.getAnimations().forEach(animation => animation.finish());
+      await frame();
+      await frame();
+      stable = document.activeElement === last ? stable + 1 : 0;
+      last = document.activeElement;
+      if (stable >= 3) return true;
+    }
+    return false;
+  })()`);
+  assert.equal(settled, true, `the Package Review refresh settles (${expectedMessage})`);
+}
+// The documented focus order after a refresh, focusPackageReviewDialog
+// (renderer/app.js): a shown, non-empty result message takes focus; otherwise
+// Back (or Cancel) when enabled; otherwise the first focusable control, then
+// the dialog. showPackageModal also focuses the message when it shows one.
+// Back is accepted here only when no message is shown; no other control is.
+async function assertSettledFocus(page, expectedMessage) {
+  const observed = await page.evaluate(`(() => {
+    const message = document.querySelector('#modal-package-review-message'), focused = document.activeElement;
+    return { active: window.__label(focused), inDialog: !!focused && document.querySelector('#modal-package').contains(focused),
+      messageShown: !message.classList.contains('hidden') && !message.classList.contains('is-empty') && message.getClientRects().length > 0,
+      messageClass: message.className, text: message.textContent,
+      semantics: [message.getAttribute('role'), message.getAttribute('aria-live'), message.tabIndex] };
+  })()`);
+  const where = json(observed);
+  assert.notEqual(observed.active, 'BODY', `focus is never on <body>: ${where}`);
+  assert.equal(observed.inDialog, true, `focus stays inside Package Review: ${where}`);
+  assert.deepEqual(observed.semantics, ['status', 'polite', -1], where);
+  if (observed.messageShown) {
+    assert.equal(observed.text, expectedMessage, where);
+    assert.equal(observed.active, 'modal-package-review-message', `a shown result message takes focus (focusPackageReviewDialog): ${where}`);
+  } else {
+    assert.equal(observed.active, 'btn-back-package', `with no message shown, Back takes focus: ${where}`);
+  }
+  return observed;
+}
+
+test('Package Review font rows: keyboard Exclude, Include and licence confirmation; one call per press; disabled in flight; visible at 1100x760', { skip, timeout: 60000 }, async () => {
+  await withPage({ width: 1100, height: 760 }, async page => {
+    await start(page, []);
+    assert.equal(await page.evaluate('showPackageModal({ runPreScan: false })'), true, 'Package Review opens through the renderer');
+    await idle(page);
+    await page.evaluate(settleStyles);
+    const layout = await page.evaluate(`(() => {
+      const modal = document.querySelector('#modal-package');
+      const controls = [...document.querySelectorAll('#package-review-font-list button, #package-review-font-list input')];
+      return { open: !modal.classList.contains('hidden'), pageOverflow: document.documentElement.scrollWidth - innerWidth,
+        controls: controls.map(control => {
+          control.scrollIntoView({ block: 'center' });
+          const r = control.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2, hit = document.elementFromPoint(x, y);
+          const label = control.getAttribute('aria-label') || document.querySelector('label[for="' + control.id + '"]')?.textContent || '';
+          return { label, visible: control.getClientRects().length > 0 && getComputedStyle(control).visibility === 'visible',
+            opacity: getComputedStyle(control).opacity, inViewport: r.left >= 0 && r.right <= innerWidth && r.top >= 0 && r.bottom <= innerHeight,
+            receivesPointer: !!hit && (hit === control || control.contains(hit) || hit.htmlFor === control.id), size: [Math.round(r.width), Math.round(r.height)] };
+        }) };
+    })()`);
+    assert.equal(layout.open, true);
+    assert.ok(layout.pageOverflow <= 0, json(layout));
+    assert.deepEqual(layout.controls.map(control => control.label), ['Exclude Brand-Regular.otf',
+      'My licence for this font file, Found-Regular.otf, which contains Found Regular, allows me to give it to the people receiving this package.',
+      'Include Found-Regular.otf', 'Exclude Found-Regular.otf'], 'accessible names');
+    for (const control of layout.controls) {
+      assert.ok(control.visible && control.opacity === '1' && control.inViewport && control.receivesPointer, `visible and reachable at 1100x760: ${json(control)}`);
+      assert.ok(control.size[0] > 0 && control.size[1] > 0, json(control));
+    }
+    assert.equal(await fontStatus(page, 'Brand-Regular.otf'), 'Included · Fonts folder');
+    assert.equal(await fontStatus(page, 'Found-Regular.otf'), 'Not included');
+    // The result message never transitions, so Reduce Motion's 0.01ms
+    // transitions cannot keep it hidden while it is focused.
+    assert.equal(await page.evaluate("getComputedStyle(document.querySelector('#modal-package-review-message')).transitionProperty"), 'none');
+    const focusAfter = [];
+    let reviewsBefore;
+
+    // Exclude by Enter: exactly one call; the row reads Excluded and offers Include.
+    assert.equal(await tabInReview(page, 'Exclude Brand-Regular.otf'), true);
+    reviewsBefore = await reviewsPrepared(page);
+    await pressOnce(page, 'Enter', ['setFontRowChoice', fontKeys.brand, 'remove']);
+    await settleReview(page, reviewsBefore, 'Font excluded.');
+    assert.equal(await reviewMessage(page), 'Font excluded.');
+    assert.equal(await fontStatus(page, 'Brand-Regular.otf'), 'Excluded');
+    assert.ok(await page.evaluate("!!window.__button('Include Brand-Regular.otf') && !window.__button('Exclude Brand-Regular.otf')"));
+    focusAfter.push(await assertSettledFocus(page, 'Font excluded.'));
+
+    // Include by Space on the found font: it needs its confirmation, so it is still not included.
+    assert.equal(await tabInReview(page, 'Include Found-Regular.otf'), true);
+    reviewsBefore = await reviewsPrepared(page);
+    await pressOnce(page, 'Space', ['setFontRowChoice', fontKeys.found, 'include']);
+    await settleReview(page, reviewsBefore, 'Font updated.');
+    assert.equal(await fontStatus(page, 'Found-Regular.otf'), 'Needs your confirmation');
+    assert.equal(await page.evaluate("document.querySelector('#package-review-fonts-summary').textContent.startsWith('0 font files will be included.')"), true);
+    focusAfter.push(await assertSettledFocus(page, 'Font updated.'));
+
+    // The licence checkbox by Space: exactly one confirmation, then included.
+    const box = `package-review-font-confirm-${fontKeys.found}`;
+    assert.equal(await tabInReview(page, box), true);
+    assert.equal(await page.evaluate(`document.getElementById(${json(box)}).checked`), false);
+    reviewsBefore = await reviewsPrepared(page);
+    await pressOnce(page, 'Space', ['confirmFontLicence', fontKeys.found, '2'.repeat(64), true]);
+    await settleReview(page, reviewsBefore, 'Font confirmed.');
+    assert.equal(await reviewMessage(page), 'Font confirmed.');
+    assert.equal(await fontStatus(page, 'Found-Regular.otf'), 'Included · Fonts folder');
+    focusAfter.push(await assertSettledFocus(page, 'Font confirmed.'));
+
+    // In flight: every font control is disabled, and a double click makes one call.
+    // (Focus is not checked mid-flight here: the second mousedown lands on the
+    // now-disabled control, so Chromium moves focus to the dialog itself,
+    // index.html #modal-package tabindex=-1. The keyboard step below checks it.)
+    await page.evaluate('window.__bridge.holdNext()');
+    const before = (await calls(page)).length;
+    reviewsBefore = await reviewsPrepared(page);
+    await click(page, 'Exclude Found-Regular.otf', 2);
+    await page.sleep(100);
+    assert.equal(await page.evaluate("[...document.querySelectorAll('#package-review-fonts button, #package-review-fonts input')].every(control => control.disabled)"), true,
+      'font controls are disabled while the action is in flight');
+    await page.evaluate('window.__bridge.hold = null; window.__bridge.release()');
+    await idle(page);
+    await settleReview(page, reviewsBefore, 'Font excluded.');
+    assert.deepEqual((await calls(page)).slice(before), [['setFontRowChoice', fontKeys.found, 'remove']], 'one call for a double click');
+    assert.equal(await fontStatus(page, 'Found-Regular.otf'), 'Excluded');
+    assert.deepEqual(await page.evaluate("[...document.querySelectorAll('#package-review-font-list button, #package-review-font-list input, #btn-add-installed-fonts, #btn-add-font-files')].filter(control => control.disabled).map(control => control.getAttribute('aria-label') || control.id)"), [],
+      'the font rows and the add buttons are enabled again');
+    focusAfter.push(await assertSettledFocus(page, 'Font excluded.'));
+
+    // One held keyboard action: while it is in flight, focus waits on Back
+    // (runPackageReviewFontAction); after the refresh settles, the contract above.
+    assert.equal(await tabInReview(page, 'Include Brand-Regular.otf'), true);
+    await page.evaluate('window.__bridge.holdNext()');
+    const beforeHeld = (await calls(page)).length;
+    reviewsBefore = await reviewsPrepared(page);
+    await page.press('Enter');
+    await page.sleep(100);
+    assert.equal(await active(page), 'btn-back-package', 'while the action is in flight, focus waits on Back');
+    await page.evaluate('window.__bridge.hold = null; window.__bridge.release()');
+    await idle(page);
+    await settleReview(page, reviewsBefore, 'Font updated.');
+    assert.deepEqual((await calls(page)).slice(beforeHeld), [['setFontRowChoice', fontKeys.brand, 'include']], 'one call for one press');
+    focusAfter.push(await assertSettledFocus(page, 'Font updated.'));
+    // Every action here shows a result message, so after settling each one
+    // must have focused it.
+    assert.deepEqual(focusAfter.map(item => [item.active, item.messageShown]), Array(5).fill(['modal-package-review-message', true]), json(focusAfter));
+  });
+});
