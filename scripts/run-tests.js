@@ -42,7 +42,8 @@
 //
 // When it gives up on a run. It does not let a run continue that it cannot
 // watch: no answer from the sampler for three seconds, or a process of the run
-// whose start time and memory cannot be read. It stops the run and exits 125.
+// whose start time and memory cannot be read, the test runner itself included
+// from the first scan on. It stops the run and exits 125.
 // It also exits 125, whatever the tests' own result, when it cannot confirm
 // that every process of the run is gone.
 //
@@ -57,6 +58,10 @@
 //   check of a start time and its signal lie a few microseconds in which the
 //   target could end and its pid pass to another process. Nothing available to
 //   an ordinary program on macOS closes that gap.
+// - Not able to end the whole run when no sampler works any more (the one in
+//   use, the one standing by, and a newly started one all fail). It then kills
+//   the runner's process group, leaves whatever the run started outside that
+//   group running, lists it, and exits 125.
 // - Not a guard at all if it is itself killed with SIGKILL or frozen: the run
 //   then continues unwatched.
 // - macOS only. Elsewhere, or when the sampler cannot be started, it refuses
@@ -297,10 +302,13 @@ async function startCheckedSampler() {
 }
 
 // Works out, scan by scan, which processes belong to the run, and notices
-// when one of them cannot be read.
-function createOwnership({ guardPid, samplerPid, runnerPid }) {
+// when one of them, the runner first of all, cannot be read.
+function createOwnership({ guardPid, helperPids = [], runnerPid }) {
+  const helpers = new Set(helperPids);
   let runnerStart = null;
-  let anchored = false; // the runner leads the process group that carries its pid
+  let anchored = null; // does the runner lead the process group that carries its pid? null until a scan shows it
+  let runnerProblem = null; // what is wrong with the runner's own row in the latest scan, if anything
+  let runnerMissing = 0; // scans in a row that did not list the runner although it exists
   let owned = new Map();
   let latest = new Map();
   const identified = new Map(); // pid -> start time under which that pid was last identified as the run's
@@ -309,21 +317,27 @@ function createOwnership({ guardPid, samplerPid, runnerPid }) {
   return {
     get owned() { return owned; },
     get runnerStart() { return runnerStart; },
+    // False once a scan showed the runner outside the group it was started to lead.
+    get groupUsable() { return anchored !== false; },
     row(pid) { return latest.get(pid) || null; },
-    setSampler(pid) { samplerPid = pid; },
-    // A process known to be the run's that is in the runner's group right now,
-    // while the runner still reserves the group's id: the evidence that a
-    // signal to the whole group reaches only the run.
+    addHelper(pid) { helpers.add(pid); },
+    // An identified process of the run that is in the runner's group right
+    // now, while the runner still exists: something the sampler can check
+    // again at the moment it signals the whole group.
     groupMember(runnerExists) {
-      if (!anchored || !runnerExists) return null;
+      if (anchored !== true || !runnerExists) return null;
       const inGroup = row => row.infoError === 0 && row.pgid === runnerPid && isIdentified(row) && !hasEnded(row);
       const runner = owned.get(runnerPid);
       return (runner && inGroup(runner) && runner) || [...owned.values()].find(inGroup) || null;
     },
-    // A process of the run the guard cannot watch, or null.
+    // Why the guard cannot watch the run, or null. `problem` is 'unreadable'
+    // (start time and memory of a process of the run cannot be read),
+    // 'missing' (the runner exists and scans do not list it) or 'inconsistent'
+    // (scans show the runner as something this guard did not start).
     readFailure() {
+      if (runnerProblem) return { pid: runnerPid, ...runnerProblem };
       for (const [pid, entry] of unread) {
-        if (entry.errno !== ESRCH || entry.samples > UNREADABLE_SAMPLES) return { pid, ...entry };
+        if (entry.errno !== ESRCH || entry.samples > UNREADABLE_SAMPLES) return { pid, problem: 'unreadable', ...entry };
       }
       return null;
     },
@@ -340,7 +354,7 @@ function createOwnership({ guardPid, samplerPid, runnerPid }) {
       const next = new Map();
       const queue = [];
       const adopt = row => {
-        if (!row || row.pid <= 1 || row.pid === guardPid || row.pid === samplerPid || next.has(row.pid)) return;
+        if (!row || row.pid <= 1 || row.pid === guardPid || helpers.has(row.pid) || next.has(row.pid)) return;
         next.set(row.pid, row);
         queue.push(row);
       };
@@ -351,13 +365,34 @@ function createOwnership({ guardPid, samplerPid, runnerPid }) {
           for (const child of children.get(parent.pid) || []) adopt(child);
         }
       };
+      // The runner. This process started it and has not collected it, so its
+      // pid cannot have passed to anyone else: whatever a scan lists under
+      // that pid is the runner, readable or not. It is the root of the run
+      // from the first scan on. A scan that does not list it, or shows it as
+      // something this guard did not start, cannot be trusted with the run.
       const runner = latest.get(runnerPid);
-      if (runner && runnerStart === null && runner.infoError === 0 && isIdentified(runner) && runner.ppid === guardPid) {
-        runnerStart = runner.start;
-        anchored = runner.pgid === runnerPid;
+      let runnerSeen = false;
+      runnerProblem = null;
+      if (!runnerExists) {
+        runnerMissing = 0;
+      } else if (!runner) {
+        runnerMissing += 1;
+        if (runnerMissing > UNREADABLE_SAMPLES) runnerProblem = { problem: 'missing', errno: ESRCH, samples: runnerMissing };
+      } else {
+        runnerMissing = 0;
+        adopt(runner);
+        if (runner.infoError === 0 && isIdentified(runner) && !hasEnded(runner)) {
+          if (runnerStart === null && runner.ppid === guardPid) {
+            runnerStart = runner.start;
+            anchored = runner.pgid === runnerPid;
+          }
+          runnerSeen = runner.ppid === guardPid && runner.start === runnerStart && runner.pgid === runnerPid;
+          if (!runnerSeen) {
+            if (runner.pgid !== runnerPid) anchored = false;
+            runnerProblem = { problem: 'inconsistent', errno: 0, samples: 1 };
+          }
+        }
       }
-      const runnerSeen = Boolean(runner) && isIdentified(runner) && runner.start === runnerStart;
-      if (runnerSeen) adopt(runner);
       // Identified as the run's before: same pid and the same start time,
       // however long ago and whether or not it showed up in every scan since.
       for (const row of rows) {
@@ -365,9 +400,8 @@ function createOwnership({ guardPid, samplerPid, runnerPid }) {
       }
       // In the runner's group, in a scan that shows the runner itself. Only the
       // run's own session can put a process there while the runner holds the
-      // pid that names the group. Being told the runner exists is not enough:
-      // word of its end arrives a moment after the system frees its pid.
-      if (anchored && runnerExists && runnerSeen) {
+      // pid that names the group.
+      if (anchored === true && runnerSeen) {
         for (const row of rows) if (row.infoError === 0 && row.pgid === runnerPid) adopt(row);
       }
       descend();
@@ -396,7 +430,7 @@ function createOwnership({ guardPid, samplerPid, runnerPid }) {
 // The guard's decisions, separated from real processes: it is given a way to
 // scan, to signal, to wait and to read the clock.
 function createGuard({
-  ownership, runnerPid, scan, signalProcesses, signalGroup, sleep, now, isRunnerGone,
+  ownership, runnerPid, scan, signalProcesses, signalGroup, signalGroupWhileHeld, sleep, now, isRunnerGone,
   onAnomaly = () => {}, timing = TIMING,
 }) {
   const alive = () => [...ownership.owned.values()].filter(row => !hasEnded(row));
@@ -404,13 +438,18 @@ function createGuard({
   const unidentifiedRows = () => alive().filter(row => !isIdentified(row));
   const observe = async () => ownership.update(await scan(), !isRunnerGone());
 
-  // Signals the runner's group in one call when that provably reaches only the
-  // run, and every identified process not covered by that call one by one.
-  // Returns the rows whose signal was sent, by either route.
+  // Signals the runner's group in one call, and every identified process not
+  // covered by that call one by one. Returns the rows whose signal was sent,
+  // by either route.
   const signalRun = async (name, except = () => false) => {
     const rows = identifiedRows().filter(row => !except(row));
     const member = ownership.groupMember(!isRunnerGone());
-    const grouped = member !== null && (await signalGroup(name, runnerPid, member)) === 'sent';
+    let grouped = member !== null && (await signalGroup(name, runnerPid, member)) === 'sent';
+    // No identified process to check the group by: the runner itself may be
+    // the one that cannot be read. Until this process has collected the
+    // runner, the runner's pid, and with it the group's number, is still the
+    // run's, so the group can be signalled by that number alone.
+    if (!grouped && ownership.groupUsable && !isRunnerGone()) grouped = signalGroupWhileHeld(name);
     const inGroup = row => grouped && row.infoError === 0 && row.pgid === runnerPid;
     const single = rows.filter(row => !inGroup(row));
     const results = single.length > 0 ? await signalProcesses(name, single) : [];
@@ -510,10 +549,16 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
     say('the memory guard works on macOS only. Refusing to run the tests unguarded.');
     return EXIT_GUARD_FAILURE;
   }
+  // Two samplers, both proven before any test starts. The second does nothing
+  // until the first fails: cleanup then does not depend on being able to start
+  // a new process at the worst moment.
   let sampler;
+  let standby;
   try {
     sampler = await openSampler();
+    standby = await openSampler();
   } catch (error) {
+    if (sampler) sampler.stop();
     say(`the memory guard's sampler does not work (${error.message}). Refusing to run the tests unguarded.`);
     return EXIT_GUARD_FAILURE;
   }
@@ -536,16 +581,17 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
     runnerExit = { code: signal ? 128 + (os.constants.signals[signal] || 0) : code };
     wake();
   });
-  // Without a sampler nothing can be matched by pid and start time. What is
-  // left is the runner's process group, signalled without that check and only
-  // while the runner has not been collected, so that its number is still the
-  // run's. Processes the run started outside the group are not reached.
-  const killGroupUnchecked = () => {
+  // Signals the runner's process group by its number alone. That needs no
+  // sampler and no start time, and is done only while this process has not
+  // collected the runner, when the number cannot have passed to anyone else.
+  // The check and the signal are one step. Processes the run started outside
+  // the group are not reached this way.
+  const signalGroupWhileHeld = name => {
     if (runnerCollected()) return false;
-    try { process.kill(-runner.pid, 'SIGKILL'); return true; } catch { return false; }
+    try { process.kill(-runner.pid, name); return true; } catch { return false; }
   };
   // Last resort for a guard that is going down with the run still up.
-  process.on('exit', killGroupUnchecked);
+  process.on('exit', () => signalGroupWhileHeld('SIGKILL'));
   process.on('uncaughtException', error => {
     say(`the memory guard failed (${error && error.stack ? error.stack : error}). Stopping the test run.`);
     process.exit(EXIT_GUARD_FAILURE);
@@ -559,13 +605,14 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
     process.on(name, () => { received.push(name); wake(); });
   }
 
-  const ownership = createOwnership({ guardPid: process.pid, samplerPid: sampler.pid, runnerPid: runner.pid });
+  const ownership = createOwnership({ guardPid: process.pid, helperPids: [sampler.pid, standby.pid], runnerPid: runner.pid });
   const guard = createGuard({
     ownership,
     runnerPid: runner.pid,
     scan: () => sampler.scan(),
     signalProcesses: (name, rows) => sampler.signalProcesses(name, rows),
     signalGroup: (name, pgid, member) => sampler.signalGroup(name, pgid, member),
+    signalGroupWhileHeld,
     sleep: ms => new Promise(resolve => { setTimeout(resolve, ms); }),
     now: Date.now,
     isRunnerGone: runnerCollected,
@@ -610,7 +657,11 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
       else if (received.length > 0) reason = 'signal';
       else if (unreadable) {
         reason = 'unreadable';
-        report = [`GUARD CANNOT READ PROCESS ${unreadable.pid} OF THE RUN after ${seconds()} s (errno ${unreadable.errno}, ${unreadable.samples} samples in a row). Its memory is unknown.`];
+        report = [{
+          unreadable: `GUARD CANNOT READ PROCESS ${unreadable.pid} OF THE RUN after ${seconds()} s (errno ${unreadable.errno}, ${unreadable.samples} samples in a row). Its memory is unknown.`,
+          missing: `GUARD CANNOT FIND THE TEST RUNNER after ${seconds()} s: process ${unreadable.pid} exists and ${unreadable.samples} scans in a row did not list it. The run's memory is unknown.`,
+          inconsistent: `GUARD CANNOT TRUST ITS READING OF THE TEST RUNNER after ${seconds()} s: process ${unreadable.pid} does not show as this guard's child, leading its own process group, with one start time.`,
+        }[unreadable.problem]];
       } else if (largest && largest.megabytes > limits.process) {
         reason = 'memory';
         offender = largest.pid;
@@ -633,16 +684,27 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
 
   // From here on the run is being ended, and every step below is bounded.
   // Cleanup identifies processes by pid and start time, so it needs a working
-  // sampler; if the current one fails, it is replaced once.
-  const withSight = async action => {
-    try {
-      return await action();
-    } catch (error) {
-      sampler.stop();
+  // sampler. When the current one fails, the one standing by takes over, and
+  // when that fails too, a new one is started. After that there is no sight.
+  const replaceSampler = async () => {
+    sampler.stop();
+    if (standby) {
+      sampler = standby;
+      standby = null;
+    } else {
       sampler = await openSampler();
-      ownership.setSampler(sampler.pid);
-      say(`the sampler failed during cleanup (${error.message}); continuing with a new one`);
-      return action();
+      ownership.addHelper(sampler.pid);
+    }
+  };
+  const withSight = async action => {
+    for (let replacements = 0; ; replacements += 1) {
+      try {
+        return await action();
+      } catch (error) {
+        if (replacements === 2) throw error;
+        say(`the sampler failed (${error.message}); continuing with ${standby ? 'the one standing by' : 'a new one'}`);
+        await replaceSampler();
+      }
     }
   };
   let exitCode = EXIT_GUARD_FAILURE;
@@ -674,22 +736,27 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
         return guard.endRun('SIGTERM', timing.leftoverGraceMs);
       });
     } else {
-      // Blind: the old sampler is not trusted any more.
-      sampler.stop();
-      sampler = await openSampler();
-      ownership.setSampler(sampler.pid);
+      // Blind: the sampler that lost sight is not trusted any more.
+      await replaceSampler();
       cleanup = await withSight(() => guard.stopRun({
         onFrozen: frozen => report.push(`Stopping the test run (${frozen.length} processes).`),
       }));
     }
   } catch (error) {
+    // No sampler works. Nothing can be matched by pid and start time any more,
+    // so only the runner's process group can still be ended. Whatever the run
+    // started outside that group is left running: the guard is not able to
+    // stop the whole run in this case, and says so.
+    const outside = [...ownership.owned.values()].filter(row => !hasEnded(row) && !(row.infoError === 0 && row.pgid === runner.pid));
     report.push(`Cleanup could not be verified (${error.message}).`);
-    report.push(killGroupUnchecked()
+    report.push(signalGroupWhileHeld('SIGKILL')
       ? 'Killed the test runner\'s process group. Processes the run started outside that group were NOT touched and may still be running.'
       : 'Processes the run started may still be running. They were NOT touched.');
+    if (outside.length > 0) report.push(`Last seen outside that group, not signalled: ${outside.map(row => row.pid).join(', ')}.`);
     cleanup = { survivors: [], unverified: [], unknown: true };
   }
   sampler.stop();
+  if (standby) standby.stop();
 
   if (cleanup.survivors.length > 0) {
     report.push(`CLEANUP INCOMPLETE: ${cleanup.survivors.length} processes of the run were still there ${timing.confirmMs / 1000} s after SIGKILL: ${cleanup.survivors.map(row => row.pid).join(', ')}.`);

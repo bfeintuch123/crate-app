@@ -32,9 +32,9 @@ Forbidden:
 
 ## State
 
-- current phase: guard hardening committed locally; waiting for the independent safety review of the guard, and for #328 to merge before the rest resumes
-- last completed checkpoint: guard hardening as a normal follow-up commit on top of the WIP checkpoint; both local, unpushed
-- next action: wait for Mack. Review findings on the guard come back to this writer as follow-up commits.
+- current phase: guard correction cycle 2 of at most 3 committed locally; waiting for the exact-head reread, and for #328 to merge before the rest resumes
+- last completed checkpoint: three local commits, unpushed: the WIP checkpoint, the guard hardening, and the cycle 2 corrections
+- next action: wait for Mack. Review findings on the guard come back to this writer as follow-up commits. One correction cycle is left.
 - blocker: independent review of the guard has not passed; #328 must merge before the paused work resumes
 - approval state: writer ownership of this branch for guard work only; no approval to use the guard, push, or merge
 - preferences applied: one writer, read-only reviewers, no concurrent heavy Mac tests, pinned Node, bounded synthetic tests only
@@ -57,11 +57,12 @@ Forbidden:
 
 ## How the guard works
 
-- A long-lived sampler reads every process through libproc: parent, process group, owner, state, start time, resident size and `ri_phys_footprint`, which includes compressed memory. One scan of about 930 processes takes about 2 ms. The guard scans every 50 ms.
-- A process is identified by pid and start time together. It belongs to the run when it is the runner, is in the runner's process group in a scan that also shows the runner, was started by a process of the run (including detached children in their own session and group), or was identified as the run's before.
+- A long-lived sampler reads every process through libproc: parent, process group, owner, state, start time, resident size and `ri_phys_footprint`, which includes compressed memory. One scan of about 930 processes takes about 2 ms. The guard scans every 50 ms. A second sampler is started and checked before any test runs and stands by for cleanup.
+- The runner is the root of the run by its own pid from the first scan, readable or not: the guard started it and has not collected it, so that pid cannot belong to anyone else. Every other process is identified by pid and start time together. It belongs to the run when it is in the runner's process group in a scan that also shows the runner, was started by a process of the run (including detached children in their own session and group), or was identified as the run's before.
 - Stopping a run: SIGSTOP to the group and to every identified process, repeated until a scan finds nothing new; then SIGKILL; then scans until everything is gone or five seconds pass. The sampler sends every signal: it reads the target's start time again and signals in the next system call.
 - The same cleanup runs on a memory limit, the deadline, a signal to the guard (after a grace period, skipped on a second signal), and for whatever a finished run leaves running.
-- It stops the run and exits 125 when the sampler does not answer for three seconds or ends, or when a process of the run cannot be read. It exits 125, replacing the tests' own status, whenever it cannot confirm that every process of the run is gone.
+- It stops the run and exits 125 when the sampler does not answer for three seconds or ends, or when a process of the run cannot be read. That includes the runner itself from the first scan: unreadable, not listed for more than three scans, or listed as something the guard did not start. With an unreadable runner the group is signalled by the runner's pid alone, which is sound only while the guard has not collected the runner, and is done only then.
+- It exits 125, replacing the tests' own status, whenever it cannot confirm that every process of the run is gone.
 - Exit status: the runner's own; 137 memory limit; 124 deadline; 128+N after signal N; 125 guard failure; 2 bad option.
 
 ## Evidence
@@ -71,13 +72,23 @@ Bounded synthetic tests only. Allocators stop by themselves at 256 MB and let go
 | Time | Action | Evidence | Result |
 | --- | --- | --- | --- |
 | 2026-11-12 | Prototype on #328 head 1ef9c46: full serial suite through the prototype guard | private log | 4091 tests, 4089 pass, 0 fail, 2 skip. Does not cover this branch or the hardened guard. |
-| 2026-11-13 | `node --test tests/run-tests-memory-guard.test.js`, twice, pinned Node 22.23.1 | private logs | 34 of 34 pass both times, about 20 s each, nothing left running. 19 tests on a simulated process table, 15 with real processes. |
+| 2026-11-13 | First hardening: `node --test tests/run-tests-memory-guard.test.js`, twice, pinned Node 22.23.1 | private logs | 34 of 34 pass both times, about 20 s each, nothing left running. |
 | 2026-11-13 | Eight deliberate regressions in the guard, one at a time, against the simulated tests | terminal | Each was caught by at least one test: group adoption without the runner in the scan; pid remembered without start time; unreadable process dropped; unreadable tolerated forever; kill without freeze; group signal after the runner is gone; frozen stranger not resumed; no confirmation deadline. |
+| 2026-11-13 | Cycle 2: the same test file, twice | private logs | 40 of 40 pass both times, about 24 s each, nothing left running. 22 tests on a simulated process table, 18 with real processes. |
+| 2026-11-13 | Cycle 2: eight more deliberate regressions, against the simulated tests or the command-level tests | terminal | Each was caught: runner adopted only when readable (simulated and at the command line); missing runner tolerated; inconsistent runner accepted; group signalled by number after collection; group signalled by number with the runner in another group; no group signal by number; standby sampler unused. |
 | 2026-11-13 | Finite allocator under `--memory-limit-mb=128`, three runs | terminal | Stopped at 132, 132 and 140 MB after 0.5 to 0.6 s, exit 137, run confirmed gone, 0.64 to 0.70 s wall. |
 | 2026-11-13 | Sampler reading against the macOS `footprint` tool for one process holding 96 MB | terminal | Sampler footprint 109.0 MB, tool 109.2 MB; resident 137.1 MB against 137.4 MB from Node. |
 | 2026-11-13 | Guard cost on a 10 s idle run | terminal | 165 samples; about 5 percent of one core in total (sampler about 2 ms of CPU per scan, guard process about 0.02 s per second). |
 
-Real-process scenarios covered by the tests: pass and fail passed through; per-process and total limit; a memory stop that takes nested, detached and adopted processes with it; leftovers of a finished run, including one that ignores SIGTERM; SIGTERM, SIGINT and a second signal; deadline; sampler killed and sampler frozen; a leftover that cannot be ended and one that cannot be identified, both turning a passing run into exit 125; a process of the run that cannot be read stopping the run; bad options. In each, a process started outside the guarded run survives.
+Real-process scenarios covered by the tests: pass and fail passed through; per-process and total limit; a memory stop that takes nested, detached and adopted processes with it; leftovers of a finished run, including one that ignores SIGTERM; SIGTERM, SIGINT and a second signal; deadline; both samplers killed and both frozen; a leftover that cannot be ended and one that cannot be identified, both turning a passing run into exit 125; a process of the run that cannot be read stopping the run; a runner that cannot be read stopped at the first scan before the fixture starts anything; the sampler in use failing with no new one available, where the standby stops the whole run; no sampler working at all, where only the runner's group is ended; bad options. In each scenario that starts one, a process outside the guarded run survives.
+
+## Review record
+
+At most three correction cycles.
+
+- Review 1, on the in-progress guard: four blocking findings (read failures dropped or zeroed; exit 0 with unconfirmed cleanup; signals sent from a stale snapshot; test cleanup by bare pid). Answered in the guard hardening commit.
+- Review 2, on that commit: the four findings substantially addressed; 34 of 34 rerun independently. One new blocking finding: a runner unreadable from the first scan was never adopted, so nothing was owned and the run could continue unmeasured until the deadline. One limit to evaluate: when the sampler and its replacement both fail, detached children are left. Answered in the cycle 2 commit: the runner is the root by its own pid; the second sampler stands by from the start. The total-failure case remains a limit and is stated below.
+- Fallback evaluated for the total-failure case and not built: identifying detached processes with `ps` start times. It needs a second identity kept for every process, has one-second resolution and a millisecond gap before each signal, and fails in the same condition as starting a new sampler (no new process can be started). Nothing in Node can read another process's start time.
 
 ## Limits of the guard, measured where possible
 
@@ -85,10 +96,11 @@ Real-process scenarios covered by the tests: pass and fail passed through; per-p
 - A detached child is missed when its parent exits before the next sample. Measured with a parent that starts a detached child and exits N ms later, 12 runs each: missed 12 of 12 for N of 0, 10, 20 and 40; found 12 of 12 for N of 60 and 100. A missed process is not tracked, limited or cleaned up, and the guard does not know it exists. The three detached launches in #328 (the browser in `tests/asset-controls-cdp-helper.js` and `tests/ui-stability-responsive-geometry.test.js`, an idle Node process in `tests/asset-controls-real-browser.test.js`) keep their parent test process alive, so they are found at the next sample. Ways to narrow this further, not implemented: fork notifications from kqueue (still a sub-millisecond race), or a marker variable in the run's environment (changes the environment the tests see).
 - Pid reuse. Every signal is checked against the start time by the sampler immediately before it is sent. A gap of microseconds remains between that check and the signal. A process frozen in that gap by mistake is resumed and not killed; a kill in that gap cannot be undone. Nothing available to an ordinary program on macOS closes it.
 - If the guard itself is killed with SIGKILL or frozen, the run continues unwatched. Measured: the sampler ends, the test processes keep running.
-- When no sampler works at all during cleanup, only the runner's process group is killed, without the start-time check, and only while the runner has not been collected. Detached processes are then left running and the guard says so and exits 125.
+- The guard is not able to end the whole run when no sampler works any more: the one in use, the one standing by, and a newly started one all fail. It then kills only the runner's process group, by the runner's pid and only while the runner has not been collected, leaves whatever the run started outside that group running, lists those pids, and exits 125. In that case it fails closed for the group, not for the full tree. A test pins this behavior.
 - A process of the run that the guard cannot read (another user's, for example) is never signalled by pid. The run is stopped and exits 125 with that process reported.
 - Compressed memory is read through footprint at every sample. Not tested under real memory pressure.
 - macOS only. Needs `/usr/bin/python3` or `python3` on the path; without a working sampler the guard refuses to run the tests.
+- A runner that is unreadable only in the way an ending process is, or missing from scans, is tolerated for three samples (about 0.15 s) before the run is stopped.
 - The guard's own waits are bounded: 5 s grace after a signal, 2 s for leftovers, 5 s to confirm a kill, 1 s per sampler request, at most 3 s without a sample.
 
 ## Open items for the paused work

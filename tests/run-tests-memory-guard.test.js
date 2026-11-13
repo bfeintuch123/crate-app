@@ -26,6 +26,7 @@ const EPERM = 1;
 
 const GUARD = 10;
 const SAMPLER = 11;
+const STANDBY = 13;
 const RUNNER = 100;
 
 function row(pid, ppid, pgid, extra = {}) {
@@ -37,10 +38,11 @@ const unreadableRow = (pid, ppid, pgid, errno = EPERM) => row(pid, ppid, pgid, {
 // SIGCONT freeze and resume, SIGKILL removes (children pass to pid 1), other
 // signals remove unless the process ignores them. Like the real sampler, it
 // checks the start time at the moment of each signal and reports what it did.
-function simulate(rows) {
+function simulate(rows, { collected = false } = {}) {
   const table = new Map(rows.map(item => [item.pid, { ...item }]));
   const delivered = [];
   const attempts = [];
+  const held = [];
   const afterScan = new Map();
   const races = new Map();
   let scans = 0;
@@ -48,6 +50,8 @@ function simulate(rows) {
   const remove = pid => {
     table.delete(pid);
     for (const item of table.values()) if (item.ppid === pid) item.ppid = 1;
+    // The guard collects its runner as soon as the runner is gone.
+    if (pid === RUNNER) machine.collected = true;
   };
   const deliver = (item, name, target) => {
     delivered.push([target, name]);
@@ -65,6 +69,11 @@ function simulate(rows) {
     table,
     delivered,
     attempts,
+    // Group signals sent by the runner's pid alone, without a start-time check.
+    held,
+    // Whether the guard has collected the runner. Until then the runner's pid
+    // is the runner's, and the group that carries it is the run's.
+    collected,
     get scans() { return scans; },
     deliveredTo: pid => delivered.filter(([target]) => target === pid).map(([, name]) => name),
     // Runs `change` right after scan number `number` is taken, before the
@@ -99,14 +108,21 @@ function simulate(rows) {
       for (const item of [...table.values()].filter(candidate => candidate.pgid === pgid)) deliver(item, name, -pgid);
       return 'sent';
     },
+    signalGroupWhileHeld: name => {
+      if (machine.collected) throw new Error('the guard signalled the group by number after collecting the runner');
+      held.push(name);
+      attempts.push([-RUNNER, name]);
+      for (const item of [...table.values()].filter(candidate => candidate.pgid === RUNNER)) deliver(item, name, -RUNNER);
+      return true;
+    },
     sleep: async ms => { clock += ms; },
     now: () => clock,
   };
   return machine;
 }
 
-function guardFor(machine, { runnerGone = () => false, seed = null } = {}) {
-  const ownership = createOwnership({ guardPid: GUARD, samplerPid: SAMPLER, runnerPid: RUNNER });
+function guardFor(machine, { seed = null } = {}) {
+  const ownership = createOwnership({ guardPid: GUARD, helperPids: [SAMPLER, STANDBY], runnerPid: RUNNER });
   if (seed) ownership.update(seed, true);
   const anomalies = [];
   const guard = createGuard({
@@ -115,15 +131,17 @@ function guardFor(machine, { runnerGone = () => false, seed = null } = {}) {
     scan: machine.scan,
     signalProcesses: machine.signalProcesses,
     signalGroup: machine.signalGroup,
+    signalGroupWhileHeld: machine.signalGroupWhileHeld,
     sleep: machine.sleep,
     now: machine.now,
-    isRunnerGone: runnerGone,
+    isRunnerGone: () => machine.collected,
     onAnomaly: message => anomalies.push(message),
   });
   return { ownership, guard, anomalies };
 }
 
-const system = [row(1, 0, 1), row(GUARD, 1, GUARD), row(SAMPLER, GUARD, GUARD), row(12, GUARD, GUARD)];
+const system = [row(1, 0, 1), row(GUARD, 1, GUARD), row(SAMPLER, GUARD, GUARD), row(STANDBY, GUARD, GUARD), row(12, GUARD, GUARD)];
+const newOwnership = () => createOwnership({ guardPid: GUARD, helperPids: [SAMPLER, STANDBY], runnerPid: RUNNER });
 const stranger = [row(200, 1, 200), row(201, 200, 200)];
 const run = [
   row(RUNNER, GUARD, RUNNER),   // the test runner, leader of its own group
@@ -136,7 +154,7 @@ const pids = owned => [...owned.keys()].sort((a, b) => a - b);
 const clean = { survivors: [], unverified: [] };
 
 test('the run is the runner, its group, everything they started and everything identified before; nobody else', () => {
-  const ownership = createOwnership({ guardPid: GUARD, samplerPid: SAMPLER, runnerPid: RUNNER });
+  const ownership = newOwnership();
   const inGroupOrphan = row(105, 1, RUNNER); // lost its parent before any scan, still in the runner's group
   assert.deepEqual(pids(ownership.update([...system, ...stranger, ...run, inGroupOrphan], true)), [100, 101, 102, 103, 104, 105]);
   assert.equal(ownership.groupMember(true).pid, RUNNER);
@@ -157,7 +175,7 @@ test('the run is the runner, its group, everything they started and everything i
 });
 
 test('a process missing from one scan is still the run\'s when it shows up again with the same start time', () => {
-  const ownership = createOwnership({ guardPid: GUARD, samplerPid: SAMPLER, runnerPid: RUNNER });
+  const ownership = newOwnership();
   ownership.update([...system, ...run], true);
   // The detached pair is adopted by pid 1 and, for one scan, not listed at all.
   assert.deepEqual(pids(ownership.update([...system, row(RUNNER, GUARD, RUNNER)], true)), [100]);
@@ -165,7 +183,7 @@ test('a process missing from one scan is still the run\'s when it shows up again
 });
 
 test('a pid is the run\'s only together with its start time', () => {
-  const ownership = createOwnership({ guardPid: GUARD, samplerPid: SAMPLER, runnerPid: RUNNER });
+  const ownership = newOwnership();
   ownership.update([...system, ...run], true);
   // 103 ended and the system gave its pid to an unrelated process, which has a
   // child of its own. The run's old 104 passed to pid 1 and is still the run's.
@@ -177,18 +195,87 @@ test('a pid is the run\'s only together with its start time', () => {
   assert.deepEqual(pids(ownership.update([...system, ...runnerReused], false)), [104]);
 });
 
-test('a process holding the runner\'s pid is the runner only if this guard started it', () => {
-  const ownership = createOwnership({ guardPid: GUARD, samplerPid: SAMPLER, runnerPid: RUNNER });
-  assert.deepEqual(pids(ownership.update([...system, row(RUNNER, 1, RUNNER), row(101, RUNNER, RUNNER)], true)), []);
-  assert.equal(ownership.runnerStart, null);
-  assert.equal(ownership.groupMember(true), null);
+test('the runner is the root of the run by its own pid from the first scan, readable or not', () => {
+  // Its start time and memory cannot be read. It is the root all the same, with
+  // everything it started, and the guard cannot watch the run.
+  const unreadable = newOwnership();
+  const fromTheStart = [...system, unreadableRow(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), row(103, 101, 103)];
+  assert.deepEqual(pids(unreadable.update(fromTheStart, true)), [100, 101, 103]);
+  assert.deepEqual(unreadable.readFailure(), { pid: RUNNER, problem: 'unreadable', errno: EPERM, samples: 1 });
+  assert.equal(unreadable.runnerStart, null);
+  assert.equal(unreadable.groupMember(true), null);
+  assert.equal(unreadable.groupUsable, true);
+
+  // Nothing but its pid can be read.
+  const opaque = newOwnership();
+  const onlyPid = row(RUNNER, 0, 0, { status: 0, start: '0', megabytes: 0, infoError: EPERM, usageError: EPERM });
+  assert.deepEqual(pids(opaque.update([...system, onlyPid, row(101, RUNNER, RUNNER)], true)), [100, 101]);
+  assert.deepEqual(opaque.readFailure(), { pid: RUNNER, problem: 'unreadable', errno: EPERM, samples: 1 });
+
+  // Unreadable the way an ending process is: tolerated for a few samples only.
+  const ending = newOwnership();
+  for (let sample = 1; sample <= UNREADABLE_SAMPLES; sample += 1) {
+    ending.update([...system, unreadableRow(RUNNER, GUARD, RUNNER, ESRCH)], true);
+    assert.equal(ending.readFailure(), null, `sample ${sample}`);
+  }
+  ending.update([...system, unreadableRow(RUNNER, GUARD, RUNNER, ESRCH)], true);
+  assert.deepEqual(ending.readFailure(), { pid: RUNNER, problem: 'unreadable', errno: ESRCH, samples: UNREADABLE_SAMPLES + 1 });
+});
+
+test('a runner that exists and is not listed, or is listed as something this guard did not start, makes the guard give up', () => {
+  const missing = newOwnership();
+  for (let sample = 1; sample <= UNREADABLE_SAMPLES; sample += 1) {
+    assert.deepEqual(pids(missing.update([...system, ...stranger], true)), []);
+    assert.equal(missing.readFailure(), null, `sample ${sample}`);
+  }
+  missing.update([...system, ...stranger], true);
+  assert.deepEqual(missing.readFailure(), { pid: RUNNER, problem: 'missing', errno: ESRCH, samples: UNREADABLE_SAMPLES + 1 });
+  // Listed again: watched again.
+  assert.deepEqual(pids(missing.update([...system, ...run], true)), [100, 101, 102, 103, 104]);
+  assert.equal(missing.readFailure(), null);
+
+  const inconsistent = { pid: RUNNER, problem: 'inconsistent', errno: 0, samples: 1 };
+  const notOurChild = newOwnership();
+  notOurChild.update([...system, row(RUNNER, 1, RUNNER), row(101, RUNNER, RUNNER)], true);
+  assert.deepEqual(notOurChild.readFailure(), inconsistent);
+  assert.equal(notOurChild.groupMember(true), null);
+
+  const otherGroup = newOwnership();
+  otherGroup.update([...system, row(RUNNER, GUARD, 555)], true);
+  assert.deepEqual(otherGroup.readFailure(), inconsistent);
+  assert.equal(otherGroup.groupUsable, false, 'its group is not signalled by number');
+
+  const restarted = newOwnership();
+  restarted.update([...system, ...run], true);
+  assert.equal(restarted.readFailure(), null);
+  restarted.update([...system, row(RUNNER, GUARD, RUNNER, { start: 'another-start' })], true);
+  assert.deepEqual(restarted.readFailure(), inconsistent);
+
+  // A runner that has ended and waits to be collected is neither.
+  const ended = newOwnership();
+  ended.update([...system, ...run], true);
+  ended.update([...system, row(RUNNER, GUARD, RUNNER, { status: ZOMBIE, start: '0', megabytes: 0, usageError: ESRCH })], true);
+  assert.equal(ended.readFailure(), null);
+});
+
+test('once the guard has collected the runner, a process holding the runner\'s old pid is nothing to the run', () => {
+  const ownership = newOwnership();
+  ownership.update([...system, ...run], true);
+  const reused = [row(RUNNER, 1, RUNNER, { start: 'someone-else' }), row(301, RUNNER, RUNNER), unreadableRow(302, RUNNER, RUNNER)];
+  assert.deepEqual(pids(ownership.update([...system, ...reused], false)), []);
+  assert.equal(ownership.readFailure(), null);
+  assert.equal(ownership.groupMember(false), null);
+  // Never having been listed is no failure either, once the runner is collected.
+  const never = newOwnership();
+  for (let sample = 0; sample < UNREADABLE_SAMPLES + 2; sample += 1) never.update([...system], false);
+  assert.equal(never.readFailure(), null);
   // The guard and its own helpers are not part of the run, whatever the table says.
-  const odd = [row(1, 0, 1), row(GUARD, RUNNER, RUNNER), row(SAMPLER, RUNNER, RUNNER), row(RUNNER, GUARD, RUNNER)];
-  assert.deepEqual(pids(ownership.update(odd, true)), [100]);
+  const odd = [row(1, 0, 1), row(GUARD, RUNNER, RUNNER), row(SAMPLER, RUNNER, RUNNER), row(STANDBY, RUNNER, RUNNER), row(RUNNER, GUARD, RUNNER)];
+  assert.deepEqual(pids(newOwnership().update(odd, true)), [100]);
 });
 
 test('a process of the run that cannot be read is kept, counted, and makes the guard give up', () => {
-  const ownership = createOwnership({ guardPid: GUARD, samplerPid: SAMPLER, runnerPid: RUNNER });
+  const ownership = newOwnership();
   ownership.update([...system, ...run], true);
   assert.equal(ownership.readFailure(), null);
 
@@ -196,7 +283,7 @@ test('a process of the run that cannot be read is kept, counted, and makes the g
   // It is not dropped, and neither is what it started.
   const blocked = [row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), unreadableRow(103, 1, 103), row(104, 103, 103)];
   assert.deepEqual(pids(ownership.update([...system, ...blocked], true)), [100, 101, 103, 104]);
-  assert.deepEqual(ownership.readFailure(), { pid: 103, errno: EPERM, samples: 1 });
+  assert.deepEqual(ownership.readFailure(), { pid: 103, problem: 'unreadable', errno: EPERM, samples: 1 });
   // Readable again: no failure.
   ownership.update([...system, row(RUNNER, GUARD, RUNNER), row(103, 1, 103), row(104, 103, 103)], true);
   assert.equal(ownership.readFailure(), null);
@@ -204,16 +291,16 @@ test('a process of the run that cannot be read is kept, counted, and makes the g
   // Started by the run and never readable at all.
   const born = [row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), unreadableRow(108, 101, 108)];
   assert.deepEqual(pids(ownership.update([...system, ...born], true)), [100, 101, 108]);
-  assert.deepEqual(ownership.readFailure(), { pid: 108, errno: EPERM, samples: 1 });
+  assert.deepEqual(ownership.readFailure(), { pid: 108, problem: 'unreadable', errno: EPERM, samples: 1 });
 
   // Nothing but the pid could be read (parent, group and state unknown too).
   const opaque = [row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), row(108, 0, 0, { status: 0, start: '0', megabytes: 0, infoError: EPERM, usageError: EPERM })];
   assert.deepEqual(pids(ownership.update([...system, ...opaque], true)), [100, 101, 108]);
-  assert.deepEqual(ownership.readFailure(), { pid: 108, errno: EPERM, samples: 2 });
+  assert.deepEqual(ownership.readFailure(), { pid: 108, problem: 'unreadable', errno: EPERM, samples: 2 });
 });
 
 test('a process that is ending may be unreadable for a few samples, and no longer', () => {
-  const ownership = createOwnership({ guardPid: GUARD, samplerPid: SAMPLER, runnerPid: RUNNER });
+  const ownership = newOwnership();
   ownership.update([...system, ...run], true);
   const ending = [...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), unreadableRow(102, 101, RUNNER, ESRCH)];
   for (let sample = 1; sample <= UNREADABLE_SAMPLES; sample += 1) {
@@ -221,7 +308,7 @@ test('a process that is ending may be unreadable for a few samples, and no longe
     assert.equal(ownership.readFailure(), null, `sample ${sample}`);
   }
   ownership.update(ending, true);
-  assert.deepEqual(ownership.readFailure(), { pid: 102, errno: ESRCH, samples: UNREADABLE_SAMPLES + 1 });
+  assert.deepEqual(ownership.readFailure(), { pid: 102, problem: 'unreadable', errno: ESRCH, samples: UNREADABLE_SAMPLES + 1 });
   // Gone: nothing to read, nothing wrong.
   ownership.update([...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER)], true);
   assert.equal(ownership.readFailure(), null);
@@ -297,10 +384,36 @@ test('if a pid changes hands in the instant between the check and the signal, th
   for (const pid of [100, 101, 102, 104]) assert.equal(machine.table.has(pid), false);
 });
 
-test('the process group is signalled only while the runner exists and an identified process of the run is in it', async () => {
-  // The runner has been collected: group 100 may be anybody's by now.
-  const leftover = simulate([...system, row(102, 1, RUNNER), row(103, 1, 103), row(400, 1, RUNNER, { start: 'someone-else' })]);
-  const first = guardFor(leftover, { runnerGone: () => true, seed: [...system, ...run] });
+test('a run whose runner cannot be read is stopped through the runner\'s own process group', async () => {
+  const machine = simulate([...system, ...stranger, unreadableRow(RUNNER, GUARD, RUNNER), ...run.slice(1)]);
+  const { guard, ownership } = guardFor(machine);
+  await guard.observe();
+  assert.equal(ownership.readFailure().problem, 'unreadable');
+  assert.deepEqual(await guard.stopRun(), clean);
+  // Frozen (once per freezing round) and then killed by the number of the group
+  // the guard still held; the detached processes, identified, one by one.
+  assert.match(machine.held.join(' '), /^(SIGSTOP )+SIGKILL$/);
+  assert.deepEqual([...new Set(machine.attempts.map(([target]) => target))].sort((a, b) => a - b), [-100, 103, 104]);
+  for (const pid of [100, 101, 102, 103, 104]) assert.equal(machine.table.has(pid), false, `process ${pid} is gone`);
+  for (const pid of [1, GUARD, SAMPLER, STANDBY, 12, 200, 201]) assert.equal(machine.table.get(pid).frozen, undefined);
+
+  // The same when the runner is the only process and nothing else can vouch for the group.
+  const alone = simulate([...system, unreadableRow(RUNNER, GUARD, RUNNER)]);
+  assert.deepEqual(await guardFor(alone).guard.endRun('SIGTERM', 5000), clean);
+  assert.deepEqual(alone.held, ['SIGTERM']);
+  assert.equal(alone.table.has(RUNNER), false);
+
+  // A runner shown outside its own group: its group is not signalled by number.
+  const elsewhere = simulate([...system, row(RUNNER, GUARD, 555)]);
+  await guardFor(elsewhere).guard.stopRun();
+  assert.deepEqual(elsewhere.held, []);
+});
+
+test('the process group is signalled only while the runner exists, or an identified process of the run vouches for it', async () => {
+  // The runner has been collected: group 100 may be anybody's by now. The
+  // simulated machine itself refuses a group signal by number at this point.
+  const leftover = simulate([...system, row(102, 1, RUNNER), row(103, 1, 103), row(400, 1, RUNNER, { start: 'someone-else' })], { collected: true });
+  const first = guardFor(leftover, { seed: [...system, ...run] });
   assert.deepEqual(await first.guard.stopRun(), clean);
   assert.deepEqual(leftover.attempts.filter(([target]) => target < 0), []);
   assert.deepEqual(leftover.attempts.filter(([target]) => target === 400), []);
@@ -308,17 +421,19 @@ test('the process group is signalled only while the runner exists and an identif
   assert.equal(leftover.table.has(102), false);
   assert.equal(leftover.table.has(103), false);
 
-  // The runner exists but the guard never saw it as its own child: nothing is signalled.
-  const unproven = simulate([...system, row(RUNNER, 1, RUNNER), row(101, RUNNER, RUNNER)]);
-  await guardFor(unproven).guard.stopRun();
-  assert.deepEqual(unproven.attempts, []);
-
-  // The group member the guard vouches with changes hands before the signal: no group signal.
+  // The runner ends, is collected, and its pid passes to another process
+  // before the guard's next signal: nothing is sent, by any route.
   const swapped = simulate([...system, row(RUNNER, GUARD, RUNNER)]);
   swapped.after(1, () => swapped.replace(RUNNER, row(RUNNER, 1, RUNNER, { start: 'someone-else' })));
   await guardFor(swapped).guard.stopRun();
   assert.deepEqual(swapped.delivered, []);
+  assert.deepEqual(swapped.held, []);
   assert.equal(swapped.table.get(RUNNER).start, 'someone-else');
+
+  // While the runner exists, the sampler's checked signal is used, not the number alone.
+  const normal = simulate([...system, ...run]);
+  assert.deepEqual(await guardFor(normal).guard.stopRun(), clean);
+  assert.deepEqual(normal.held, []);
 });
 
 test('a process that cannot be identified by start time is not signalled by pid, and cleanup reports it', async () => {
@@ -333,8 +448,8 @@ test('a process that cannot be identified by start time is not signalled by pid,
 
   // One that was the run's and turned unreadable is reported too, after a stop and after a signal.
   for (const act of [item => item.stopRun(), item => item.endRun('SIGTERM', 1000)]) {
-    const turned = simulate([...system, row(103, 1, 103, { start: '0', megabytes: 0, usageError: EPERM })]);
-    const outcome = await act(guardFor(turned, { runnerGone: () => true, seed: [...system, ...run] }).guard);
+    const turned = simulate([...system, row(103, 1, 103, { start: '0', megabytes: 0, usageError: EPERM })], { collected: true });
+    const outcome = await act(guardFor(turned, { seed: [...system, ...run] }).guard);
     assert.deepEqual(outcome.survivors, []);
     assert.deepEqual(outcome.unverified.map(item => item.pid), [103]);
     assert.deepEqual(turned.attempts, []);
@@ -377,14 +492,15 @@ test('a failing scan stops a cleanup instead of letting it act on stale knowledg
   const machine = simulate([...system, ...run]);
   let calls = 0;
   const broken = createGuard({
-    ownership: createOwnership({ guardPid: GUARD, samplerPid: SAMPLER, runnerPid: RUNNER }),
+    ownership: newOwnership(),
     runnerPid: RUNNER,
     scan: async () => { calls += 1; if (calls > 1) throw new Error('sampler did not answer within 1000 ms'); return machine.scan(); },
     signalProcesses: machine.signalProcesses,
     signalGroup: machine.signalGroup,
+    signalGroupWhileHeld: machine.signalGroupWhileHeld,
     sleep: machine.sleep,
     now: machine.now,
-    isRunnerGone: () => false,
+    isRunnerGone: () => machine.collected,
   });
   await assert.rejects(() => broken.stopRun(), /sampler did not answer/);
   assert.deepEqual(machine.delivered.filter(([, name]) => name === 'SIGKILL'), []);
@@ -523,9 +639,10 @@ function scenario(t) {
 
 const treeRoles = ['nested', 'nested-child', 'detached', 'detached-child', 'short-lived', 'adopted'];
 
-function samplerOf(guardPid) {
+// The guard's samplers: the one in use and the one standing by.
+function samplersOf(guardPid) {
   const children = execFileSync('pgrep', ['-P', String(guardPid)], { encoding: 'utf8' }).split('\n').filter(Boolean).map(Number);
-  return children.find(pid => isOurs(pid, 'run-tests-sampler.py'));
+  return children.filter(pid => isOurs(pid, 'run-tests-sampler.py'));
 }
 
 test('an ordinary run reports its results and exit status unchanged', { timeout: 60000 }, async t => {
@@ -647,20 +764,71 @@ test('a process of the run that cannot be read stops the run: its memory would b
   assert.equal(bystanderSurvived(), true);
 });
 
+test('a test runner that cannot be read is stopped at the first scan, before its tests get anywhere', { timeout: 60000 }, async t => {
+  const { environment, recorded, bystanderSurvived } = scenario(t);
+  const result = await startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'unreadable-runner' }, faultyGuard).done;
+  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+  assert.match(result.stderr, /run-tests: GUARD CANNOT READ PROCESS \d+ OF THE RUN after 0\.\d s \(errno 1, 1 samples in a row\)\. Its memory is unknown\./);
+  assert.match(result.stderr, /run-tests: Every process of the run is gone\./);
+  assert.match(result.stderr, /run-tests: memory guard: 1 samples,/);
+  assert.doesNotMatch(result.stdout, /^ok 1 /m);
+  assert.deepEqual([...recorded().keys()], [], 'the fixture never started its process tree');
+  assert.ok(result.seconds < 10, `took ${result.seconds} s`);
+  assert.equal(bystanderSurvived(), true);
+});
+
+test('when the sampler in use fails and no new one can be started, the one standing by stops the whole run', { timeout: 60000 }, async t => {
+  const { environment, ready, allGone, bystanderSurvived } = scenario(t);
+  const run = startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'primary-fails' }, faultyGuard);
+  await ready();
+  const result = await run.done;
+  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+  assert.match(result.stderr, /run-tests: GUARD LOST SIGHT OF THE RUN after [\d.]+ s: sampler exited \(injected\)\./);
+  assert.match(result.stderr, /run-tests: Stopping the test run \(\d+ processes\)\./);
+  assert.match(result.stderr, /run-tests: Every process of the run is gone\./);
+  assert.doesNotMatch(result.stderr, /could not be verified|NOT touched/);
+  await allGone([...treeRoles, 'ready']);
+  assert.equal(bystanderSurvived(), true);
+});
+
+test('when no sampler works at all, only the runner\'s process group is ended, and the guard says what it left running', { timeout: 60000 }, async t => {
+  const { environment, ready, recorded, stillThere, allGone, bystanderSurvived } = scenario(t);
+  const run = startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'all-samplers-fail' }, faultyGuard);
+  await ready();
+  const result = await run.done;
+  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+  assert.match(result.stderr, /run-tests: GUARD LOST SIGHT OF THE RUN after [\d.]+ s: sampler exited \(injected\)\./);
+  assert.match(result.stderr, /run-tests: Cleanup could not be verified \(no new sampler can be started \(injected\)\)\./);
+  assert.match(result.stderr, /run-tests: Killed the test runner's process group\. Processes the run started outside that group were NOT touched and may still be running\./);
+  assert.match(result.stderr, /run-tests: Not every process of the run is confirmed gone\./);
+  assert.doesNotMatch(result.stderr, /Every process of the run is gone/);
+  // The runner's group is gone: the test file and what it started in that group.
+  await allGone(['nested', 'nested-child', 'short-lived', 'ready']);
+  // What the run started outside the group is still there. This is the limit
+  // of the guard without a sampler; it names those processes, and this test ends them.
+  const tree = recorded();
+  const outside = ['detached', 'detached-child', 'adopted'];
+  for (const role of outside) assert.equal(stillThere(role), true, `${role} was left running`);
+  const listed = /Last seen outside that group, not signalled: ([\d, ]+)\./.exec(result.stderr);
+  assert.ok(listed, result.stderr);
+  assert.deepEqual(listed[1].split(', ').map(Number).sort((a, b) => a - b), outside.map(role => tree.get(role)).sort((a, b) => a - b));
+  assert.equal(bystanderSurvived(), true);
+});
+
 for (const [name, status] of [['SIGTERM', 143], ['SIGINT', 130]]) {
   test(`${name} to the guard ends the whole run and is reported as ${status}`, { timeout: 60000 }, async t => {
     const { environment, ready, allGone, bystanderSurvived } = scenario(t);
     const run = startGuard([descendants], environment('idle'));
     await ready();
-    const sampler = samplerOf(run.pid);
-    assert.ok(sampler, 'found the guard\'s sampler');
+    const samplers = samplersOf(run.pid);
+    assert.equal(samplers.length, 2, 'the guard runs a sampler and keeps one standing by');
     run.signal(name);
     const result = await run.done;
     assert.equal(result.code, status, result.stderr);
     assert.match(result.stderr, new RegExp(`run-tests: Received ${name} after [\\d.]+ s; ending the test run\\.`));
     assert.match(result.stderr, /run-tests: Every process of the run is gone\./);
     await allGone([...treeRoles, 'ready']);
-    assert.equal(isOurs(sampler, 'run-tests-sampler.py'), false, 'the sampler ended with the guard');
+    for (const sampler of samplers) assert.equal(isOurs(sampler, 'run-tests-sampler.py'), false, 'the samplers ended with the guard');
     assert.equal(bystanderSurvived(), true);
   });
 }
@@ -695,13 +863,14 @@ test('a run that passes its deadline is stopped and reported as 124', { timeout:
   assert.equal(bystanderSurvived(), true);
 });
 
-for (const [how, name] of [['ends', 'SIGKILL'], ['hangs', 'SIGSTOP']]) {
-  test(`when the sampler ${how}, the guard stops the run rather than leave it unwatched`, { timeout: 60000 }, async t => {
+for (const [how, name] of [['end', 'SIGKILL'], ['hang', 'SIGSTOP']]) {
+  test(`when its samplers ${how}, the guard stops the run with a new one rather than leave it unwatched`, { timeout: 60000 }, async t => {
     const { environment, ready, allGone, bystanderSurvived } = scenario(t);
     const run = startGuard([descendants], environment('idle'));
     await ready();
-    const sampler = samplerOf(run.pid);
-    assert.equal(signalOurs(sampler, 'run-tests-sampler.py', name), true, 'signalled the guard\'s sampler');
+    const samplers = samplersOf(run.pid);
+    assert.equal(samplers.length, 2);
+    for (const sampler of samplers) assert.equal(signalOurs(sampler, 'run-tests-sampler.py', name), true, 'signalled a sampler of the guard');
     const result = await run.done;
     assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
     assert.match(result.stderr, /run-tests: GUARD LOST SIGHT OF THE RUN after [\d.]+ s: sampler (exited|did not answer within 1000 ms)/);
@@ -709,7 +878,7 @@ for (const [how, name] of [['ends', 'SIGKILL'], ['hangs', 'SIGSTOP']]) {
     assert.match(result.stderr, /run-tests: Every process of the run is gone\./);
     assert.ok(result.seconds < 20, `took ${result.seconds} s`);
     await allGone([...treeRoles, 'ready']);
-    await waitFor(() => !isOurs(sampler, 'run-tests-sampler.py'), 3000, 'the old sampler to be gone');
+    await waitFor(() => samplers.every(sampler => !isOurs(sampler, 'run-tests-sampler.py')), 3000, 'the old samplers to be gone');
     assert.equal(bystanderSurvived(), true);
   });
 }
