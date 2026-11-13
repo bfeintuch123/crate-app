@@ -8,7 +8,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
-const { findBrowser, launch } = require('./asset-controls-cdp-helper');
+const { findBrowser, launch, withBrowserPage } = require('./asset-controls-cdp-helper');
 
 const fs = require('node:fs');
 const os = require('node:os');
@@ -144,9 +144,8 @@ function bootstrap() {
 }
 
 const json = value => JSON.stringify(value);
-async function withPage(options, run) {
-  const page = await launch({ browser, rendererDir, bootstrapSource: `(${bootstrap.toString()})();`, ...options });
-  try { return await run(page); } finally { await page.close(); }
+function withPage(options, run) {
+  return withBrowserPage({ browser, rendererDir, bootstrapSource: `(${bootstrap.toString()})();`, ...options }, run);
 }
 async function start(page, names) {
   assert.equal(await page.evaluate(`window.__start(${json(names)})`), true);
@@ -508,4 +507,90 @@ test('a browser that cannot start fails the launch cleanly: no crash, no leftove
     const running = childProcess.spawnSync('/usr/bin/pgrep', ['-f', fake], { encoding: 'utf8' });
     assert.equal(running.stdout.trim(), '', 'no browser process is left');
   } finally { fs.rmSync(holder, { recursive: true, force: true }); }
+});
+
+// Light, no Chrome: a harmless test-owned node process stands in for the browser.
+const ownedFixtureDirs = () => fs.readdirSync(os.tmpdir()).filter(name => name.startsWith('crate-asset-controls-')).sort();
+const processRunning = marker => childProcess.spawnSync('/usr/bin/pgrep', ['-f', marker], { encoding: 'utf8' }).stdout.trim() !== '';
+function withStubbedBrowser(marker, run) {
+  const originalSpawn = childProcess.spawn, originalKill = process.kill;
+  const signals = [];
+  let owned = null;
+  childProcess.spawn = (_browser, _args, options) => {
+    owned = originalSpawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', marker], options);
+    // The startup CDP request is pending when the transport fails.
+    owned.once('spawn', () => setTimeout(() => owned.stdio[4].emit('error', Object.assign(new Error('synthetic pipe failure'), { code: 'EIO' })), 50));
+    return owned;
+  };
+  process.kill = function (pid, signal) { signals.push([pid, signal]); return originalKill.call(process, pid, signal); };
+  const restore = () => { childProcess.spawn = originalSpawn; process.kill = originalKill; };
+  return Promise.resolve().then(() => run(() => owned, signals)).finally(restore);
+}
+
+test('a transport error during a pending request ends only the owned browser group and removes the fixture', { timeout: 30000 }, async () => {
+  const ownedMarker = `crate-owned-transport-${process.pid}-${Date.now()}`;
+  const bystanderMarker = `crate-bystander-${process.pid}-${Date.now()}`;
+  const before = ownedFixtureDirs();
+  const bystander = childProcess.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', bystanderMarker], { detached: true, stdio: 'ignore' });
+  const bystanderExit = new Promise(resolve => bystander.once('exit', resolve));
+  try {
+    await withStubbedBrowser(ownedMarker, async (owned, signals) => {
+      await assert.rejects(launch({ browser: process.execPath, rendererDir, bootstrapSource: '' }), /synthetic pipe failure/);
+      assert.ok(owned()?.pid > 0, 'the stub process was spawned');
+      assert.ok(signals.length >= 1, 'the owned group was terminated');
+      assert.ok(signals.every(([pid, signal]) => pid === -owned().pid && signal === 'SIGKILL'), `only the owned group is signalled: ${JSON.stringify(signals)}`);
+    });
+    assert.deepEqual(ownedFixtureDirs(), before, 'the fixture directory is removed');
+    assert.equal(processRunning(ownedMarker), false, 'the owned browser process is gone');
+    assert.equal(processRunning(bystanderMarker), true, 'an unrelated process is untouched');
+  } finally {
+    try { process.kill(-bystander.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+    await bystanderExit;
+  }
+});
+
+test('run and cleanup both failing: the original failure stays primary and every cleanup failure is reported', { timeout: 30000 }, async () => {
+  // withBrowserPage: a failing test body and a failing close.
+  const original = new Error('original assertion failure');
+  const cleanup = new Error('post-run identity failure');
+  await assert.rejects(withBrowserPage({}, async () => { throw original; }, async () => ({ close: async () => { throw cleanup; } })), error => {
+    assert.ok(error instanceof AggregateError, String(error));
+    assert.equal(error.errors[0], original);
+    assert.equal(error.cause, original);
+    assert.ok(error.errors.includes(cleanup));
+    assert.ok(error.message.startsWith('original assertion failure'), error.message);
+    return true;
+  });
+  // A passing body with a failing close still fails, with the cleanup error itself.
+  await assert.rejects(withBrowserPage({}, async () => 'ok', async () => ({ close: async () => { throw cleanup; } })), error => error === cleanup);
+
+  // launch: a startup transport failure and a fixture removal failure.
+  const marker = `crate-owned-dual-${process.pid}-${Date.now()}`;
+  const before = ownedFixtureDirs();
+  const originalRm = fs.rmSync;
+  let removalFailures = 0;
+  fs.rmSync = function (target, ...rest) {
+    if (String(target).includes(`${path.sep}crate-asset-controls-`) && removalFailures === 0) {
+      removalFailures += 1;
+      throw Object.assign(new Error('synthetic removal failure'), { code: 'EBUSY' });
+    }
+    return originalRm.call(fs, target, ...rest);
+  };
+  try {
+    await withStubbedBrowser(marker, async () => {
+      await assert.rejects(launch({ browser: process.execPath, rendererDir, bootstrapSource: '' }), error => {
+        assert.ok(error instanceof AggregateError, String(error));
+        assert.equal(error.errors[0].message, 'synthetic pipe failure', 'the startup failure stays primary');
+        assert.equal(error.cause, error.errors[0]);
+        assert.ok(error.errors.some(item => item.message === 'synthetic removal failure'), 'the removal failure is reported');
+        return true;
+      });
+    });
+  } finally {
+    fs.rmSync = originalRm;
+    for (const name of ownedFixtureDirs().filter(name => !before.includes(name))) fs.rmSync(path.join(os.tmpdir(), name), { recursive: true, force: true });
+  }
+  assert.equal(removalFailures, 1);
+  assert.equal(processRunning(marker), false, 'the owned browser process is gone even when removal fails');
+  assert.deepEqual(ownedFixtureDirs(), before);
 });

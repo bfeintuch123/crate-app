@@ -34,48 +34,86 @@ function productionPage(rendererDir, bootstrapSource) {
     bootstrapSource + '\nwindow.__pageReady = true;</script></body></html>';
 }
 
+// Keeps the original failure primary while reporting every cleanup failure.
+function combineFailures(primary, ...cleanup) {
+  const extra = cleanup.flatMap(error => error instanceof AggregateError && error.cleanup ? error.errors : [error]).filter(Boolean);
+  if (!extra.length) return primary;
+  const combined = new AggregateError([primary, ...extra],
+    `${primary?.message || primary}; cleanup also failed: ${extra.map(error => error.message).join('; ')}`, { cause: primary });
+  combined.primary = primary;
+  return combined;
+}
+
+function cleanupFailure(errors) {
+  if (!errors.length) return null;
+  if (errors.length === 1) return errors[0];
+  const combined = new AggregateError(errors, `browser cleanup failed: ${errors.map(error => error.message).join('; ')}`);
+  combined.cleanup = true;
+  return combined;
+}
+
 async function launch({ browser, rendererDir, bootstrapSource, width = 1100, height = 760 }) {
   const pinned = process.env.CRATE_UI_TEST_BROWSER_PIN === '1' && browser === process.env.CRATE_UI_TEST_BROWSER;
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-  let directory = null, child = null, nextId = 0, buffer = '', exited = false, failure = null, closed = false;
+  // processExited: an actual exit/close of the spawned process was observed.
+  // transportFailure: the CDP pipe (or the spawn) failed; the process may still be alive.
+  let directory = null, child = null, nextId = 0, buffer = '', processExited = false, transportFailure = null, closed = false;
   const pending = new Map();
   const rejectPending = error => {
     for (const { reject } of pending.values()) reject(error);
     pending.clear();
   };
-  const stop = error => {
-    if (exited) return;
-    exited = true;
-    failure ||= error;
-    rejectPending(failure || new Error('browser exited'));
+  const failTransport = error => {
+    transportFailure ||= error;
+    rejectPending(transportFailure);
   };
-  // Ends the browser process group (if one started) and always removes the
-  // fixture directory, even when the pinned identity check after the run throws.
+  const markExited = () => {
+    processExited = true;
+    rejectPending(transportFailure || new Error('browser exited'));
+  };
+  const waitForExit = async timeoutMs => {
+    const deadline = Date.now() + timeoutMs;
+    while (!processExited && Date.now() < deadline) await sleep(25);
+    return processExited;
+  };
+  // Ends the owned browser process group and removes the fixture directory.
+  // Every cleanup failure is collected; none is swallowed except an already
+  // absent group (ESRCH). Only the detached group this launch spawned is signalled.
   async function close() {
     if (closed) return;
     closed = true;
+    const errors = [];
     try {
-      if (child && !exited) {
-        try { await Promise.race([send('Browser.close'), sleep(3000)]); } catch (_) {}
-        const deadline = Date.now() + 5000;
-        while (!exited && Date.now() < deadline) await sleep(50);
-      }
-      if (child && Number.isInteger(child.pid) && !exited) {
-        try { process.kill(-child.pid, 'SIGKILL'); } catch (_) {}
-        await sleep(200);
+      const owned = child && Number.isInteger(child.pid) && child.pid > 0;
+      if (owned && !processExited) {
+        if (!transportFailure) {
+          try { await Promise.race([send('Browser.close'), sleep(3000)]); } catch (_) { /* fall through to termination */ }
+          await waitForExit(5000);
+        }
+        if (!processExited) {
+          try { process.kill(-child.pid, 'SIGKILL'); }
+          catch (error) { if (error.code !== 'ESRCH') errors.push(error); }
+          if (!await waitForExit(5000)) errors.push(new Error(`browser process group ${child.pid} did not exit after SIGKILL`));
+        }
       }
       for (const stream of child ? [child.stdio[3], child.stdio[4]] : []) stream?.destroy();
-      if (pinned) ciChrome.verifyIdentity(browser);
+      if (pinned) {
+        try { ciChrome.verifyIdentity(browser); } catch (error) { errors.push(error); }
+      }
     } finally {
-      if (directory) fs.rmSync(directory, { recursive: true, force: true });
+      if (directory) {
+        try { fs.rmSync(directory, { recursive: true, force: true }); } catch (error) { errors.push(error); }
+      }
     }
+    const failure = cleanupFailure(errors);
+    if (failure) throw failure;
   }
   const send = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
-    if (exited || !child) { reject(failure || new Error('browser exited')); return; }
+    if (transportFailure || processExited || !child) { reject(transportFailure || new Error('browser exited')); return; }
     const id = ++nextId;
     pending.set(id, { resolve, reject, method });
     child.stdio[3].write(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }) + '\0', error => {
-      if (error) stop(error);
+      if (error) failTransport(error);
     });
   });
   try {
@@ -92,9 +130,10 @@ async function launch({ browser, rendererDir, bootstrapSource, width = 1100, hei
     ], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
     // A failed spawn (for example EACCES) is reported asynchronously; handle it
     // and any pipe error so the test fails cleanly instead of crashing Node.
-    child.on('error', error => stop(error));
-    child.on('exit', () => stop(null));
-    for (const stream of [child.stdio[3], child.stdio[4]]) stream?.on('error', error => stop(error));
+    child.on('error', error => failTransport(error));
+    child.on('exit', markExited);
+    child.on('close', markExited);
+    for (const stream of [child.stdio[3], child.stdio[4]]) stream?.on('error', error => failTransport(error));
     child.stdio[4]?.on('data', chunk => {
       buffer += chunk.toString('utf8');
       let end;
@@ -158,10 +197,25 @@ async function launch({ browser, rendererDir, bootstrapSource, width = 1100, hei
     }
     return { evaluate, press, clickAt, moveAway, screenshot, setViewport, emulateReducedMotion, close, sleep };
   } catch (error) {
-    try { await close(); }
-    catch (cleanupError) { error.message += `; cleanup: ${cleanupError.message}`; }
+    try { await close(); } catch (cleanupError) { throw combineFailures(error, cleanupError); }
     throw error;
   }
 }
 
-module.exports = { findBrowser, launch };
+// Runs a test body against a page and always closes it. A failing body stays
+// the primary failure even when closing the browser also fails.
+async function withBrowserPage(options, run, launcher = launch) {
+  const page = await launcher(options);
+  let failure = null;
+  try { return await run(page); }
+  catch (error) { failure = error; throw error; }
+  finally {
+    try { await page.close(); }
+    catch (cleanupError) {
+      // A throw from finally replaces the pending one, so report both here.
+      throw failure ? combineFailures(failure, cleanupError) : cleanupError;
+    }
+  }
+}
+
+module.exports = { findBrowser, launch, withBrowserPage, combineFailures };
