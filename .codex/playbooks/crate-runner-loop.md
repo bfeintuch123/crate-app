@@ -144,15 +144,15 @@ node --check parsers/index.js
 node --check parsers/powerpoint.js
 node --check parsers/figma.js
 node --check parsers/package-safety.js
-node --test tests/main-window-lifecycle.test.js
-node --test tests/provenance.test.js
-node --test tests/provenance-dual-write.test.js
-node --test tests/psd-embedded-safety.test.js
-node --test tests/figma-link-per-project.test.js
-node --test tests/figma-scope.test.js
-node --test tests/figma-token-privacy.test.js
-node --test tests/renderer-figma-scope.test.js
-node --test tests/quick-package-parser.test.js
+node scripts/run-tests.js tests/main-window-lifecycle.test.js
+node scripts/run-tests.js tests/provenance.test.js
+node scripts/run-tests.js tests/provenance-dual-write.test.js
+node scripts/run-tests.js tests/psd-embedded-safety.test.js
+node scripts/run-tests.js tests/figma-link-per-project.test.js
+node scripts/run-tests.js tests/figma-scope.test.js
+node scripts/run-tests.js tests/figma-token-privacy.test.js
+node scripts/run-tests.js tests/renderer-figma-scope.test.js
+node scripts/run-tests.js tests/quick-package-parser.test.js
 git diff --check
 ```
 
@@ -201,7 +201,7 @@ Example:
 ```markdown
 ## Runner Evidence
 
-- command: `node --test tests/provenance-dual-write.test.js`
+- command: `node scripts/run-tests.js tests/provenance-dual-write.test.js`
 - environment: Tier A, Codex App on Mac mini
 - branch/commit: `fix/example`, `abc1234`
 - standing order: `SO-002 Autonomous Crate Failure Loop`
@@ -232,8 +232,8 @@ For docs-only work, use the docs check commands from the relevant playbook inste
 Use for provenance, live evidence, diagnostics, package manifest, and session decision-layer changes.
 
 ```sh
-node --test tests/provenance.test.js
-node --test tests/provenance-dual-write.test.js
+node scripts/run-tests.js tests/provenance.test.js
+node scripts/run-tests.js tests/provenance-dual-write.test.js
 git diff --check
 ```
 
@@ -241,10 +241,10 @@ git diff --check
 Use for Figma scope, token privacy, renderer scope, and per-project link changes.
 
 ```sh
-node --test tests/figma-link-per-project.test.js
-node --test tests/figma-scope.test.js
-node --test tests/figma-token-privacy.test.js
-node --test tests/renderer-figma-scope.test.js
+node scripts/run-tests.js tests/figma-link-per-project.test.js
+node scripts/run-tests.js tests/figma-scope.test.js
+node scripts/run-tests.js tests/figma-token-privacy.test.js
+node scripts/run-tests.js tests/renderer-figma-scope.test.js
 git diff --check
 ```
 
@@ -256,9 +256,9 @@ node --check parsers/index.js
 node --check parsers/admission-budgets.js
 node --check parsers/powerpoint.js
 node --check parsers/package-safety.js
-node --test tests/parser-admission-limits.test.js
-node --test tests/psd-embedded-safety.test.js
-node --test tests/quick-package-parser.test.js
+node scripts/run-tests.js tests/parser-admission-limits.test.js
+node scripts/run-tests.js tests/psd-embedded-safety.test.js
+node scripts/run-tests.js tests/quick-package-parser.test.js
 git diff --check
 ```
 

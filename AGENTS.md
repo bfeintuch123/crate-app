@@ -14,6 +14,12 @@ Never use `main` as the PR base for Crate release work unless Bryant explicitly 
 - If multiple agents are involved, keep ownership boundaries explicit and avoid overlapping file edits.
 - Documentation-only workflow setup may edit docs and Codex configuration files, but must not touch app code, `package.json`, or `package-lock.json` unless Bryant explicitly scopes that work.
 
+## Running Tests
+- Run node:test files through the memory guard: `node scripts/run-tests.js <files and node --test options>`, or `npm test` for the whole serial suite. Do not call `node --test` directly.
+- The guard watches the run from outside and stops it when one process holds more than 2 GB, the whole run more than 4 GB, or the run takes longer than 40 minutes (`--memory-limit-mb`, `--total-memory-limit-mb`, `--deadline-seconds`). It samples twenty times a second, so it is not a hard cap. It needs macOS and a system `python3`, and refuses to run tests without them.
+- Exit status 137 (memory), 124 (deadline) or 125 (the guard could not watch the run or confirm its cleanup) comes from the guard, not from a test. Treat it as a failure to investigate, not as a limit to raise.
+- In test files, import assert with `require('./bounded-assert')`, never from `node:assert`, and do not use `t.assert`. It passes and fails exactly as `node:assert/strict` does, but a failed assertion on a large value (the synthetic DOM, a Buffer, a long string) is summarized instead of diffed without bound. `tests/bounded-assert.test.js` enforces this.
+
 ## Major PR Routing
 - A major PR changes a major surface: watcher/admission; filesystem/path handling; provenance/project isolation; parsers/archive handling; packaging/quota; IPC; async/concurrency/cancellation/deadlines/stale-result handling; privacy/security; large-list state/performance; or signing/release.
 - Before ready-for-review or merge, a major PR requires protected CI that passed on the exact current head and a fresh independent read-only review by a distinct Luna agent at high reasoning effort. The highest-risk security, performance, or state-integrity changes require a second distinct independent reviewer.

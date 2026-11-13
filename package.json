@@ -6,6 +6,7 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "test": "node scripts/run-tests.js",
     "test:app-contents": "node --test tests/app-content-policy.test.js",
     "verify:app-contents": "node scripts/verify-app-contents.js"
   },

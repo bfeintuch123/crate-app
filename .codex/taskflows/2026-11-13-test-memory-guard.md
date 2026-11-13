@@ -8,8 +8,8 @@
 - standing order: none selected yet; select one from `.codex/ops/standing-orders.md` on resume
 - repo: bfeintuch123/crate-app
 - branch: t3/test-memory-guard
-- base: v2.4.x at f80d5bc (after #327). Must be brought onto v2.4.x again after #328 merges.
-- mode: separate draft PR, not opened yet; no push, merge, ready-for-review, or release is authorized
+- base: v2.4.x at 885bb56 (after #327 and #328), brought in by a normal merge with no conflicts
+- mode: separate draft PR, not opened yet; merge, ready-for-review and release are not authorized
 - status: blocked
 
 ## Goal
@@ -18,41 +18,64 @@ Stop a failing test from exhausting the machine. A failed `assert.equal` or `ass
 
 ## Scope
 
-Two components with different states.
+Allowed:
 
-1. Memory guard: `scripts/run-tests.js`, `scripts/run-tests-sampler.py`, `tests/run-tests-memory-guard.test.js`, `tests/fixtures/memory-guard/`. Hardened on 2026-11-13 under a scoped resumption so that it could protect #328's next test run before the rest of this work merges. It is NOT approved for that or any use until an independent read-only safety review of the final head passes.
-2. Everything else is paused at the prototype state of the checkpoint commit: `tests/bounded-assert.js` and its tests, the one-line assert import in test files, the `npm test` script, the CI workflow steps and their pins, and the documented test commands.
+- `tests/bounded-assert.js`, its tests and fixtures
+- the one-line assert import in test files
+- `scripts/run-tests.js`, `scripts/run-tests-sampler.py`, their tests and fixtures
+- `package.json` `test` script, the two node:test steps in `.github/workflows/security-gate.yml` and their pins in `tests/release-artifact-policy.test.js`
+- test commands in AGENTS.md, check suites, playbooks and QA smoke templates
 
 Forbidden:
 
 - app source (`main.js`, `renderer/`, `parsers/`, `preload.js`)
 - removing, skipping or weakening any test or assertion
-- editing the #328 worktree or branch
-- full suite, push, PR, CI, merge, ready-for-review, release, or publishing private machine evidence, until Mack says otherwise
+- merge, auto-merge, ready-for-review, release, or publishing private machine evidence
+- any deliberate runaway or memory-exhaustion test
+- a fourth correction cycle on the guard without Bryant
 
 ## State
 
-- current phase: guard correction cycle 3 of 3 committed locally; no correction cycle is left. Waiting for Mack, and for #328 to merge before the rest resumes
-- last completed checkpoint: four local commits, unpushed: the WIP checkpoint, the guard hardening, and the cycle 2 and cycle 3 corrections
-- next action: wait for Mack. A further blocking finding on the guard is escalated to Bryant, not answered with a fourth cycle.
-- blocker: independent review of the guard has not passed; #328 must merge before the paused work resumes
-- approval state: writer ownership of this branch for guard work only; no approval to use the guard, push, or merge
-- preferences applied: one writer, read-only reviewers, no concurrent heavy Mac tests, pinned Node, bounded synthetic tests only
-- routing decision: major PR (shared test infrastructure and CI); needs exact-head protected CI, an independent Luna review at high effort and a distinct second reviewer, at most three correction cycles
-- workflow eval suite/result: guard tests only, see Evidence
+- current phase: STOPPED on a blocking issue in the reviewed guard, found by the writer during focused checks on the merged base. Waiting for Bryant.
+- last completed checkpoint: v2.4.x (885bb56) merged in; bounded assert finished and tested; guard wired into `npm test`, CI and documented commands; all committed locally, unpushed
+- next action: Bryant decides how the guard should treat a process of the run that it cannot read because another user owns it (see Blocker). Then one more guard change, bounded tests, the heavy slot for a full suite, push, draft PR, exact-head CI, and the independent reviews.
+- blocker: see Blocker below. All three correction cycles are used; this needs a fourth, which is Bryant's call.
+- approval state: resumption authorized after #328 merged; no approval to merge, mark ready, or release
+- preferences applied: one writer, read-only reviewers, no concurrent heavy Mac tests, every run through the guard, pinned Node, live process preflight before each run
+- routing decision: major PR (shared test infrastructure and CI); needs exact-head protected CI and independent read-only reviews by Astra at high effort and Claude Fable 5.2 at high effort, each in a fresh session
+- workflow eval suite/result: focused checks only, see Evidence. No full suite on this base.
 - outcome receipt: none
+
+## Blocker
+
+The guard stops any run in which a test starts a tool that runs as another user while a sample lands on it. `/bin/ps` is such a tool (it is installed setuid root). The sampler reports a `ps` child as owned by uid 0 with its start time and memory unreadable (errno 1, EPERM), and the rule added after the first review, that a process of the run which cannot be read stops the run, then ends the whole run with exit 125. Seen on the merged base: a focused run was stopped after 22 s while `tests/run-tests-memory-guard.test.js` was running; in a direct check, 240 of 240 scans of the writer's own `ps` children came back unreadable in exactly this way.
+
+Seven test files start `ps`: `cross-app-live-pipeline`, `olivia-baseline-discovery`, `provenance-dual-write`, `working-file-choice-ipc`, `working-source-recovery-core`, `working-source-recovery-ipc`, and the guard's own test file. A `ps` lives for about 15 ms and the guard samples every 50 ms, so the full suite, which makes dozens of such calls, would almost certainly be stopped. With the guard wired into CI as it is on this branch, CI would fail the same way. The branch is therefore not pushed and no PR is open.
+
+Nothing else is affected: the same focused set without those files passes through the guard, 517 of 517.
+
+Choices, for Bryant:
+
+1. Tolerate briefly (recommended). A process of the run that another user owns may stay unreadable for a short, fixed time, for example ten samples (0.5 s), before the run is stopped as now. A `ps` is gone long before that. What it gives up: such a process is unmeasured for up to that time; the guard cannot signal it either way.
+2. Recognize system tools by path and exempt only those. More exact, more code, and a list to maintain.
+3. Change the seven test files not to start `ps`. Touches tests outside this work, including files from #328 and the provenance suite.
+4. Leave the rule as it is. The guard then cannot run this suite.
+
+Each of 1 to 3 is a change to reviewed guard behavior or to other tests, so it needs a new review at the new head.
 
 ## Checkpoints
 
 - [x] preflight / doctor (read-only preflight of v2.4.x, #327, #328 and duplicate work; no duplicate found)
 - [x] context loaded
-- [x] implementation: memory guard hardening (pending review)
-- [ ] implementation: bounded assert hardening, import switch on the final base, CI and doc wiring (paused)
-- [x] verification: guard tests, bounded and synthetic only
-- [ ] verification: full serial suite on the final head (not run on this base)
-- [ ] independent safety review of the guard
-- [ ] proof bundle
-- [ ] ledger/state update
+- [x] implementation: memory guard hardening (three correction cycles, reviewed through 90fd869; one later wording commit not yet reviewed)
+- [x] merge of v2.4.x at 885bb56 (#328), normal merge, no conflicts
+- [x] implementation: bounded assert hardening, import switch on the merged base, CI and doc wiring
+- [x] verification: focused checks through the guard on the merged base
+- [ ] BLOCKED: the guard must cope with tests that start `ps` (Bryant's decision)
+- [ ] verification: full serial suite on the final head (heavy slot, coordinated; not run)
+- [ ] push and draft PR
+- [ ] exact-head CI
+- [ ] independent reviews: Astra high and Claude Fable 5.2 high, fresh read-only sessions
 - [ ] REQUIRED post-merge acceptance on the exact merged commit (see below; not run)
 
 ## How the guard works
@@ -78,6 +101,10 @@ Bounded synthetic tests only. Allocators stop by themselves at 256 MB and let go
 | 2026-11-13 | Cycle 2: eight more deliberate regressions, against the simulated tests or the command-level tests | terminal | Each was caught: runner adopted only when readable (simulated and at the command line); missing runner tolerated; inconsistent runner accepted; group signalled by number after collection; group signalled by number with the runner in another group; no group signal by number; standby sampler unused. |
 | 2026-11-13 | Cycle 3: 120 samplers ended with SIGKILL and asked for a scan right after | terminal | Reported as ended through its exit 113 times and through its closed input 7 times; marked gone for good every time. |
 | 2026-11-13 | Cycle 3: the test file three times; the two sampler-loss tests alone 12 times | private logs | 41 of 41 pass all three times, about 24 s each; 12 of 12. Nothing left running. 22 tests on a simulated process table, 19 with real processes. |
+| 2026-11-13 | Merged base: `tests/bounded-assert.test.js` through the guard | private log | 19 of 19 pass. Ten deliberate regressions in the wrapper, one at a time, each caught. With the size bound removed on purpose, the whole file still finishes: 10 tests fail and it peaks at 547 MB, the guarded child stopped at its 512 MB limit as designed. |
+| 2026-11-13 | Merged base: focused files through the guard, including the guard's own test file | private log | Stopped by the guard after 22 s with exit 125: a `ps` started by a test could not be read. This is the Blocker. Every test that had run had passed (541). |
+| 2026-11-13 | Merged base: the same focused set without files that start `ps` (bounded assert, release, install and app-content policy, legacy conf, excluded-needs-review IPC, renderer Figma scope, four `.cjs` files) | private log | 517 of 517 pass through the guard in 21 s; peak 364 MB in one process. Includes the focus test from #328 and the updated CI pins. |
+| 2026-11-13 | Merged base: `node --test tests/run-tests-memory-guard.test.js` directly | private log | 41 of 41 pass, 27 s, nothing left running. |
 | 2026-11-13 | Finite allocator under `--memory-limit-mb=128`, three runs | terminal | Stopped at 132, 132 and 140 MB after 0.5 to 0.6 s, exit 137, run confirmed gone, 0.64 to 0.70 s wall. |
 | 2026-11-13 | Sampler reading against the macOS `footprint` tool for one process holding 96 MB | terminal | Sampler footprint 109.0 MB, tool 109.2 MB; resident 137.1 MB against 137.4 MB from Node. |
 | 2026-11-13 | Guard cost on a 10 s idle run | terminal | 165 samples; about 5 percent of one core in total (sampler about 2 ms of CPU per scan, guard process about 0.02 s per second). |
@@ -91,6 +118,7 @@ At most three correction cycles.
 - Review 1, on the in-progress guard: four blocking findings (read failures dropped or zeroed; exit 0 with unconfirmed cleanup; signals sent from a stale snapshot; test cleanup by bare pid). Answered in the guard hardening commit.
 - Review 2, on that commit: the four findings substantially addressed; 34 of 34 rerun independently. One new blocking finding: a runner unreadable from the first scan was never adopted, so nothing was owned and the run could continue unmeasured until the deadline. One limit to evaluate: when the sampler and its replacement both fail, detached children are left. Answered in the cycle 2 commit: the runner is the root by its own pid; the second sampler stands by from the start. The total-failure case remains a limit and is stated below.
 - Review 3, on the cycle 2 commit: source approved for narrow, supervised use with #328; 40 of 40 in one of three independent runs, 39 of 40 in the other two. The failing test expected the words "sampler exited" or "did not answer" and got "sampler closed its input". Cause confirmed: a sampler that ends is noticed as its exit or as its closed input, whichever the guard sees first, and the guard acts the same on both (it marks the sampler gone and stops the run; the captured run exited 125 with every process gone). Answered in the cycle 3 commit: both are reported as "sampler ended", with the way it was noticed in brackets; the test accepts exactly those two wordings for a killed sampler and only "did not answer" for a frozen one, with its exit status, cleanup and bystander checks unchanged; one test added at the sampler client. No change to what the guard does.
+- After the merge of #328 (2026-11-13), by the writer, during focused checks on the merged base: the rule from review 1 that a process of the run which cannot be read stops the run also stops runs in which a test starts `ps`. Not fixed: no correction cycle is left. See Blocker.
 - Fallback evaluated for the total-failure case and not built: identifying detached processes with `ps` start times. It needs a second identity kept for every process, has one-second resolution and a millisecond gap before each signal, and fails in the same condition as starting a new sampler (no new process can be started). Nothing in Node can read another process's start time.
 
 ## Limits of the guard, measured where possible
@@ -106,32 +134,35 @@ At most three correction cycles.
 - A runner that is unreadable only in the way an ending process is, or missing from scans, is tolerated for three samples (about 0.15 s) before the run is stopped.
 - The guard's own waits are bounded: 5 s grace after a signal, 2 s for leftovers, 5 s to confirm a kill, 1 s per sampler request, at most 3 s without a sample.
 
-## Open items for the paused work
+## What the bounded assert covers
 
-None of these is done.
+- equal, notEqual, deepEqual, notDeepEqual and their strict aliases: decided exactly as `node:assert/strict` decides them; Node's own message when both operands are small, a summary otherwise.
+- throws and rejects with a validation object: the function or promise is settled once; Node judges it when its message would be small, otherwise the same rule is applied here with a summary in place of the diff.
+- the deprecated `fail(actual, expected)` and `partialDeepStrictEqual` do not render large operands (the second refuses them).
+- `assert.Assert` is not handed out, and a test forbids `t.assert`, direct imports of `node:assert`, and hand-built AssertionErrors in test files.
+- Not bounded in time for a comparison Node itself cannot finish quickly: the comparison is Node's own.
+- The search for the first difference is limited to 64 levels, 50,000 comparisons and one second.
 
-- Bounded assert: treat a value whose size cannot be measured safely (measurement throws, iterators, promises, module namespaces) as too large; never call into a Proxy while summarizing; cap the work spent locating the first difference; cover every exposed path (`throws`/`rejects` with an object validator, legacy `fail(actual, expected)`, `partialDeepStrictEqual`, `assert.Assert`, `t.assert`); add a differential parity test against `node:assert/strict`.
-- `tests/run-tests-memory-guard.test.js` imports `./bounded-assert`, which is still the prototype.
-- #328 adds `tests/asset-controls-real-browser.test.js` and `tests/excluded-needs-review-ipc.test.js`, which import `node:assert/strict` directly. With #328 merged first, this branch switches their imports when it is brought onto the new base.
-- `npm test`, the CI workflow steps and their pins, and documented commands are not wired.
-- The default deadline of 2400 s and the default limits were chosen from one full-suite run of the prototype and need confirming on the final head.
+Still open, apart from the Blocker:
 
-## Sequence after resumption
+- The default deadline of 2400 s and the default limits were chosen from one full-suite run of the prototype and need confirming on the final head. CI passes `--deadline-seconds=2580`, just under the job's 45 minutes; the suite step took 35 min 47 s in the post-merge run on 885bb56.
+- The guard has not run this suite on CI yet. It needs `/usr/bin/python3` or `python3` on the runner.
 
-1. Independent read-only review of the guard at its final head. Findings return to this writer as follow-up commits. The guard is not used for #328 before that review passes.
-2. Wait for #328's separately approved merge. Do not resume the paused work before Mack's message.
-3. Bring this branch onto the new v2.4.x and regenerate the one-line import switch so it covers every test file on that base, including #328's new files.
-4. Close the open items above. Keep exact assertion coverage: no test or assertion removed, skipped or weakened.
-5. Focused checks, then a live process preflight, then the full serial suite on the exact head from a non-hidden workspace with the pinned Node and Chrome. Wait if another session's Chrome or heavy run is active. Never signal a process another session started.
-6. Push, open a draft PR, exact-head CI, independent Luna review at high effort plus a distinct second reviewer, at most three correction cycles.
-7. Bryant's own approval for ready-for-review and for merge. Neither is authorized today.
-8. After a separately authorized merge: the post-merge acceptance below.
+## Sequence from here
+
+1. Bryant decides the Blocker.
+2. One guard change for it, with bounded synthetic tests, as a normal follow-up commit.
+3. Report "ready for heavy checks" on that head and wait for the coordinator. Then a live process preflight and the full serial suite through the guard, from a non-hidden workspace with the pinned Node and Chrome. Wait if another session's test, sampler or Chrome is active. Never signal a process another session started.
+4. Push, open a draft PR against v2.4.x, exact-head CI.
+5. Independent read-only reviews at that head: Astra high and Claude Fable 5.2 high, each in a fresh session. This writer does not count as a reviewer. A finding that needs a fix goes to Bryant.
+6. Bryant's own approval for ready-for-review and for merge. Neither is authorized today.
+7. After a separately authorized merge: the post-merge acceptance below.
 
 ## Required post-merge acceptance (Bryant, 2026-11-13)
 
 Status: REQUIRED. NOT RUN. A planned run does not count as completed. This is acceptance of the merged code, in addition to pre-merge evidence. The narrower guard work above does not replace it.
 
-When: after this PR and #328 are both on v2.4.x by separately authorized merges. The focus test lives in #328, so the acceptance needs both.
+When: after this PR is on v2.4.x by a separately authorized merge. #328, which carries the focus test, merged on 2026-11-13 as 885bb56.
 
 Rules: one check at a time, after a live process preflight. Every Node process runs under an external limit. Never reproduce unbounded growth. Never raise a limit to make a check pass. Never signal a process this procedure did not start.
 
@@ -165,5 +196,5 @@ Comparison to report: checks 2 and 3 side by side (after and before) for the fai
 Next exact action:
 
 ```text
-Wait for Mack. If review findings on the guard arrive, read this taskflow, verify branch t3/test-memory-guard and its working tree, and answer them with normal follow-up commits and bounded synthetic tests only. Do not use the guard for #328, run a full suite, push, or open a PR before Mack says so. Do not run the post-merge acceptance before a separately authorized merge of this PR and of #328.
+Wait for Bryant's decision on the Blocker. Do not change the guard, push, open a PR or run a full suite before it. Then read this taskflow, verify branch t3/test-memory-guard and its working tree, and continue from "Sequence from here" step 2. Do not run the post-merge acceptance before a separately authorized merge of this PR.
 ```

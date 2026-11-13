@@ -90,6 +90,7 @@ jobs:
           node --check parsers/package-transaction-worker.js
           node --check scripts/ci-chrome.js
           node --check scripts/install-approved-canvas-prebuild.js
+          node --check scripts/run-tests.js
           node --check scripts/verify-app-contents.js
           node --check scripts/verify-install-scripts.js
           node --check scripts/verify-macos-release-app.js
@@ -104,14 +105,14 @@ jobs:
         env:
           CRATE_VERIFY_LIVE_TOOLCHAIN: '1'
           npm_config_cache: ${{ runner.temp }}/crate-npm-cache
-        run: node --test --test-concurrency=1 tests/release-toolchain-integration.test.js
+        run: node scripts/run-tests.js --test-concurrency=1 tests/release-toolchain-integration.test.js
 
       - name: Run complete serial source suite
         env:
           npm_config_cache: ${{ runner.temp }}/crate-npm-cache
           CRATE_UI_TEST_BROWSER_PIN: '1'
           CRATE_UI_TEST_BROWSER: ${{ runner.temp }}/crate-ci-chrome/payload/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
-        run: node --test --test-concurrency=1 tests/*.test.js
+        run: node scripts/run-tests.js --deadline-seconds=2580 --test-concurrency=1 tests/*.test.js
 
       - name: Verify fixed Chrome for Testing remained unchanged
         if: always()

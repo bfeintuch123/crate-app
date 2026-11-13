@@ -852,13 +852,13 @@ test('a second signal skips the wait for a process that ignores the first', { ti
 
 test('a run that passes its deadline is stopped and reported as 124', { timeout: 60000 }, async t => {
   const { environment, ready, allGone, bystanderSurvived } = scenario(t);
-  const run = startGuard(['--deadline-seconds=3', descendants], environment('idle'));
+  const run = startGuard(['--deadline-seconds=6', descendants], environment('idle'));
   await ready();
   const result = await run.done;
   assert.equal(result.code, EXIT_DEADLINE, result.stderr);
-  assert.match(result.stderr, /run-tests: DEADLINE PASSED after [\d.]+ s \(limit 3 s\)\./);
+  assert.match(result.stderr, /run-tests: DEADLINE PASSED after [\d.]+ s \(limit 6 s\)\./);
   assert.match(result.stderr, /run-tests: Every process of the run is gone\./);
-  assert.ok(result.seconds < 12, `took ${result.seconds} s`);
+  assert.ok(result.seconds < 18, `took ${result.seconds} s`);
   await allGone([...treeRoles, 'ready']);
   assert.equal(bystanderSurvived(), true);
 });

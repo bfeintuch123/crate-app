@@ -50,7 +50,7 @@ Run:
 node --check tests/ui-smoothness-fixture.js
 node --check tests/ui-smoothness-preload.js
 node --check tests/ui-smoothness-electron-baseline.js
-node --test --test-concurrency=1 \
+node scripts/run-tests.js --test-concurrency=1 \
   tests/ui-smoothness-fixture.test.js \
   tests/ui-smoothness-preload-contract.test.js \
   tests/ui-smoothness-harness-contract.test.js
@@ -60,7 +60,7 @@ git diff --check d2a7be01b89d3ff8bebfe3daf927aa34e6a16629...HEAD
 Run the complete serial source suite when supported by the approved environment:
 
 ```sh
-node --test --test-concurrency=1 tests/*.test.js
+node scripts/run-tests.js --test-concurrency=1 tests/*.test.js
 ```
 
 Record exact commands, versions, exit codes, pass/fail/skip counts, and durations.

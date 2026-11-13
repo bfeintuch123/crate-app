@@ -2,6 +2,8 @@
 
 Named check suites keep prompts short and make loop results easier to compare. A playbook or user prompt may add stricter checks.
 
+Test commands use `node scripts/run-tests.js`, which is `node --test` under a memory guard: it accepts the same files and options, and stops a run that allocates without limit or outlives its deadline instead of letting it exhaust the machine. Do not call `node --test` directly.
+
 ## docs-only
 
 Use for workflow docs, playbooks, skills, and Markdown-only changes.
@@ -86,15 +88,15 @@ node --check tests/main-window-lifecycle.test.js
 node --check tests/provenance-dual-write.test.js
 node --check tests/quick-package-parser.test.js
 node --check tests/renderer-figma-scope.test.js
-node --test tests/main-window-lifecycle.test.js
-node --test tests/provenance.test.js
-node --test tests/provenance-dual-write.test.js
-node --test tests/psd-embedded-safety.test.js
-node --test tests/figma-scope.test.js
-node --test tests/figma-link-per-project.test.js
-node --test tests/figma-token-privacy.test.js
-node --test tests/renderer-figma-scope.test.js
-node --test tests/quick-package-parser.test.js
+node scripts/run-tests.js tests/main-window-lifecycle.test.js
+node scripts/run-tests.js tests/provenance.test.js
+node scripts/run-tests.js tests/provenance-dual-write.test.js
+node scripts/run-tests.js tests/psd-embedded-safety.test.js
+node scripts/run-tests.js tests/figma-scope.test.js
+node scripts/run-tests.js tests/figma-link-per-project.test.js
+node scripts/run-tests.js tests/figma-token-privacy.test.js
+node scripts/run-tests.js tests/renderer-figma-scope.test.js
+node scripts/run-tests.js tests/quick-package-parser.test.js
 git diff --check
 ```
 
@@ -106,8 +108,8 @@ Use when changes affect provenance, live evidence, package details, diagnostics,
 node --check provenance.js
 node --check main.js
 node --check tests/provenance-dual-write.test.js
-node --test tests/provenance.test.js
-node --test tests/provenance-dual-write.test.js
+node scripts/run-tests.js tests/provenance.test.js
+node scripts/run-tests.js tests/provenance-dual-write.test.js
 git diff --check
 ```
 
@@ -119,10 +121,10 @@ Use when changes affect Figma links, token handling, scope, page lock, package-t
 node --check parsers/figma.js
 node --check renderer/app.js
 node --check tests/renderer-figma-scope.test.js
-node --test tests/figma-scope.test.js
-node --test tests/figma-link-per-project.test.js
-node --test tests/figma-token-privacy.test.js
-node --test tests/renderer-figma-scope.test.js
+node scripts/run-tests.js tests/figma-scope.test.js
+node scripts/run-tests.js tests/figma-link-per-project.test.js
+node scripts/run-tests.js tests/figma-token-privacy.test.js
+node scripts/run-tests.js tests/renderer-figma-scope.test.js
 git diff --check
 ```
 
@@ -137,9 +139,9 @@ node --check parsers/powerpoint.js
 node --check parsers/package-safety.js
 node --check tests/parser-admission-limits.test.js
 node --check tests/quick-package-parser.test.js
-node --test tests/parser-admission-limits.test.js
-node --test tests/quick-package-parser.test.js
-node --test tests/psd-embedded-safety.test.js
+node scripts/run-tests.js tests/parser-admission-limits.test.js
+node scripts/run-tests.js tests/quick-package-parser.test.js
+node scripts/run-tests.js tests/psd-embedded-safety.test.js
 git diff --check
 ```
 
@@ -154,12 +156,12 @@ node --check tests/ui-stability-fixture.js
 node --check tests/ui-stability-preload.js
 node --check tests/ui-stability-electron-harness.js
 node --check tests/ui-stability-responsive-geometry.test.js
-node --test tests/ui-stability-fixture.test.js
-node --test tests/ui-stability-harness-contract.test.js
-node --test tests/ui-stability-responsive.test.js
-node --test tests/ui-stability-responsive-geometry.test.js
-node --test tests/renderer-figma-scope.test.js
-node --test tests/main-window-lifecycle.test.js
+node scripts/run-tests.js tests/ui-stability-fixture.test.js
+node scripts/run-tests.js tests/ui-stability-harness-contract.test.js
+node scripts/run-tests.js tests/ui-stability-responsive.test.js
+node scripts/run-tests.js tests/ui-stability-responsive-geometry.test.js
+node scripts/run-tests.js tests/renderer-figma-scope.test.js
+node scripts/run-tests.js tests/main-window-lifecycle.test.js
 git diff --check
 ```
 
@@ -227,7 +229,7 @@ For public-release mode, first create two detached clean worktrees at the approv
 Required after changing nested asset layouts, virtual-row geometry or dependency controls. Use the authenticated Node runtime and isolated fixture-home preload selected by the active task.
 
 ```sh
-node --test tests/nested-asset-geometry-runner.test.js
+node scripts/run-tests.js tests/nested-asset-geometry-runner.test.js
 node scripts/run-nested-asset-geometry.js
 ```
 
