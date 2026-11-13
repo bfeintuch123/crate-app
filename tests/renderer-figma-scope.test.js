@@ -1095,7 +1095,7 @@ test('renderer presents the required Existing Assets decision with source-safe c
   await renderer.renderFiles();
 
   assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
-  assert.equal(elements['existing-assets-modal-count'].textContent, 'Include or skip all existing assets in this project.');
+  assert.equal(elements['existing-assets-modal-count'].textContent, 'Include or exclude all existing assets in this project.');
   assert.equal(elements['existing-assets-modal-title'].textContent, '1 existing asset found');
   assert.equal(elements['existing-assets-modal-source'].textContent, 'Illustrator · Existing Project.ai');
   assert.equal(elements['existing-assets-modal-list'].children.length, 1);
@@ -1212,7 +1212,7 @@ test('repaired Figma decision includes partial and fully skipped assets in its c
       assert.equal(elements['existing-assets-modal-title'].textContent, '2 existing assets found');
       assert.equal(elements['existing-assets-modal-list'].children.length, 2);
       assert.equal(elements['existing-assets-modal-count'].textContent,
-        `${skippedCount} of these assets currently skipped. This choice applies to all existing assets in the project.`);
+        `${skippedCount} of these assets currently excluded. This choice applies to all existing assets in the project.`);
       await elements[`btn-${decision}-existing-assets`].listeners.click[0]();
       assert.deepEqual(decisions, [[project.id, decision]]);
       assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
@@ -1374,8 +1374,11 @@ test('Current Project separates protected sources, Existing Assets, and Added Wh
   const sourceButtons = elements['project-file-list'].children[0].children.filter(child => child.tagName === 'BUTTON');
   assert.equal(sourceButtons.length, 0);
   const removeButton = elements['added-assets-list'].children[0].children.find(child => child.tagName === 'BUTTON');
-  assert.equal(removeButton.textContent, '\u00D7');
-  assert.equal(removeButton.getAttribute('aria-label'), 'Exclude Added.png from this project');
+  // Included assets offer only the square [x]: drawn in CSS, no text, no hover title.
+  assert.equal(getElementTreeText(removeButton).trim(), '');
+  assert.equal(removeButton.dataset.rowAction, 'exclude');
+  assert.equal(removeButton.title, undefined);
+  assert.equal(removeButton.getAttribute('aria-label'), 'Exclude Added.png');
 });
 
 test('Review Assets renders the accepted source card and omits scoped stale pending rows', async () => {
@@ -1882,9 +1885,9 @@ test('Existing Assets batch controls use the persisted cohort decision IPC and p
   assert.equal(elements['btn-skip-all-existing'].disabled, true);
 });
 
-test('Needs Review items all use the individual Add contract through one bulk action', async () => {
+test('Needs Review items all use the individual Include contract through one bulk action', async () => {
   const fixture = await loadPendingBatchFixture({ id: 'pending-batch-add' });
-  assert.equal(fixture.elements['btn-include-all-existing'].textContent, 'Add All');
+  assert.equal(fixture.elements['btn-include-all-existing'].textContent, 'Include All (4)');
   assert.equal(fixture.elements['btn-include-all-existing'].disabled, false);
   assert.equal(fixture.elements['pending-file-list'].children.length, 4);
 
@@ -1902,9 +1905,9 @@ test('Needs Review items all use the individual Add contract through one bulk ac
   assert.equal(fixture.document.querySelector('#btn-review-assets-continue').disabled, false);
 });
 
-test('Needs Review items all use the individual Skip contract through one bulk action', async () => {
+test('Needs Review items all use the individual Exclude contract through one bulk action', async () => {
   const fixture = await loadPendingBatchFixture({ id: 'pending-batch-skip' });
-  assert.equal(fixture.elements['btn-skip-all-existing'].textContent, 'Skip All');
+  assert.equal(fixture.elements['btn-skip-all-existing'].textContent, 'Exclude All (4)');
   assert.equal(fixture.elements['btn-skip-all-existing'].disabled, false);
 
   assert.equal(await fixture.renderer.submitAssetReviewBatchDecision('skip'), true);
@@ -1954,9 +1957,12 @@ test('Needs Review bulk decisions exclude Needs Save and Opened items while pres
   assert.deepEqual(addFixture.getPersisted().pendingFiles.map(file => file.captureState), ['needs-save', 'observed']);
   assert.equal(addFixture.elements['filter-count-added'].textContent, '2');
   assert.equal(addFixture.elements['filter-count-missing'].textContent, '2');
-  assert.equal(addFixture.elements['btn-include-all-existing'].textContent, 'Add All');
+  assert.equal(addFixture.elements['btn-include-all-existing'].textContent, 'Include All (0)');
   assert.equal(addFixture.elements['btn-include-all-existing'].disabled, true);
   assert.equal(addFixture.elements['btn-skip-all-existing'].disabled, true);
+  // With no "Include or Exclude" rows left, both batch buttons are hidden.
+  assert.equal(addFixture.elements['btn-include-all-existing'].classList.contains('hidden'), true);
+  assert.equal(addFixture.elements['btn-skip-all-existing'].classList.contains('hidden'), true);
   assert.deepEqual(
     Array.from(addFixture.elements['pending-file-list'].children).map(row => (
       row.children.find(child => child.className === 'pending-state-badge').textContent
@@ -2017,7 +2023,7 @@ test('duplicate pending names bind bulk actions by stable identity or original s
           Array.from(fixture.elements['pending-file-list'].children).map(row => (
             row.children.find(child => child.className === 'pending-state-badge').textContent
           )),
-          reviewFirst ? ['Needs Review', 'Needs Save'] : ['Needs Save', 'Needs Review'],
+          reviewFirst ? ['Include or Exclude', 'Needs Save'] : ['Needs Save', 'Include or Exclude'],
         );
 
         assert.equal(await fixture.renderer.submitAssetReviewBatchDecision(decision), true);
@@ -2096,15 +2102,17 @@ test('Needs Review bulk actions accept identity-only targets for Add and Skip', 
   assert.deepEqual(skipFixture.getPersisted().excludedAssetKeys, ['identity-only-skip']);
 });
 
-test('Needs Review bulk actions stay disabled when only Needs Save and Opened items remain', async () => {
+test('Needs Review bulk actions are hidden and disabled when only Needs Save and Opened items remain', async () => {
   const project = createPendingBatchProject('pending-batch-no-review');
   project.pendingFiles[0].captureState = 'needs-save';
   project.pendingFiles[1].captureState = 'observed';
   project.pendingFiles = project.pendingFiles.slice(0, 2);
   const fixture = await loadPendingBatchFixture({ project });
 
-  assert.equal(fixture.elements['btn-include-all-existing'].textContent, 'Add All');
-  assert.equal(fixture.elements['btn-skip-all-existing'].textContent, 'Skip All');
+  assert.equal(fixture.elements['btn-include-all-existing'].textContent, 'Include All (0)');
+  assert.equal(fixture.elements['btn-skip-all-existing'].textContent, 'Exclude All (0)');
+  assert.equal(fixture.elements['btn-include-all-existing'].classList.contains('hidden'), true);
+  assert.equal(fixture.elements['btn-skip-all-existing'].classList.contains('hidden'), true);
   assert.equal(fixture.elements['btn-include-all-existing'].disabled, true);
   assert.equal(fixture.elements['btn-skip-all-existing'].disabled, true);
   assert.equal(await fixture.renderer.submitAssetReviewBatchDecision('include'), false);
@@ -2156,14 +2164,18 @@ test('Needs Review bulk controls remain disabled when no pending item has an ind
   assert.deepEqual(fixture.getPersisted().pendingFiles, [{ name: 'No identity.png', ext: '.png' }]);
 });
 
-test('Needs Review rows expose no individual Add or Skip controls', async () => {
+test('Needs Review "Include or Exclude" rows expose one square [+] and [x] each', async () => {
   const fixture = await loadPendingBatchFixture({ id: 'pending-no-individual-actions' });
   for (const row of fixture.elements['pending-file-list'].children) {
     assert.equal(row.children.some(child => child.tagName === 'BUTTON'), false);
     assert.equal(row.children.some(child => child.className === 'pending-actions'), false);
+    const group = row.children.find(child => child.className === 'pending-row-actions');
+    assert.ok(group);
+    assert.deepEqual(group.children.map(button => button.dataset.rowAction), ['include', 'exclude']);
+    assert.equal(group.children.every(button => button.tagName === 'BUTTON' && button.title === undefined), true);
   }
-  assert.equal(fixture.elements['btn-include-all-existing'].textContent, 'Add All');
-  assert.equal(fixture.elements['btn-skip-all-existing'].textContent, 'Skip All');
+  assert.equal(fixture.elements['btn-include-all-existing'].textContent, 'Include All (4)');
+  assert.equal(fixture.elements['btn-skip-all-existing'].textContent, 'Exclude All (4)');
 });
 
 test('Needs Review batch recovery copy names list-level retry actions', () => {
@@ -2178,21 +2190,21 @@ test('Review Before Packaging uses the approved terminology and retains keyboard
   assert.match(html, /data-asset-filter="missing"[^>]*aria-pressed="false">Needs Review/);
   assert.doesNotMatch(html, /<p>Crate automatically includes files/);
   assert.match(html, /<h2 class="asset-panel-title" id="pending-header">Needs Review<\/h2>/);
-  assert.match(html, /<button type="button"[^>]*id="btn-include-all-existing"[^>]*>Add All<\/button>/);
-  assert.match(html, /<button type="button"[^>]*id="btn-skip-all-existing"[^>]*>Skip All<\/button>/);
-  assert.match(html, /id="btn-include-all-existing"[^>]*aria-label="Add all assets needing review"/);
-  assert.match(html, /id="btn-skip-all-existing"[^>]*aria-label="Skip all assets needing review"/);
+  assert.match(html, /<button type="button"[^>]*id="btn-include-all-existing"[^>]*>Include All \(0\)<\/button>/);
+  assert.match(html, /<button type="button"[^>]*id="btn-skip-all-existing"[^>]*>Exclude All \(0\)<\/button>/);
+  assert.match(html, /id="btn-include-all-existing"[^>]*aria-label="Include 0 assets"/);
+  assert.match(html, /id="btn-skip-all-existing"[^>]*aria-label="Exclude 0 assets"/);
 
   const fixture = await loadPendingBatchFixture({ id: 'pending-accessibility' });
-  assert.equal(fixture.elements['btn-include-all-existing'].getAttribute('aria-label'), 'Add all assets needing review');
-  assert.equal(fixture.elements['btn-skip-all-existing'].getAttribute('aria-label'), 'Skip all assets needing review');
+  assert.equal(fixture.elements['btn-include-all-existing'].getAttribute('aria-label'), 'Include 4 assets');
+  assert.equal(fixture.elements['btn-skip-all-existing'].getAttribute('aria-label'), 'Exclude 4 assets');
   assert.equal(fixture.elements['btn-include-all-existing'].getAttribute('aria-busy'), 'false');
   assert.equal(fixture.elements['btn-skip-all-existing'].getAttribute('aria-busy'), 'false');
   const pendingRow = fixture.elements['pending-file-list'].children[0];
   const pendingStateBadge = pendingRow.children.find(child => child.className === 'pending-state-badge');
   const pendingCopy = pendingRow.children.find(child => child.className === 'pending-file-copy');
-  assert.equal(pendingStateBadge.textContent, 'Needs Review');
-  assert.match(pendingCopy.children[1].textContent, /Needs review before packaging\./);
+  assert.equal(pendingStateBadge.textContent, 'Include or Exclude');
+  assert.match(pendingCopy.children[1].textContent, /Crate isn’t sure it belongs\./);
 
   const needsSaveProject = createPendingBatchProject('pending-accessibility-needs-save');
   needsSaveProject.pendingFiles = [{
@@ -2292,9 +2304,12 @@ test('excluded Added While Working assets remain visible and restore without a f
   assert.equal(elements['added-assets-list'].children.length, 1);
   const excludedRow = elements['added-assets-list'].children[0];
   assert.equal(excludedRow.className.includes('is-excluded'), true);
-  const restoreButton = excludedRow.children.find(child => child.className === 'app-file-remove');
-  assert.equal(restoreButton.textContent, '\u00D7');
-  assert.equal(restoreButton.getAttribute('aria-label'), 'Include Added.png in this project');
+  const restoreButton = excludedRow.children.find(child => child.tagName === 'BUTTON');
+  // Excluded assets offer only the square [+]: drawn in CSS, no text, no hover title.
+  assert.equal(restoreButton.dataset.rowAction, 'include');
+  assert.equal(getElementTreeText(restoreButton).trim(), '');
+  assert.equal(restoreButton.title, undefined);
+  assert.equal(restoreButton.getAttribute('aria-label'), 'Include Added.png');
 
   vm.runInContext("state.assetReviewFilter = 'excluded';", renderer);
   renderer.applyAssetReviewFilter();
@@ -5572,7 +5587,7 @@ test('Package Review dialog exposes live status semantics and visible disabled s
 
   assert.match(html, /id="modal-existing-assets"[^>]*role="dialog"[^>]*aria-modal="true"/);
   assert.match(html, /All existing assets · Working files unchanged/);
-  assert.match(html, /<button[^>]*id="btn-skip-existing-assets"[^>]*>Skip existing assets<\/button>/);
+  assert.match(html, /<button[^>]*id="btn-skip-existing-assets"[^>]*>Exclude existing assets<\/button>/);
   assert.match(html, /<button[^>]*id="btn-include-existing-assets"[^>]*>Include existing assets<\/button>/);
   assert.match(html, /id="modal-package"[^>]*role="dialog"[^>]*aria-modal="true"/);
   assert.match(html, /<button[^>]*id="btn-change-dest"[^>]*>Choose Folder<\/button>/);
@@ -7526,7 +7541,7 @@ for (const decision of ['include', 'skip']) for (const rejected of [false, true]
     await f.renderer.renderFiles();
     assertOliviaBulkReason(f, /already included/, [true, false]);
     assert.equal(f.elements['btn-include-all-existing'].textContent, 'All Existing Included');
-    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
+    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Exclude All Existing');
     for (const id of ['btn-include-all-existing', 'btn-skip-all-existing']) {
       assert.equal(f.elements[id].getAttribute('aria-busy'), 'false');
       assert.equal(f.elements[id].classList.contains('is-action-busy'), false);
@@ -8239,6 +8254,19 @@ function attachOliviaReviewDescriptions(fixture) {
   }
 }
 
+// With no "Include or Exclude" rows left there is no message: both batch
+// buttons are hidden (and stay disabled) instead.
+function assertNoPendingBatchControls(fixture) {
+  const reason = fixture.elements['asset-review-batch-reason'];
+  assert.equal(reason.textContent, '');
+  assert.equal(reason.classList.contains('hidden'), true);
+  ['btn-include-all-existing', 'btn-skip-all-existing'].forEach(id => {
+    assert.equal(fixture.elements[id].classList.contains('hidden'), true);
+    assert.equal(fixture.elements[id].disabled, true);
+    assert.equal(fixture.elements[id].getAttribute('aria-describedby'), reason.id);
+  });
+}
+
 function assertOliviaBulkReason(fixture, expected, disabled = [true, true]) {
   const reason = fixture.elements['asset-review-batch-reason'];
   assert.match(reason.textContent, expected);
@@ -8302,7 +8330,8 @@ for (const kind of ['needs-save-opened', 'unidentified']) {
     const before = cloneTestValue(project);
     const f = await loadPendingBatchFixture({ project });
     attachOliviaReviewDescriptions(f);
-    assertOliviaBulkReason(f, kind === 'unidentified' ? /cannot identify which files/ : /No eligible items/);
+    if (kind === 'unidentified') assertOliviaBulkReason(f, /cannot identify which files/);
+    else assertNoPendingBatchControls(f);
     assert.equal(await f.renderer.submitAssetReviewBatchDecision('include'), false);
     assert.equal(await f.renderer.submitAssetReviewBatchDecision('skip'), false);
     assert.deepEqual(f.calls, []);
@@ -8383,7 +8412,7 @@ test('Olivia UI: stale project batch completion cannot replace the current eligi
     'C1 current B include control must remain disabled after retired A cleanup');
   assertOliviaBulkReason(f, /No existing assets/);
   assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All Existing');
-  assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
+  assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Exclude All Existing');
   for (const id of ['btn-include-all-existing', 'btn-skip-all-existing']) {
     assert.equal(f.elements[id].getAttribute('aria-busy'), 'false');
     assert.equal(f.elements[id].classList.contains('is-action-busy'), false);
@@ -8496,7 +8525,7 @@ for (const decision of ['include', 'skip']) for (const rejected of [false, true]
     assertOliviaBulkReason(f, /Sign in to review assets/);
     assertC1Busy(f, false);
     assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All Existing');
-    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
+    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Exclude All Existing');
     assert.deepEqual(cloneTestValue(vm.runInContext('state.projects', f.renderer)), [before]);
     assert.equal(await f.renderer.submitPendingAssetsBatchDecision(decision, f.project, [{ target: 'second' }]), false);
     assert.deepEqual(calls, ['first']);
@@ -8542,7 +8571,7 @@ for (const rejected of [false, true]) {
     assertOliviaBulkReason(f, /Current asset review is unavailable/, [true, true]);
     assertC1Busy(f, false);
     assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All Existing');
-    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
+    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Exclude All Existing');
     assert.equal(JSON.stringify(vm.runInContext('state.projects', f.renderer)), before);
     assert.equal(vm.runInContext("rendererActionsInFlight.has('asset-review-batch:c1-return-A')", f.renderer), false);
     assert.equal(workspaceReads, 1, 'retired cleanup must not fetch another workspace');
@@ -8555,7 +8584,7 @@ for (const rejected of [false, true]) {
     assert.equal(f.elements['btn-include-all-existing'].disabled, false);
     assert.equal(f.elements['btn-skip-all-existing'].disabled, false);
     assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All Existing');
-    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
+    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Exclude All Existing');
     assert.equal(f.elements['asset-review-batch-reason'].textContent, '');
     assert.equal(f.elements['asset-review-batch-reason'].classList.contains('hidden'), true);
     assertC1Busy(f, false);
@@ -8594,8 +8623,8 @@ for (const newerDecision of ['include', 'skip']) {
     assert.equal(JSON.stringify(vm.runInContext('state.projects', f.renderer)), before);
     assertOliviaBulkReason(f, /Updating assets/);
     assertC1Busy(f, true);
-    assert.equal(f.elements['btn-include-all-existing'].textContent, 'Add All');
-    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All');
+    assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All (1)');
+    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Exclude All (1)');
     assert.equal(vm.runInContext("rendererActionsInFlight.has('asset-review-batch:c1-owned-B')", f.renderer), true);
     assert.equal(await f.renderer.submitAssetReviewBatchDecision(newerDecision), undefined);
     assert.equal(calls.length, 2);
@@ -8622,7 +8651,7 @@ test('C1: removed current project stays disabled when a retired action settles',
   assertOliviaBulkReason(f, /Select a project to review assets/);
   assertC1Busy(f, false);
   assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All Existing');
-  assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
+  assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Exclude All Existing');
 });
 
 for (const decision of ['include', 'skip']) for (const outcome of ['success', 'error']) {
@@ -8658,7 +8687,7 @@ for (const decision of ['include', 'skip']) for (const outcome of ['success', 'e
     assert.deepEqual(f.getPersisted().workingSourceSelection, before.workingSourceSelection);
     assert.deepEqual(f.getPersisted().assetBaseline, before.assetBaseline);
     if (outcome === 'success') {
-      assertOliviaBulkReason(f, /No eligible items/);
+      assertNoPendingBatchControls(f);
       assert.deepEqual(f.getPersisted().pendingFiles, before.pendingFiles.slice(1));
     } else {
       assertOliviaBulkReason(f, /only to eligible review items/, [false, false]);
@@ -8731,7 +8760,7 @@ for (const phase of ['decision', 'project-read']) {
     assert.deepEqual(cloneTestValue(vm.runInContext('state.projects', f.renderer)), [f.renderer.otherProject]);
     assertOliviaBulkReason(f, /No existing assets/); assertC1Busy(f, false);
     assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All Existing');
-    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
+    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Exclude All Existing');
   });
 }
 
@@ -8798,7 +8827,7 @@ for (const invalidation of ['account', 'selection', 'generation', 'request', 'lo
     assertOliviaBulkReason(f, /Current asset review is unavailable/);
     assertC1Busy(f, false);
     assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All Existing');
-    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
+    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Exclude All Existing');
     assert.equal(reads, invalidation === 'request' ? 1 : 0, 'projection cleanup is synchronous and never fetches');
     const decisionCalls = [];
     for (const method of ['setExistingAssetsDecision', 'acceptPending', 'rejectPending']) {
@@ -8919,7 +8948,7 @@ test('SEC-S1-001: retired A cannot clear newer B busy ownership during a held pr
   assert.equal(await actionA, false);
   assertOliviaBulkReason(f, /Updating assets/); assertC1Busy(f, true);
   assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All Existing');
-  assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
+  assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Exclude All Existing');
   assert.equal(vm.runInContext("rendererActionsInFlight.has('asset-review-batch:sec-owned-B')", f.renderer), true);
   assert.equal(await f.renderer.submitAssetReviewBatchDecision('skip'), undefined);
   assert.equal(calls.length, 2);
@@ -9037,3 +9066,485 @@ for (const identity of ['A', 'B']) {
     assert.deepEqual(saved.pendingFiles, before.pendingFiles);
   });
 }
+
+// ===== Asset Include/Exclude controls (approved criteria 8-23) =====
+
+async function settleRendererActions(renderer) {
+  for (let index = 0; index < 50; index += 1) {
+    await new Promise(resolve => setImmediate(resolve));
+    if (vm.runInContext('rendererActionsInFlight.size', renderer) === 0) break;
+  }
+  for (let index = 0; index < 5; index += 1) await new Promise(resolve => setImmediate(resolve));
+}
+
+function pendingRowNamed(fixture, name) {
+  return Array.from(fixture.elements['pending-file-list'].children)
+    .find(row => getElementTreeText(row).includes(name));
+}
+
+function pendingRowButtons(row) {
+  const group = row?.children.find(child => child.className === 'pending-row-actions');
+  return group ? { include: group.children[0], exclude: group.children[1] } : null;
+}
+
+test('Include or Exclude rows: [+] includes one row, confirms it by name and focuses [+] on the next row', async () => {
+  const fixture = await loadPendingBatchFixture({ id: 'row-include-one' });
+  const row = pendingRowNamed(fixture, 'Needs_2.png');
+  const { include, exclude } = pendingRowButtons(row);
+  assert.equal(include.getAttribute('aria-label'), 'Include Needs_2.png');
+  assert.equal(exclude.getAttribute('aria-label'), 'Exclude Needs_2.png');
+  assert.equal(row.children.find(child => child.className === 'pending-state-badge').textContent, 'Include or Exclude');
+  assert.equal(row.children.find(child => child.className === 'pending-file-copy').children[1].textContent,
+    'Found in Illustrator. Crate isn’t sure it belongs.');
+
+  include.click();
+  await settleRendererActions(fixture.renderer);
+
+  assert.deepEqual(fixture.calls.map(call => [call.action, call.target]), [['acceptPending', '/synthetic/Needs_2.png']]);
+  assert.equal(fixture.elements['toast-message'].textContent, 'Needs_2.png included');
+  assert.deepEqual(Array.from(fixture.elements['pending-file-list'].children).map(child => child.children[1].children[0].textContent),
+    ['Needs_1.png', 'Needs_3.png', 'Needs_4.png']);
+  assert.equal(fixture.document.activeElement, pendingRowButtons(pendingRowNamed(fixture, 'Needs_3.png')).include);
+  assert.equal(fixture.elements['btn-include-all-existing'].textContent, 'Include All (3)');
+  assert.equal(fixture.elements['btn-include-all-existing'].getAttribute('aria-label'), 'Include 3 assets');
+  assert.equal(fixture.elements['btn-skip-all-existing'].getAttribute('aria-label'), 'Exclude 3 assets');
+});
+
+test('Include or Exclude rows: [x] excludes the last decidable row and focus moves to the Needs Review title', async () => {
+  const project = createPendingBatchProject('row-exclude-last');
+  project.pendingFiles = project.pendingFiles.slice(0, 3);
+  project.pendingFiles[1].captureState = 'needs-save';
+  project.pendingFiles[2].captureState = 'observed';
+  project.pendingFiles[2].captureEvidence = { appFamily: 'illustrator' };
+  const fixture = await loadPendingBatchFixture({ project });
+  // Needs Save and Opened rows keep their pill and text and get no buttons.
+  for (const [name, pill] of [['Needs_2.png', 'Needs Save'], ['Needs_3.png', 'Opened']]) {
+    const row = pendingRowNamed(fixture, name);
+    assert.equal(pendingRowButtons(row), null);
+    assert.equal(row.children.some(child => child.tagName === 'BUTTON'), false);
+    assert.equal(row.children.find(child => child.className === 'pending-state-badge').textContent, pill);
+  }
+  assert.equal(pendingRowNamed(fixture, 'Needs_3.png').children[1].children[1].textContent, 'Observed in Illustrator.');
+  // Counts include only the one "Include or Exclude" row, in the singular.
+  assert.equal(fixture.elements['btn-include-all-existing'].textContent, 'Include All (1)');
+  assert.equal(fixture.elements['btn-skip-all-existing'].textContent, 'Exclude All (1)');
+  assert.equal(fixture.elements['btn-include-all-existing'].getAttribute('aria-label'), 'Include 1 asset');
+  assert.equal(fixture.elements['btn-skip-all-existing'].getAttribute('aria-label'), 'Exclude 1 asset');
+
+  pendingRowButtons(pendingRowNamed(fixture, 'Needs_1.png')).exclude.click();
+  await settleRendererActions(fixture.renderer);
+
+  assert.deepEqual(fixture.calls.map(call => [call.action, call.target]), [['rejectPending', '/synthetic/Needs_1.png']]);
+  assert.equal(fixture.elements['toast-message'].textContent, 'Needs_1.png excluded');
+  assert.equal(fixture.document.activeElement, fixture.elements['pending-header']);
+  assert.equal(fixture.elements['pending-header'].getAttribute('tabindex'), '-1');
+  assert.equal(fixture.elements['btn-include-all-existing'].classList.contains('hidden'), true);
+  assert.equal(fixture.elements['btn-skip-all-existing'].classList.contains('hidden'), true);
+});
+
+test('Include or Exclude rows without a known app read "Crate isn’t sure it belongs."', async () => {
+  const project = createPendingBatchProject('row-no-app');
+  project.pendingFiles = [{ ...project.pendingFiles[0], captureEvidence: {} }];
+  const fixture = await loadPendingBatchFixture({ project });
+  assert.equal(pendingRowNamed(fixture, 'Needs_1.png').children[1].children[1].textContent, 'Crate isn’t sure it belongs.');
+});
+
+test('a refused row decision keeps the row and its focus, and says it could not change', async () => {
+  const project = createPendingBatchProject('row-refused');
+  const fixture = await loadPendingBatchFixture({ project, allowedPaths: [] });
+  const { exclude } = pendingRowButtons(pendingRowNamed(fixture, 'Needs_2.png'));
+  exclude.click();
+  await settleRendererActions(fixture.renderer);
+  assert.equal(fixture.calls.length, 1);
+  assert.match(fixture.elements['toast-message'].textContent, /^Crate could not exclude Needs_2\.png\./);
+  assert.equal(fixture.elements['pending-file-list'].children.length, 4);
+  assert.equal(fixture.document.activeElement, pendingRowButtons(pendingRowNamed(fixture, 'Needs_2.png')).exclude);
+});
+
+test('row and batch decisions share one reservation: no double submission', async () => {
+  const gate = createDeferred();
+  const fixture = await loadPendingBatchFixture({ id: 'row-batch-reservation', beforeAccept: () => gate.promise });
+  const first = pendingRowButtons(pendingRowNamed(fixture, 'Needs_1.png')).include;
+  const second = pendingRowButtons(pendingRowNamed(fixture, 'Needs_2.png')).include;
+  first.click();
+  await new Promise(resolve => setImmediate(resolve));
+  second.click();
+  assert.equal(await fixture.renderer.submitAssetReviewBatchDecision('include'), undefined);
+  assert.equal(await fixture.renderer.submitPendingAssetDecision('include', fixture.project.id, '/synthetic/Needs_3.png', second), undefined);
+  assert.equal(fixture.calls.length, 1);
+  gate.resolve();
+  await settleRendererActions(fixture.renderer);
+  assert.deepEqual(fixture.calls.map(call => call.target), ['/synthetic/Needs_1.png']);
+});
+
+test('row decisions are refused for a signed-out account or a stale projection', async () => {
+  const fixture = await loadPendingBatchFixture({ id: 'row-guards' });
+  const button = pendingRowButtons(pendingRowNamed(fixture, 'Needs_1.png')).include;
+  vm.runInContext('accountStatus = { ...accountStatus, canUseWorkspace: false };', fixture.renderer);
+  assert.equal(await fixture.renderer.submitPendingAssetDecision('include', fixture.project.id, '/synthetic/Needs_1.png', button), false);
+  vm.runInContext('accountStatus = { ...accountStatus, canUseWorkspace: true }; assetReviewBatchProjection = null;', fixture.renderer);
+  assert.equal(await fixture.renderer.submitPendingAssetDecision('include', fixture.project.id, '/synthetic/Needs_1.png', button), false);
+  assert.equal(fixture.calls.length, 0);
+});
+
+test('Enter and Space on a row button press the button instead of selecting the row', async () => {
+  const fixture = await loadPendingBatchFixture({ id: 'row-keyboard' });
+  const row = pendingRowNamed(fixture, 'Needs_1.png');
+  const { include } = pendingRowButtons(row);
+  let prevented = 0;
+  for (const key of ['Enter', ' ']) {
+    row.dispatchEvent({ type: 'keydown', key, target: include, preventDefault: () => { prevented += 1; } });
+  }
+  assert.equal(prevented, 0);
+  assert.equal(vm.runInContext('state.assetReviewSelectedKey', fixture.renderer) ?? null, null);
+  row.dispatchEvent({ type: 'keydown', key: 'Enter', target: row, preventDefault: () => { prevented += 1; } });
+  assert.equal(prevented, 1);
+});
+
+test('batch decisions report "N assets included/excluded", in the singular, and partial results', async () => {
+  const plural = await loadPendingBatchFixture({ id: 'batch-plural' });
+  assert.equal(await plural.renderer.submitAssetReviewBatchDecision('skip'), true);
+  assert.equal(plural.elements['toast-message'].textContent, '4 assets excluded');
+
+  const singleProject = createPendingBatchProject('batch-singular');
+  singleProject.pendingFiles = singleProject.pendingFiles.slice(0, 1);
+  const single = await loadPendingBatchFixture({ project: singleProject });
+  assert.equal(await single.renderer.submitAssetReviewBatchDecision('include'), true);
+  assert.equal(single.elements['toast-message'].textContent, '1 asset included');
+
+  const partialProject = createPendingBatchProject('batch-partial');
+  const partial = await loadPendingBatchFixture({ project: partialProject, allowedPaths: partialProject.pendingFiles.slice(0, 3).map(file => file.path) });
+  assert.equal(await partial.renderer.submitAssetReviewBatchDecision('include'), true);
+  assert.equal(partial.elements['toast-message'].textContent, '3 assets included; 1 left unchanged');
+});
+
+test('Included asset [x] confirms by name and focus moves to the same row\'s new [+]', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const added = {
+    name: 'Texture.png', ext: '.png', assetOrigin: 'added', projectRole: 'asset', protectedSource: false,
+    excluded: false, visualIdentity: 'texture-identity', visualRevision: 'texture-revision',
+  };
+  const project = {
+    id: 'asset-row-toggle', name: 'Asset row toggle', type: 'branding', status: 'watching',
+    files: [added], pendingFiles: [], excludedAssetKeys: [], assetBaseline: { status: 'included', decision: 'include' },
+  };
+  let current = cloneTestValue(project);
+  const renderer = loadRendererHelpers(document, { crate: {
+    removeFile: async () => {
+      const wasExcluded = current.files[0].excluded === true;
+      current = { ...current, files: [{ ...current.files[0], excluded: !wasExcluded }] };
+    },
+    getProjects: async () => [cloneTestValue(current)],
+    getAssetWorkspace: async () => ({ projectId: project.id, files: cloneTestValue(current.files), pendingFiles: [] }),
+  } });
+  renderer.testProject = project;
+  vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+  renderer.renderAssetWorkspace(project, {}, project.files);
+  const before = elements['added-assets-list'].children[0].children.find(child => child.tagName === 'BUTTON');
+  assert.equal(before.getAttribute('aria-label'), 'Exclude Texture.png');
+  before.click();
+  await settleRendererActions(renderer);
+
+  assert.equal(elements['toast-message'].textContent, 'Texture.png excluded');
+  const after = elements['added-assets-list'].children[0].children.find(child => child.tagName === 'BUTTON');
+  assert.equal(after.dataset.rowAction, 'include');
+  assert.equal(after.getAttribute('aria-label'), 'Include Texture.png');
+  assert.equal(document.activeElement, after);
+
+  after.click();
+  await settleRendererActions(renderer);
+  assert.equal(elements['toast-message'].textContent, 'Texture.png included');
+  assert.equal(document.activeElement.dataset.rowAction, 'exclude');
+});
+
+test('working files read Included and offer Include and Exclude text buttons', () => {
+  const renderer = loadRendererHelpers();
+  assert.equal(renderer.getWorkingSourceStatus({ sourceSelection: 'selected' }).label, 'Included');
+  assert.equal(renderer.getWorkingSourceStatus({ sourceSelection: 'excluded' }).label, 'Excluded');
+  assert.equal(renderer.getWorkingSourceStatus({ sourceSelection: 'selected', verificationRequired: true, verificationStatus: 'pending' }).label, 'Verifying…');
+  const source = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'app.js'), 'utf8');
+  assert.doesNotMatch(source, /label: 'Selected'/);
+  assert.doesNotMatch(source, /'Add All'|'Skip All'|Skip All Existing|'Existing assets skipped'/);
+});
+
+test('[+] and [x] are always-visible 22px boxes in a 28px native button with no hover reveal', () => {
+  const css = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'styles.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
+  const rule = selector => {
+    const match = css.match(new RegExp(`(?:^|\\})\\s*${selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\{([^}]*)\\}`));
+    assert.ok(match, `missing rule ${selector}`);
+    return match[1];
+  };
+  const button = rule('.row-icon-button');
+  assert.match(button, /width:\s*28px/); assert.match(button, /height:\s*28px/); assert.match(button, /opacity:\s*1/);
+  const box = rule('.row-icon-box');
+  assert.match(box, /width:\s*22px/); assert.match(box, /height:\s*22px/); assert.match(box, /border-radius:\s*5px/);
+  assert.match(box, /border:\s*1px solid var\(--gray-200\)/);
+  const focus = rule('.row-icon-button:focus-visible .row-icon-box');
+  assert.match(focus, /outline:\s*2px solid var\(--black\)/); assert.match(focus, /outline-offset:\s*2px/);
+  assert.match(rule('.pending-row-actions'), /gap:\s*2px/);
+  // No rule anywhere hides or fades the controls until hover.
+  for (const source of [css, html]) {
+    assert.doesNotMatch(source, /:hover\s+\.app-file-remove/);
+    for (const match of source.matchAll(/([^{}]*(?:row-icon|app-file-remove)[^{}]*)\{([^{}]*)\}/g)) {
+      assert.doesNotMatch(match[2], /opacity:\s*0(?:\.\d+)?\s*;|visibility:\s*hidden|display:\s*none/, match[1]);
+    }
+  }
+});
+
+test('a file excluded from Needs Review shows as Excluded with one [+], counts only as Excluded, and Include goes through accept', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const working = { name: 'Working.ai', ext: '.ai', assetOrigin: 'added', projectRole: 'source', protectedSource: true,
+    visualIdentity: 'working-identity', visualRevision: 'working-revision' };
+  const remembered = { name: 'Texture.png', ext: '.png', assetOrigin: 'added', projectRole: 'asset', protectedSource: false,
+    sourceRecoveryAllowed: false, included: false, excluded: true, excludedPending: true, visualIdentity: 'remembered-identity', visualRevision: null };
+  const project = { id: 'remembered-exclusion', name: 'Remembered', type: 'branding', status: 'watching',
+    files: [{ name: 'Working.ai', path: '/synthetic/Working.ai', ext: '.ai', projectRole: 'source' }], pendingFiles: [],
+    excludedAssetKeys: ['/synthetic/Texture.png'], assetBaseline: { status: 'included', decision: 'include' } };
+  let accepted = false;
+  const calls = [];
+  const counts = () => ({ includedAssets: accepted ? 1 : 0, selectedWorkingSources: 1, excludedWorkingSources: 0, invalidWorkingSources: 0, excludedAssets: 0 });
+  const renderer = loadRendererHelpers(document, { crate: {
+    getProjects: async () => [cloneTestValue(project)],
+    getAssetWorkspace: async projectId => ({
+      projectId,
+      files: accepted ? [working, { ...remembered, included: true, excluded: false, excludedPending: undefined }] : [working],
+      pendingFiles: [],
+      excludedPendingFiles: accepted ? [] : [remembered],
+      semanticCounts: counts(),
+    }),
+    acceptPending: async (...args) => { calls.push(args); accepted = true; return { files: [], pendingFiles: [] }; },
+    removeFile: async () => { assert.fail('a remembered exclusion is included through accept, never remove-file'); },
+  } });
+  renderer.testProject = project;
+  vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id; state.assetReviewOpen = true;', renderer);
+  await renderer.renderFiles();
+
+  assert.equal(elements['filter-count-excluded'].textContent, '1');
+  assert.equal(elements['filter-count-added'].textContent, '0');
+  assert.equal(elements['filter-count-missing'].textContent, '0');
+  assert.equal(elements['asset-review-footer-summary'].textContent, '0 assets included · 1 Working File included');
+  assert.match(elements['working-source-summary'].textContent, /^1 included local working file\(s\) · 0 excluded local working file\(s\)/);
+  const list = elements['added-assets-list'];
+  assert.ok(list.__assetReviewVirtualState, 'remembered rows use the virtualized Added list');
+  const row = list.children.find(child => getElementTreeText(child).includes('Texture.png'));
+  assert.ok(row.className.includes('is-excluded'));
+  const buttons = row.children.filter(child => child.tagName === 'BUTTON');
+  assert.equal(buttons.length, 1);
+  assert.equal(buttons[0].dataset.rowAction, 'include');
+  assert.equal(buttons[0].getAttribute('aria-label'), 'Include Texture.png');
+  assert.equal(buttons[0].title, undefined);
+
+  buttons[0].click();
+  await settleRendererActions(renderer);
+  assert.deepEqual(calls, [[project.id, 'remembered-identity']]);
+  assert.equal(elements['toast-message'].textContent, 'Texture.png included');
+  assert.equal(elements['filter-count-excluded'].textContent, '0');
+  assert.equal(elements['filter-count-added'].textContent, '1');
+  assert.equal(document.activeElement.dataset.rowAction, 'exclude', 'focus moves to the same row\'s new [x]');
+});
+
+test('every changed message is exact: Existing batch toasts, batch reasons, and row failure messages that re-enable their button', async () => {
+  // Existing assets batch: "Existing assets excluded" / "Existing assets included" through the cohort IPC.
+  {
+    const { document, elements } = createInteractiveRendererDom();
+    const existing = { name: 'Existing.png', path: '/synthetic/Existing.png', ext: '.png', assetOrigin: 'existing', projectRole: 'asset' };
+    const project = { id: 'existing-toasts', files: [{ name: 'Workspace.ai', path: '/synthetic/Workspace.ai', ext: '.ai', assetOrigin: 'added', projectRole: 'source' }, existing],
+      pendingFiles: [], excludedAssetKeys: [], assetBaseline: { status: 'included', decision: 'include' } };
+    let current = cloneTestValue(project);
+    const decisions = [];
+    const renderer = loadRendererHelpers(document, { crate: {
+      setExistingAssetsDecision: async (projectId, decision) => {
+        decisions.push(decision);
+        current = { ...current, excludedAssetKeys: decision === 'skip' ? [existing.path] : [],
+          assetBaseline: decision === 'skip' ? { status: 'skipped', decision: 'skip' } : { status: 'included', decision: 'include' } };
+        return { success: true, project: current };
+      },
+      getProjects: async () => [cloneTestValue(current)],
+    } });
+    renderer.testProject = project;
+    vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+    await renderer.ensureProjectAssetWorkspace(project);
+    assert.equal(elements['btn-skip-all-existing'].textContent, 'Exclude All Existing');
+    assert.equal(elements['btn-skip-all-existing'].getAttribute('aria-label'), 'Exclude all existing assets');
+    assert.equal(await renderer.submitExistingAssetsBatchDecision('skip'), true);
+    assert.equal(elements['toast-message'].textContent, 'Existing assets excluded');
+    vm.runInContext('state.projects = [' + JSON.stringify(current) + '];', renderer);
+    await renderer.ensureProjectAssetWorkspace(vm.runInContext('state.projects[0]', renderer));
+    assert.equal(await renderer.submitExistingAssetsBatchDecision('include'), true);
+    assert.equal(elements['toast-message'].textContent, 'Existing assets included');
+    assert.deepEqual(decisions, ['skip', 'include']);
+  }
+
+  // Batch reasons, full text.
+  {
+    const mixed = createPendingBatchProject('reason-mixed');
+    mixed.pendingFiles[3].captureState = 'needs-save';
+    const f = await loadPendingBatchFixture({ project: mixed });
+    assert.equal(f.elements['asset-review-batch-reason'].textContent,
+      'Include All and Exclude All apply only to eligible review items. Other items stay unchanged.');
+    const unidentified = createPendingBatchProject('reason-unidentified');
+    unidentified.pendingFiles = [{ name: 'Unidentified.png', captureState: 'pending' }];
+    const g = await loadPendingBatchFixture({ project: unidentified });
+    assert.equal(g.elements['asset-review-batch-reason'].textContent,
+      'Crate cannot identify which files to update. Include All and Exclude All are unavailable.');
+  }
+
+  // A row decision that throws: exact message; the row stays and its buttons are usable again.
+  {
+    const f = await loadPendingBatchFixture({ id: 'row-throws' });
+    f.renderer.window.crate.rejectPending = async () => { throw new Error('synthetic reject failure'); };
+    const row = pendingRowNamed(f, 'Needs_1.png');
+    pendingRowButtons(row).exclude.click();
+    await settleRendererActions(f.renderer);
+    assert.equal(f.elements['toast-message'].textContent, 'Crate could not exclude Needs_1.png. Try again.');
+    const again = pendingRowButtons(pendingRowNamed(f, 'Needs_1.png'));
+    assert.equal(again.exclude.disabled, false);
+    assert.equal(again.include.disabled, false);
+    assert.equal(vm.runInContext('rendererActionsInFlight.size', f.renderer), 0);
+  }
+
+  // Asset row [x]: an unconfirmed toggle and a thrown toggle, each re-enabling the button.
+  for (const mode of ['unconfirmed', 'throws']) {
+    const { document, elements } = createInteractiveRendererDom();
+    const added = { name: 'Texture.png', ext: '.png', assetOrigin: 'added', projectRole: 'asset', protectedSource: false,
+      excluded: false, visualIdentity: 'texture-identity', visualRevision: 'texture-revision' };
+    const project = { id: `asset-row-${mode}`, name: 'Asset row', type: 'branding', status: 'watching', files: [added], pendingFiles: [],
+      excludedAssetKeys: [], assetBaseline: { status: 'included', decision: 'include' } };
+    const renderer = loadRendererHelpers(document, { crate: {
+      removeFile: async () => { if (mode === 'throws') throw new Error('synthetic toggle failure'); },
+      getProjects: async () => [cloneTestValue(project)],
+      getAssetWorkspace: async () => ({ projectId: project.id, files: [added], pendingFiles: [] }),
+    } });
+    renderer.testProject = project;
+    vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+    renderer.renderAssetWorkspace(project, {}, project.files);
+    const button = elements['added-assets-list'].children[0].children.find(child => child.tagName === 'BUTTON');
+    button.click();
+    await settleRendererActions(renderer);
+    assert.equal(elements['toast-message'].textContent, mode === 'throws'
+      ? 'Crate could not exclude that asset. Try again.'
+      : 'Crate could not confirm that change. Review the asset list.');
+    const current = elements['added-assets-list'].children[0].children.find(child => child.tagName === 'BUTTON');
+    assert.equal(current.disabled, false);
+  }
+
+  // Remembered exclusion [+]: accept refused, exact message, still Excluded with a usable [+].
+  {
+    const { document, elements } = createInteractiveRendererDom();
+    const remembered = { name: 'Texture.png', ext: '.png', assetOrigin: 'added', projectRole: 'asset', protectedSource: false,
+      included: false, excluded: true, excludedPending: true, visualIdentity: 'remembered-identity', visualRevision: null };
+    const project = { id: 'remembered-refused', name: 'Remembered', type: 'branding', status: 'watching', files: [], pendingFiles: [],
+      excludedAssetKeys: ['/synthetic/Texture.png'], assetBaseline: { status: 'included', decision: 'include' } };
+    const renderer = loadRendererHelpers(document, { crate: {
+      getProjects: async () => [cloneTestValue(project)],
+      getAssetWorkspace: async projectId => ({ projectId, files: [], pendingFiles: [], excludedPendingFiles: [remembered] }),
+      acceptPending: async () => null,
+    } });
+    renderer.testProject = project;
+    vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id; state.assetReviewOpen = true;', renderer);
+    await renderer.renderFiles();
+    elements['added-assets-list'].children[0].children.find(child => child.tagName === 'BUTTON').click();
+    await settleRendererActions(renderer);
+    assert.equal(elements['toast-message'].textContent, 'Crate could not include Texture.png. Try again.');
+    const plus = elements['added-assets-list'].children[0].children.find(child => child.tagName === 'BUTTON');
+    assert.deepEqual([plus.dataset.rowAction, plus.disabled], ['include', false]);
+  }
+});
+
+test('a row action never takes focus back from a control the person moved to while it was running', async () => {
+  // Pending row [+]: held accept; the person moves to Search; focus stays there.
+  const gate = createDeferred();
+  const fixture = await loadPendingBatchFixture({ id: 'row-focus-moved', beforeAccept: () => gate.promise });
+  const include = pendingRowButtons(pendingRowNamed(fixture, 'Needs_2.png')).include;
+  include.focus();
+  include.click();
+  await new Promise(resolve => setImmediate(resolve));
+  const search = fixture.elements['asset-review-search'];
+  search.focus();
+  gate.resolve();
+  await settleRendererActions(fixture.renderer);
+  assert.equal(fixture.elements['toast-message'].textContent, 'Needs_2.png included');
+  assert.equal(fixture.document.activeElement, search, 'focus stays on Search');
+
+  // Included asset [x]: held toggle; the person moves to Search; focus stays there.
+  const { document, elements } = createInteractiveRendererDom();
+  const added = { name: 'Texture.png', ext: '.png', assetOrigin: 'added', projectRole: 'asset', protectedSource: false,
+    excluded: false, visualIdentity: 'texture-identity', visualRevision: 'texture-revision' };
+  const project = { id: 'asset-focus-moved', name: 'Asset row', type: 'branding', status: 'watching', files: [added], pendingFiles: [],
+    excludedAssetKeys: [], assetBaseline: { status: 'included', decision: 'include' } };
+  let current = cloneTestValue(project);
+  const toggle = createDeferred();
+  const renderer = loadRendererHelpers(document, { crate: {
+    removeFile: async () => { await toggle.promise; current = { ...current, files: [{ ...current.files[0], excluded: true }] }; },
+    getProjects: async () => [cloneTestValue(current)],
+    getAssetWorkspace: async () => ({ projectId: project.id, files: cloneTestValue(current.files), pendingFiles: [] }),
+  } });
+  renderer.testProject = project;
+  vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+  renderer.renderAssetWorkspace(project, {}, project.files);
+  const exclude = elements['added-assets-list'].children[0].children.find(child => child.tagName === 'BUTTON');
+  exclude.focus();
+  exclude.click();
+  await new Promise(resolve => setImmediate(resolve));
+  elements['asset-review-search'].focus();
+  toggle.resolve();
+  await settleRendererActions(renderer);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(elements['toast-message'].textContent, 'Texture.png excluded');
+  assert.equal(document.activeElement, elements['asset-review-search'], 'focus stays on Search');
+
+  // Control: when focus was simply lost, it still moves to the next row's same button.
+  const lost = await loadPendingBatchFixture({ id: 'row-focus-lost' });
+  pendingRowButtons(pendingRowNamed(lost, 'Needs_2.png')).include.click();
+  await settleRendererActions(lost.renderer);
+  assert.equal(lost.document.activeElement, pendingRowButtons(pendingRowNamed(lost, 'Needs_3.png')).include);
+});
+
+test('Package Review font rows say Exclude for the package decision, and an excluded font reads Excluded', async () => {
+  const { document } = createInteractiveRendererDom();
+  // The shared element stub predates Element.append and childElementCount, which font rows use.
+  const createElement = document.createElement;
+  document.createElement = tagName => {
+    const element = createElement(tagName);
+    element.append = (...nodes) => nodes.forEach(node => element.appendChild(node));
+    Object.defineProperty(element, 'childElementCount', { get: () => element.children.length });
+    return element;
+  };
+  const choices = [];
+  const renderer = loadRendererHelpers(document, { crate: {
+    setFontRowChoice: async (...args) => { choices.push(args); return { success: true }; },
+  } });
+  vm.runInContext(`
+    state.selectedProjectId = 'font-project';
+    canRefreshPackageReviewFrom = () => true;
+    showPackageModal = async options => { globalThis.lastPackageModal = options; return true; };
+  `, renderer);
+  const base = { key: 'a'.repeat(32), fileName: 'Poppins-Regular.ttf', label: 'Poppins Regular', faces: [], origin: 'added-file' };
+  const buttons = item => {
+    const found = [];
+    const walk = node => { for (const child of node.children || []) { if (child.tagName === 'BUTTON') found.push(child); walk(child); } };
+    walk(item);
+    return found;
+  };
+  const status = item => item.children[0].children[1].textContent;
+
+  const included = renderer.createPackageReviewFontRow({ ...base, outcome: 'included', canRemove: true, canInclude: false }, 'font-project');
+  const [exclude] = buttons(included);
+  assert.equal(exclude.textContent, 'Exclude');
+  assert.equal(exclude.getAttribute('aria-label'), 'Exclude Poppins-Regular.ttf');
+  assert.equal(buttons(included).some(button => /Remove/.test(button.textContent + button.getAttribute('aria-label'))), false);
+  exclude.click();
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(choices, [['font-project', base.key, 'remove']], 'the internal choice is unchanged');
+  assert.equal(vm.runInContext('globalThis.lastPackageModal.successMessage', renderer), 'Font excluded.');
+
+  for (const reason of ['removed', 'asset-excluded']) {
+    const excluded = renderer.createPackageReviewFontRow({ ...base, outcome: 'not-included', reason, reasonText: 'x', canRemove: false, canInclude: true }, 'font-project');
+    assert.equal(status(excluded), 'Excluded', reason);
+    assert.deepEqual(buttons(excluded).map(button => [button.textContent, button.getAttribute('aria-label')]), [['Include', 'Include Poppins-Regular.ttf']]);
+  }
+  const found = renderer.createPackageReviewFontRow({ ...base, outcome: 'not-included', reason: 'found', canRemove: true, canInclude: true }, 'font-project');
+  assert.equal(status(found), 'Not included', 'a found-only font keeps its existing status');
+});

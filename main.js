@@ -1689,6 +1689,8 @@ function normalizeAutoCaptureProjectState(project, stageContext = null) {
   } else {
     const beforeLength = project.pendingFiles.length;
     const acceptedKeys = getTrackedFileKeySet(project.files);
+    // Same key set: retire remembered exclusions whose file is a project file again.
+    if (pruneShadowedExcludedPendingRecords(project, acceptedKeys)) changed = true;
     const seenPendingKeys = new Set();
     const seenWeakBroadPendingNames = new Set();
     project.pendingFiles = project.pendingFiles.filter(file => {
@@ -2661,6 +2663,138 @@ function createAcceptedPendingFile(fileEntry) {
   const appFamily = getAcceptedPendingAppFamily(fileEntry);
   if (appFamily) acceptedFile.acceptedPendingAppFamily = appFamily;
   return acceptedFile;
+}
+
+// --- Excluded Needs Review records ---
+// Excluding a Needs Review row keeps today's effects (row removed, exclusion
+// key, rejection provenance) and also remembers a stripped copy of the row in
+// project.excludedPendingFiles, so the Excluded tab can show it and Include can
+// replay the ordinary accept transition. A record is never a project file: it
+// carries no acceptedPending marker or accept provenance, and it never enters
+// a package. There is no capacity limit; the list grows only with rejects.
+const EXCLUDED_PENDING_RECORD_VERSION = 1;
+const EXCLUDED_PENDING_RECORD_FIELDS = ['excludedRecordVersion', 'excludedAt', 'excludedAppFamily'];
+// Capture metadata (including the full captureEvidence blob) and acceptance
+// markers are never stored; only the app family that accept reads is kept.
+const EXCLUDED_PENDING_FORBIDDEN_FIELDS = [
+  'captureState', 'captureReason', 'captureEvidence', 'acceptedPending', 'acceptedPendingAppFamily',
+];
+
+function isValidExcludedPendingRecord(record) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return false;
+  if (record.excludedRecordVersion !== EXCLUDED_PENDING_RECORD_VERSION) return false;
+  if (typeof record.path !== 'string' || !record.path.trim()) return false;
+  if (record.name !== undefined && typeof record.name !== 'string') return false;
+  if (!Number.isFinite(record.excludedAt)) return false;
+  if (record.excludedAppFamily !== undefined && !getExactAppFamilyMarker(record.excludedAppFamily)) return false;
+  return EXCLUDED_PENDING_FORBIDDEN_FIELDS.every(field => !Object.prototype.hasOwnProperty.call(record, field));
+}
+
+// A malformed list is shown as empty and left untouched on disk; callers that
+// would write a new record fail closed instead of overwriting it.
+function readExcludedPendingRecords(project) {
+  const raw = project?.excludedPendingFiles;
+  if (raw === undefined) return { valid: true, records: [] };
+  if (!Array.isArray(raw) || !raw.every(isValidExcludedPendingRecord)) return { valid: false, records: [] };
+  return { valid: true, records: raw };
+}
+
+function createExcludedPendingRecord(fileEntry, excludedAt = Date.now()) {
+  const record = { ...stripLiveCaptureMetadata(fileEntry) };
+  for (const field of [...EXCLUDED_PENDING_RECORD_FIELDS, ...EXCLUDED_PENDING_FORBIDDEN_FIELDS]) delete record[field];
+  record.excludedRecordVersion = EXCLUDED_PENDING_RECORD_VERSION;
+  record.excludedAt = excludedAt;
+  const appFamily = getAcceptedPendingAppFamily(fileEntry);
+  if (appFamily) record.excludedAppFamily = appFamily;
+  return record;
+}
+
+// Rebuild the pending row that accept expects. The app family travels the
+// same way the live row carried it, so createAcceptedPendingFile produces the
+// same accepted record (fields and order) as accepting the original row.
+function materializeExcludedPendingRecord(record) {
+  const entry = { ...record };
+  for (const field of EXCLUDED_PENDING_RECORD_FIELDS) delete entry[field];
+  if (record.excludedAppFamily) entry.captureEvidence = { appFamily: record.excludedAppFamily };
+  return entry;
+}
+
+// Decide what rejecting a pending row stores. Rows without a path or key keep
+// today's behavior. A key already excluded without a record (a legacy skip)
+// is never given a record, so legacy keys are never shown, counted or deleted.
+function planExcludedPendingRecord(project, fileEntry) {
+  if (!fileEntry || typeof fileEntry.path !== 'string' || !fileEntry.path.trim()) return { record: null };
+  if (!normalizeTrackedFilePath(fileEntry.path)) return { record: null };
+  const exclusionKey = getAssetReviewExclusionKey(fileEntry);
+  if (!exclusionKey) return { record: null };
+  const state = readExcludedPendingRecords(project);
+  if (!state.valid) return { error: 'excluded_pending_records_invalid' };
+  const dedupKey = getTrackedFileDedupKey(fileEntry);
+  const replaceIndex = state.records.findIndex(record => getTrackedFileDedupKey(record) === dedupKey);
+  if (replaceIndex === -1 && (project.excludedAssetKeys || []).includes(exclusionKey)) return { record: null };
+  const record = createExcludedPendingRecord(fileEntry);
+  // Never store a record the reader would reject (for example a non-string
+  // name): that would hide every remembered row. Refuse only this row.
+  if (!isValidExcludedPendingRecord(record)) return { error: 'excluded_pending_record_invalid' };
+  return { record, replaceIndex };
+}
+
+function storeExcludedPendingRecord(project, plan) {
+  if (!plan?.record) return;
+  const records = [...readExcludedPendingRecords(project).records];
+  // Dedupe keeps the original position so the Excluded order stays stable.
+  if (plan.replaceIndex >= 0) records[plan.replaceIndex] = plan.record;
+  else records.push(plan.record);
+  project.excludedPendingFiles = records;
+}
+
+// Including a file retires every record for it. Its exclusion key is deleted
+// only when no remaining record still needs it; legacy keys never have a
+// record, so they are never touched here.
+function releaseExcludedPendingRecords(project, fileEntry) {
+  const state = readExcludedPendingRecords(project);
+  if (!state.valid || !state.records.length) return false;
+  const dedupKey = getTrackedFileDedupKey(fileEntry);
+  const released = state.records.filter(record => getTrackedFileDedupKey(record) === dedupKey);
+  if (!released.length) return false;
+  const remaining = state.records.filter(record => !released.includes(record));
+  project.excludedPendingFiles = remaining;
+  const stillNeeded = new Set(remaining.map(record => getAssetReviewExclusionKey(record)).filter(Boolean));
+  const releasedKeys = new Set(released.map(record => getAssetReviewExclusionKey(record)).filter(key => key && !stillNeeded.has(key)));
+  if (releasedKeys.size) {
+    project.excludedAssetKeys = (project.excludedAssetKeys || []).filter(key => !releasedKeys.has(key));
+  }
+  return true;
+}
+
+// A record is retired once the same file is a project file again (for example
+// after + Add Files). This runs only in post-mutation auto-capture
+// normalization, reusing the project-file key set built there; it is never
+// part of a store read, so reads do no per-file path resolution for records.
+function pruneShadowedExcludedPendingRecords(project, fileKeys = null) {
+  const state = readExcludedPendingRecords(project);
+  if (!state.valid || !state.records.length) return false;
+  fileKeys ||= getTrackedFileKeySet(project.files);
+  const kept = state.records.filter(record => !fileKeys.has(getTrackedFileDedupKey(record)));
+  if (kept.length === state.records.length) return false;
+  project.excludedPendingFiles = kept;
+  return true;
+}
+
+// The Excluded tab shows valid, unshadowed records under the same Illustrator
+// activation scope as Needs Review rows.
+function getProjectedExcludedPendingEntries(project, scopedProject) {
+  const state = readExcludedPendingRecords(project);
+  if (!state.valid || !state.records.length) return [];
+  const scopedState = readExcludedPendingRecords(scopedProject);
+  const scopedPaths = new Set((scopedState.valid ? scopedState.records : [])
+    .map(record => normalizeTrackedFilePath(record.path)).filter(Boolean));
+  const fileKeys = getTrackedFileKeySet(project.files);
+  return state.records
+    .filter(record => scopedPaths.has(normalizeTrackedFilePath(record.path)) &&
+      !fileKeys.has(getTrackedFileDedupKey(record)))
+    .map(materializeExcludedPendingRecord)
+    .filter(entry => isIllustratorScopedFileAllowed(project, entry));
 }
 
 function classifyLiveObservedFile(project, fileEntry, observation = {}, stageIndex = null) {
@@ -6704,6 +6838,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   if (!project || !scopedProject) return null;
   const projectFiles = project.files;
   const projectPendingFiles = project.pendingFiles;
+  const projectExcludedPendingFiles = project.excludedPendingFiles;
   const selectionSignature = getPackageSelectionInputSignature(project);
   const illustratorScope = getIllustratorActivationScope(projectId);
   const cacheEpoch = getFileVisualProjectCacheEpoch(projectId);
@@ -6723,6 +6858,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
     fileVisualProjectCacheGeneration === cacheGeneration &&
     project.files === projectFiles &&
     project.pendingFiles === projectPendingFiles &&
+    project.excludedPendingFiles === projectExcludedPendingFiles &&
     selectionSignature === getPackageSelectionInputSignature(currentProjectAfterSelection) &&
     getIllustratorActivationScope(projectId) === illustratorScope &&
     currentProjectAfterSelection
@@ -6744,6 +6880,23 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   })));
   const pendingFiles = await Promise.all((scopedProject.pendingFiles || []).map(async (file, sourceIndex) => ({
     ...(await createRendererFilePresentation(project, file, membership, attribution)),
+    sourceIndex,
+  })));
+  // Excluded Needs Review records: Excluded rows of Added origin with one [+].
+  // They are never working files or package members until Include accepts them.
+  const excludedPendingEntries = getProjectedExcludedPendingEntries(project, scopedProject);
+  const excludedPendingFiles = await Promise.all(excludedPendingEntries.map(async (entry, sourceIndex) => ({
+    ...(await createRendererFilePresentation(project, entry, membership, null)),
+    assetOrigin: 'added',
+    projectRole: 'asset',
+    protectedSource: false,
+    sourceRecoveryAllowed: false,
+    included: false,
+    excluded: true,
+    excludedPending: true,
+    // File visuals stay limited to project and Needs Review files; the row
+    // shows its type badge instead of a thumbnail.
+    visualRevision: null,
     sourceIndex,
   })));
   const visualRecords = new Map();
@@ -6774,6 +6927,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
     fileVisualProjectCacheGeneration === cacheGeneration &&
     project.files === projectFiles &&
     project.pendingFiles === projectPendingFiles &&
+    project.excludedPendingFiles === projectExcludedPendingFiles &&
     selectionSignature === getPackageSelectionInputSignature(currentProject) &&
     getIllustratorActivationScope(projectId) === illustratorScope &&
     currentProject && diskInput === captureWorkingSourcePresentationDiskInput(presentedFiles,
@@ -6817,6 +6971,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
     projectId,
     files,
     pendingFiles,
+    excludedPendingFiles,
     trackedFigmaFiles,
     semanticCounts: membership.counts,
     workingSourceSelectionBlocked: membership.blocked || membership.choiceReviewNames.length > 0,
@@ -7343,6 +7498,14 @@ function isAssetReviewFileExcluded(project, file) {
   if (!excluded.size) return false;
   const fingerprint = getAssetReviewContentFingerprint(file);
   return !!(fingerprint && fingerprint !== file.individualContentInclude && excluded.has(fingerprint));
+}
+
+// Whether the package leaves this row out, by the same test as
+// selectProjectFilesForPackagingSnapshot: its working-source fact is not
+// included, or it is excluded for review and not kept as a required dependency.
+function isAssetEffectivelyExcluded(project, membership, file) {
+  const fact = membership?.facts.get(getTrackedFileDedupKey(file));
+  return (!!fact && !fact.included) || (isAssetReviewFileExcluded(project, file) && !fact?.includedAsDependency);
 }
 
 function getProjectAssetBaselineSourceKeys(project, startedAt) {
@@ -7881,6 +8044,23 @@ function setProjectExistingAssetsDecision(projectId, decision) {
         .filter(Boolean)
     );
     const excludedKeys = new Set(project.excludedAssetKeys || []);
+    // Include brings back Existing assets this batch moves from Excluded to
+    // Included; like [+] on one row, that also clears each one's own font-row
+    // Exclude. Excluded and Included are the package's own membership,
+    // measured before and after the batch, so an asset that was already
+    // Included (for example kept as required) keeps its font-row choice. Only
+    // with font handoff data and an Existing font in the batch is it measured.
+    const fontCandidates = decision === 'include' && project.fontHandoff !== undefined
+      ? existingAssets.filter(file => typeof file?.path === 'string' && isGatedFontPath(file.path))
+      : [];
+    let fontsExcludedBefore = null;
+    if (fontCandidates.length) {
+      const membership = getWorkingSourceMembership(project);
+      fontsExcludedBefore = new Set(fontCandidates
+        .filter(file => isAssetEffectivelyExcluded(project, membership, file))
+        .map(getTrackedFileDedupKey)
+        .filter(Boolean));
+    }
     for (const key of existingAssetKeys) {
       if (decision === 'skip') excludedKeys.add(key);
       else excludedKeys.delete(key);
@@ -7939,6 +8119,12 @@ function setProjectExistingAssetsDecision(projectId, decision) {
           file.existingIncludeEpisode = { version: 1, ownersDigest: getExistingIncludeEpisodeDigest(owners), ownerCount: count };
         } else if (count > 0) file.existingIncludeEpisode = { version: 1, owners };
       }
+    }
+    if (fontsExcludedBefore?.size) {
+      const membership = getWorkingSourceMembership(project);
+      const restored = (project.files || []).filter(file => typeof file?.path === 'string' && isGatedFontPath(file.path) &&
+        fontsExcludedBefore.has(getTrackedFileDedupKey(file)) && !isAssetEffectivelyExcluded(project, membership, file));
+      clearFontRowExclusionChoices(project, restored.map(file => file.path));
     }
     return { success: true };
   });
@@ -19512,7 +19698,7 @@ function notifyExistingAssetsDecision(projectId) {
     const icon = getNotificationIconPath();
     const notification = new Notification({
       title: 'Crate — Existing assets found',
-      body: 'Choose whether to include or skip existing assets. Click to review in Crate.',
+      body: 'Choose whether to include or exclude existing assets. Click to review in Crate.',
       silent: false,
       ...(icon ? { icon } : {}),
     });
@@ -20608,6 +20794,7 @@ registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileI
             if (fingerprint) removedFile.individualContentInclude = fingerprint;
           }
           if (fact?.excludedSourceOnly === true) removedFile.keptAfterSourceExclusion = true;
+          clearFontRowExclusionChoice(project, removedFile.path);
         } else {
           priorExclusions.add(exclusionKey);
           delete removedFile.individualContentInclude;
@@ -20647,10 +20834,22 @@ registerTrustedIpcHandler('projects:accept-pending', async (event, projectId, fi
       const idx = (project.pendingFiles || []).findIndex(f => (
         f.path === filePath || createProjectFileVisualIdentity(project.id, f) === filePath
       ));
-    if (idx === -1) return null;
-    if (!isIllustratorScopedFileAllowed(project, project.pendingFiles[idx])) return null;
+    // Include from the Excluded tab replays this same accept transition for a
+    // remembered Needs Review row. Pending rows keep their existing lookup.
+    let excludedEntry = null;
+    if (idx === -1) {
+      excludedEntry = readExcludedPendingRecords(project).records.map(materializeExcludedPendingRecord).find(entry => (
+        entry.path === filePath || createProjectFileVisualIdentity(project.id, entry) === filePath
+      )) || null;
+      if (!excludedEntry) return null;
+    }
+    if (!isIllustratorScopedFileAllowed(project, excludedEntry || project.pendingFiles[idx])) return null;
 
-    const [file] = project.pendingFiles.splice(idx, 1);
+    const [file] = excludedEntry ? [excludedEntry] : project.pendingFiles.splice(idx, 1);
+    // Retire the record and its own exclusion key in this same mutation,
+    // before any scan, so the file is never both Included and excluded.
+    releaseExcludedPendingRecords(project, file);
+    clearFontRowExclusionChoice(project, file.path);
     const acceptedKey = getTrackedFileDedupKey(file);
     const acceptedPaths = getTrackedFileKeySet(project.files);
 
@@ -20697,18 +20896,35 @@ registerTrustedIpcHandler('projects:accept-pending', async (event, projectId, fi
   } finally { operation.close(); }
 });
 
+// The reject transition for one Needs Review row inside a project mutation.
+function rejectPendingFileInProject(project, filePath) {
+  const file = (project.pendingFiles || []).find(f => (
+    f.path === filePath || createProjectFileVisualIdentity(project.id, f) === filePath
+  ));
+  // Fail closed before any change: a malformed record list is never
+  // overwritten, so the row stays in Needs Review with no key or provenance.
+  const recordPlan = file ? planExcludedPendingRecord(project, file) : null;
+  if (recordPlan?.error) return { refusal: recordPlan.error };
+  project.pendingFiles = (project.pendingFiles || []).filter(f => f !== file);
+  if (file) {
+    recordPendingFileDecision(project, file, 'rejected');
+    storeExcludedPendingRecord(project, recordPlan);
+  }
+  return { pendingFiles: project.pendingFiles };
+}
+
 registerTrustedIpcHandler('projects:reject-pending', (event, projectId, filePath) => {
+  let refusal = null;
   const result = mutateProject(projectId, (project) => {
-    const file = (project.pendingFiles || []).find(f => (
-      f.path === filePath || createProjectFileVisualIdentity(project.id, f) === filePath
-    ));
-    project.pendingFiles = (project.pendingFiles || []).filter(f => f !== file);
-    if (file) {
-      recordPendingFileDecision(project, file, 'rejected');
+    const outcome = rejectPendingFileInProject(project, filePath);
+    if (outcome.refusal) {
+      refusal = outcome.refusal;
+      return null;
     }
-    return { pendingFiles: project.pendingFiles };
+    return outcome;
   });
 
+  if (refusal) return { success: false, error: refusal };
   if (!result) return null;
 
   sendProjectFileStateToRenderer(projectId);
@@ -20838,6 +21054,7 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
         ]) {
           if (exclusionKey) excludedKeys.delete(exclusionKey);
         }
+        clearFontRowExclusionChoice(project, filePath);
         recordSessionObservedFile(project, authorizedFile, {
           kind: OBSERVER_KINDS.MANUAL_USER_ACTION,
           method: 'projects:add-files',
@@ -22922,6 +23139,9 @@ function collectFontCandidates(project, files) {
       groups.set(key, group);
     }
     group.origins.add(origin);
+    // Package files already went through asset selection, including the
+    // required-dependency rules; only Package Review font picks bypass it.
+    if (extra.fromPackageFiles) group.fromPackageFiles = true;
     if (Number.isFinite(extra.addedAt)) group.addedAt = Math.min(group.addedAt, extra.addedAt);
     if (extra.postscriptName) group.requested.add(extra.postscriptName);
   };
@@ -22937,7 +23157,7 @@ function collectFontCandidates(project, files) {
       return;
     }
     if (isGatedFontFile(file) && typeof file.path === 'string') {
-      add(file.path, isExplicitUserCapturedFile(file) ? 'project-file' : 'found', { addedAt: file.addedAt });
+      add(file.path, isExplicitUserCapturedFile(file) ? 'project-file' : 'found', { addedAt: file.addedAt, fromPackageFiles: true });
     }
   });
   for (const selection of handoff.installed) {
@@ -22947,13 +23167,92 @@ function collectFontCandidates(project, files) {
   return { handoff, groups: [...groups.values()] };
 }
 
+// Asset decisions apply to fonts too: a file the designer excluded (from Needs
+// Review, Exclude All or an Included row) stays out of the package even if it
+// was picked earlier in Package Review. Path keys are compared canonically.
+// This runs only for Package Review and packaging, never on store reads.
+function isFontPathAssetExcluded(project, sourcePath) {
+  const keys = Array.isArray(project?.excludedAssetKeys) ? project.excludedAssetKeys : [];
+  if (!keys.length || typeof sourcePath !== 'string' || !sourcePath) return false;
+  if (isAssetReviewFileExcluded(project, { path: sourcePath, name: path.basename(sourcePath), ext: path.extname(sourcePath).toLowerCase() })) return true;
+  const target = normalizeTrackedFilePath(sourcePath);
+  if (!target) return false;
+  if (keys.some(key => typeof key === 'string' && path.isAbsolute(key) && normalizeTrackedFilePath(key) === target)) return true;
+  // Opaque keys (for example a fileId) are resolved through every row that
+  // carries one, including validated remembered Needs Review records; a
+  // malformed record list reads as empty.
+  const keySet = new Set(keys);
+  return [...(project.files || []), ...(project.pendingFiles || []), ...readExcludedPendingRecords(project).records].some(file => (
+    keySet.has(getAssetReviewExclusionKey(file)) && normalizeTrackedFilePath(file?.path) === target
+  ));
+}
+
+// The latest explicit inclusion wins: picking a font file again, or Include on
+// its font row, clears that file's asset exclusion the same way + Add Files
+// does, and retires its remembered Needs Review record (and its own key).
+function includeExplicitlyChosenFontFile(project, sourcePath) {
+  // Nothing to clear: no exclusion keys, no remembered records, and no project
+  // file still carrying a content-exclusion marker (a marker without its key
+  // never excludes, but it is read as an individual choice, so it is kept on
+  // the slow path exactly as before). No path is resolved in this case.
+  if (!(project?.excludedAssetKeys || []).length && !readExcludedPendingRecords(project).records.length &&
+      !(project?.files || []).some(file => file && file.individualContentExclusion !== undefined)) return false;
+  const target = normalizeTrackedFilePath(sourcePath);
+  if (!target) return false;
+  const released = releaseExcludedPendingRecords(project, { path: sourcePath });
+  const keys = Array.isArray(project.excludedAssetKeys) ? project.excludedAssetKeys : [];
+  const remove = new Set([sourcePath]);
+  for (const file of [...(project.files || []), ...(project.pendingFiles || [])]) {
+    if (normalizeTrackedFilePath(file?.path) !== target) continue;
+    const key = getAssetReviewExclusionKey(file);
+    if (key) remove.add(key);
+    if ((project.files || []).includes(file)) delete file.individualContentExclusion;
+  }
+  for (const key of keys) {
+    if (typeof key === 'string' && path.isAbsolute(key) && normalizeTrackedFilePath(key) === target) remove.add(key);
+  }
+  const kept = keys.filter(key => !remove.has(key));
+  if (kept.length !== keys.length) project.excludedAssetKeys = kept;
+  return released || kept.length !== keys.length;
+}
+
+// An asset Include (+ Add Files, [+] on an Excluded row, accepting a remembered
+// or Needs Review row) is the latest explicit choice for that file, so it also
+// clears that file's own font-row Exclude. Other rows' choices and
+// confirmations are untouched.
+function clearFontRowExclusionChoice(project, filePath) {
+  return clearFontRowExclusionChoices(project, [filePath]) > 0;
+}
+
+// The same clearing for several files at once (Include All Existing), reading
+// and writing the font handoff at most once. Without font handoff data, or
+// without a gated font among the paths, no path is resolved.
+function clearFontRowExclusionChoices(project, filePaths) {
+  if (!project || project.fontHandoff === undefined) return 0;
+  const fontPaths = (filePaths || []).filter(filePath => typeof filePath === 'string' && isGatedFontPath(filePath));
+  if (!fontPaths.length) return 0;
+  let handoff = null;
+  let cleared = 0;
+  for (const filePath of fontPaths) {
+    const key = getFontRowKey(filePath);
+    if (!key) continue;
+    handoff ||= readProjectFontHandoff(project);
+    if (handoff.choices[key] !== 'remove') continue;
+    delete handoff.choices[key];
+    cleared += 1;
+  }
+  if (cleared) writeProjectFontHandoff(project, handoff);
+  return cleared;
+}
+
 function getFontRowOrigin(group) {
   return FONT_ORIGIN_PRIORITY.find(origin => group.origins.has(origin)) || 'found';
 }
 
-function getFontGateInput(group, inspected, handoff, homeDir) {
+function getFontGateInput(group, inspected, handoff, homeDir, assetExcluded = false) {
   return {
     embedded: group.embedded === true,
+    assetExcluded: assetExcluded === true,
     file: { state: inspected.fingerprint.state },
     readError: inspected.readError,
     faces: inspected.parsed?.faces || [],
@@ -22979,7 +23278,8 @@ function evaluateFontHandoff(project, files) {
     const inspected = group.embedded
       ? { sourcePath: null, fingerprint: { state: 'virtual' }, realPath: null, sha256: null, parsed: null, readError: null }
       : inspectFontFile(group.sourcePath);
-    const gateInput = getFontGateInput(group, inspected, handoff, homeDir);
+    const assetExcluded = !group.embedded && !group.fromPackageFiles && isFontPathAssetExcluded(project, group.sourcePath);
+    const gateInput = getFontGateInput(group, inspected, handoff, homeDir, assetExcluded);
     return { group, inspected, gateInput, gate: fontHandoff.evaluateFontGate({ ...gateInput, conflict: false }) };
   });
   const live = rows.filter(row => row.gate.outcome === 'included' || row.gate.outcome === 'needs-confirmation');
@@ -23018,7 +23318,10 @@ function getFontRowLabel(row) {
 // else the gate says about them; the sender's choice decides, not the reason.
 function isFontRowOmittedFromNote(row) {
   const { choice, intent } = row.gateInput;
-  return row.gate.reason === 'duplicate' || choice === 'remove' || (intent !== 'explicit' && choice !== 'include');
+  // An asset-excluded file is the sender's own exclusion, whatever the gate's
+  // final reason (for example restricted or missing): never name it.
+  return row.gate.reason === 'duplicate' || row.gateInput.assetExcluded === true || choice === 'remove' ||
+    (intent !== 'explicit' && choice !== 'include');
 }
 
 function getFontNoteModel(fontReview, inputs, licenceOutputs) {
@@ -23067,6 +23370,7 @@ function planFontOutputs(fontReview, layoutMode, outputAllocator) {
     inputs.push({
       rowKey: row.group.key,
       sourcePath: row.group.sourcePath,
+      selectedInPackageReview: row.group.fromPackageFiles !== true,
       sourceFingerprint: row.inspected.fingerprint,
       sha256: row.inspected.sha256,
       basis: row.gate.basis,
@@ -23186,9 +23490,10 @@ function presentFontReview(fontReview, plan) {
         ? fontHandoff.getFontConfirmationStatement(faces, fileName) : null,
       statementVersion: fontHandoff.FONT_CONFIRMATION_WORDING_VERSION,
       confirmed: fontHandoff.isCurrentConfirmation(row.gateInput.confirmation, row.inspected.sha256),
-      canConfirm: !excluded && reason !== 'removed' && reason !== 'conflict' && basis !== 'verified-release' && faces.length > 0,
-      canRemove: row.gateInput.choice !== 'remove',
-      canInclude: reason === 'found' || reason === 'removed',
+      canConfirm: !excluded && reason !== 'removed' && reason !== 'asset-excluded' && reason !== 'conflict' &&
+        basis !== 'verified-release' && faces.length > 0,
+      canRemove: row.gateInput.choice !== 'remove' && reason !== 'asset-excluded',
+      canInclude: reason === 'found' || reason === 'removed' || reason === 'asset-excluded',
       packageFolder: inputKeys.has(row.group.key) ? getFontFolderLabel(plan) : null,
     };
   });
@@ -23361,6 +23666,7 @@ function storeInstalledFontSelections(projectId, selections, fence) {
       handoff.installed.push({ ...selection, addedAt: Date.now() });
       const key = getFontRowKey(selection.path);
       if (key && handoff.choices[key] === 'remove') delete handoff.choices[key];
+      includeExplicitlyChosenFontFile(project, selection.path);
       stored++;
     }
     writeProjectFontHandoff(project, handoff);
@@ -23476,6 +23782,8 @@ function setFontRowChoice(projectId, rowKey, choice) {
     const group = getProjectFontCandidateGroup(project, rowKey);
     if (!group) return { error: 'font_not_found' };
     if (choice === 'include' && group.embedded) return { error: 'font_not_eligible' };
+    // Include on the font row is the latest explicit choice for this file.
+    if (choice === 'include' && group.sourcePath) includeExplicitlyChosenFontFile(project, group.sourcePath);
     const handoff = readProjectFontHandoff(project);
     if (choice === 'remove') {
       handoff.installed = handoff.installed.filter(item => getFontRowKey(item.path) !== rowKey);
@@ -23550,7 +23858,12 @@ function addFontFilePaths(projectId, filePaths) {
     for (const filePath of accepted) {
       const key = getFontRowKey(filePath);
       if (!key) continue;
-      if (handoff.choices[key] === 'remove') delete handoff.choices[key];
+      // Picking the file again is the latest explicit choice: it is included.
+      // Only a kept pick clears anything; a refused pick changes nothing.
+      const keepPick = () => {
+        if (handoff.choices[key] === 'remove') delete handoff.choices[key];
+        includeExplicitlyChosenFontFile(project, filePath);
+      };
       const existing = handoff.files.find(item => getFontRowKey(item.path) === key);
       if (existing) {
         // The same real file was added through a link: keep the file itself.
@@ -23558,6 +23871,7 @@ function addFontFilePaths(projectId, filePaths) {
           existing.path = filePath;
           added++;
         }
+        keepPick();
         continue;
       }
       if (handoff.files.length >= MAX_FONT_HANDOFF_SELECTIONS) {
@@ -23565,6 +23879,7 @@ function addFontFilePaths(projectId, filePaths) {
         continue;
       }
       handoff.files.push({ path: filePath, addedAt: Date.now() });
+      keepPick();
       added++;
     }
     writeProjectFontHandoff(project, handoff);
@@ -24086,7 +24401,7 @@ async function buildCanonicalPackageReviewManifest(projectId) {
       project: currentProject, files, entries,
       entryStatuses: entryStatuses.map((status, index) => excludedRequired[index] ? 'unavailable' : status),
       reviewedInputSignature, reviewedSettingsKey: packageSettingsKey, materializable: false,
-      packageMessage: 'A working file requires an excluded asset. Restore the asset or exclude that working file.',
+      packageMessage: 'A working file requires an excluded asset. Include the asset or exclude that working file.',
     };
     let plan;
     const presentationMediaByEntry = new Map();
@@ -24348,7 +24663,7 @@ async function createUnavailablePackageReview(projectId, manifest) {
     semanticCounts: membership.counts,
     workingFileChoices: getWorkingFileChoicePresentation(manifest.project),
     materializable: false,
-    message: manifest.packageMessage || (manifest.files.length === 0 ? 'No files are selected for packaging.' :
+    message: manifest.packageMessage || (manifest.files.length === 0 ? 'No files are included in the package.' :
       (membership.counts.relationshipHolds > 0 ? 'Photoshop asset association is unresolved. Your files are preserved; this package is blocked.' :
         membership.blocked ? 'Working-source verification is unresolved. Resolve it before packaging.' :
         'Some files are unavailable. Resolve them before packaging.')),
@@ -26363,6 +26678,10 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
         const staleFontResult = await abortStalePackage(); if (staleFontResult) return staleFontResult;
         const allocatedOutputName = outputAllocator.reserveGroupedOutputName(input.rawName, 'fonts');
         if (allocatedOutputName !== input.outputName || getOutputRelativePath(allocatedOutputName) !== input.relativePath) {
+          throw new PackageReviewChangedError();
+        }
+        if (input.selectedInPackageReview !== false &&
+            isFontPathAssetExcluded(getProjects().find(project => project.id === id), input.sourcePath)) {
           throw new PackageReviewChangedError();
         }
         const { buffer, mode } = readGatedFontForPackaging(input, layoutMode);

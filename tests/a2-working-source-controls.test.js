@@ -104,7 +104,7 @@ for (const list of ['working-assets-list', 'project-file-list']) {
         clicked.click(); await mounted.completions[1];
         assert.equal(f.calls.length, 1);
         first.resolve(); await mounted.completions[0];
-        const label = action === 'restore' ? 'Restore' : 'Exclude';
+        const label = action === 'restore' ? 'Include' : 'Exclude';
         for (const button of mounted.buttons()) {
           assert.equal(button.disabled, false, 'unchanged authoritative rows must allow retry');
           assert.equal(button.textContent, label);
@@ -118,7 +118,7 @@ for (const list of ['working-assets-list', 'project-file-list']) {
         assert.deepEqual(clone(f.calls[1]), [f.project.id, f.row.visualIdentity, { action, expectedRevision: 2 }]);
         for (const button of mounted.buttons()) {
           assert.equal(button.disabled, false);
-          assert.equal(button.textContent, action === 'restore' ? 'Exclude' : 'Restore', 'new backend state determines the next action');
+          assert.equal(button.textContent, action === 'restore' ? 'Exclude' : 'Include', 'new backend state determines the next action');
         }
         assert.equal(vm.runInContext('state.packageReviewToken', f.renderer), null);
       });
@@ -441,8 +441,10 @@ test('an asset withheld with its excluded working file presents as Excluded with
   assert.ok(row); assert.match(row.className, /is-excluded/);
   assert.match(getElementTreeText(row), /Excluded/);
   assert.equal(buttonFor(row, 'Required asset'), undefined);
-  const include = descendants(row).find(child => child.tagName === 'BUTTON' && child.title === 'Include Withheld.png');
+  const include = descendants(row).find(child => child.tagName === 'BUTTON' && child.getAttribute?.('aria-label') === 'Include Withheld.png');
   assert.ok(include, 'the existing Include action is offered');
+  assert.equal(include.dataset.rowAction, 'include');
+  assert.equal(include.title, undefined, 'the square [+] has no hover title');
 });
 
 test('effective asset filters preserve excluded working-source intent and legacy fallback', () => {
@@ -487,7 +489,7 @@ for (const outcome of ['failure', 'close']) test(`pending continuation keeps key
 for (const state of ['selected', 'excluded']) test(`working-source ${state} uses an explicit reversible action`, () => {
   const f = setup({ sourceSelection: state, included: state === 'selected' });
   const row = f.renderer.createAssetFileRow(f.project, f.row, { protectedSource: true });
-  assert.ok(buttonFor(row, state === 'selected' ? 'Exclude' : 'Restore'));
+  assert.ok(buttonFor(row, state === 'selected' ? 'Exclude' : 'Include'));
   assert.doesNotMatch(getElementTreeText(row), /always included|Ready/);
 });
 
@@ -495,7 +497,7 @@ test('excluded dependency remains required and uses safe requiring-source names'
   const f = setup({ sourceSelection: 'excluded', included: true, includedAsDependency: true, effectiveRole: 'asset', requiredBy: ['Current.ai'] });
   const row = f.renderer.createAssetFileRow(f.project, f.row, { protectedSource: true });
   assert.match(getElementTreeText(row), /Required by Current.ai/);
-  assert.ok(buttonFor(row, 'Restore'));
+  assert.ok(buttonFor(row, 'Include'));
 });
 
 test('required ordinary asset does not expose a removal toggle', () => {
@@ -571,7 +573,7 @@ test('semantic count summary uses backend selected/dependency counts rather than
   Object.assign(f.row, { sourceSelection: 'excluded', includedAsDependency: true, effectiveRole: 'asset' });
   f.renderer.renderAssetWorkspace(f.project, {}, [f.row]);
   assert.equal(f.elements['project-file-count'].textContent, '0 of 1');
-  assert.match(f.elements['working-source-summary'].textContent, /0 selected.*1 excluded.*1 included asset/);
+  assert.match(f.elements['working-source-summary'].textContent, /0 included local working.*1 excluded.*1 included asset/);
   assert.equal(f.elements['metric-excluded-count'].textContent, '1');
 });
 
@@ -630,7 +632,7 @@ for (const status of ['pending', 'failed', 'stale', 'incomplete']) test(`exclude
   assert.doesNotMatch(text, /Still included/);
   assert.match(text, status === 'pending' ? /Verifying/ : /Needs attention/);
   assert.match(text, /Excluded working file/);
-  assert.ok(buttonFor(row, 'Restore'));
+  assert.ok(buttonFor(row, 'Include'));
 });
 
 test('included dependency with failed verification still shows needs attention', () => {
