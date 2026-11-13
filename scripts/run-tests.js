@@ -198,13 +198,16 @@ function startSampler(command, requestTimeoutMs = TIMING.requestTimeoutMs) {
     nextId += 1;
     pending = { id, read: makeReader(id), resolve, reject };
     pending.timer = setTimeout(() => settle(new Error(`sampler did not answer within ${timeoutMs} ms`)), timeoutMs);
-    child.stdin.write(`${[words[0], id, ...words.slice(1)].join(' ')}\n`, error => { if (error) fail('sampler closed its input'); });
+    child.stdin.write(`${[words[0], id, ...words.slice(1)].join(' ')}\n`, error => { if (error) fail('sampler ended (closed its input)'); });
     return undefined;
   });
 
   child.on('error', error => fail(`sampler could not start (${error.code || error.message})`));
-  child.on('exit', (code, signal) => fail(`sampler exited (${signal || code})`));
-  child.stdin.on('error', () => fail('sampler closed its input'));
+  // A sampler that ends is noticed as its exit or as its closed input,
+  // whichever this process happens to see first. Both mean the same thing,
+  // that it is gone for good, and both are reported as "sampler ended".
+  child.on('exit', (code, signal) => fail(`sampler ended (exited: ${signal || code})`));
+  child.stdin.on('error', () => fail('sampler ended (closed its input)'));
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', chunk => { stderrTail = (stderrTail + chunk).trim().split('\n').pop().slice(0, 200); });
   child.stdout.setEncoding('utf8');

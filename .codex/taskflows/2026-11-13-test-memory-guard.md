@@ -32,9 +32,9 @@ Forbidden:
 
 ## State
 
-- current phase: guard correction cycle 2 of at most 3 committed locally; waiting for the exact-head reread, and for #328 to merge before the rest resumes
-- last completed checkpoint: three local commits, unpushed: the WIP checkpoint, the guard hardening, and the cycle 2 corrections
-- next action: wait for Mack. Review findings on the guard come back to this writer as follow-up commits. One correction cycle is left.
+- current phase: guard correction cycle 3 of 3 committed locally; no correction cycle is left. Waiting for Mack, and for #328 to merge before the rest resumes
+- last completed checkpoint: four local commits, unpushed: the WIP checkpoint, the guard hardening, and the cycle 2 and cycle 3 corrections
+- next action: wait for Mack. A further blocking finding on the guard is escalated to Bryant, not answered with a fourth cycle.
 - blocker: independent review of the guard has not passed; #328 must merge before the paused work resumes
 - approval state: writer ownership of this branch for guard work only; no approval to use the guard, push, or merge
 - preferences applied: one writer, read-only reviewers, no concurrent heavy Mac tests, pinned Node, bounded synthetic tests only
@@ -76,6 +76,8 @@ Bounded synthetic tests only. Allocators stop by themselves at 256 MB and let go
 | 2026-11-13 | Eight deliberate regressions in the guard, one at a time, against the simulated tests | terminal | Each was caught by at least one test: group adoption without the runner in the scan; pid remembered without start time; unreadable process dropped; unreadable tolerated forever; kill without freeze; group signal after the runner is gone; frozen stranger not resumed; no confirmation deadline. |
 | 2026-11-13 | Cycle 2: the same test file, twice | private logs | 40 of 40 pass both times, about 24 s each, nothing left running. 22 tests on a simulated process table, 18 with real processes. |
 | 2026-11-13 | Cycle 2: eight more deliberate regressions, against the simulated tests or the command-level tests | terminal | Each was caught: runner adopted only when readable (simulated and at the command line); missing runner tolerated; inconsistent runner accepted; group signalled by number after collection; group signalled by number with the runner in another group; no group signal by number; standby sampler unused. |
+| 2026-11-13 | Cycle 3: 120 samplers ended with SIGKILL and asked for a scan right after | terminal | Reported as ended through its exit 113 times and through its closed input 7 times; marked gone for good every time. |
+| 2026-11-13 | Cycle 3: the test file three times; the two sampler-loss tests alone 12 times | private logs | 41 of 41 pass all three times, about 24 s each; 12 of 12. Nothing left running. 22 tests on a simulated process table, 19 with real processes. |
 | 2026-11-13 | Finite allocator under `--memory-limit-mb=128`, three runs | terminal | Stopped at 132, 132 and 140 MB after 0.5 to 0.6 s, exit 137, run confirmed gone, 0.64 to 0.70 s wall. |
 | 2026-11-13 | Sampler reading against the macOS `footprint` tool for one process holding 96 MB | terminal | Sampler footprint 109.0 MB, tool 109.2 MB; resident 137.1 MB against 137.4 MB from Node. |
 | 2026-11-13 | Guard cost on a 10 s idle run | terminal | 165 samples; about 5 percent of one core in total (sampler about 2 ms of CPU per scan, guard process about 0.02 s per second). |
@@ -88,6 +90,7 @@ At most three correction cycles.
 
 - Review 1, on the in-progress guard: four blocking findings (read failures dropped or zeroed; exit 0 with unconfirmed cleanup; signals sent from a stale snapshot; test cleanup by bare pid). Answered in the guard hardening commit.
 - Review 2, on that commit: the four findings substantially addressed; 34 of 34 rerun independently. One new blocking finding: a runner unreadable from the first scan was never adopted, so nothing was owned and the run could continue unmeasured until the deadline. One limit to evaluate: when the sampler and its replacement both fail, detached children are left. Answered in the cycle 2 commit: the runner is the root by its own pid; the second sampler stands by from the start. The total-failure case remains a limit and is stated below.
+- Review 3, on the cycle 2 commit: source approved for narrow, supervised use with #328; 40 of 40 in one of three independent runs, 39 of 40 in the other two. The failing test expected the words "sampler exited" or "did not answer" and got "sampler closed its input". Cause confirmed: a sampler that ends is noticed as its exit or as its closed input, whichever the guard sees first, and the guard acts the same on both (it marks the sampler gone and stops the run; the captured run exited 125 with every process gone). Answered in the cycle 3 commit: both are reported as "sampler ended", with the way it was noticed in brackets; the test accepts exactly those two wordings for a killed sampler and only "did not answer" for a frozen one, with its exit status, cleanup and bystander checks unchanged; one test added at the sampler client. No change to what the guard does.
 - Fallback evaluated for the total-failure case and not built: identifying detached processes with `ps` start times. It needs a second identity kept for every process, has one-second resolution and a millisecond gap before each signal, and fails in the same condition as starting a new sampler (no new process can be started). Nothing in Node can read another process's start time.
 
 ## Limits of the guard, measured where possible

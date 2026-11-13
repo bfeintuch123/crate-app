@@ -6,7 +6,7 @@ const path = require('node:path');
 const { spawn, execFileSync } = require('node:child_process');
 const assert = require('./bounded-assert');
 const {
-  parseArguments, parseRow, createOwnership, createGuard, UsageError, TIMING,
+  parseArguments, parseRow, createOwnership, createGuard, startCheckedSampler, UsageError, TIMING,
   DEFAULT_PROCESS_LIMIT_MB, DEFAULT_TOTAL_LIMIT_MB, DEFAULT_DEADLINE_SECONDS, UNREADABLE_SAMPLES,
   EXIT_MEMORY_LIMIT, EXIT_DEADLINE, EXIT_GUARD_FAILURE, ZOMBIE, ESRCH,
 } = require('../scripts/run-tests');
@@ -863,7 +863,38 @@ test('a run that passes its deadline is stopped and reported as 124', { timeout:
   assert.equal(bystanderSurvived(), true);
 });
 
-for (const [how, name] of [['end', 'SIGKILL'], ['hang', 'SIGSTOP']]) {
+test('a sampler that ends is reported as ended and gone for good, whichever way the guard notices first', { timeout: 60000 }, async () => {
+  for (let round = 0; round < 12; round += 1) {
+    const sampler = await startCheckedSampler();
+    try {
+      assert.ok((await sampler.scan()).length > 0);
+      assert.equal(sampler.dead, false);
+      assert.equal(signalOurs(sampler.pid, 'run-tests-sampler.py', 'SIGKILL'), true);
+      // Asked at once, on the next turn, or a few milliseconds later: the exit
+      // and the closed input can be noticed in either order.
+      if (round % 3 === 1) await new Promise(resolve => { setImmediate(resolve); });
+      if (round % 3 === 2) await new Promise(resolve => { setTimeout(resolve, round % 7); });
+      const failure = await sampler.scan().then(() => null, error => error);
+      assert.ok(failure, 'a scan of an ended sampler fails');
+      assert.match(failure.message, /^sampler ended \((exited: SIGKILL|closed its input)\)$/);
+      assert.equal(sampler.dead, true);
+      // It stays failed, in the same words, and nothing is sent to it again.
+      const again = await sampler.signalProcesses('SIGCONT', [{ pid: process.pid, start: '1' }]).then(() => null, error => error);
+      assert.equal(again && again.message, failure.message);
+    } finally {
+      sampler.stop();
+    }
+  }
+});
+
+// How the guard words the loss of the sampler in use. A sampler that ends is
+// noticed as its exit or as its closed input, whichever the guard sees first;
+// one that hangs, as a request that got no answer.
+const samplerLoss = [
+  ['end', 'SIGKILL', /sampler ended \((exited: SIGKILL|closed its input)\)\./],
+  ['hang', 'SIGSTOP', /sampler did not answer within 1000 ms\./],
+];
+for (const [how, name, wording] of samplerLoss) {
   test(`when its samplers ${how}, the guard stops the run with a new one rather than leave it unwatched`, { timeout: 60000 }, async t => {
     const { environment, ready, allGone, bystanderSurvived } = scenario(t);
     const run = startGuard([descendants], environment('idle'));
@@ -873,7 +904,7 @@ for (const [how, name] of [['end', 'SIGKILL'], ['hang', 'SIGSTOP']]) {
     for (const sampler of samplers) assert.equal(signalOurs(sampler, 'run-tests-sampler.py', name), true, 'signalled a sampler of the guard');
     const result = await run.done;
     assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
-    assert.match(result.stderr, /run-tests: GUARD LOST SIGHT OF THE RUN after [\d.]+ s: sampler (exited|did not answer within 1000 ms)/);
+    assert.match(result.stderr, new RegExp(`run-tests: GUARD LOST SIGHT OF THE RUN after [\\d.]+ s: ${wording.source}`));
     assert.match(result.stderr, /run-tests: Stopping the test run \(\d+ processes\)\./);
     assert.match(result.stderr, /run-tests: Every process of the run is gone\./);
     assert.ok(result.seconds < 20, `took ${result.seconds} s`);
