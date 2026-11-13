@@ -1,0 +1,3 @@
+# OFL.txt is the verbatim upstream licence for the Poppins fixture (google/fonts), which
+# has a trailing space on one line. Keep it byte-identical: skip only the end-of-line check.
+OFL.txt whitespace=-blank-at-eol

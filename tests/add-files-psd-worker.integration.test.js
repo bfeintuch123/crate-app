@@ -86,7 +86,9 @@ function harness(t, options = {}) {
   t.after(async () => { for (const child of children) child.kill(); await Promise.all(finishes.map(finish => finish())); fs.rmSync(root, { recursive: true, force: true }); });
   const events = [];
   const fsView = { ...fs, promises: { ...fs.promises, ...options.io } };
+  // Output naming keeps font names font names, through the shipped font check.
   const context = { fs: fsView, path, os: { tmpdir: () => root }, crypto, process, Buffer, Uint8Array, ArrayBuffer,
+    fontHandoff: require('../parsers/font-handoff'),
     setImmediate, console, MAX_PARSE_FILE_SIZE: 300 * 1024 * 1024, OWNER_ONLY_FILE_MODE: 0o600,
     ADD_FILES_PSD_WORKER_PATH: workerPath,
     ADD_FILES_REGEX_WORKER_PATH: path.join(path.dirname(workerPath), 'add-files-regex-worker.js'),
@@ -1091,3 +1093,31 @@ for (const mode of ['timeline', 'video', 'linked']) {
     assert.ok(inventory.references.length > 0); await run.finish();
   });
 }
+
+// Integration correction 4: the Add Files Photoshop route names its outputs
+// with the same shared font rule. An object named with a font extension and an
+// iota form keeps a font name (so the font gate, not the ordinary output path,
+// decides it); "X.otf" + U+0345 and "X.otfι" in one save keep distinct bytes
+// even on a volume that treats the two spellings as one file.
+test('Add Files worker: objects named with a font extension and an iota form keep font names; ordinary names are unchanged', async t => {
+  const fontHandoff = require('../parsers/font-handoff');
+  const objects = [
+    { name: 'X.otf\u0345', data: Buffer.from('ypogegrammeni object') },
+    { name: 'X.otf\u03b9', data: Buffer.from('iota object') },
+    { name: 'Kit.ttf\u0399', data: Buffer.from('capital iota object') },
+    { name: 'Report.otf\u03b9\u03b1', data: Buffer.from('ordinary greek object') },
+  ];
+  const h = harness(t, { parsed: parsed(objects) });
+  const run = await h.start();
+  await run.promise;
+  const assets = run.transaction.promote();
+  assert.deepEqual(Array.from(assets, asset => asset.embeddedOriginalName), objects.map(item => item.name));
+  for (const [index, asset] of assets.entries()) {
+    const leaf = path.basename(asset.filePath);
+    assert.equal(fontHandoff.isGatedFontName(leaf), index < 3, `${JSON.stringify(objects[index].name)} -> ${JSON.stringify(leaf)}`);
+    assert.deepEqual(fs.readFileSync(asset.filePath), objects[index].data, `${JSON.stringify(leaf)} holds its own bytes`);
+  }
+  assert.equal(path.basename(assets[3].filePath), 'Report.otf\u03b9\u03b1', 'ordinary name unchanged');
+  assert.equal(new Set(assets.map(asset => fs.realpathSync.native(asset.filePath).normalize('NFD').toUpperCase().toLowerCase())).size, 4, 'four distinct files');
+  await run.finish();
+});

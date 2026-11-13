@@ -1046,6 +1046,27 @@
                 <div class="modal-file-list" id="modal-file-list" role="list" aria-label="Package files"></div>
               </div>
               <button type="button" id="btn-toggle-package-contents" class="package-review-contents-toggle hidden" aria-expanded="false" aria-controls="modal-file-list">Show all files</button>
+              <section class="package-review-fonts" id="package-review-fonts" aria-labelledby="package-review-fonts-heading">
+                <div class="package-review-fonts-header">
+                  <div class="modal-row-label" id="package-review-fonts-heading">Fonts</div>
+                  <div class="package-review-fonts-actions">
+                    <button type="button" class="package-review-font-action" id="btn-add-installed-fonts" aria-controls="package-review-font-picker" aria-expanded="false">Add installed fonts</button>
+                    <button type="button" class="package-review-font-action" id="btn-add-font-files">Add font files</button>
+                  </div>
+                </div>
+                <p class="package-review-fonts-summary" id="package-review-fonts-summary">No fonts added.</p>
+                <div class="package-review-font-picker hidden" id="package-review-font-picker">
+                  <label class="package-review-font-picker-label" for="package-review-font-search">Installed font families</label>
+                  <input type="search" id="package-review-font-search" class="package-review-font-search" placeholder="Search installed fonts" autocomplete="off" spellcheck="false">
+                  <div class="package-review-font-picker-list" id="package-review-font-picker-list" role="group" aria-label="Installed font families"></div>
+                  <div class="package-review-font-picker-actions">
+                    <button type="button" class="package-review-font-action" id="btn-font-picker-cancel">Cancel</button>
+                    <button type="button" class="package-review-font-action is-primary" id="btn-font-picker-add" disabled>Add selected</button>
+                  </div>
+                </div>
+                <div class="package-review-font-choices hidden" id="package-review-font-choices" aria-label="Choose a font file"></div>
+                <ul class="package-review-font-list" id="package-review-font-list" aria-label="Font files"></ul>
+              </section>
             </section>
             <aside class="package-review-summary" aria-labelledby="package-review-summary-heading">
               <div class="modal-row-label" id="package-review-summary-heading">Package Summary</div>

@@ -24,11 +24,13 @@
 const fs = require('fs');
 const path = require('path');
 const { isParserAdmissionError } = require('./admission-budgets');
+const { isGatedFontName } = require('./font-handoff');
 const {
   assertSafeCopySource,
   copyFileIntoPackage,
   ensureSafePackageDirectory,
   removeCreatedPackageFiles,
+  sanitizePackageFileName,
   writeFileIntoPackage,
 } = require('./package-safety');
 
@@ -160,6 +162,18 @@ function getParserInfo(extOrPath) {
  *   files: Array<{original: string, copied: string, source: string}>
  * }>}
  */
+// Quick Package has no review step, so no font can receive the include choice
+// or per-font licence confirmation that the font gate requires. A font a
+// document only links is therefore never copied here; it is reported instead.
+const QUICK_PACKAGE_FONT_LINK_MESSAGE = 'This presentation links a font file. Quick Package can\'t include font files. ' +
+  'Use a Crate project and Package Review to add fonts.';
+
+// Judged by the source name and by the name it would be written under.
+function isGatedFontAsset(asset) {
+  if (!asset || typeof asset.path !== 'string') return false;
+  return isGatedFontName(asset.path) || isGatedFontName(sanitizePackageFileName(path.basename(asset.path), 'asset'));
+}
+
 async function packageMasterFile(filePath, outputDir, options = {}) {
   const {
     flat = false,
@@ -217,6 +231,11 @@ async function packageMasterFile(filePath, outputDir, options = {}) {
 
   result.assetsFound = assets.length;
   if (path.extname(filePath).toLowerCase() === '.pptx' && assets.some(asset => asset.source === 'pptx-linked')) {
+    // Every external link must be rewritten to a packaged copy, so a linked
+    // font cannot be skipped here without leaving a broken absolute link.
+    if (assets.some(asset => asset.source === 'pptx-linked' && isGatedFontAsset(asset))) {
+      throw new Error(QUICK_PACKAGE_FONT_LINK_MESSAGE);
+    }
     const { readFileWithinBudget, ADMISSION_LIMITS } = require('./admission-budgets');
     const { rewriteLinks } = require('./ooxml-links');
     const source = readFileWithinBudget(filePath, ADMISSION_LIMITS.localParserFileBytes, 'Presentation is too large to package safely.');
@@ -280,6 +299,13 @@ async function packageMasterFile(filePath, outputDir, options = {}) {
     }
 
     if (isArchiveEmbeddedAsset(asset)) {
+      continue;
+    }
+
+    if (isGatedFontAsset(asset)) {
+      // Present only when a font was skipped, so ordinary results keep their shape.
+      if (!result.fontsNotIncluded) result.fontsNotIncluded = [];
+      result.fontsNotIncluded.push({ name: path.basename(asset.path), reason: 'quick-package' });
       continue;
     }
 

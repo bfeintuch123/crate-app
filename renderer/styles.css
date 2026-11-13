@@ -3707,3 +3707,174 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Package Review: Fonts */
+.package-review-fonts {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--gray-200);
+}
+.package-review-fonts-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.package-review-fonts-actions,
+.package-review-font-picker-actions,
+.package-review-font-row-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.package-review-font-action {
+  min-height: 32px;
+  border: 1px solid var(--gray-200);
+  border-radius: 7px;
+  background: var(--white);
+  color: var(--gray-700);
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.package-review-font-action:hover { background: var(--gray-50); }
+.package-review-font-action:disabled { opacity: 0.55; cursor: not-allowed; }
+.package-review-font-action.is-primary { background: var(--black); border-color: var(--black); color: var(--white); }
+.package-review-font-action:focus-visible,
+.package-review-font-search:focus-visible,
+.package-review-font-confirm input:focus-visible,
+.package-review-font-family input:focus-visible {
+  outline: 2px solid var(--black);
+  outline-offset: 2px;
+}
+.package-review-fonts-summary {
+  margin: 8px 0 0;
+  color: var(--gray-500);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.package-review-font-picker,
+.package-review-font-choices {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--gray-200);
+  border-radius: 8px;
+  background: var(--gray-50);
+}
+.package-review-font-picker-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--gray-700);
+  font-size: 12px;
+  font-weight: 650;
+}
+.package-review-font-search {
+  width: 100%;
+  min-height: 32px;
+  box-sizing: border-box;
+  border: 1px solid var(--gray-300);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 12px;
+  background: var(--white);
+}
+.package-review-font-picker-list {
+  max-height: 190px;
+  overflow-y: auto;
+  margin: 8px 0;
+}
+.package-review-font-family {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 2px 6px;
+  align-items: start;
+  padding: 6px 2px;
+  border-bottom: 1px solid var(--gray-200);
+  font-size: 12px;
+  color: var(--gray-700);
+}
+.package-review-font-family.is-excluded { color: var(--gray-500); }
+.package-review-font-family-note {
+  grid-column: 2;
+  font-size: 11px;
+  color: var(--gray-500);
+  overflow-wrap: anywhere;
+}
+.package-review-font-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+}
+.package-review-font-row {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--gray-200);
+  font-size: 12px;
+  color: var(--gray-700);
+}
+.package-review-font-row-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: baseline;
+}
+.package-review-font-name {
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+.package-review-font-status {
+  flex: none;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  background: var(--gray-100);
+  color: var(--gray-700);
+}
+.package-review-font-status.is-included { background: var(--green-light); color: var(--green-text); }
+.package-review-font-status.is-needs-confirmation { background: #fff7ed; color: #9a3412; }
+.package-review-font-status.is-excluded { background: #fef2f2; color: #991b1b; }
+.package-review-font-meta,
+.package-review-font-reason,
+.package-review-font-contents {
+  margin-top: 3px;
+  color: var(--gray-500);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.package-review-font-confirm {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 6px;
+  align-items: start;
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--gray-700);
+}
+.package-review-font-confirm-note {
+  grid-column: 2;
+  font-size: 11px;
+  color: var(--gray-500);
+}
+.package-review-font-row-actions { margin-top: 8px; }
+.package-review-font-choice {
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--gray-700);
+}
+.package-review-font-choice .package-review-font-row-actions { margin-top: 6px; }
+
+/* Quick Package: why fonts were left out (must wrap, never truncate). */
+.v2-result-font-note {
+  margin: 4px 0 6px;
+  color: var(--gray-500);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
