@@ -2132,6 +2132,10 @@ body {
   font-size: 12px;
   line-height: 1.45;
   color: #78350f;
+  /* The message is shown and focused in the same task. Under Reduce Motion
+     every property transitions for 0.01ms, which kept visibility hidden while
+     focus() ran, so focus was ignored. It never animates. */
+  transition-property: none;
 }
 
 .modal-review-message.is-empty {

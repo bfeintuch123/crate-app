@@ -807,6 +807,9 @@ test('Package Review font rows: keyboard Exclude, Include and licence confirmati
     }
     assert.equal(await fontStatus(page, 'Brand-Regular.otf'), 'Included · Fonts folder');
     assert.equal(await fontStatus(page, 'Found-Regular.otf'), 'Not included');
+    // The result message never transitions, so Reduce Motion's 0.01ms
+    // transitions cannot keep it hidden while it is focused.
+    assert.equal(await page.evaluate("getComputedStyle(document.querySelector('#modal-package-review-message')).transitionProperty"), 'none');
     const focusAfter = [];
     let reviewsBefore;
 
