@@ -17,6 +17,7 @@ compiled._compile(harness + '\n(' + cases.toString() + ')();', harnessPath);
 function cases() {
   const crypto = require('node:crypto');
   const { buildFont, buildCollection, englishNames, nameRecord, OFL_STATEMENT } = require('./font-fixtures');
+  const fontHandoff = require('../parsers/font-handoff');
   const sha = buffer => crypto.createHash('sha256').update(buffer).digest('hex');
 
   let registryRows = [];
@@ -1199,6 +1200,82 @@ function cases() {
     const result = reviewResult.materializable ? await callIpcRaw('projects:package', f.project.id, f.out, reviewResult.token) : null;
     assertNotWritten({ result }, restrictedFont, 'B0');
   });
+
+  // Integration correction 3: whatever Crate does to a Photoshop object's name
+  // (replacing control or forbidden characters, collapsing spaces, shortening,
+  // adding a counter), a name the font rule classifies as a font stays one.
+  // Inputs and expectations are independent of the implementation.
+  const fontRule = name => /\.(otf|ttf|ttc|otc)[^\p{L}\p{N}]*$/u.test(
+    path.posix.basename(name).normalize('NFKD').replace(/[\p{Default_Ignorable_Code_Point}\p{Cf}\p{Cc}]/gu, '').toLowerCase());
+  function generatedFontNames() {
+    const zw = '​', bom = '﻿';
+    const inside = ['\u0001', '\t', '\u001f', '\u007f', bom, zw, '⁠', '­', '‍'];
+    const names = [];
+    for (const ext of ['otf', 'ttf', 'ttc', 'otc']) {
+      for (const ch of inside) {
+        for (let at = 0; at <= ext.length; at++) names.push(`Base.${ext.slice(0, at)}${ch}${ext.slice(at)}`);
+        names.push(`Base${ch}.${ext}`);
+      }
+      for (const run of [zw.repeat(200), bom.repeat(200), '\u0001'.repeat(170), zw.repeat(80) + bom.repeat(80)]) {
+        names.push(`A.${ext[0]}${run}${ext.slice(1)}`, `A.${ext}${run}`);
+      }
+      for (const suffix of ['.', '~', ' ', '⠀', ' .~']) names.push(`Base.${ext}${suffix}`);
+      names.push(`${'A'.repeat(170)}.${ext}`, `${'A'.repeat(170)}.${ext}.`, `${'A'.repeat(150)}.${ext[0]}${zw.repeat(30)}${ext.slice(1)}`);
+      names.push(`.${ext}`, `...${ext.toUpperCase()}`.replace('...', '.'), `.${ext[0]}\u0001${ext.slice(1)}`);
+    }
+    return names;
+  }
+
+  fontTest('integration: every name derived for a font-named Photoshop object is still a font name, and none is packaged ungated', { timeout: 60000 }, async () => {
+    const f = await psdDocFixture('Derived names');
+    const fontNames = generatedFontNames();
+    for (const name of fontNames) assert.equal(fontRule(name), true, `input is a font name by the stated rule: ${JSON.stringify(name)}`);
+    assert.equal(fontNames.every(name => fontHandoff.isGatedFontName(name)), true, 'the shipped rule agrees on every input');
+    // Each name twice, so the second copy gets a counter (collision on top of every other change).
+    const objects = [...fontNames, ...fontNames].map(name => ({ name, data: restrictedFont }));
+    const ordinary = [
+      ['Photo.png', 'Photo.png'], ['Photo.png', 'Photo_1.png'], ['a<b>.png', 'a_b_.png'], ['.hidden.png', 'hidden.png'],
+      [`${'B'.repeat(200)}.png`, `${'B'.repeat(156)}.png`], ['Tab\tName.png', 'Tab_Name.png'], ['X.otf1', 'X.otf1'], ['X.otf.png', 'X.otf.png'],
+    ].map(([name, expected], index) => ({ name, expected, data: Buffer.from(`ordinary ${index}`) }));
+    currentPsdFixture = { children: [], linkedFiles: [...objects, ...ordinary.map(({ name, data }) => ({ name, data }))] };
+    await callIpcRaw('projects:pre-package-scan', f.project.id);
+    const rows = psdRows(f);
+    const fontRows = rows.filter(row => fontRule((row.psdExtractionReceipt || row.psdResource)?.originalName || ''));
+    assert.ok(fontRows.length >= fontNames.length, `${fontRows.length} font-named outputs`);
+    for (const row of fontRows) {
+      const original = (row.psdExtractionReceipt || row.psdResource).originalName;
+      assert.equal(fontRule(path.basename(row.path)), true, `${JSON.stringify(original)} -> ${JSON.stringify(path.basename(row.path))}`);
+    }
+    const ordinaryLeaves = rows.filter(row => !fontRows.includes(row)).map(row => path.basename(row.path)).sort();
+    assert.deepEqual(ordinaryLeaves, ordinary.map(item => item.expected).sort(), 'ordinary names are derived as before');
+    const reviewResult = await callIpcRaw('projects:prepare-package-review', f.project.id, f.out);
+    const result = reviewResult.materializable ? await callIpcRaw('projects:package', f.project.id, f.out, reviewResult.token) : null;
+    assertNotWritten({ result }, restrictedFont, 'derived names');
+    if (result) for (const item of ordinary) assert.equal(writtenAs(result.folderPath, item.data).length, 1, item.name);
+  });
+
+  for (const [label, firstName, secondSave, bytes] of [
+    ['G1 control character inside the extension', 'X.o_tf', [{ name: 'X.o\u0001tf', data: restrictedFont }], restrictedFont],
+    ['G2 U+FEFF inside the extension', 'X.o tf', [{ name: 'X.o﻿tf', data: restrictedFont }], restrictedFont],
+    ['G3 long invisible run inside the extension', `A.o${'​'.repeat(157)}`, [{ name: `A.o${'​'.repeat(200)}tf`, data: restrictedFont }], restrictedFont],
+    ['G4 control character, uncatalogued font without a confirmation', 'Brand.o_tf', [{ name: 'Brand.o\u0001tf', data: uncataloguedFont }], uncataloguedFont],
+    ['G5 tab inside the extension', 'X.ot_f', [{ name: 'X.ot\tf', data: restrictedFont }], restrictedFont],
+  ]) {
+    fontTest(`integration: a font refilled after a lost cache file is never packaged ungated (${label})`, { timeout: 30000 }, async () => {
+      const outcome = await refillCase(label.split(' ')[0], firstName, secondSave);
+      assertNotWritten(outcome, bytes, label);
+      // The object's bytes are written under a font name of their own, never at the ordinary row's path;
+      // that row's lost file keeps the review from packaging (it fails closed), or the font is gated.
+      const fontOutputs = psdRows(outcome.f).filter(row => fontRule((row.psdExtractionReceipt || row.psdResource)?.originalName || ''));
+      assert.ok(fontOutputs.length >= 1, JSON.stringify(psdRows(outcome.f).map(row => path.basename(row.path))));
+      for (const row of fontOutputs) {
+        assert.equal(fontRule(path.basename(row.path)), true, JSON.stringify(path.basename(row.path)));
+        assert.deepEqual(fs.readFileSync(row.path), bytes, 'the font bytes sit at the font-named output');
+      }
+      assert.ok(!outcome.reviewResult.materializable || (outcome.reviewResult.fonts?.rows || []).some(item => fontRule(item.fileName)),
+        'either the review fails closed or the object is a font row');
+    });
+  }
 
   fontTest('registry failure reports unavailable and leaves packaging untouched', async () => {
     const f = await fixture();

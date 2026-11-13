@@ -11296,11 +11296,14 @@ function cleanName(s) {
   return cleaned || DEFAULT_PACKAGE_FOLDER_NAME;
 }
 
-// A font-named object always keeps a font name (see getFontNameTail), so any
-// row that ends up at its output path still goes through the font check.
+// A font-named object always keeps a font name, so any row that ends up at its
+// output path still goes through the font check. Whether the object is a font
+// is decided on its raw name, before any character is replaced; whatever the
+// steps below do, a lost font ending is restored at the end (keepFontName).
 function sanitizeEmbeddedPsdAssetName(rawName, fallbackName = 'embedded-asset') {
   const fallback = `${fallbackName}`.replace(/[^a-zA-Z0-9 ._\-()]/g, '').trim() || 'embedded-asset';
   const normalized = `${rawName || ''}`.replace(/\\/g, '/');
+  const rawFontExtension = fontHandoff.getGatedFontExtension(path.basename(normalized));
   let name = path.basename(normalized).replace(/[\x00-\x1f\x7f<>:"|?*]/g, '_').replace(/\s+/g, ' ').trim();
   const fontTail = getFontNameTail(name);
   name = name.replace(/^\.+/, '');
@@ -11319,7 +11322,15 @@ function sanitizeEmbeddedPsdAssetName(rawName, fallbackName = 'embedded-asset') 
       name = `${base}${ext}`;
     }
   }
-  return name;
+  return keepFontName(name, rawFontExtension, 160);
+}
+
+// The final check: a name derived from a font name ends in a plain font
+// extension if every earlier step lost it, within `limit` characters.
+function keepFontName(name, fontExtension, limit = Infinity) {
+  if (!fontExtension || fontHandoff.isGatedFontName(name)) return name;
+  const base = name.replace(/[.\s]+$/u, '') || 'embedded-asset';
+  return `${base.slice(0, Math.max(1, limit - fontExtension.length))}${fontExtension}`;
 }
 
 function reserveUniqueName(name, usedNames) {
@@ -11328,10 +11339,13 @@ function reserveUniqueName(name, usedNames) {
   const font = getFontNameTail(safeName);
   const ext = font ? font.tail : path.extname(safeName);
   const base = font ? font.base : path.basename(safeName, ext);
-  let candidate = safeName;
+  // The final check runs on every candidate, so the name that is reserved is
+  // the name that is checked for collisions.
+  const fontExtension = fontHandoff.getGatedFontExtension(path.basename(`${name || ''}`.replace(/\\/g, '/')));
+  let candidate = keepFontName(safeName, fontExtension);
   let counter = 1;
   while (usedNames.has(candidate.toLowerCase())) {
-    candidate = `${base}_${counter}${ext}`;
+    candidate = keepFontName(`${base}_${counter}${ext}`, fontExtension);
     counter++;
   }
   usedNames.add(candidate.toLowerCase());
@@ -11347,8 +11361,7 @@ function getFontNameTail(name) {
   for (let index = name.length - 1; index >= Math.max(0, name.length - 256); index -= 1) {
     if (fontHandoff.isGatedFontName(name.slice(index))) return { base: name.slice(0, index), tail: name.slice(index) };
   }
-  const extension = name.normalize('NFKD').toLowerCase().match(/(?:otf|ttf|ttc|otc)(?!.*(?:otf|ttf|ttc|otc))/u)?.[0] || 'otf';
-  return { base: name.slice(0, Math.max(1, name.length - 256)), tail: `.${extension}` };
+  return { base: name.slice(0, Math.max(1, name.length - 256)), tail: fontHandoff.getGatedFontExtension(name) || '.otf' };
 }
 
 // Concurrent PSDs may reserve the same name while their bytes are staged.

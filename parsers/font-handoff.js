@@ -80,14 +80,21 @@ function isFontTextTruncated(value, limit = MAX_FONT_NAME_TEXT_LENGTH) {
 const IGNORABLE_NAME_CHARS = /[\p{Default_Ignorable_Code_Point}\p{Cf}\p{Cc}]/gu;
 // Lower-cased first instead of the i flag: with /iu a negated class also
 // excludes characters whose case folding is a letter (U+0345 folds to iota).
-const GATED_FONT_NAME_PATTERN = /\.(?:otf|ttf|ttc|otc)[^\p{L}\p{N}]*$/u;
-function isGatedFontName(name) {
-  if (typeof name !== 'string' || !name) return false;
+const GATED_FONT_NAME_PATTERN = /\.(otf|ttf|ttc|otc)[^\p{L}\p{N}]*$/u;
+// The plain font extension (".otf", ".ttf", ".ttc", ".otc") a name is
+// classified by, or null when the name is not a font name. Same folding as
+// isGatedFontName, so callers that rename a file can keep it a font name.
+function getGatedFontExtension(name) {
+  if (typeof name !== 'string' || !name) return null;
   const leaf = path.posix.basename(name.replace(/\\/g, '/'))
     .normalize('NFKD')
     .replace(IGNORABLE_NAME_CHARS, '')
     .toLowerCase();
-  return GATED_FONT_NAME_PATTERN.test(leaf);
+  const match = GATED_FONT_NAME_PATTERN.exec(leaf);
+  return match ? `.${match[1]}` : null;
+}
+function isGatedFontName(name) {
+  return getGatedFontExtension(name) !== null;
 }
 
 function cleanIdentityText(value) {
@@ -662,6 +669,7 @@ module.exports = {
   findCatalogRelease,
   findFace,
   getFontConfirmationStatement,
+  getGatedFontExtension,
   isCurrentConfirmation,
   isGatedFontName,
   loadFontReleaseCatalog,

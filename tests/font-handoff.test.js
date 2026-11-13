@@ -1097,3 +1097,17 @@ test('round 8: the fonts note names the verified source and licence file for a c
   assert.match(note, /did not verify|does not prove|not legal advice/i);
   assert.doesNotMatch(note, /\(from the font\)/);
 });
+
+test('integration correction 3: the font extension a name is classified by matches the font rule, for known inputs', () => {
+  const { getGatedFontExtension, isGatedFontName } = fontHandoff;
+  const cases = [
+    ['Brand.otf', '.otf'], ['Brand.TTF', '.ttf'], ['Brand.ttc.', '.ttc'], ['Brand.OTC~', '.otc'],
+    ['X.o\u0001tf', '.otf'], ['X.o﻿tf', '.otf'], ['X.ot\tf', '.otf'], [`A.o${'​'.repeat(200)}tf`, '.otf'],
+    ['X．ｔｔｆ', '.ttf'], ['dir/Sub.otf', '.otf'],
+    ['Photo.png', null], ['X.otf1', null], ['X.otf.png', null], ['X.otfa', null], ['', null], [null, null],
+  ];
+  for (const [name, expected] of cases) {
+    assert.equal(getGatedFontExtension(name), expected, JSON.stringify(name));
+    assert.equal(isGatedFontName(name), expected !== null, JSON.stringify(name));
+  }
+});
