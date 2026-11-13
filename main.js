@@ -1687,6 +1687,8 @@ function normalizeAutoCaptureProjectState(project, stageContext = null) {
   } else {
     const beforeLength = project.pendingFiles.length;
     const acceptedKeys = getTrackedFileKeySet(project.files);
+    // Same key set: retire remembered exclusions whose file is a project file again.
+    if (pruneShadowedExcludedPendingRecords(project, acceptedKeys)) changed = true;
     const seenPendingKeys = new Set();
     const seenWeakBroadPendingNames = new Set();
     project.pendingFiles = project.pendingFiles.filter(file => {
@@ -2728,7 +2730,11 @@ function planExcludedPendingRecord(project, fileEntry) {
   const dedupKey = getTrackedFileDedupKey(fileEntry);
   const replaceIndex = state.records.findIndex(record => getTrackedFileDedupKey(record) === dedupKey);
   if (replaceIndex === -1 && (project.excludedAssetKeys || []).includes(exclusionKey)) return { record: null };
-  return { record: createExcludedPendingRecord(fileEntry), replaceIndex };
+  const record = createExcludedPendingRecord(fileEntry);
+  // Never store a record the reader would reject (for example a non-string
+  // name): that would hide every remembered row. Refuse only this row.
+  if (!isValidExcludedPendingRecord(record)) return { error: 'excluded_pending_record_invalid' };
+  return { record, replaceIndex };
 }
 
 function storeExcludedPendingRecord(project, plan) {
@@ -2759,12 +2765,14 @@ function releaseExcludedPendingRecords(project, fileEntry) {
   return true;
 }
 
-// A record stops being shown once the same file is a project file again (for
-// example after + Add Files or a direct add). Its exclusion key is unchanged.
-function pruneShadowedExcludedPendingRecords(project) {
+// A record is retired once the same file is a project file again (for example
+// after + Add Files). This runs only in post-mutation auto-capture
+// normalization, reusing the project-file key set built there; it is never
+// part of a store read, so reads do no per-file path resolution for records.
+function pruneShadowedExcludedPendingRecords(project, fileKeys = null) {
   const state = readExcludedPendingRecords(project);
   if (!state.valid || !state.records.length) return false;
-  const fileKeys = getTrackedFileKeySet(project.files);
+  fileKeys ||= getTrackedFileKeySet(project.files);
   const kept = state.records.filter(record => !fileKeys.has(getTrackedFileDedupKey(record)));
   if (kept.length === state.records.length) return false;
   project.excludedPendingFiles = kept;
@@ -6615,9 +6623,6 @@ function normalizeProjectAssetReviewState(project) {
       }
     }
   }
-  // A remembered Needs Review exclusion is no longer shown once the same file
-  // is a project file again; a malformed list is left untouched.
-  if (pruneShadowedExcludedPendingRecords(project)) changed = true;
   return changed;
 }
 
@@ -19620,7 +19625,7 @@ function notifyExistingAssetsDecision(projectId) {
     const icon = getNotificationIconPath();
     const notification = new Notification({
       title: 'Crate — Existing assets found',
-      body: 'Choose whether to include or skip existing assets. Click to review in Crate.',
+      body: 'Choose whether to include or exclude existing assets. Click to review in Crate.',
       silent: false,
       ...(icon ? { icon } : {}),
     });

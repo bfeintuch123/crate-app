@@ -19,6 +19,7 @@ replaceOnce("fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual-write-
 replaceOnce('  captureProjectOperation,\n  runScanOnOpen',
   '  stageLiveObservedFileForTest(projectId, fileEntry, observation) { let staged = null; mutateProject(projectId, project => { staged = stageLiveObservedFile(project, fileEntry, observation); return staged; }); return staged; },\n' +
   '  mutateProjectForTest(projectId, fn) { return mutateProject(projectId, fn); },\n' +
+  '  getProjectsForTest() { return getProjects(); },\n' +
   '  rejectPendingFilesForTest(projectId, targets) { return mutateProject(projectId, project => targets.map(target => rejectPendingFileInProject(project, target))); },\n' +
   '  selectProjectFilesForPackagingForTest(projectId) { return selectProjectFilesForPackaging(getProjects().find(project => project.id === projectId)); },\n' +
   '  getWorkingSourceVerificationForTest(project, file) { return getWorkingSourceVerification(project, file); },\n' +
@@ -382,5 +383,56 @@ function excludedCases() {
     assert.deepEqual(fs.readFileSync(desk('Readd.png')), originalBytes, 'the original file is untouched');
     assert.ok((await metadataTestHooks.selectProjectFilesForPackagingForTest(f.id)).some(file => file.path === desk('Readd.png')));
     assert.equal((await metadataTestHooks.selectProjectFilesForPackagingForTest(f.id)).some(file => file.path === desk('Other.png')), false);
+  });
+
+  // Store reads and project mutations must not do per-file path work because a
+  // remembered exclusion exists. Counted, not timed: realpath calls are
+  // compared on the same 500-file project without and then with one record.
+  excludedTest('a remembered exclusion adds no per-file path work to store reads or mutations (500 project files)', { timeout: 120000 }, async () => {
+    const count = 500;
+    const f = await fixture('operation-count', { sources: [] });
+    const folder = desk('Operation count');
+    fs.mkdirSync(folder, { recursive: true });
+    f.current().files = Array.from({ length: count }, (_, index) => ({ path: path.join(folder, `Linked_${index}.png`),
+      name: `Linked_${index}.png`, ext: '.png', source: 'indd-linked', projectRole: 'asset', addedAt: Date.now() }));
+    const remembered = desk('Remembered.png');
+    f.current().excludedAssetKeys = [remembered];
+    roundTripFakeStore();
+    const measure = () => {
+      const original = fs.realpathSync.native;
+      let calls = 0;
+      fs.realpathSync.native = function (...args) { calls += 1; return original.apply(this, args); };
+      try {
+        calls = 0; metadataTestHooks.getProjectsForTest(); const read = calls;
+        calls = 0; metadataTestHooks.mutateProjectForTest(f.id, () => ({})); const mutate = calls;
+        return { read, mutate };
+      } finally { fs.realpathSync.native = original; }
+    };
+    const without = measure();
+    f.current().excludedPendingFiles = [{ path: remembered, name: 'Remembered.png', ext: '.png', source: 'indd-linked',
+      excludedRecordVersion: 1, excludedAt: Date.now(), excludedAppFamily: 'indesign' }];
+    roundTripFakeStore();
+    const withRecord = measure();
+    const detail = `realpath calls with one record ${JSON.stringify(withRecord)} vs none ${JSON.stringify(without)}`;
+    // Reads: no path work at all for records. One mutation: only the record's
+    // own key (one call per record); the project-file key set is reused.
+    assert.equal(withRecord.read, without.read, detail);
+    assert.equal(withRecord.mutate, without.mutate + 1, detail);
+    assert.equal(f.current().files.length, count);
+    assert.deepEqual(f.current().excludedPendingFiles.map(record => record.name), ['Remembered.png'], 'the unshadowed record is kept');
+  });
+
+  excludedTest('a row that would make an invalid record is refused alone; remembered rows stay valid', { timeout: 30000 }, async () => {
+    const good = pendingRow('Good.png');
+    const bad = pendingRow('Nameless.png', { name: null });
+    const f = await fixture('invalid-record', { pending: [good, bad] });
+    assert.ok(Array.isArray(await f.reject(good.path)));
+    const keys = JSON.stringify(f.current().excludedAssetKeys);
+    const observations = f.observations();
+    assert.deepEqual(await f.reject(bad.path), { success: false, error: 'excluded_pending_record_invalid' });
+    assert.ok(f.current().pendingFiles.some(row => row.path === bad.path), 'the refused row stays in Needs Review');
+    assert.equal(JSON.stringify(f.current().excludedAssetKeys), keys);
+    assert.equal(f.observations(), observations);
+    assert.deepEqual((await f.workspace()).excludedPendingFiles.map(file => file.name), ['Good.png'], 'the list is still valid and shown');
   });
 }
