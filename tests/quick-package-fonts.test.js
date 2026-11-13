@@ -218,3 +218,56 @@ test('PPTX without font links keeps its existing Quick Package behavior', async 
   assert.equal(Object.hasOwn(result, 'fontsNotIncluded'), false, 'result shape unchanged without fonts');
   assert.deepEqual(listOutput(w.out), ['Deck.pptx', 'Logo.png']);
 });
+
+// Integration correction 4: names ending in a font extension and a Greek iota
+// form are font names (a case-insensitive macOS volume treats "X.otf" + U+0345
+// and "X.otfι" as one file). Quick Package never copies them; ordinary files
+// with Greek letters near an extension still copy.
+test('integration correction 4: Quick Package never copies a linked font named with an iota form; ordinary controls still copy', async t => {
+  const w = workspace(t);
+  const fonts = ['Hidden.otf\u03b9', 'Lock.TTF\u0399', 'Accent.ttc\u03af', 'Mark.otf\u0345'].map(name => path.join(w.root, 'Brand Kit', name));
+  const controls = ['Report.otf\u03b9\u03b1', 'Photo.png\u03b9', 'Notes.otf\u03b91'].map(name => path.join(w.root, 'Brand Kit', name));
+  for (const file of fonts) fs.writeFileSync(file, buildFont({ fsType: 2 }));
+  controls.forEach((file, index) => fs.writeFileSync(file, Buffer.alloc(300 + index, 5)));
+  const linkedFile = (file, id) => ({ id, name: path.basename(file), childDocumentID: '',
+    linkedFile: { fileSize: 800, name: path.basename(file), fullPath: file, originalPath: file, relativePath: '' } });
+  const ids = Array.from({ length: 8 }, (_, index) => `${'cdef0123'[index]}${'1'.repeat(7)}-1111-4111-8111-111111111111`);
+  const psd = path.join(w.root, 'Comp.psd');
+  fs.writeFileSync(psd, ag.writePsdBuffer({ width: 1, height: 1, linkedFiles: [w.image, ...fonts, ...controls].map((file, index) => linkedFile(file, ids[index])) }));
+  for (const flat of [false, true]) {
+    const out = path.join(w.root, `out-iota-${flat}`); fs.mkdirSync(out);
+    const result = await packageMasterFile(psd, out, { flat });
+    const copied = listOutput(out);
+    assert.ok(!copied.some(file => /Hidden|Lock|Accent|Mark/.test(file)), copied.join(', '));
+    for (const control of controls) assert.ok(copied.some(file => path.basename(file) === path.basename(control)), `${path.basename(control)} copied: ${copied.join(', ')}`);
+    assert.deepEqual((result.fontsNotIncluded || []).map(item => item.name).sort(), fonts.map(file => path.basename(file)).sort());
+  }
+  const idmlLinks = [w.image, ...fonts, controls[0]].map(file => `<Link LinkResourceURI="file://${encodeURI(file)}"/>`).join('');
+  const idml = zip(w.root, 'Layout.idml', { 'Spreads/Spread_1.xml': `<Spread>${idmlLinks}</Spread>` });
+  const out = path.join(w.root, 'out-iota-idml'); fs.mkdirSync(out);
+  const idmlResult = await packageMasterFile(idml, out);
+  assert.ok(!listOutput(out).some(file => /Hidden|Lock|Accent|Mark/.test(file)), listOutput(out).join(', '));
+  assert.ok(listOutput(out).some(file => path.basename(file) === path.basename(controls[0])), listOutput(out).join(', '));
+  assert.deepEqual((idmlResult.fontsNotIncluded || []).map(item => item.name).sort(), fonts.map(file => path.basename(file)).sort());
+});
+
+test('integration correction 4: a PowerPoint deck linking a font named with an iota form is refused; one linking an ordinary Greek-named file packages as before', async t => {
+  const w = workspace(t);
+  const font = path.join(w.root, 'Brand Kit', 'Kit.ttf\u0399');
+  fs.writeFileSync(font, buildFont());
+  const ordinary = path.join(w.root, 'Brand Kit', 'Report.otf\u03b9\u03b1');
+  fs.writeFileSync(ordinary, Buffer.alloc(400, 6));
+  const rel = (id, type, target) => `<Relationship Id="${id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/${type}" Target="file://${encodeURI(target)}" TargetMode="External"/>`;
+  const rels = targets => `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${targets}</Relationships>`;
+  const deck = zip(w.root, 'Deck.pptx', { 'ppt/slides/_rels/slide1.xml.rels': rels(rel('rId1', 'image', w.image) + rel('rId2', 'oleObject', font)) });
+  const before = fs.readFileSync(deck);
+  const deckOut = path.join(w.root, 'out-deck-iota'); fs.mkdirSync(deckOut);
+  await assert.rejects(packageMasterFile(deck, deckOut), /font file/i);
+  assert.deepEqual(fs.readdirSync(deckOut), []);
+  assert.deepEqual(fs.readFileSync(deck), before);
+  const plainDeck = zip(w.root, 'Plain.pptx', { 'ppt/slides/_rels/slide1.xml.rels': rels(rel('rId1', 'image', w.image) + rel('rId2', 'oleObject', ordinary)) });
+  const plainOut = path.join(w.root, 'out-deck-plain'); fs.mkdirSync(plainOut);
+  const result = await packageMasterFile(plainDeck, plainOut);
+  assert.equal(Object.hasOwn(result, 'fontsNotIncluded'), false, 'result shape unchanged without fonts');
+  assert.deepEqual(listOutput(plainOut).map(file => path.basename(file)).sort(), ['Logo.png', 'Plain.pptx', path.basename(ordinary)].sort());
+});

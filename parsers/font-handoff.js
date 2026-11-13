@@ -74,13 +74,20 @@ function isFontTextTruncated(value, limit = MAX_FONT_NAME_TEXT_LENGTH) {
 // extension followed only by characters that are neither letters nor digits
 // counts: spaces, dots, U+2800 and other blank symbols, punctuation, symbols,
 // emoji, marks and private-use characters ("Hidden.otf~", "Hidden.otf⠀").
+// A Greek iota form after the extension also counts (see GREEK_IOTA).
 // Not recognized, by design (the gate is name-based, with no content
-// sniffing): a letter or digit after the extension ("x.otf1", "x.otfa"),
+// sniffing): another letter or a digit after the extension ("x.otf1", "x.otfa"),
 // homoglyph extensions (Cyrillic "о"), font bytes under unrelated names.
 const IGNORABLE_NAME_CHARS = /[\p{Default_Ignorable_Code_Point}\p{Cf}\p{Cc}]/gu;
 // Lower-cased first instead of the i flag: with /iu a negated class also
 // excludes characters whose case folding is a letter (U+0345 folds to iota).
 const GATED_FONT_NAME_PATTERN = /\.(otf|ttf|ttc|otc)[^\p{L}\p{N}]*$/u;
+// macOS volumes fold U+0345 COMBINING GREEK YPOGEGRAMMENI (a mark, so a font
+// name after an extension) to Greek iota, so "X.otf" + U+0345 and "X.otfι"
+// are one file. Every iota form (ι, Ι, accented, Greek Extended, mathematical;
+// compatibility decomposition and lower-casing reduce them all to U+03B9)
+// counts like U+0345, so both spellings are font names. This only adds names.
+const GREEK_IOTA = /\u03b9/gu;
 // The plain font extension (".otf", ".ttf", ".ttc", ".otc") a name is
 // classified by, or null when the name is not a font name. Same folding as
 // isGatedFontName, so callers that rename a file can keep it a font name.
@@ -89,7 +96,8 @@ function getGatedFontExtension(name) {
   const leaf = path.posix.basename(name.replace(/\\/g, '/'))
     .normalize('NFKD')
     .replace(IGNORABLE_NAME_CHARS, '')
-    .toLowerCase();
+    .toLowerCase()
+    .replace(GREEK_IOTA, '\u0345');
   const match = GATED_FONT_NAME_PATTERN.exec(leaf);
   return match ? `.${match[1]}` : null;
 }

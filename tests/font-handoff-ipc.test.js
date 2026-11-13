@@ -1277,6 +1277,90 @@ function cases() {
     });
   }
 
+  // Integration correction 4: on a case-insensitive macOS volume "X.otf" +
+  // U+0345 (a font name) and "X.otfι" (iota) are one file. Both spellings are
+  // now font names, so neither route packages the font ungated. Each case runs
+  // on either kind of volume: where the volume folds the two spellings the
+  // alias itself is asserted; where it does not, the separate files are.
+  const IOTA = '\u03b9', CAPITAL_IOTA = '\u0399', YPOGEGRAMMENI = '\u0345';
+  const volumeFoldsIota = (() => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-iota-fold-'));
+    try {
+      fs.writeFileSync(path.join(dir, `probe.otf${YPOGEGRAMMENI}`), 'probe');
+      return fs.existsSync(path.join(dir, `probe.otf${IOTA}`));
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  })();
+  const nativeLeaf = file => path.basename(fs.realpathSync.native(file));
+  for (const [label, firstName, secondSave, bytes, options] of [
+    ['U1 one font object named with U+0345 after an ordinary iota-named object', `X.otf${IOTA}`, [{ name: `X.otf${YPOGEGRAMMENI}`, data: restrictedFont }], restrictedFont, {}],
+    ['U2 the same plus a second object with the same restricted font', `X.otf${IOTA}`, [{ name: `X.otf${YPOGEGRAMMENI}`, data: restrictedFont }, { name: 'Y.otf', data: restrictedFont }], restrictedFont, {}],
+    ['U3 the same with an uncatalogued font and no confirmation', `Brand.otf${IOTA}`, [{ name: `Brand.otf${YPOGEGRAMMENI}`, data: uncataloguedFont }, { name: 'Other.otf', data: uncataloguedFont }], uncataloguedFont, {}],
+    ['U4 control: U2 with the cache file kept', `X.otf${IOTA}`, [{ name: `X.otf${YPOGEGRAMMENI}`, data: restrictedFont }, { name: 'Y.otf', data: restrictedFont }], restrictedFont, { loseCache: false }],
+    ['U5 control: U2 with a plain X.otf object', `X.otf${IOTA}`, [{ name: 'X.otf', data: restrictedFont }, { name: 'Y.otf', data: restrictedFont }], restrictedFont, {}],
+    ['U6 U2 with the ordinary row named with capital iota', `X.otf${CAPITAL_IOTA}`, [{ name: `X.otf${YPOGEGRAMMENI}`, data: restrictedFont }, { name: 'Y.otf', data: restrictedFont }], restrictedFont, {}],
+  ]) {
+    fontTest(`integration correction 4: ${label} is never packaged ungated`, { timeout: 30000 }, async t => {
+      t.diagnostic(`volume folds U+0345 with iota: ${volumeFoldsIota}`);
+      const outcome = await refillCase(label.split(' ')[0], firstName, secondSave, options);
+      assertNotWritten(outcome, bytes, label);
+      assert.equal(fontHandoff.isGatedFontName(firstName), true, 'the first object is a font name by the rule');
+      const rows = psdRows(outcome.f);
+      const firstRow = rows.find(row => (row.psdExtractionReceipt || row.psdResource)?.originalName === firstName);
+      assert.ok(firstRow, JSON.stringify(rows.map(row => path.basename(row.path))));
+      // The first row's own name is a font name, so it never takes the ordinary output path.
+      assert.equal(fontHandoff.isGatedFontName(path.basename(firstRow.path)), true, path.basename(firstRow.path));
+      assert.ok(!(outcome.reviewResult.files || []).some(file => file.name === path.basename(firstRow.path) && file.status === 'ready'),
+        'the iota-named row is not a ready ordinary file');
+      if (label.startsWith('U1') || label.startsWith('U2') || label.startsWith('U3') || label.startsWith('U6')) {
+        if (volumeFoldsIota && fs.existsSync(firstRow.path)) {
+          // The alias is exercised: the row's iota path is the file written for the U+0345 object.
+          assert.equal(nativeLeaf(firstRow.path), secondSave[0].name, 'the volume resolves the iota row to the U+0345 entry');
+        } else if (!volumeFoldsIota) {
+          assert.ok(!fs.existsSync(firstRow.path) || !fs.readFileSync(firstRow.path).equals(bytes), 'no alias on this volume');
+        }
+      }
+    });
+  }
+
+  for (const [label, diskName, linkName, bytesOf, expected] of [
+    ['L1 link spelled with iota, restricted font stored under the U+0345 name', `Brand.otf${YPOGEGRAMMENI}`, `Brand.otf${IOTA}`, () => restrictedFont, 'excluded'],
+    ['L2 control: link spelled as stored', `Brand.otf${YPOGEGRAMMENI}`, `Brand.otf${YPOGEGRAMMENI}`, () => restrictedFont, 'excluded'],
+    ['L3 link spelled with iota, uncatalogued font, no confirmation', `Kit.ttf${YPOGEGRAMMENI}`, `Kit.ttf${IOTA}`, () => uncataloguedFont, 'not-included'],
+    ['L4 link spelled with capital iota, restricted font stored under the iota name', `Kit.ttf${IOTA}`, `Kit.ttf${CAPITAL_IOTA}`, () => restrictedFont, 'excluded'],
+  ]) {
+    fontTest(`integration correction 4: a linked font is never packaged ungated (${label})`, { timeout: 30000 }, async t => {
+      t.diagnostic(`volume folds U+0345 with iota: ${volumeFoldsIota}`);
+      const f = await psdDocFixture(label.split(' ')[0]);
+      const bytes = bytesOf();
+      fs.writeFileSync(path.join(f.dir, diskName), bytes);
+      const linked = path.join(f.dir, linkName);
+      const resolves = fs.existsSync(linked);
+      if (diskName === linkName || volumeFoldsIota) assert.equal(resolves, true, 'the link reaches the stored font');
+      else assert.equal(resolves, false, 'a case-sensitive volume keeps the spellings apart');
+      currentPsdFixture = { children: [{ name: 'Layer', linkedFile: { fullPath: linked } }], linkedFiles: [] };
+      await callIpcRaw('projects:pre-package-scan', f.project.id);
+      const reviewResult = await callIpcRaw('projects:prepare-package-review', f.project.id, f.out);
+      const result = reviewResult.materializable ? await callIpcRaw('projects:package', f.project.id, f.out, reviewResult.token) : null;
+      assertNotWritten({ result }, bytes, label);
+      assert.ok(!(reviewResult.files || []).some(file => file.name === linkName && file.status === 'ready'), 'not a ready ordinary file');
+      if (resolves) assert.equal(row(reviewResult, linkName).outcome, expected, JSON.stringify(reviewResult.fonts?.rows));
+    });
+  }
+
+  fontTest('integration correction 4 control: ordinary files with Greek letters near a font extension are still packaged as before', { timeout: 30000 }, async () => {
+    const f = await psdDocFixture('Iota ordinary');
+    const ordinary = [`Report.otf${IOTA}\u03b1`, `Photo.png${IOTA}`, `Notes.otf${IOTA}1`].map((name, index) => ({ name, data: Buffer.from(`ordinary iota ${index}`) }));
+    currentPsdFixture = { children: [], linkedFiles: ordinary };
+    await callIpcRaw('projects:pre-package-scan', f.project.id);
+    for (const item of ordinary) assert.equal(fontHandoff.isGatedFontName(item.name), false, item.name);
+    const reviewResult = await callIpcRaw('projects:prepare-package-review', f.project.id, f.out);
+    assert.equal(reviewResult.materializable, true, JSON.stringify(reviewResult.error));
+    assert.deepEqual(reviewResult.fonts?.rows || [], []);
+    const result = await callIpcRaw('projects:package', f.project.id, f.out, reviewResult.token);
+    assert.equal(result.success, true, JSON.stringify(result));
+    for (const item of ordinary) assert.deepEqual(writtenAs(result.folderPath, item.data).map(leaf => path.basename(leaf)), [item.name], item.name);
+  });
+
   fontTest('registry failure reports unavailable and leaves packaging untouched', async () => {
     const f = await fixture();
     registryFailure = true;

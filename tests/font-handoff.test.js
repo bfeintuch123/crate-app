@@ -1111,3 +1111,91 @@ test('integration correction 3: the font extension a name is classified by match
     assert.equal(isGatedFontName(name), expected !== null, JSON.stringify(name));
   }
 });
+
+// Integration correction 4 (Bryant approved the conservative equivalence fix):
+// macOS volumes fold U+0345 COMBINING GREEK YPOGEGRAMMENI to Greek iota, so
+// "X.otf" + U+0345 (a font name by the rule) and "X.otfι" are one file. Every
+// iota form after a font extension now counts like U+0345, so both spellings
+// are font names. Expectations below are written out by hand or come from an
+// independent model of the volume's folding, not from the implementation.
+const IOTA_FONT_NAMES = [
+  'X.otf\u0345', 'X.otf\u03b9', 'X.otf\u0399', 'X.OTF\u0399', 'Kit.ttf\u03af', 'Kit.ttf\u0390', 'Kit.ttf\u03ca', 'Kit.ttf\u038a',
+  'Kit.ttf\u03aa', 'X.ttc\u1f30', 'X.ttc\u1f38', 'X.otc\u1fbe', 'X.otf\u1fd6', 'X.otf\u1fdb', 'X.otf\u{1d6ca}', 'X.otf\u{1d6b0}',
+  'X.otf\u0301\u0345', 'X.otf\u0301\u03b9', 'X.otf\u03b9\u0301', 'X.otf\u0308\u0399', 'Brand.otf \u03b9', 'Brand.otf\u03b9.',
+  'Brand.otf\u03b9~', 'X.otf\u03b9\u03b9', 'X.otf\u0345\u0399', 'X.o\u200btf\u03b9', 'dir/Sub.ttf\u0399',
+];
+const IOTA_ORDINARY_NAMES = [
+  'X.otf\u03b9\u03b1', 'X.otf\u1fb3', 'X.otf\u03b1\u0345', 'X.otf\u03b9a', 'X.otf\u03b91', 'X.otf\u03ba', 'X.otf\u0269', 'X.otf\u0196',
+  'Photo.png\u03b9', 'Photo.png\u0345', 'Photo.png\u0399', 'X.woff\u03b9', 'X.woff2\u0399', 'Report.otf\u03b9\u03b1.pdf',
+  '\u0399\u03c3\u03c4\u03bf\u03c1\u03af\u03b1.otf.txt', 'X.o\u03b9tf', 'X\u03b9.png',
+];
+
+test('integration correction 4: iota forms after a font extension are font names; ordinary names stay ordinary (explicit cases)', () => {
+  const { getGatedFontExtension, isGatedFontName } = fontHandoff;
+  for (const name of IOTA_FONT_NAMES) {
+    assert.equal(isGatedFontName(name), true, JSON.stringify(name));
+    assert.equal(getGatedFontExtension(name), `.${/\.(otf|ttf|ttc|otc)/i.exec(name.replace(/\u200b/g, ''))[1].toLowerCase()}`, JSON.stringify(name));
+  }
+  for (const name of IOTA_ORDINARY_NAMES) {
+    assert.equal(isGatedFontName(name), false, JSON.stringify(name));
+    assert.equal(getGatedFontExtension(name), null, JSON.stringify(name));
+  }
+});
+
+// The rule as it stood before correction 4, written out independently.
+const ruleBeforeCorrection4 = name => typeof name === 'string' && /\.(otf|ttf|ttc|otc)[^\p{L}\p{N}]*$/u.test(
+  name.replace(/\\/g, '/').split('/').pop().normalize('NFKD').replace(/[\p{Default_Ignorable_Code_Point}\p{Cf}\p{Cc}]/gu, '').toLowerCase());
+const GREEK_AND_MARK_BLOCKS = [[0x300, 0x36f], [0x370, 0x3ff], [0x1f00, 0x1fff]];
+function boundedSuffixNames() {
+  const names = [];
+  for (let cp = 0x20; cp <= 0x10ffff; cp++) {
+    if ((cp >= 0xd800 && cp <= 0xdfff) || cp === 0x2f || cp === 0x5c) continue;
+    names.push(`X.otf${String.fromCodePoint(cp)}`);
+  }
+  const chars = [];
+  for (const [from, to] of GREEK_AND_MARK_BLOCKS) for (let cp = from; cp <= to; cp++) chars.push(String.fromCodePoint(cp));
+  for (const a of chars) for (const b of chars) names.push(`X.otf${a}${b}`);
+  return names;
+}
+
+test('integration correction 4: every earlier font name is still a font name; only names with a Greek iota form after the extension are added', () => {
+  const { isGatedFontName } = fontHandoff;
+  const added = [];
+  let earlierFonts = 0;
+  for (const name of boundedSuffixNames()) {
+    const before = ruleBeforeCorrection4(name);
+    const now = isGatedFontName(name);
+    if (before) { earlierFonts++; assert.equal(now, true, `still a font name: ${JSON.stringify(name)}`); }
+    else if (now) added.push(name);
+  }
+  assert.ok(earlierFonts > 100000, `${earlierFonts} earlier font names checked`);
+  for (const name of added) {
+    assert.ok(name.slice('X.otf'.length).normalize('NFKD').toLowerCase().includes('\u03b9'), `added only for an iota form: ${JSON.stringify(name)}`);
+  }
+  // Single characters added: the iota forms, each listed by hand.
+  const singles = added.filter(name => [...name.slice('X.otf'.length)].length === 1).map(name => name.codePointAt(5));
+  for (const cp of [0x38a, 0x390, 0x399, 0x3aa, 0x3af, 0x3b9, 0x3ca, 0x1f30, 0x1f37, 0x1f38, 0x1f3f, 0x1f76, 0x1f77, 0x1fbe,
+    0x1fd0, 0x1fd3, 0x1fd6, 0x1fdb, 0x1d6b0, 0x1d6ca, 0x1d7b2]) assert.ok(singles.includes(cp), `U+${cp.toString(16)} is added`);
+  assert.ok(singles.length <= 60, `${singles.length} single iota forms added`);
+});
+
+test('integration correction 4: names a case-insensitive volume treats as one file get one classification (bounded)', () => {
+  const { isGatedFontName } = fontHandoff;
+  // Independent model of the volume's folding: canonical decomposition plus case folding.
+  const volumeKey = name => name.normalize('NFD').toUpperCase().toLowerCase().normalize('NFD');
+  const groups = new Map();
+  for (const name of boundedSuffixNames()) {
+    const key = volumeKey(name);
+    const font = isGatedFontName(name);
+    const seen = groups.get(key);
+    if (!seen) groups.set(key, { font, name });
+    else assert.equal(font, seen.font, `${JSON.stringify(name)} and ${JSON.stringify(seen.name)} fold to one name`);
+  }
+  // The pairs the reviewer reproduced, by hand.
+  for (const [a, b] of [['X.otf\u0345', 'X.otf\u03b9'], ['X.otf\u0345', 'X.otf\u0399'], ['X.otf\u0301\u0345', 'X.otf\u0301\u03b9'],
+    ['Brand.otf\u0345', 'Brand.otf\u03b9'], ['Kit.ttf\u0345', 'Kit.ttf\u03b9']]) {
+    assert.equal(volumeKey(a), volumeKey(b), `${JSON.stringify(a)} folds with ${JSON.stringify(b)}`);
+    assert.equal(isGatedFontName(a), true, JSON.stringify(a));
+    assert.equal(isGatedFontName(b), true, JSON.stringify(b));
+  }
+});
