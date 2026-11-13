@@ -11296,24 +11296,38 @@ function cleanName(s) {
   return cleaned || DEFAULT_PACKAGE_FOLDER_NAME;
 }
 
+// A font-named object always keeps a font name (see getFontNameTail), so any
+// row that ends up at its output path still goes through the font check.
 function sanitizeEmbeddedPsdAssetName(rawName, fallbackName = 'embedded-asset') {
   const fallback = `${fallbackName}`.replace(/[^a-zA-Z0-9 ._\-()]/g, '').trim() || 'embedded-asset';
   const normalized = `${rawName || ''}`.replace(/\\/g, '/');
   let name = path.basename(normalized).replace(/[\x00-\x1f\x7f<>:"|?*]/g, '_').replace(/\s+/g, ' ').trim();
+  const fontTail = getFontNameTail(name);
   name = name.replace(/^\.+/, '');
   if (!name) name = fallback;
+  // ".otf" would become "otf": keep the font ending on a fallback base instead.
+  if (fontTail && !getFontNameTail(name)) name = `${fallback}${fontTail.tail}`;
   if (name.length > 160) {
-    const ext = path.extname(name);
-    const base = path.basename(name, ext).slice(0, Math.max(1, 160 - ext.length));
-    name = `${base}${ext}`;
+    const font = getFontNameTail(name);
+    if (font) {
+      // Shorten the base, never the font ending ("…AAA.otf." keeps ".otf.").
+      const tail = font.tail.slice(0, 159);
+      name = `${font.base.slice(0, Math.max(1, 160 - tail.length))}${tail}`;
+    } else {
+      const ext = path.extname(name);
+      const base = path.basename(name, ext).slice(0, Math.max(1, 160 - ext.length));
+      name = `${base}${ext}`;
+    }
   }
   return name;
 }
 
 function reserveUniqueName(name, usedNames) {
   const safeName = sanitizeEmbeddedPsdAssetName(name);
-  const ext = path.extname(safeName);
-  const base = path.basename(safeName, ext);
+  // A counter goes before a font ending ("X_1.otf."), so the name stays a font name.
+  const font = getFontNameTail(safeName);
+  const ext = font ? font.tail : path.extname(safeName);
+  const base = font ? font.base : path.basename(safeName, ext);
   let candidate = safeName;
   let counter = 1;
   while (usedNames.has(candidate.toLowerCase())) {
@@ -11322,6 +11336,19 @@ function reserveUniqueName(name, usedNames) {
   }
   usedNames.add(candidate.toLowerCase());
   return candidate;
+}
+
+// For a name the font check classifies as a font, splits it into a base and
+// the shortest ending that is itself a font name (".otf", ".otf.", ".ttf~",
+// "．ｏｔｆ"); null for any other name. Only the last 256 characters are
+// searched; a longer font ending is replaced by its plain extension.
+function getFontNameTail(name) {
+  if (typeof name !== 'string' || !fontHandoff.isGatedFontName(name)) return null;
+  for (let index = name.length - 1; index >= Math.max(0, name.length - 256); index -= 1) {
+    if (fontHandoff.isGatedFontName(name.slice(index))) return { base: name.slice(0, index), tail: name.slice(index) };
+  }
+  const extension = name.normalize('NFKD').toLowerCase().match(/(?:otf|ttf|ttc|otc)(?!.*(?:otf|ttf|ttc|otc))/u)?.[0] || 'otf';
+  return { base: name.slice(0, Math.max(1, name.length - 256)), tail: `.${extension}` };
 }
 
 // Concurrent PSDs may reserve the same name while their bytes are staged.
@@ -22379,6 +22406,9 @@ function findEmbeddedPsdLinkedFileMatch(file, linkedFiles) {
   const matchesFile = (linkedFile) => {
     if (!linkedFile) return false;
     if (expectedOriginalName && linkedFile.name === expectedOriginalName) return true;
+    // Judged by the object as it is now: a font-named object never matches a
+    // row whose own name is not a font name through a derived name.
+    if (getFontNameTail(`${linkedFile.name || ''}`) && !getFontNameTail(expectedSafeName)) return false;
     return sanitizeEmbeddedPsdAssetName(linkedFile.name) === expectedSafeName;
   };
 

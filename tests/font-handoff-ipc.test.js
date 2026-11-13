@@ -1065,6 +1065,141 @@ function cases() {
     assert.ok(!tree.some(item => fs.readFileSync(path.join(out.result.folderPath, item)).equals(restrictedBytes)), tree.join(', '));
   });
 
+  // Integration correction 2: names Crate derives for Photoshop objects (on a
+  // name collision, a name over 160 characters, or a name starting with dots)
+  // keep a font name a font name, and a stored embedded row never matches a
+  // font-named object by a derived name. Cases from the 34f1ccf review.
+  const psdRows = f => {
+    const project = storeInstance.data.projects.find(item => item.id === f.project.id);
+    return [...(project.files || []), ...(project.pendingFiles || [])].filter(item => item.source === 'psd-embedded');
+  };
+  const writtenAs = (folder, bytes) => listTree(folder).filter(item => fs.readFileSync(path.join(folder, item)).equals(bytes));
+  async function psdDocFixture(label) {
+    const f = await fixture(label);
+    fs.rmSync(path.join(os.tmpdir(), `crate-psd-extract-${f.project.id}`), { recursive: true, force: true });
+    f.parent = path.join(f.dir, 'Doc.psd');
+    fs.writeFileSync(f.parent, 'synthetic PSD v1');
+    await setProjectFiles(f.project.id, { files: [
+      { path: f.image, name: 'Logo.png', ext: '.png', addedAt: Date.now(), source: 'manual-browse' },
+      { path: f.parent, name: 'Doc.psd', ext: '.psd', addedAt: Date.now(), source: 'manual-browse' } ] });
+    return f;
+  }
+  // First save has one ordinary object; its cached file is then lost; the second
+  // save holds `secondSave`. Returns the review and, if it can package, the result.
+  async function refillCase(label, firstName, secondSave, { loseCache = true } = {}) {
+    const f = await psdDocFixture(label);
+    currentPsdFixture = { children: [], linkedFiles: [{ name: firstName, data: Buffer.from('ordinary picture bytes v1') }] };
+    await callIpcRaw('projects:pre-package-scan', f.project.id);
+    const first = psdRows(f);
+    assert.equal(first.length, 1, JSON.stringify(first.map(item => item.name)));
+    if (loseCache) fs.rmSync(first[0].path);
+    fs.writeFileSync(f.parent, 'synthetic PSD v2 with more bytes');
+    currentPsdFixture = { children: [], linkedFiles: secondSave };
+    await callIpcRaw('projects:pre-package-scan', f.project.id);
+    const reviewResult = await callIpcRaw('projects:prepare-package-review', f.project.id, f.out);
+    const result = reviewResult.materializable ? await callIpcRaw('projects:package', f.project.id, f.out, reviewResult.token) : null;
+    return { f, reviewResult, result };
+  }
+  const restrictedFont = buildFont({ fsType: 2 });
+  const uncataloguedFont = buildFont(brand('Regular'));
+  const assertNotWritten = ({ result }, bytes, label) => {
+    if (result) assert.equal(result.success, true, JSON.stringify(result));
+    assert.deepEqual(result ? writtenAs(result.folderPath, bytes) : [], [], label);
+  };
+
+  for (const [label, firstName, secondSave, bytes] of [
+    ['A1 collision suffix, second object restricted', 'X.otf_1.', [{ name: 'X.otf.', data: Buffer.from('first object') }, { name: 'X.otf.', data: restrictedFont }], restrictedFont],
+    ['A3 collision suffix, both objects the same restricted font', 'X.otf_1.', [{ name: 'X.otf.', data: restrictedFont }, { name: 'X.otf.', data: restrictedFont }], restrictedFont],
+    ['A4 collision suffix, uncatalogued font without a confirmation', 'Brand.otf_1.', [{ name: 'Brand.otf.', data: Buffer.from('first object') }, { name: 'Brand.otf.', data: uncataloguedFont }], uncataloguedFont],
+    ['A5 truncated long name', `${'A'.repeat(159)}.`, [{ name: `${'A'.repeat(170)}.otf.`, data: restrictedFont }], restrictedFont],
+    ['A6 leading dot', 'otf', [{ name: '.otf', data: restrictedFont }], restrictedFont],
+  ]) {
+    fontTest(`integration: a font refilled after a lost cache file is never packaged ungated (${label})`, { timeout: 30000 }, async () => {
+      const outcome = await refillCase(label.split(' ')[0], firstName, secondSave);
+      assertNotWritten(outcome, bytes, label);
+      // Every output written from a font-named object has a font name itself.
+      for (const row of psdRows(outcome.f)) {
+        const original = (row.psdExtractionReceipt || row.psdResource)?.originalName;
+        if (typeof original === 'string' && /\.(otf|ttf|ttc|otc)[^a-z0-9]*$/i.test(original)) {
+          assert.match(path.basename(row.path), /\.(otf|ttf|ttc|otc)[^a-z0-9]*$/i, `${original} -> ${path.basename(row.path)}`);
+        }
+      }
+    });
+  }
+
+  fontTest('integration: controls - with the cache file present, and long or leading-dot font names on their own, the font is gated', { timeout: 30000 }, async () => {
+    assertNotWritten(await refillCase('C1', 'X.otf_1.', [{ name: 'X.otf.', data: Buffer.from('first object') }, { name: 'X.otf.', data: restrictedFont }],
+      { loseCache: false }), restrictedFont, 'C1');
+    for (const [label, name] of [['T', `${'A'.repeat(170)}.otf.`], ['D1', '.otf']]) {
+      const f = await psdDocFixture(label);
+      currentPsdFixture = { children: [], linkedFiles: [{ name, data: restrictedFont }] };
+      await callIpcRaw('projects:pre-package-scan', f.project.id);
+      const reviewResult = await callIpcRaw('projects:prepare-package-review', f.project.id, f.out);
+      assert.ok((reviewResult.fonts?.rows || []).some(item => item.reason === 'restricted'), JSON.stringify(reviewResult.fonts));
+      const result = reviewResult.materializable ? await callIpcRaw('projects:package', f.project.id, f.out, reviewResult.token) : null;
+      assertNotWritten({ result }, restrictedFont, label);
+    }
+  });
+
+  fontTest('integration: ordinary Photoshop outputs keep their usual derived names and are packaged', { timeout: 30000 }, async () => {
+    const f = await psdDocFixture('Ordinary names');
+    const longName = `${'B'.repeat(200)}.png`;
+    const objects = [
+      { name: 'Photo.png', data: Buffer.from('photo one') },
+      { name: 'Photo.png', data: Buffer.from('photo two') },
+      { name: longName, data: Buffer.from('long name photo') },
+      { name: '.hidden.png', data: Buffer.from('dot photo') },
+    ];
+    currentPsdFixture = { children: [], linkedFiles: objects };
+    await callIpcRaw('projects:pre-package-scan', f.project.id);
+    const leaves = psdRows(f).map(item => path.basename(item.path)).sort();
+    assert.deepEqual(leaves, [`${'B'.repeat(156)}.png`, 'Photo.png', 'Photo_1.png', 'hidden.png'].sort());
+    const reviewResult = await review(f);
+    assert.equal(reviewResult.fonts, undefined, 'no font rows for ordinary outputs');
+    const { result } = await packageNow(f, reviewResult);
+    assert.equal(result.success, true, JSON.stringify(result));
+    for (const object of objects) assert.equal(writtenAs(result.folderPath, object.data).length, 1, object.name);
+  });
+
+  for (const [label, rowName, currentName] of [
+    ['B1 truncated long name', `${'A'.repeat(159)}.`, `${'A'.repeat(170)}.otf.`],
+    ['B3 leading dot', 'otf', '.otf'],
+    ['B2 control, short names', 'X.otf_1.', 'X.otf.'],
+  ]) {
+    fontTest(`integration: a stored embedded row never binds a font-named object by a derived name (${label})`, { timeout: 30000 }, async () => {
+      const f = await fixture(label.split(' ')[0]);
+      const parentPsd = path.join(f.dir, 'Parent.psd');
+      fs.writeFileSync(parentPsd, Buffer.from('PSD container bytes'));
+      currentPsdFixture = { children: [], linkedFiles: [{ name: currentName, data: restrictedFont }] };
+      await setProjectFiles(f.project.id, { files: [
+        { path: f.image, name: 'Logo.png', ext: '.png', addedAt: Date.now(), source: 'manual-browse' },
+        { path: parentPsd, name: 'Parent.psd', ext: '.psd', addedAt: Date.now(), source: 'manual-browse' },
+        { path: parentPsd, parentPsd, name: rowName, ext: path.extname(rowName).toLowerCase(), addedAt: Date.now(),
+          source: 'scan-on-save-embedded', embedded: true, embeddedOriginalName: rowName, embeddedIndex: 0, fileId: 'synthetic-embedded-row' },
+      ] });
+      const reviewResult = await callIpcRaw('projects:prepare-package-review', f.project.id, f.out);
+      const result = reviewResult.materializable ? await callIpcRaw('projects:package', f.project.id, f.out, reviewResult.token) : null;
+      assertNotWritten({ result }, restrictedFont, label);
+    });
+  }
+
+  fontTest('integration: control B0 - a stored embedded row that records the font name is excluded', { timeout: 30000 }, async () => {
+    const f = await fixture('B0');
+    const parentPsd = path.join(f.dir, 'Parent.psd');
+    fs.writeFileSync(parentPsd, Buffer.from('PSD container bytes'));
+    const longName = `${'A'.repeat(170)}.otf.`;
+    currentPsdFixture = { children: [], linkedFiles: [{ name: longName, data: restrictedFont }] };
+    await setProjectFiles(f.project.id, { files: [
+      { path: f.image, name: 'Logo.png', ext: '.png', addedAt: Date.now(), source: 'manual-browse' },
+      { path: parentPsd, name: 'Parent.psd', ext: '.psd', addedAt: Date.now(), source: 'manual-browse' },
+      { path: parentPsd, parentPsd, name: `${'A'.repeat(159)}.`, ext: '.', addedAt: Date.now(), source: 'scan-on-save-embedded', embedded: true,
+        embeddedOriginalName: longName, embeddedIndex: 0, fileId: 'synthetic-embedded-row' },
+    ] });
+    const reviewResult = await callIpcRaw('projects:prepare-package-review', f.project.id, f.out);
+    const result = reviewResult.materializable ? await callIpcRaw('projects:package', f.project.id, f.out, reviewResult.token) : null;
+    assertNotWritten({ result }, restrictedFont, 'B0');
+  });
+
   fontTest('registry failure reports unavailable and leaves packaging untouched', async () => {
     const f = await fixture();
     registryFailure = true;

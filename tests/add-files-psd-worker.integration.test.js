@@ -86,7 +86,9 @@ function harness(t, options = {}) {
   t.after(async () => { for (const child of children) child.kill(); await Promise.all(finishes.map(finish => finish())); fs.rmSync(root, { recursive: true, force: true }); });
   const events = [];
   const fsView = { ...fs, promises: { ...fs.promises, ...options.io } };
+  // Output naming keeps font names font names, through the shipped font check.
   const context = { fs: fsView, path, os: { tmpdir: () => root }, crypto, process, Buffer, Uint8Array, ArrayBuffer,
+    fontHandoff: require('../parsers/font-handoff'),
     setImmediate, console, MAX_PARSE_FILE_SIZE: 300 * 1024 * 1024, OWNER_ONLY_FILE_MODE: 0o600,
     ADD_FILES_PSD_WORKER_PATH: workerPath,
     ADD_FILES_REGEX_WORKER_PATH: path.join(path.dirname(workerPath), 'add-files-regex-worker.js'),
