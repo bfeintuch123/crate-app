@@ -20761,6 +20761,7 @@ registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileI
             priorExclusions.delete(exclusionKey);
             delete removedFile.individualContentExclusion;
             if (fingerprint) removedFile.individualContentInclude = fingerprint;
+            clearFontRowExclusionChoice(project, removedFile.path);
           }
           if (fact?.excludedSourceOnly === true) removedFile.keptAfterSourceExclusion = true;
         } else {
@@ -20817,6 +20818,7 @@ registerTrustedIpcHandler('projects:accept-pending', async (event, projectId, fi
     // Retire the record and its own exclusion key in this same mutation,
     // before any scan, so the file is never both Included and excluded.
     releaseExcludedPendingRecords(project, file);
+    clearFontRowExclusionChoice(project, file.path);
     const acceptedKey = getTrackedFileDedupKey(file);
     const acceptedPaths = getTrackedFileKeySet(project.files);
 
@@ -21021,6 +21023,7 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
         ]) {
           if (exclusionKey) excludedKeys.delete(exclusionKey);
         }
+        clearFontRowExclusionChoice(project, filePath);
         recordSessionObservedFile(project, authorizedFile, {
           kind: OBSERVER_KINDS.MANUAL_USER_ACTION,
           method: 'projects:add-files',
@@ -23157,6 +23160,12 @@ function isFontPathAssetExcluded(project, sourcePath) {
 // its font row, clears that file's asset exclusion the same way + Add Files
 // does, and retires its remembered Needs Review record (and its own key).
 function includeExplicitlyChosenFontFile(project, sourcePath) {
+  // Nothing to clear: no exclusion keys, no remembered records, and no project
+  // file still carrying a content-exclusion marker (a marker without its key
+  // never excludes, but it is read as an individual choice, so it is kept on
+  // the slow path exactly as before). No path is resolved in this case.
+  if (!(project?.excludedAssetKeys || []).length && !readExcludedPendingRecords(project).records.length &&
+      !(project?.files || []).some(file => file && file.individualContentExclusion !== undefined)) return false;
   const target = normalizeTrackedFilePath(sourcePath);
   if (!target) return false;
   const released = releaseExcludedPendingRecords(project, { path: sourcePath });
@@ -23174,6 +23183,21 @@ function includeExplicitlyChosenFontFile(project, sourcePath) {
   const kept = keys.filter(key => !remove.has(key));
   if (kept.length !== keys.length) project.excludedAssetKeys = kept;
   return released || kept.length !== keys.length;
+}
+
+// An asset Include (+ Add Files, [+] on an Excluded row, accepting a remembered
+// or Needs Review row) is the latest explicit choice for that file, so it also
+// clears that file's own font-row Exclude. Other rows' choices and
+// confirmations are untouched.
+function clearFontRowExclusionChoice(project, filePath) {
+  if (!project || project.fontHandoff === undefined || typeof filePath !== 'string' || !isGatedFontPath(filePath)) return false;
+  const key = getFontRowKey(filePath);
+  if (!key) return false;
+  const handoff = readProjectFontHandoff(project);
+  if (handoff.choices[key] !== 'remove') return false;
+  delete handoff.choices[key];
+  writeProjectFontHandoff(project, handoff);
+  return true;
 }
 
 function getFontRowOrigin(group) {
@@ -23789,9 +23813,12 @@ function addFontFilePaths(projectId, filePaths) {
     for (const filePath of accepted) {
       const key = getFontRowKey(filePath);
       if (!key) continue;
-      if (handoff.choices[key] === 'remove') delete handoff.choices[key];
       // Picking the file again is the latest explicit choice: it is included.
-      includeExplicitlyChosenFontFile(project, filePath);
+      // Only a kept pick clears anything; a refused pick changes nothing.
+      const keepPick = () => {
+        if (handoff.choices[key] === 'remove') delete handoff.choices[key];
+        includeExplicitlyChosenFontFile(project, filePath);
+      };
       const existing = handoff.files.find(item => getFontRowKey(item.path) === key);
       if (existing) {
         // The same real file was added through a link: keep the file itself.
@@ -23799,6 +23826,7 @@ function addFontFilePaths(projectId, filePaths) {
           existing.path = filePath;
           added++;
         }
+        keepPick();
         continue;
       }
       if (handoff.files.length >= MAX_FONT_HANDOFF_SELECTIONS) {
@@ -23806,6 +23834,7 @@ function addFontFilePaths(projectId, filePaths) {
         continue;
       }
       handoff.files.push({ path: filePath, addedAt: Date.now() });
+      keepPick();
       added++;
     }
     writeProjectFontHandoff(project, handoff);
