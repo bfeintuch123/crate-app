@@ -22720,9 +22720,13 @@ const installedFontCopyOffers = new Map();
 const pendingFontFilePickers = new Set();
 
 // Any name that decides what is written counts: the source path, the row's
-// extension, the package output (display) name and an embedded original name.
+// extension, the package output (display) name, an embedded original name and
+// the original name in a Photoshop output's extraction record (an output can
+// be renamed on extraction, for example when another document reserved its
+// name, while the record keeps the name the document gave it).
 function getFontRelevantNames(file) {
-  const names = [file.ext ? `x${file.ext}` : null, getPackageFileDisplayName(file), file.name, file.embeddedOriginalName];
+  const names = [file.ext ? `x${file.ext}` : null, getPackageFileDisplayName(file), file.name, file.embeddedOriginalName,
+    file.psdResource?.originalName, file.psdExtractionReceipt?.originalName];
   if (!isScanOnSaveEmbeddedPsdFile(file)) names.push(file.path);
   return names.filter(name => typeof name === 'string' && name);
 }

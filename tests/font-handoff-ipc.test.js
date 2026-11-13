@@ -974,6 +974,97 @@ function cases() {
     assert.deepEqual((result.fontsNotIncluded || []).map(item => item.name), ['Poppins-Regular.ttf']);
   });
 
+  // Integration correction (after #326): a Photoshop output renamed during
+  // extraction (for example when another document reserved its name) is still
+  // judged by the original name recorded in its extraction record.
+  const psdOutputRow = (file, extra = {}) => ({ path: file, name: path.basename(file), ext: path.extname(file), addedAt: Date.now(),
+    source: 'psd-embedded', ...extra });
+  function fontTree(folder) {
+    return listTree(folder).filter(item => item.startsWith('Fonts/') || /\.(otf|ttf|ttc|otc)/i.test(item));
+  }
+
+  fontTest('integration: a restricted font renamed by a reserved Photoshop output name is still gated and never copied', async () => {
+    const f = await fixture('Reserved name');
+    const parent = path.join(f.dir, 'Worker.psd');
+    const other = path.join(f.dir, 'Other.psd');
+    fs.writeFileSync(parent, 'synthetic PSD');
+    const restrictedBytes = buildFont({ fsType: 2 });
+    const reserve = name => psdOutputRow(path.join(os.tmpdir(), `crate-psd-extract-${f.project.id}`, name), {
+      psdExtractionReceipt: { version: 1, parentPath: other, sourceDigest: 'a'.repeat(64), outputDigest: 'b'.repeat(64),
+        layerPath: null, linkedIndex: 0, originalName: name } });
+    const stored = storeInstance.data.projects.find(item => item.id === f.project.id);
+    stored.pendingFiles = [reserve('Restricted.otf.'), reserve('Photo.png')];
+    const photoBytes = createSyntheticPngBytes();
+    currentPsdFixture = { children: [], linkedFiles: [{ name: 'Restricted.otf.', data: restrictedBytes }, { name: 'Photo.png', data: photoBytes }] };
+    manualDialogFor([parent]);
+    await callIpcRaw('projects:add-files', f.project.id);
+    const outputs = storeInstance.data.projects.find(item => item.id === f.project.id).files.filter(item => item.source === 'psd-embedded');
+    const fontOutput = outputs.find(item => item.psdResource?.originalName === 'Restricted.otf.');
+    const photoOutput = outputs.find(item => item.psdResource?.originalName === 'Photo.png');
+    assert.ok(fontOutput && photoOutput, JSON.stringify(outputs.map(item => [item.name, item.psdResource?.originalName])));
+    assert.notEqual(fontOutput.name, 'Restricted.otf.', 'the reservation renamed the output (the case under test)');
+    assert.notEqual(photoOutput.name, 'Photo.png');
+    const reviewResult = await review(f);
+    assert.ok(!reviewResult.files.some(item => item.name === fontOutput.name), 'the renamed font is not an ordinary output');
+    assert.ok(reviewResult.files.some(item => item.name === photoOutput.name), 'a renamed ordinary output stays ordinary');
+    assert.equal(row(reviewResult, fontOutput.name).reason, 'restricted');
+    const { result } = await packageNow(f, reviewResult);
+    assert.equal(result.success, true, JSON.stringify(result));
+    for (const item of listTree(result.folderPath)) {
+      assert.notDeepEqual(fs.readFileSync(path.join(result.folderPath, item)), restrictedBytes, `restricted bytes written as ${item}`);
+    }
+    assert.ok(listTree(result.folderPath).some(item => fs.readFileSync(path.join(result.folderPath, item)).equals(photoBytes)),
+      'the renamed ordinary output is still packaged');
+  });
+
+  fontTest('integration: a renamed Photoshop output is judged by its recorded original name; ordinary renamed outputs stay ordinary', async () => {
+    const f = await fixture('Original name');
+    const parent = path.join(f.dir, 'Source.psd');
+    fs.writeFileSync(parent, 'synthetic PSD container');
+    const receipt = (name, bytes) => ({ version: 1, parentPath: parent, sourceDigest: sha(fs.readFileSync(parent)), outputDigest: sha(bytes),
+      layerPath: null, linkedIndex: 0, originalName: name });
+    const restrictedFile = path.join(f.dir, 'Restricted.otf_1.');
+    const restrictedBytes = writeFont(restrictedFile, { fsType: 2, names: englishNames({ family: 'Restricted', style: 'Regular', postscriptName: 'Restricted-Regular' }) });
+    const brandFile = path.join(f.dir, 'Brand.otf_2');
+    const brandBytes = writeFont(brandFile, brand('Bold'));
+    const logoFile = path.join(f.dir, 'Logo_1.png');
+    const logoBytes = createSyntheticPngBytes();
+    fs.writeFileSync(logoFile, logoBytes);
+    await setProjectFiles(f.project.id, { files: [
+      { path: f.image, name: 'Logo.png', ext: '.png', source: 'manual-browse' },
+      // Route 1: the worker route's psdResource record; route 2: the extraction receipt.
+      psdOutputRow(restrictedFile, { psdResource: { version: 1, parentPath: parent, ...receipt('Restricted.otf', restrictedBytes) } }),
+      psdOutputRow(brandFile, { psdExtractionReceipt: receipt('Brand.otf', brandBytes) }),
+      psdOutputRow(logoFile, { psdExtractionReceipt: receipt('Logo.png', logoBytes) }),
+    ] });
+    const first = await review(f);
+    assert.equal(row(first, 'Restricted.otf_1.').reason, 'restricted');
+    const brandRow = row(first, 'Brand.otf_2');
+    assert.equal(brandRow.reason, 'found', 'a renamed non-restricted font is a found font row, not an asset');
+    assert.ok(!first.files.some(item => item.name === 'Brand.otf_2' || item.name === 'Restricted.otf_1.'));
+    assert.ok(first.files.some(item => item.name === 'Logo_1.png'), 'a renamed PNG stays an ordinary asset');
+    let out = await packageNow(f, first);
+    assert.equal(out.result.success, true, JSON.stringify(out.result));
+    for (const item of listTree(out.result.folderPath)) {
+      const bytes = fs.readFileSync(path.join(out.result.folderPath, item));
+      assert.ok(!bytes.equals(restrictedBytes) && !bytes.equals(brandBytes), `font bytes written as ${item}`);
+    }
+    assert.ok(listTree(out.result.folderPath).some(item => fs.readFileSync(path.join(out.result.folderPath, item)).equals(logoBytes)));
+    fs.rmSync(out.result.folderPath, { recursive: true, force: true });
+    // Consent still applies only to the eligible font, through its own row.
+    assert.equal((await callIpcRaw('fonts:set-row-choice', f.project.id, brandRow.key, 'include')).success, true);
+    const pending = row(await review(f), 'Brand.otf_2');
+    assert.equal(pending.outcome, 'needs-confirmation');
+    assert.equal((await callIpcRaw('fonts:confirm-licence', f.project.id, pending.key, { confirmed: true, sha256: pending.sha256 })).success, true);
+    const restrictedRow = row(await review(f), 'Restricted.otf_1.');
+    assert.notEqual((await callIpcRaw('fonts:confirm-licence', f.project.id, restrictedRow.key, { confirmed: true, sha256: sha(restrictedBytes) })).success, true);
+    out = await packageNow(f);
+    assert.equal(out.result.success, true, JSON.stringify(out.result));
+    const tree = listTree(out.result.folderPath);
+    assert.ok(tree.some(item => item.startsWith('Fonts/') && fs.readFileSync(path.join(out.result.folderPath, item)).equals(brandBytes)), tree.join(', '));
+    assert.ok(!tree.some(item => fs.readFileSync(path.join(out.result.folderPath, item)).equals(restrictedBytes)), tree.join(', '));
+  });
+
   fontTest('registry failure reports unavailable and leaves packaging untouched', async () => {
     const f = await fixture();
     registryFailure = true;
