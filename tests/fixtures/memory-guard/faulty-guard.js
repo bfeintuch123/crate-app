@@ -9,6 +9,8 @@
 //   CRATE_GUARD_FAULT=unreadable:<role>            that process's start time and memory cannot be read
 //   CRATE_GUARD_FAULT=unreadable-after-run:<role>  the same, but only once the test run has ended
 //   CRATE_GUARD_FAULT=unreadable-runner            the test runner itself cannot be read, from the first scan
+//   CRATE_GUARD_FAULT=system-tool:<role>           that process reads exactly as the system's set-uid ps does, for as long as it lives
+//   CRATE_GUARD_FAULT=other-tool:<role>            the same, but its executable is another set-uid tool
 //   CRATE_GUARD_FAULT=primary-fails                the sampler in use fails once the tree is up, and no new one can be started
 //   CRATE_GUARD_FAULT=all-samplers-fail            the same, and the sampler standing by fails too
 //
@@ -21,6 +23,8 @@ const EPERM = 1;
 const recorded = () => new Map(fs.readFileSync(process.env.CRATE_GUARD_FIXTURE_PIDS, 'utf8').split('\n').filter(Boolean)
   .map(line => line.split(' ')).map(([name, pid]) => [name, Number(pid)]));
 const cannotRead = row => ({ ...row, start: '0', megabytes: 0, usageError: EPERM });
+// What the sampler reports for a set-uid root tool this user started.
+const asTool = (row, path) => ({ ...cannotRead(row), uid: 0, ruid: process.getuid(), path });
 
 const samplerPids = new Set();
 let opened = 0;
@@ -33,6 +37,10 @@ function misread(rows) {
   if (kind === 'unreadable-runner') {
     // The runner is the guard's only child that is not a sampler.
     return rows.map(row => (row.ppid === process.pid && !samplerPids.has(row.pid) ? cannotRead(row) : row));
+  }
+  if (kind === 'system-tool' || kind === 'other-tool') {
+    const target = recorded().get(role);
+    return rows.map(row => (row.pid === target ? asTool(row, kind === 'system-tool' ? '/bin/ps' : '/usr/bin/top') : row));
   }
   if (!kind.startsWith('unreadable')) return rows;
   const pids = recorded();
@@ -77,6 +85,8 @@ async function startFaultySampler() {
     get dead() { return failed || real.dead; },
     stop: () => real.stop(),
     scan: (...args) => use(async () => misread(await real.scan(...args))),
+    // The real sampler signals the group through a readable member; the faults
+    // above do not change what it reads.
     signalGroup: (...args) => use(() => real.signalGroup(...args)),
     signalProcesses: (name, rows) => use(() => signalProcesses(name, rows)),
   };

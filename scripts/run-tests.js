@@ -14,12 +14,13 @@
 //   --total-memory-limit-mb=N   most memory the whole run may hold            (CRATE_TEST_TOTAL_MEMORY_LIMIT_MB)
 //   --deadline-seconds=N        longest the run may take                      (CRATE_TEST_DEADLINE_SECONDS)
 //
-// What it does. Twenty times a second it asks scripts/run-tests-sampler.py for
-// every process on the machine: parent, process group, start time, resident
-// size and memory footprint (macOS's own accounting, which includes compressed
-// memory). From that it works out which processes belong to the run, and it
-// stops the run when one of them, or all of them together, passes a limit, or
-// when the deadline passes. It reads from outside the test processes, so it
+// What it does. About twenty times a second (every 50 ms, plus the time one
+// scan takes) it asks scripts/run-tests-sampler.py for every process on the
+// machine: parent, process group, start time, resident size and memory
+// footprint (macOS's own accounting, which includes compressed memory). From
+// that it works out which processes belong to the run, and it stops the run
+// when one of them, or all of them together, passes a limit, or when the
+// deadline passes. It reads from outside the test processes, so it
 // works while a test is stuck in a synchronous loop, and it changes nothing
 // about the environment the tests run in.
 //
@@ -33,10 +34,13 @@
 // pid AND start time: the system reuses pids, not the pair.
 //
 // How it stops a run. It freezes first: SIGSTOP to the group and to every
-// process of the run, repeated until a scan finds nothing new, so nothing can
-// start more processes behind its back. Then SIGKILL, and then it scans until
-// every process of the run is gone. Every signal is sent by the sampler, which
-// reads the target's start time again and signals in the next system call.
+// process of the run it has identified, repeated until a scan finds nothing
+// new (at most fifty times), so that what it can signal does not start more
+// processes behind its back. Then SIGKILL, and then it scans until every
+// process of the run has ended. A process it could not identify outside the
+// group is not signalled; if it is still running at the end, the guard says
+// so and exits 125. Every signal is sent by the sampler, which reads the
+// target's start time again and signals in the next system call.
 // The same cleanup runs after a signal (once the run has had a few seconds to
 // stop by itself) and for anything a finished run leaves behind.
 //
@@ -44,12 +48,36 @@
 // watch: no answer from the sampler for three seconds, or a process of the run
 // whose start time and memory cannot be read, the test runner itself included
 // from the first scan on. It stops the run and exits 125.
+//
+// The one exception is the system's own `ps`. Tests start it, and macOS
+// installs it set-uid root, so this user may not read its memory. A process is
+// let through as that tool only when the system reports its executable as
+// exactly /bin/ps, it runs as root for this user (real owner this user), it
+// was started by a process of the run or is in the run's process group in the
+// same scan, and it has been there for no longer than two seconds or forty
+// samples, with no more than eight at once. It is counted at an assumed 32 MB,
+// which is an estimate and not a measurement, and it is never signalled by
+// pid. Once it has ended it is neither counted nor waited for, even while its
+// parent has not collected it. Anything else the guard cannot read, including
+// a `ps` that fails any of these conditions, stops the run as before.
+//
+// For a fraction of a millisecond while it starts, and again while it ends, a
+// `ps` is not that tool: it already runs as root while its executable is
+// still its parent's, or its executable is already gone. The guard allows
+// nothing for that. Instead the sampler reads a process this user started
+// and may not read a second time, a millisecond later, and up to twice more
+// while its readings differ, and reports the last reading (see there). The
+// price: a state of such a process that is over within those few milliseconds
+// does not reach the guard, even one it would have stopped the run for. The
+// test runner is not read again; its first reading always reaches the guard.
+//
 // It also exits 125, whatever the tests' own result, when it cannot confirm
-// that every process of the run is gone.
+// that every process of the run has ended.
 //
 // What it is not.
 // - Not a hard cap. It samples. A run can pass its limit by whatever it
-//   allocates between two samples (0.05 s) plus the time to freeze it.
+//   allocates between two samples (0.05 s and the time one scan takes, more
+//   under load) plus the time to freeze it.
 // - Not able to see a process that never appears in a scan as part of the run:
 //   one that is started, leaves the runner's process group, and loses its
 //   parent, all between two samples. Such a process is not tracked, limited or
@@ -58,6 +86,18 @@
 //   check of a start time and its signal lie a few microseconds in which the
 //   target could end and its pid pass to another process. Nothing available to
 //   an ordinary program on macOS closes that gap.
+// - Not a measurement of the system's `ps`. While one is let through, the
+//   guard counts an assumed 32 MB for it and does not know what it holds; a
+//   run that starts one after another has that much unmeasured the whole
+//   time. One that leaves the run's process group, or outlives the runner, is
+//   not signalled either, because it cannot be identified: if it is still
+//   there when the run is cleaned up, the guard lists it and exits 125.
+// - Not free of false stops. It stops a run that did nothing wrong when a
+//   `ps` runs for more than two seconds, when more than eight run at once,
+//   when one is started by a process that has left the run's group and lost
+//   its parent, and when one stays between two states (starting or ending)
+//   for longer than the few milliseconds the sampler waits for it to settle,
+//   which can happen when the machine is too busy to let it finish starting.
 // - Not able to end the whole run when no sampler works any more (the one in
 //   use, the one standing by, and a newly started one all fail). It then kills
 //   the runner's process group, leaves whatever the run started outside that
@@ -103,6 +143,17 @@ const EXIT_DEADLINE = 124;
 const EXIT_GUARD_FAILURE = 125;
 const ZOMBIE = 5; // SZOMB in <sys/proc.h>
 const ESRCH = 3;
+const EPERM = 1;
+// The one tool a test may start that this user cannot read, and the bounds
+// within which it is let through. See the header.
+const SYSTEM_TOOL = {
+  path: '/bin/ps',
+  effectiveUid: 0,
+  samples: 40,
+  milliseconds: 2000,
+  atOnce: 8,
+  assumedMegabytes: 32,
+};
 const MB = 1024 * 1024;
 const SIGNAL_RESULTS = new Set(['sent', 'mismatch', 'gone', 'unreadable', 'denied']);
 const root = path.resolve(__dirname, '..');
@@ -152,18 +203,28 @@ function formatSize(megabytes) {
 // One line of a scan. `start` stays text: it identifies the process and must
 // compare exactly, whatever its size.
 function parseRow(line) {
-  if (!/^\d+(?: \d+){9}$/.test(line)) return null;
-  const [pid, ppid, pgid, uid, status, start, resident, footprint, infoError, usageError] = line.split(' ');
+  if (!/^\d+(?: \d+){10} (?:-|[A-Za-z0-9\/%._~-]+)$/.test(line)) return null;
+  const [pid, ppid, pgid, uid, status, start, resident, footprint, infoError, usageError, ruid, encodedPath] = line.split(' ');
+  let path = null;
+  if (encodedPath !== '-') {
+    try {
+      path = decodeURIComponent(encodedPath);
+    } catch {
+      return null;
+    }
+  }
   return {
     pid: Number(pid),
     ppid: Number(ppid),
     pgid: Number(pgid),
     uid: Number(uid),
+    ruid: Number(ruid),
     status: Number(status),
     start,
     megabytes: Math.max(Number(resident), Number(footprint)) / MB,
     infoError: Number(infoError),
     usageError: Number(usageError),
+    path,
   };
 }
 
@@ -306,8 +367,9 @@ async function startCheckedSampler() {
 
 // Works out, scan by scan, which processes belong to the run, and notices
 // when one of them, the runner first of all, cannot be read.
-function createOwnership({ guardPid, helperPids = [], runnerPid }) {
+function createOwnership({ guardPid, guardUid, helperPids = [], runnerPid, now = () => performance.now() }) {
   const helpers = new Set(helperPids);
+  const toolStats = { samples: 0, longestSamples: 0, longestMilliseconds: 0 };
   let runnerStart = null;
   let anchored = null; // does the runner lead the process group that carries its pid? null until a scan shows it
   let runnerProblem = null; // what is wrong with the runner's own row in the latest scan, if anything
@@ -315,11 +377,19 @@ function createOwnership({ guardPid, helperPids = [], runnerPid }) {
   let owned = new Map();
   let latest = new Map();
   const identified = new Map(); // pid -> start time under which that pid was last identified as the run's
-  const unread = new Map(); // pid -> { errno, samples } for processes of the run that cannot be read
+  // Processes of the run that cannot be read: pid -> { errno, samples, since,
+  // ending, allowed }. `samples` counts the scans in a row that could not read
+  // it and `since` is the time of the first; `ending` counts those in a row
+  // that said it no longer exists; `allowed` marks the system tool while it is
+  // let through.
+  const unread = new Map();
 
   return {
     get owned() { return owned; },
     get runnerStart() { return runnerStart; },
+    // How often a system tool was let through (once per tool per scan, the
+    // scans of a cleanup included), and the longest any one of them stayed.
+    get toolStats() { return toolStats; },
     // False once a scan showed the runner outside the group it was started to lead.
     get groupUsable() { return anchored !== false; },
     row(pid) { return latest.get(pid) || null; },
@@ -340,7 +410,8 @@ function createOwnership({ guardPid, helperPids = [], runnerPid }) {
     readFailure() {
       if (runnerProblem) return { pid: runnerPid, ...runnerProblem };
       for (const [pid, entry] of unread) {
-        if (entry.errno !== ESRCH || entry.samples > UNREADABLE_SAMPLES) return { pid, problem: 'unreadable', ...entry };
+        if (entry.allowed) continue;
+        if (entry.errno !== ESRCH || entry.ending > UNREADABLE_SAMPLES) return { pid, problem: 'unreadable', errno: entry.errno, samples: entry.samples };
       }
       return null;
     },
@@ -356,9 +427,16 @@ function createOwnership({ guardPid, helperPids = [], runnerPid }) {
       }
       const next = new Map();
       const queue = [];
+      // Pids whose place in the run this very scan shows: the runner, a process
+      // identified before, a member of the runner's group, or something one of
+      // those started. A process kept only because it was in the run a moment
+      // ago is in the run, but not in this set.
+      const shownInRun = new Set();
+      let carrying = false;
       const adopt = row => {
         if (!row || row.pid <= 1 || row.pid === guardPid || helpers.has(row.pid) || next.has(row.pid)) return;
         next.set(row.pid, row);
+        if (!carrying) shownInRun.add(row.pid);
         queue.push(row);
       };
       // Started by a process of the run, wherever it went afterwards.
@@ -410,18 +488,44 @@ function createOwnership({ guardPid, helperPids = [], runnerPid }) {
       descend();
       // In the run a moment ago and unreadable now. It cannot be shown to be
       // the same process, and it must not be quietly dropped: it stays, counted
-      // as a process the guard cannot read.
+      // as a process the guard cannot read. One that has ended stays too, for
+      // what it started: a scan is not one instant, and a child read while its
+      // parent was alive may have nothing else left that ties it to the run.
+      carrying = true;
       for (const row of rows) {
-        if (before.has(row.pid) && !isIdentified(row) && !hasEnded(row)) adopt(row);
+        if (before.has(row.pid) && !isIdentified(row)) adopt(row);
       }
       descend();
+      const time = now();
+      let allowed = 0;
       for (const pid of [...unread.keys()]) if (!next.has(pid)) unread.delete(pid);
       for (const row of next.values()) {
-        if (isIdentified(row)) identified.set(row.pid, row.start);
+        // Never learned from a process that has ended: its start time and its
+        // state come from two reads, and only a live process is worth knowing again.
+        if (isIdentified(row) && !hasEnded(row)) identified.set(row.pid, row.start);
         if (hasEnded(row) || (isIdentified(row) && row.infoError === 0)) {
           unread.delete(row.pid);
-        } else {
-          unread.set(row.pid, { errno: row.usageError || row.infoError, samples: (unread.get(row.pid)?.samples || 0) + 1 });
+          continue;
+        }
+        const errno = row.usageError || row.infoError;
+        const earlier = unread.get(row.pid) || { samples: 0, since: time, ending: 0 };
+        const entry = { errno, samples: earlier.samples + 1, since: earlier.since, ending: errno === ESRCH ? earlier.ending + 1 : 0, allowed: false };
+        unread.set(row.pid, entry);
+        // The system tool (see the header). Every condition is read from this
+        // scan; a remembered pid is not enough, and neither is the runner's pid.
+        const isTool = row.pid !== runnerPid && shownInRun.has(row.pid)
+          && row.infoError === 0 && row.usageError === EPERM && row.path === SYSTEM_TOOL.path
+          && row.ruid === guardUid && row.uid === SYSTEM_TOOL.effectiveUid && guardUid !== SYSTEM_TOOL.effectiveUid;
+        const withinBounds = entry.samples <= SYSTEM_TOOL.samples && time - entry.since <= SYSTEM_TOOL.milliseconds;
+        if (isTool && withinBounds && allowed < SYSTEM_TOOL.atOnce) {
+          allowed += 1;
+          entry.allowed = true;
+          // An estimate, because it cannot be measured. The row stays unidentified.
+          row.megabytes = SYSTEM_TOOL.assumedMegabytes;
+          row.assumed = true;
+          toolStats.samples += 1;
+          toolStats.longestSamples = Math.max(toolStats.longestSamples, entry.samples);
+          toolStats.longestMilliseconds = Math.max(toolStats.longestMilliseconds, time - entry.since);
         }
       }
       owned = next;
@@ -525,6 +629,18 @@ function createGuard({
   return { observe, stopRun, endRun, alive };
 }
 
+// What the run holds in one scan: all of it, and its largest process. A system
+// tool that was let through counts at its assumed size.
+function measureRun(owned) {
+  let total = 0;
+  let largest = null;
+  for (const row of owned.values()) {
+    total += row.megabytes;
+    if (largest === null || row.megabytes > largest.megabytes) largest = row;
+  }
+  return { total, largest };
+}
+
 function describeProcess(pid) {
   try {
     return execFileSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8', timeout: 1000 }).trim() || '(no command)';
@@ -608,7 +724,9 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
     process.on(name, () => { received.push(name); wake(); });
   }
 
-  const ownership = createOwnership({ guardPid: process.pid, helperPids: [sampler.pid, standby.pid], runnerPid: runner.pid });
+  const ownership = createOwnership({
+    guardPid: process.pid, guardUid: process.getuid(), helperPids: [sampler.pid, standby.pid], runnerPid: runner.pid,
+  });
   const guard = createGuard({
     ownership,
     runnerPid: runner.pid,
@@ -629,6 +747,7 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
   let reason = null; // 'exit' | 'signal' | 'memory' | 'deadline' | 'blind' | 'unreadable'
   let report = [];
   let offender = null;
+  let unreadablePid = null;
   const seconds = () => ((Date.now() - started) / 1000).toFixed(1);
 
   while (reason === null) {
@@ -647,12 +766,7 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
       }
     }
     if (owned) {
-      let total = 0;
-      let largest = null;
-      for (const row of owned.values()) {
-        total += row.megabytes;
-        if (largest === null || row.megabytes > largest.megabytes) largest = row;
-      }
+      const { total, largest } = measureRun(owned);
       if (largest) peak.process = Math.max(peak.process, largest.megabytes);
       peak.total = Math.max(peak.total, total);
       const unreadable = ownership.readFailure();
@@ -660,6 +774,7 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
       else if (received.length > 0) reason = 'signal';
       else if (unreadable) {
         reason = 'unreadable';
+        unreadablePid = unreadable.problem === 'unreadable' ? unreadable.pid : null;
         report = [{
           unreadable: `GUARD CANNOT READ PROCESS ${unreadable.pid} OF THE RUN after ${seconds()} s (errno ${unreadable.errno}, ${unreadable.samples} samples in a row). Its memory is unknown.`,
           missing: `GUARD CANNOT FIND THE TEST RUNNER after ${seconds()} s: process ${unreadable.pid} exists and ${unreadable.samples} scans in a row did not list it. The run's memory is unknown.`,
@@ -720,7 +835,9 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
       cleanup = await withSight(() => guard.stopRun({
         onFrozen: frozen => {
           if (offender) report.push(`  ${describeProcess(offender)}`);
+          if (unreadablePid) report.push(`  ${describeProcess(unreadablePid)}`);
           offender = null;
+          unreadablePid = null;
           report.push(`Stopping the test run (${frozen.length} processes).`);
         },
       }));
@@ -771,17 +888,21 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
   if (!confirmed) {
     // Whatever the tests said, a run whose processes may still be there is a failure of the guard.
     if (exitCode !== EXIT_GUARD_FAILURE) report.push(`Exit status ${EXIT_GUARD_FAILURE} replaces ${exitCode}.`);
-    report.push('Not every process of the run is confirmed gone.');
+    report.push('Not every process of the run is confirmed to have ended.');
     exitCode = EXIT_GUARD_FAILURE;
   } else if (reason !== 'exit' || leftovers > 0) {
-    report.push('Every process of the run is gone.');
+    report.push('Every process of the run has ended.');
   }
   if (reason === 'memory') {
     report.push('A test that needs this much memory is almost always a bug: rerun the file with --test-name-pattern to find the test, or pass a higher limit if the need is real.');
   }
   if (report.length > 0) process.stderr.write(`\n${report.map(line => `run-tests: ${line}`).join('\n')}\n`);
+  const { toolStats } = ownership;
   say(`memory guard: ${samples} samples, peak ${formatSize(peak.process)} in one process and ${formatSize(peak.total)} in total `
-    + `(limits ${formatSize(limits.process)}, ${formatSize(limits.total)}, ${limits.deadlineSeconds} s)`);
+    + `(limits ${formatSize(limits.process)}, ${formatSize(limits.total)}, ${limits.deadlineSeconds} s)`
+    + (toolStats.samples === 0 ? '' : `; these figures include an assumed ${SYSTEM_TOOL.assumedMegabytes} MB, not a measurement, for each `
+      + `${SYSTEM_TOOL.path} the guard could not read (let through ${toolStats.samples} times, at most ${toolStats.longestSamples} samples in a row `
+      + `and ${(toolStats.longestMilliseconds / 1000).toFixed(2)} s for any one)`));
   return exitCode;
 }
 
@@ -802,6 +923,7 @@ module.exports = {
   parseRow,
   createOwnership,
   createGuard,
+  measureRun,
   UsageError,
   TIMING,
   DEFAULT_PROCESS_LIMIT_MB,
@@ -813,4 +935,6 @@ module.exports = {
   EXIT_GUARD_FAILURE,
   ZOMBIE,
   ESRCH,
+  EPERM,
+  SYSTEM_TOOL,
 };
