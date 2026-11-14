@@ -46,16 +46,22 @@
 // start time again and signals in the next system call. One kind of signal
 // this process sends itself: to the runner's group by its number alone, only
 // while it has not collected the runner, so that the number cannot have passed
-// to anyone else. That is how the group is reached when none of its members
-// can be identified, when no sampler works, and when the guard itself goes
-// down.
+// to anyone else. That is how the group is reached when the sampler's group
+// signal is not confirmed as sent (no member of the group can be identified,
+// or the member's check does not hold), when no sampler works, and when the
+// guard itself goes down.
 // The same cleanup runs after a signal (once the run has had a few seconds to
 // stop by itself) and for anything a finished run leaves behind.
 //
 // When it gives up on a run. It does not let a run continue that it cannot
 // watch: no answer from the sampler for three seconds, or a process of the run
 // whose start time and memory cannot be read, the test runner itself included
-// from the first scan on. It stops the run and exits 125. That also holds
+// from the first scan on. It stops the run and exits 125. One allowance: a
+// process of the run for which the system answers "no such process", which
+// is how a process reads while it is ending or when it is collected between
+// two of the sampler's reads, is given three samples in a row before that
+// counts, and so is a runner that a scan does not list. A process whose
+// usage is denied gets no such allowance. All of that also holds
 // when the same scan shows that the run has just ended by itself or that a
 // signal has arrived, and for the one scan the guard makes right after a run
 // has ended: a run that was not watched to its end does not get to report its
