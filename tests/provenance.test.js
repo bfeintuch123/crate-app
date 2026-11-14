@@ -1,5 +1,5 @@
 const test = require('node:test');
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 
 const {
   PROVENANCE_SCHEMA_VERSION,

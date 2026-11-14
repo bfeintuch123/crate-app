@@ -1,6 +1,6 @@
 'use strict';
 const { test } = require('node:test');
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const path = require('node:path');
 const { AccountSession, parseCallback } = require('../account-session');
 const { loadAccountConfig, CALLBACK, CALLBACK_SCHEME } = require('../account-config');

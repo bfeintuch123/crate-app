@@ -4,7 +4,7 @@
 // function and its identity helpers run against a synthetic in-memory disk.
 // No Electron, store, producer app or real project data is loaded.
 const test = require('node:test');
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');

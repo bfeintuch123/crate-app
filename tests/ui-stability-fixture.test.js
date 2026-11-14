@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('node:test');
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const { createUiStabilityFixture } = require('./ui-stability-fixture');
 
 test('UI stability fixture reproduces the large Review Assets shape with synthetic data', () => {

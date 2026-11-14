@@ -3,7 +3,7 @@
 // Execute only the production measurement block in a closed fake environment.
 // No Electron, child_process, JXA, AppKit, application, or native probe is loaded.
 const test = require('node:test');
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');

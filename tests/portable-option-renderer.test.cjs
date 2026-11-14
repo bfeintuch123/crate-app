@@ -1,5 +1,5 @@
 'use strict';
-const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),{createRequire}=require('node:module');
+const test=require('node:test'),assert=require('./bounded-assert'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),{createRequire}=require('node:module');
 const repo=path.resolve(__dirname,'..'),helper=path.join(repo,'tests/renderer-figma-scope.test.js'),req=createRequire(helper),noop=()=>{};noop.skip=noop;noop.todo=noop;
 const c={require:n=>n==='node:test'?noop:req(n),__dirname:path.dirname(helper),console,setTimeout,clearTimeout,process,Buffer};vm.createContext(c);vm.runInContext(fs.readFileSync(helper,'utf8'),c,{filename:helper});
 function fixture(updateSetting){const f=c.createInteractiveRendererDom(),project={id:'synthetic-portable-ui',name:'Portable UI',files:[]};const renderer=c.loadRendererHelpers(f.document,{crate:{updateSetting,preparePackageReview:async()=>review(true,'new-token'),getProjects:async()=>[project]}});renderer.testProject=project;vm.runInContext("state.projects=[testProject];state.selectedProjectId=testProject.id;state.settings={packagePortablePictures:false};",renderer);return {...f,renderer,project};}

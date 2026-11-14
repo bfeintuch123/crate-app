@@ -210,7 +210,7 @@ implementation
 Patch drafted for live-app Automation breadcrumbs; tests are passing locally.
 
 ## Exact Next Prompt
-Use `.codex/playbooks/clawpatch-fix.md` on branch `fix/v2.8-live-app-automation-diagnostics`. Review the diff first, verify the task is still needed, then run `node --test tests/provenance-dual-write.test.js` and `git diff --check`. Do not commit until Bryant approves.
+Use `.codex/playbooks/clawpatch-fix.md` on branch `fix/v2.8-live-app-automation-diagnostics`. Review the diff first, verify the task is still needed, then run `node scripts/run-tests.js tests/provenance-dual-write.test.js` and `git diff --check`. Do not commit until Bryant approves.
 ```
 
 ### /handoff review

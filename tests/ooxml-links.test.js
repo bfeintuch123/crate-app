@@ -1,5 +1,5 @@
 'use strict';
-const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path'),cp=require('node:child_process');
+const test=require('node:test'),assert=require('./bounded-assert'),fs=require('node:fs'),os=require('node:os'),path=require('node:path'),cp=require('node:child_process');
 const {inspectLinks,rewriteLinks,resolveLocalTarget,relationshipParts,readArchive}=require('../parsers/ooxml-links');
 const NS='http://schemas.openxmlformats.org/package/2006/relationships',TYPE='http://schemas.openxmlformats.org/officeDocument/2006/relationships/image';
 function archive(t,target,extra=''){

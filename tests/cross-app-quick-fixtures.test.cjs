@@ -2,7 +2,7 @@
 // Run with CRATE_SOURCE=/absolute/source node --test this-file.
 // No mocks: production parser registry, unzip, gzip, ag-psd reader/writer and filesystem.
 const test = require('node:test');
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');

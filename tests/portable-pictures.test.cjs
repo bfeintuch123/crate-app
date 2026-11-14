@@ -1,5 +1,5 @@
 'use strict';
-const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),cp=require('node:child_process');
+const test=require('node:test'),assert=require('./bounded-assert'),fs=require('node:fs'),path=require('node:path'),cp=require('node:child_process');
 const {rewriteLinks,readArchive,inspectLinks}=require('../parsers/ooxml-links');
 const PNG=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==','base64');
 const RN='http://schemas.openxmlformats.org/package/2006/relationships',ON='http://schemas.openxmlformats.org/officeDocument/2006/relationships',AN='http://schemas.openxmlformats.org/drawingml/2006/main',PN='http://schemas.openxmlformats.org/presentationml/2006/main';

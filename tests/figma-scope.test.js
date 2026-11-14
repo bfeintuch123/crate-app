@@ -1,5 +1,5 @@
 const test = require('node:test');
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const Module = require('node:module');
 
 const { FigmaParser, parseFigmaRetryAfterMs } = require('../parsers/figma');

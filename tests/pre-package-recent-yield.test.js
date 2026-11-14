@@ -1,7 +1,7 @@
 'use strict';
 // The complete production pre-package handler, real owned filesystem fixtures,
 // modeled OS metadata results and command timeout limits. No deadline is changed.
-const fs = require('node:fs'), path = require('node:path'), Module = require('node:module'), assert = require('node:assert/strict');
+const fs = require('node:fs'), path = require('node:path'), Module = require('node:module'), assert = require('./bounded-assert');
 const root = process.env.CRATE_DIAGNOSTIC_SOURCE_ROOT || path.resolve(__dirname,'..');
 assert.ok(root && path.isAbsolute(root));
 const entry = path.join(root, 'tests/provenance-dual-write.test.js');

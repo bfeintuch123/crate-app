@@ -1,6 +1,6 @@
 'use strict';
 const test = require('node:test');
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const { createWorkingSourceWitnessTracker, createKeynoteWitnessObservation } = require('../parsers/working-source-witness');
 const doc = (handle = 'doc-1', file = '/synthetic/A.key', extra = {}) => ({ id: handle, file, modified: false, current: true, ...extra });
 const observe = (sequence, docs = [doc()], extra = {}) => createKeynoteWitnessObservation({

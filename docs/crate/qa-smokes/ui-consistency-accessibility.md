@@ -30,7 +30,7 @@ Do not create a new QA-only production path or dependency.
 Run the exact-head equivalents of:
 
 ```sh
-node --test --test-concurrency=1 \
+node scripts/run-tests.js --test-concurrency=1 \
   tests/ui-consistency-accessibility.test.js \
   tests/ui-consistency-keyboard-contract.test.js \
   tests/ui-consistency-keyboard-runtime.test.js \
@@ -45,7 +45,7 @@ git diff --check
 Run the complete serial source suite in the approved lockfile-identical environment:
 
 ```sh
-node --test --test-concurrency=1 tests/*.test.js
+node scripts/run-tests.js --test-concurrency=1 tests/*.test.js
 ```
 
 Record exact commands, Node and Electron versions, exit codes, pass/fail/skip counts, and durations. Do not change `package.json` or `package-lock.json`.

@@ -1,6 +1,6 @@
 'use strict';
 
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const fs = require('node:fs');
 const path = require('node:path');
 const { inflateSync } = require('node:zlib');

@@ -3,7 +3,7 @@
 // or a per-font licence confirmation there. A font a document merely links is
 // never copied by Quick Package; it is reported instead. Fonts are synthetic.
 const test = require('node:test');
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');

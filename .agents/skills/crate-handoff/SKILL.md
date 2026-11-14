@@ -101,7 +101,7 @@ Allowed anchors include approved QA root paths, approved QA fixture names, publi
 
 ## Variant Notes
 
-- Implementation: include bug, intended behavior, touched files, tests, current diff, and no-commit status. Example: "continue `fix/v2.8-live-app-automation-diagnostics`; rerun `node --test tests/provenance-dual-write.test.js`."
+- Implementation: include bug, intended behavior, touched files, tests, current diff, and no-commit status. Example: "continue `fix/v2.8-live-app-automation-diagnostics`; rerun `node scripts/run-tests.js tests/provenance-dual-write.test.js`."
 - Review: include PR URL, base, changed files, checks already run, findings, and requested review stance. Example: "review PR #79 for release blockers before merge."
 - Merge: include PR URL, base, mergeability, required checks, unresolved comments, and explicit no-merge-without-Bryant rule. Example: "PR #79 targets `v2.4.x`; verify checks before asking Bryant for merge approval."
 - Release: include target version, gate status, artifact status, tag/release state, signing/notary blockers, and public-site prohibitions. Example: "continue QA prerelease `v2.8.0-qa.18`; do not update `get-crate.com`."

@@ -1,5 +1,5 @@
 'use strict';
-const test = require('node:test'); const assert = require('node:assert/strict');
+const test = require('node:test'); const assert = require('./bounded-assert');
 const { createAccountProvider } = require('../account-provider');
 const config={issuer:'https://project.supabase.co/auth/v1',origin:'https://accounts.example.test',clientId:'test-client',publicKey:'sb_publishable_synthetic_test_key_123',redirectUri:'https://accounts.example.test/auth/desktop/callback'};
 test('real signature verification rejects wrong issuer, audience, client, nonce, subject and expiry',async()=>{

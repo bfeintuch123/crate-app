@@ -153,11 +153,11 @@ node -e "const fs=require('fs'); const p='<manifest>'; const m=JSON.parse(fs.rea
 Run relevant existing tests only when Bryant asks for verification:
 
 ```sh
-node --test tests/figma-scope.test.js
-node --test tests/figma-link-per-project.test.js
-node --test tests/psd-embedded-safety.test.js
-node --test tests/provenance.test.js
-node --test tests/provenance-dual-write.test.js
+node scripts/run-tests.js tests/figma-scope.test.js
+node scripts/run-tests.js tests/figma-link-per-project.test.js
+node scripts/run-tests.js tests/psd-embedded-safety.test.js
+node scripts/run-tests.js tests/provenance.test.js
+node scripts/run-tests.js tests/provenance-dual-write.test.js
 ```
 
 ## Approval Gates

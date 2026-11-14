@@ -1,6 +1,6 @@
 'use strict';
 
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const { fork } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');

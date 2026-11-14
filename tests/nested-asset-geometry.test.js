@@ -3,7 +3,7 @@
 // Real Chromium geometry over production HTML/CSS/JS, with synthetic IPC and
 // private temporary browser profiles. This does not launch Crate or use its data.
 const test = require('node:test');
-const assert = require('node:assert/strict');
+const assert = require('./bounded-assert');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');

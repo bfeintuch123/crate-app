@@ -1,5 +1,5 @@
 'use strict';
-const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path'),cp=require('node:child_process');
+const test=require('node:test'),assert=require('./bounded-assert'),fs=require('node:fs'),os=require('node:os'),path=require('node:path'),cp=require('node:child_process');
 const {packageMasterFile}=require('../parsers');
 const {inspectLinks,readArchive}=require('../parsers/ooxml-links');
 function fixture(t,targets){
