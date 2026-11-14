@@ -26,7 +26,7 @@ Never use `main` as the PR base for Crate release work unless Bryant explicitly 
 ## Work Ownership and Review
 - Continue the current task with its existing writer, branch or worktree, and authorization. Do not interrupt or reconfigure running work.
 - Keep one repository writer per task. Before editing, the writer records a concise plan (scope and non-goals, base and files, ordered steps, precise behavior or UI specifications, invariants and risks, tests and acceptance criteria, open decisions), verifies its assumptions against the actual source, and returns substantial design changes or unsafe instructions to Bryant. Before presenting the result, the writer checks the actual output against that plan. This is a self-check, never independent review.
-- Independent reviews run in fresh, distinct, read-only sessions that did not plan, write, or confirm the change. Give each reviewer the same packet (task, acceptance criteria, exact base and candidate, relevant sources) and record the model actually used, evidence inspected, tests run, and limitations. Bryant chooses reviewer models per task; if a required reviewer is unavailable, stop and report rather than substituting silently.
+- Independent reviews run at high reasoning effort or higher, in fresh, distinct, read-only sessions that did not plan, write, or confirm the change. Give each reviewer the same packet (task, acceptance criteria, exact base and candidate, relevant sources) and record the model actually used, evidence inspected, tests run, and limitations. Bryant chooses reviewer models per task; if a required reviewer is unavailable, stop and report rather than substituting silently.
 - Approvals are action-specific. One bounded approval covers the scoped implementation, focused tests, and the required correction loop. Commits, pushes, PRs, ready-for-review, merges, releases, signing, installation, deployment, and credential actions each keep their own authorization.
 
 ## Major PR Routing
@@ -40,6 +40,7 @@ Never use `main` as the PR base for Crate release work unless Bryant explicitly 
 
 - Spawn new coding threads in T3 Code. Cloud environments remain permitted.
 - Use Jenna's Mac only for running tests. Do not spawn coding or implementation threads there.
+- The guarded test suite needs macOS (see Running Tests). Run it on a Mac, not in a non-macOS cloud environment.
 
 ## Tool Roles
 Use T3 Code or a cloud environment for:
@@ -78,7 +79,7 @@ Use ChatGPT app for:
 ## Playbooks
 Reusable Crate workflow playbooks live in `.codex/playbooks/`.
 
-Matt Pocock's shared skills drive routine workflow (see Agent skills). `.codex/ROUTER.md`, the `crate-router` skill, the ops layer, and the playbooks below remain reference files for Crate-specific procedures. Select a playbook when its procedure is needed; never run it as a second routine controller beside Matt's skills.
+Matt Pocock's shared skills drive routine workflow (see Agent skills). `.codex/ROUTER.md`, the `crate-router` skill, the ops layer, and the playbooks below remain reference files for Crate-specific procedures. Select a playbook when its procedure is needed; never run it as a second routine controller beside Matt's skills. Where a playbook, `.codex/ROUTER.md`, the `crate-router` skill, or an ops-layer file conflicts with this file on reviewer count or model names, mandatory standing-order or taskflow routing, repository paths, or approval gates, this file controls. Never weaken a gate stated here.
 
 Supporting workflow references:
 - `WORKSPACE.md` maps crate-app, crate-web, and mission-control boundaries.
@@ -131,7 +132,7 @@ When using a playbook, state which playbook is active, confirm the current branc
 
 ## Ops Layer
 
-The ops layer (`.codex/ops/`, taskflows, state ledgers, `.codex/tools/crate_doctor.py`, and the proof-bundle template) remains available for Crate-specific procedures. Use it when a selected playbook or the task requires it, for example `python3 .codex/tools/crate_doctor.py` before release, deploy, long-running QA, or external-control work. It does not route or gate routine work.
+The ops layer (`.codex/ops/`, taskflows, state ledgers, `.codex/tools/crate_doctor.py`, and the proof-bundle template) remains available for Crate-specific procedures. Use it when a selected playbook or the task requires it, for example `CRATE_REPO=<this checkout> python3 .codex/tools/crate_doctor.py` before release, deploy, long-running QA, or external-control work. It does not route or gate routine work.
 
 ## PR Review Rules
 Before merge:
@@ -226,7 +227,7 @@ Always report:
 
 ### Workflow
 
-Matt Pocock's shared skills drive routine workflow. They live in Bryant's Home repo at `~/Documents/Codex/T3-projects/agent-home/skills/mattpocock/` and some are linked natively for Claude and Codex. Follow each skill's invocation requirements: a named-only skill runs only when Bryant names it, read from that path if your tool does not list it. Each task has one controller; the old router, ops layer, and playbooks are references, not a parallel controller.
+Matt Pocock's shared skills drive routine workflow. They live in Bryant's Home repo at `~/Documents/Codex/T3-projects/agent-home/skills/mattpocock/` and some are linked natively for Claude and Codex. Follow each skill's invocation requirements. A named-only skill (frontmatter `disable-model-invocation: true`) runs only when Bryant names it. If your tool does not list a skill you need, read its `SKILL.md` from that path. If the path is unavailable (for example in a cloud environment), say so and continue under this file's rules; do not improvise skill contents. Each task has one controller; the old router, ops layer, and playbooks are references, not a parallel controller.
 
 Imported skill instructions never override this file. Commits, branch resets or merges, concurrent writers, publishing or closing issues, creating PRs, and ready transitions follow the task's authorized actions and the gates here. Ticket readiness does not authorize execution or merge. The code-review skill supplies standards and spec criteria; its subagents do not satisfy the independent-review requirement. Resolve ambiguous skill names by explicit path. The pr skill supplies PR-body guidance only.
 
@@ -245,6 +246,6 @@ authority.
 
 ### Domain docs
 
-Use a single-context layout: root `GLOSSARY.md` and `docs/adr/`.
+Use a single-context layout: root `GLOSSARY.md` and `docs/adr/` (created when needed).
 Read `docs/agents/domain.md`. Create domain documents lazily within authorized
 work, and preserve existing decision records.
