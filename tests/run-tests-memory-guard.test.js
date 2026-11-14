@@ -20,6 +20,7 @@ const descendants = path.join(fixtures, 'descendants.fixture.js');
 const faultyGuard = path.join(fixtures, 'faulty-guard.js');
 const systemPs = path.join(fixtures, 'system-ps.fixture.js');
 const uncollected = path.join(fixtures, 'uncollected.fixture.js');
+const endsWithChild = path.join(fixtures, 'ends-with-child.fixture.js');
 const samplerFile = path.join(root, 'scripts/run-tests-sampler.py');
 const samplerHarness = path.join(fixtures, 'sampler-harness.py');
 
@@ -1071,8 +1072,10 @@ test('a passing run that leaves a process the guard cannot identify is a guard f
   const result = await startGuard([descendants], { ...environment('leave'), CRATE_GUARD_FAULT: 'unreadable-after-run:detached' }, faultyGuard).done;
   assert.match(result.stdout, /^# pass 1$/m);
   assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+  // The first scan after the run's end already cannot read it, and says so; the run's own status does not stand.
+  assert.match(result.stderr, /run-tests: GUARD CANNOT READ PROCESS \d+ OF THE RUN after [\d.]+ s \(errno 1, 1 samples in a row\)\. Its memory is unknown\./);
+  assert.match(result.stderr, /run-tests: The test run had ended by then, with exit status 0\. Exit status 125 replaces it\./);
   assert.match(result.stderr, /run-tests: CLEANUP INCOMPLETE: 1 processes of the run could not be identified by start time and were left alone: \d+\./);
-  assert.match(result.stderr, /run-tests: Exit status 125 replaces 0\./);
   assert.match(result.stderr, /run-tests: Not every process of the run is confirmed to have ended\./);
   assert.equal(stillThere('detached'), true, 'a process that cannot be identified is not signalled');
   await allGone(treeRoles.filter(role => role !== 'detached' && role !== 'detached-child'));
@@ -1517,6 +1520,44 @@ test('a process that reads as the system ps and outlives the run outside its gro
   assert.doesNotMatch(result.stderr, /Every process of the run has ended/);
   // Not identified, so not signalled by pid: it is still there, and this test ends it.
   assert.equal(stillThere('detached'), true);
+  assert.equal(bystanderSurvived(), true);
+});
+
+// A scan that cannot read a process of the run does not lose its say because
+// the run ended, or a signal arrived, while its answer was on the way.
+for (const [fault, mode, what] of [
+  ['unreadable-then-gone:nested', 'brief', 'and that is gone before the guard looks again'],
+  ['unreadable-as-run-ends:nested', 'lasting', 'and that the run leaves behind'],
+  ['unreadable-once-after-run:nested', 'lasting', 'in the one scan right after the run has ended'],
+]) {
+  test(`a process the guard cannot read as the run ends, ${what}, turns a passing run into exit 125`, { timeout: 60000 }, async t => {
+    const { environment, allGone, bystanderSurvived } = scenario(t);
+    const result = await startGuard([endsWithChild], { ...environment(mode), CRATE_GUARD_FAULT: fault }, faultyGuard).done;
+    assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+    assert.match(result.stdout, /^ok 1 - passes while its child is still running$/m);
+    assert.match(result.stderr, /run-tests: GUARD CANNOT READ PROCESS \d+ OF THE RUN after [\d.]+ s \(errno 1, 1 samples in a row\)\. Its memory is unknown\./);
+    assert.match(result.stderr, /run-tests: The test run had ended by then, with exit status 0\. Exit status 125 replaces it\./);
+    assert.match(result.stderr, /run-tests: Stopping the test run \((\d) processes\)\.\nrun-tests: Every process of the run has ended\./);
+    assert.doesNotMatch(result.stderr, /left \d+ of its processes running/);
+    await allGone(['nested']);
+    assert.equal(bystanderSurvived(), true);
+  });
+}
+
+test('a process the guard cannot read, seen as a signal arrives, ends the run with exit 125 and not with the signal\'s status', { timeout: 60000 }, async t => {
+  const { environment, ready, allGone, bystanderSurvived } = scenario(t);
+  const run = startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'unreadable-as-signal-arrives:nested' }, faultyGuard);
+  await ready();
+  // By now the scan that could not read it is on its way to the guard, and stays there until the signal.
+  await new Promise(resolve => { setTimeout(resolve, 500); });
+  run.signal('SIGTERM');
+  const result = await run.done;
+  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+  assert.match(result.stderr, /run-tests: GUARD CANNOT READ PROCESS \d+ OF THE RUN after [\d.]+ s \(errno 1, 1 samples in a row\)\. Its memory is unknown\./);
+  assert.match(result.stderr, /run-tests: SIGTERM had arrived by then\. Exit status 125 replaces 143\./);
+  assert.doesNotMatch(result.stderr, /Received SIGTERM/);
+  assert.match(result.stderr, /run-tests: Every process of the run has ended\./);
+  await allGone([...treeRoles, 'ready']);
   assert.equal(bystanderSurvived(), true);
 });
 

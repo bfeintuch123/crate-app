@@ -49,7 +49,13 @@
 // When it gives up on a run. It does not let a run continue that it cannot
 // watch: no answer from the sampler for three seconds, or a process of the run
 // whose start time and memory cannot be read, the test runner itself included
-// from the first scan on. It stops the run and exits 125.
+// from the first scan on. It stops the run and exits 125. That also holds
+// when the same scan shows that the run has just ended by itself or that a
+// signal has arrived, and for the one scan the guard makes right after a run
+// has ended: a run that was not watched to its end does not get to report its
+// own result. While the guard is ending a run, its scans follow each other
+// too closely for "three samples" to mean anything; a process it cannot read
+// then counts only if it is still running at the end.
 //
 // The one exception is the system's own `ps`. Tests start it, and macOS
 // installs it set-uid root, so this user may not read its memory. A process is
@@ -750,6 +756,22 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
   let samples = 0;
   let lastGoodSample = Date.now();
   let reason = null; // 'exit' | 'signal' | 'memory' | 'deadline' | 'blind' | 'unreadable'
+  // What the guard reports when a scan shows a process of the run that it
+  // cannot read, and what that does to a result the run already has.
+  const notWatched = unreadable => {
+    unreadablePid = unreadable.problem === 'unreadable' ? unreadable.pid : null;
+    const lines = [{
+      unreadable: `GUARD CANNOT READ PROCESS ${unreadable.pid} OF THE RUN after ${seconds()} s (errno ${unreadable.errno}, ${unreadable.samples} samples in a row). Its memory is unknown.`,
+      missing: `GUARD CANNOT FIND THE TEST RUNNER after ${seconds()} s: process ${unreadable.pid} exists and ${unreadable.samples} scans in a row did not list it. The run's memory is unknown.`,
+      inconsistent: `GUARD CANNOT TRUST ITS READING OF THE TEST RUNNER after ${seconds()} s: process ${unreadable.pid} does not show as this guard's child, leading its own process group, with one start time.`,
+    }[unreadable.problem]];
+    if (runnerExit && !runnerExit.error) {
+      lines.push(`The test run had ended by then, with exit status ${runnerExit.code}. Exit status ${EXIT_GUARD_FAILURE} replaces it.`);
+    } else if (received.length > 0) {
+      lines.push(`${received[0]} had arrived by then. Exit status ${EXIT_GUARD_FAILURE} replaces ${128 + os.constants.signals[received[0]]}.`);
+    }
+    return lines;
+  };
   let report = [];
   let offender = null;
   let unreadablePid = null;
@@ -775,16 +797,15 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
       if (largest) peak.process = Math.max(peak.process, largest.megabytes);
       peak.total = Math.max(peak.total, total);
       const unreadable = ownership.readFailure();
-      if (runnerExit) reason = 'exit';
-      else if (received.length > 0) reason = 'signal';
-      else if (unreadable) {
+      // A process the guard could not read outranks whatever else this scan
+      // shows, the end of the run and a signal included.
+      if (unreadable) {
         reason = 'unreadable';
-        unreadablePid = unreadable.problem === 'unreadable' ? unreadable.pid : null;
-        report = [{
-          unreadable: `GUARD CANNOT READ PROCESS ${unreadable.pid} OF THE RUN after ${seconds()} s (errno ${unreadable.errno}, ${unreadable.samples} samples in a row). Its memory is unknown.`,
-          missing: `GUARD CANNOT FIND THE TEST RUNNER after ${seconds()} s: process ${unreadable.pid} exists and ${unreadable.samples} scans in a row did not list it. The run's memory is unknown.`,
-          inconsistent: `GUARD CANNOT TRUST ITS READING OF THE TEST RUNNER after ${seconds()} s: process ${unreadable.pid} does not show as this guard's child, leading its own process group, with one start time.`,
-        }[unreadable.problem]];
+        report = notWatched(unreadable);
+      } else if (runnerExit) {
+        reason = 'exit';
+      } else if (received.length > 0) {
+        reason = 'signal';
       } else if (largest && largest.megabytes > limits.process) {
         reason = 'memory';
         offender = largest.pid;
@@ -830,6 +851,13 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
       }
     }
   };
+  const announceStop = frozen => {
+    if (offender) report.push(`  ${describeProcess(offender)}`);
+    if (unreadablePid) report.push(`  ${describeProcess(unreadablePid)}`);
+    offender = null;
+    unreadablePid = null;
+    report.push(`Stopping the test run (${frozen.length} processes).`);
+  };
   let exitCode = EXIT_GUARD_FAILURE;
   let cleanup = { survivors: [], unverified: [] };
   let leftovers = 0;
@@ -837,15 +865,7 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
     if (reason === 'memory' || reason === 'deadline' || reason === 'unreadable') {
       if (reason === 'memory') exitCode = EXIT_MEMORY_LIMIT;
       if (reason === 'deadline') exitCode = EXIT_DEADLINE;
-      cleanup = await withSight(() => guard.stopRun({
-        onFrozen: frozen => {
-          if (offender) report.push(`  ${describeProcess(offender)}`);
-          if (unreadablePid) report.push(`  ${describeProcess(unreadablePid)}`);
-          offender = null;
-          unreadablePid = null;
-          report.push(`Stopping the test run (${frozen.length} processes).`);
-        },
-      }));
+      cleanup = await withSight(() => guard.stopRun({ onFrozen: announceStop }));
     } else if (reason === 'signal') {
       exitCode = 128 + os.constants.signals[received[0]];
       report = [`Received ${received[0]} after ${seconds()} s; ending the test run.`];
@@ -855,6 +875,14 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
       if (runnerExit.error) report = [`Could not start ${process.execPath}: ${runnerExit.error.message}.`];
       cleanup = await withSight(async () => {
         await guard.observe();
+        // The scan right after the end of the run is judged like every scan before it.
+        const unreadable = reason === 'exit' ? ownership.readFailure() : null;
+        if (unreadable) {
+          reason = 'unreadable';
+          exitCode = EXIT_GUARD_FAILURE;
+          report.push(...notWatched(unreadable));
+        }
+        if (reason === 'unreadable') return guard.stopRun({ onFrozen: announceStop });
         leftovers = guard.alive().length;
         if (leftovers === 0) return { survivors: [], unverified: [] };
         report.push(`The test run ended and left ${leftovers} of its processes running; ending them.`);
