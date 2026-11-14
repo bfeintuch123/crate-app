@@ -3,14 +3,14 @@
 ## Metadata
 
 - created: 2026-11-13
-- updated: 2026-11-13
+- updated: 2026-11-14
 - owner: Fable (writer for this branch), coordinated by Mack for Bryant
 - standing order: none selected yet; select one from `.codex/ops/standing-orders.md` on resume
 - repo: bfeintuch123/crate-app
 - branch: t3/test-memory-guard
 - base: v2.4.x at 885bb56 (after #327 and #328), brought in by a normal merge with no conflicts
-- mode: separate draft PR, not opened yet; merge, ready-for-review and release are not authorized
-- status: in progress
+- mode: separate draft PR #329 against v2.4.x (https://github.com/bfeintuch123/crate-app/pull/329); merge, ready-for-review, auto-merge and release are not authorized
+- status: waiting for the owner
 
 ## Goal
 
@@ -36,14 +36,14 @@ Forbidden:
 
 ## State
 
-- current phase: the correction round Bryant authorized is implemented as three local commits plus tests and this record, checked with bounded runs, and reviewed independently in two Opus 5.5 sessions that together read the whole change (approve for heavy checks; their required items are done). Next gate: the coordinator's heavy slot for the full suite.
-- last completed checkpoint: three guard commits on top of the merged base, unpushed (see "The `ps` blocker and what came of it")
-- next action: report "ready for heavy checks" on the exact head and wait for the coordinator. Then the full serial suite through the guard, push, draft PR, exact-head CI, and the independent final reviews.
-- blocker: none in the code. The heavy slot and every later gate belong to the coordinator and Bryant.
-- approval state: Bryant approved all three changes on 2026-11-13 ("Proceed"); no approval to merge, mark ready, enable auto-merge, or release
+- current phase: implemented, checked, pushed and reviewed. The full serial suite passed through the guard, the draft pull request #329 is open, protected CI passed, and both final independent reviews returned PASS WITH NOTES with no blocker. What is left is Bryant's: the decisions listed under "Still open", and the merge.
+- last completed checkpoint: the commit that carries this text. It changes records and comments only (this file, the header comments of `scripts/run-tests.js` and `tests/bounded-assert.js`, and the test section of AGENTS.md), to bring this record up to date and to correct statements the final reviews found inexact. No behavior, message, test, limit, deadline or timeout changes with it.
+- next action: none for the writer until Bryant decides. Protected CI has to pass on the commit that carries this text, like on every head.
+- blocker: none in the code.
+- approval state: Bryant approved the three guard changes and this records-and-comments correction. No approval to merge, mark ready, enable auto-merge, or release.
 - preferences applied: one writer, read-only reviewers, no concurrent heavy Mac tests, every run through the guard, pinned Node, live process preflight before each run
-- routing decision: major PR (shared test infrastructure and CI); needs exact-head protected CI and two independent read-only final reviews, each in a fresh session: Claude Opus 5.5 at high effort, which replaces Astra for this work on Bryant's instruction, and Claude Fable 5.2 at high effort
-- workflow eval suite/result: bounded checks only, see Evidence. No full suite on this base.
+- routing decision: major PR (shared test infrastructure and CI); exact-head protected CI and two independent read-only final reviews, each in a fresh session: Claude Opus 5.5 at high effort, which replaces Astra for this work on Bryant's instruction, and Claude Fable 5.2 at high effort
+- workflow eval suite/result: full serial suite through the guard at f686401, locally and on CI, see Evidence
 - outcome receipt: none
 
 ## The `ps` blocker and what came of it
@@ -74,10 +74,12 @@ Running the accommodation against real processes raised three questions that wer
 - [x] the guard copes with tests that start `ps`; ended processes are recognized; a read failure is not hidden by the end of a run (three commits, each approved by Bryant)
 - [x] verification: bounded checks of that work, including the guard's own tests under the guard
 - [x] independent read-only review of the implementation, before the full suite (Claude Opus 5.5 at f2d64e0: approve with required changes)
-- [ ] verification: full serial suite on the final head (heavy slot, coordinated; not run)
-- [ ] push and draft PR
-- [ ] exact-head CI
-- [ ] independent reviews: Astra high and Claude Fable 5.2 high, fresh read-only sessions
+- [x] verification: full serial suite through the guard at f686401, in the slot the coordinator granted (4340 tests, 4338 pass, 0 fail, 2 skipped)
+- [x] push and draft PR: #329 against v2.4.x, opened at f686401
+- [x] exact-head CI at f686401: passed on the first attempt (run 43554660920)
+- [x] independent final reviews at f686401, fresh read-only sessions: Claude Opus 5.5 high and Claude Fable 5.2 high, both PASS WITH NOTES
+- [ ] exact-head CI on the commit that carries this text (records and comments only)
+- [ ] Bryant's decisions under "Still open", and his approval to mark ready and to merge
 - [ ] REQUIRED post-merge acceptance on the exact merged commit (see below; not run)
 
 ## How the guard works
@@ -120,6 +122,8 @@ Bounded synthetic tests only. Allocators stop by themselves at 256 MB and let go
 | 2026-11-13 | Real set-uid tools the guard must still reject, run by themselves and not under an outer guard: `top`; a `ps` that cannot finish; nine `ps` at once | private log | 3 of 3: each run was stopped with exit 125 and confirmed ended, nothing was left running, and a process outside the run was untouched. |
 | 2026-11-13 | Focused files through the guard on the final commits: bounded assert, release policy, excluded-needs-review IPC, renderer Figma scope, working-file-choice IPC, working-source-recovery core and IPC, cross-app live pipeline, and the guard's own test file | private log | 791 of 791 pass, exit 0, 250 s; peak 329 MB in one process and 614 MB in total. A `ps` was let through 40 times, as many as for the guard's own test file alone. |
 | 2026-11-14 | Intermittent failure reported by the implementation review: the guard's test file rerun with full output; then the one failing test alone, 60 runs before and 60 after the fix | private logs | 16 passes, then 1 failure in the per-process limit test ("stopped at 128 MB"); that test alone failed 1 of 60 before the fix, with the same message, and 0 of 60 after. |
+| 2026-11-14 | Full serial suite through the guard at f686401, the CI command (`node scripts/run-tests.js --deadline-seconds=2580 --test-concurrency=1 tests/*.test.js`), pinned Node 22.23.1 and Chrome, from a non-hidden workspace after a live process preflight | private log | Exit 0. 4340 tests, 4338 pass, 0 fail, 2 skipped (one needs an Electron ZIP supplied explicitly, one is CI-only). 19 min 48 s. Guard summary: 20600 samples, peak 452 MB in one process and 1.3 GB in total; a `ps` let through 43 times. Nothing left running. |
+| 2026-11-14 | Protected CI on f686401, first attempt | https://github.com/bfeintuch123/crate-app/actions/runs/43554660920 | Passed. Suite step: 4340 tests, 4338 pass, 0 fail, 2 skipped, 37 min 6 s. Guard summary: 37392 samples, peak 487 MB in one process and 1.1 GB in total. The base ran 4254 tests; the 86 more are the 19 bounded-assert and 67 guard tests. First run of the guard on the CI runner. |
 
 Real-process scenarios covered by the tests: pass and fail passed through; per-process and total limit; a memory stop that takes nested, detached and adopted processes with it; leftovers of a finished run, including one that ignores SIGTERM; SIGTERM, SIGINT and a second signal; deadline; both samplers killed and both frozen; a leftover that cannot be ended and one that cannot be identified, both turning a passing run into exit 125; a process of the run that cannot be read stopping the run; a runner that cannot be read stopped at the first scan before the fixture starts anything; the sampler in use failing with no new one available, where the standby stops the whole run; no sampler working at all, where only the runner's group is ended; bad options; a run that calls `ps` over and over, several at once, and with a parent too busy to collect them; a process that reads as `ps` but does not end, and one that reads as another set-uid tool; an ordinary child and a `ps` that end and wait to be collected; a process that cannot be read just as the run ends, as a signal arrives, and in the scan after the run. In each scenario that starts one, a process outside the guarded run survives.
 
@@ -138,6 +142,9 @@ At most three correction cycles.
 - The intermittent failure, found: the older test "a process that passes the per-process limit is stopped, named, and the run confirmed gone", and not a false stop. The guard had stopped the process correctly, just above its limit; its report rounded the size to the nearest megabyte and so could read "reached 128 MB (limit 128 MB per process)", and the test insists on a reported size above the limit. Seen again on the 17th of the writer's reruns of the whole file and once in 60 runs of that test alone, each time as "stopped at 128 MB". Fixed in the guard's report and not in the test: a size that passed a limit is shown in whole megabytes, rounded up, next to the limit in megabytes. A new test pins that. Afterwards 0 failures in 60 runs of the limit tests. Blind repetition was capped at that one batch, at the coordinator's instruction.
 - The first Opus 5.5 review did not read four fixtures in full or the older tests. A second, narrow Opus 5.5 session at 4c0618e, read-only and without running anything, read exactly those (the four fixtures; test lines 645 to 1071 and 1571 to the end) and the commit made after f2d64e0: GAPS CLOSED, APPROVE FOR HEAVY CHECKS. It found every fixture finite by itself, nothing weakened in the older tests, the diagnosis of the intermittent failure sound and its fix confined to the two limit messages. Required before the final reviews: the standalone validation of real rejections takes "nothing is left running" from `pgrep -f`, which it reasoned might not see the arguments of a tool that runs as root, so the check might not be able to fail. Checked by hand: on this system `pgrep -f` does see a running set-uid `ps` and `top`. The validation now proves that itself first, with a real `ps` and a real `top`, before it relies on the check; 4 of 4. Notes left as they are: the summary line still rounds to the nearest megabyte and can read "peak 128 MB" next to "reached 129 MB"; the new formatting test pins the helper and not the two messages; a blocked `ps` in the fixtures relies on a process listing larger than a pipe.
 - The message of the first of the three commits repeats the wrong count of test files that start `ps`; see the correction above.
+- Final reviews at f686401 (2026-11-14), each a fresh read-only session that ran nothing. Claude Opus 5.5: PASS WITH NOTES. It read both scripts, the bounded assert, the policy test, commit f686401, the workflow with its pins and the PR description in full, and checked by script that the assert import is the only change in each of the 95 switched test files and that no test was removed; it skimmed the guard's test file and did not read the sampler harness, the fault injector or most fixtures. Claude Fable 5.2: PASS WITH NOTES. It read both scripts, both test files of this change, the fixtures except the sampler harness and the fault injector (skimmed), the workflow, this record and the PR description in full, and made the same check of the import switch. Neither found a blocker, a weakened test, or a way to signal an unrelated process; neither reproduced the root cause, which is what the post-merge acceptance is for.
+- What those reviews asked for and what was done. Required by one of them: bring this record up to date (done in the commit that carries this text). Inexact statements, corrected in the same commit, comments and wording only: the header said every signal is sent by the sampler, while the runner's group is also signalled by its number by the guard itself while it holds the runner; it did not list a child left in the runner's group whose parent and the runner both end before the next sample; it said processes outside the group are left running when no sampler works, while they can be left frozen; AGENTS.md said the bounded assert passes and fails exactly as Node's, while `partialDeepStrictEqual` refuses very large operands; neither said plainly that a guarded run is to be ended with SIGINT or SIGTERM and not SIGKILL, or that there is no supported way to run these tests off macOS. Not done, because they are changes of behavior or of pinned values and are Bryant's to decide: see "Still open".
+- A narrow follow-up by the Fable reviewer reads the two files it had only skimmed (the sampler harness and the fault injector) and the commit that carries this text, and explains the three-sample grace from the source for Bryant. Its result is recorded in the pull request, not here.
 - Fallback evaluated for the total-failure case and not built: identifying detached processes with `ps` start times. It needs a second identity kept for every process, has one-second resolution and a millisecond gap before each signal, and fails in the same condition as starting a new sampler (no new process can be started). Nothing in Node can read another process's start time.
 
 ## Limits of the guard, measured where possible
@@ -154,6 +161,11 @@ At most three correction cycles.
 - An ended process is recognized by the process table saying so, read in a separate call from its usage. The reads of one row are not one instant. A pid that passes to a new process between them can give a row that mixes two processes for one sample; the order of the reads and the rule that an ended row teaches no identity keep that from making a live process look ended for longer, or from making a stranger a target.
 - While the guard is ending a run, a process it cannot read counts only if it is still running at the end.
 - Cleanup confirms that no process of the run is seen running or unverified any more. An ended process may still wait for its parent to collect it.
+- A child that stays in the runner's group, loses its parent, and is first scanned when the runner has already ended is missed: the group counts only in a scan that also shows the runner.
+- The run has its own session. A SIGKILL sent to the guard's process group kills the guard and its samplers and leaves the run going, unwatched, where the same signal would have ended a plain `node --test`. A guarded run is ended with SIGINT, SIGTERM, SIGHUP or SIGQUIT to the guard.
+- When no sampler works after the freeze has begun, processes outside the runner's group can be left frozen; the report calls them "NOT touched".
+- After a stop, a process that is collected in the middle of the last scan can be left as "could not be identified" and turn exit 137 or 124 into 125, with nothing running.
+- There is no supported way to run these tests off macOS or without a Python 3: the guard refuses with exit 125, and AGENTS.md forbids calling `node --test` directly.
 - Compressed memory is read through footprint at every sample. Not tested under real memory pressure.
 - macOS only. Needs `/usr/bin/python3` or `python3` on the path; without a working sampler the guard refuses to run the tests.
 - A runner that is unreadable only in the way an ending process is, or missing from scans, is tolerated for three samples (about 0.15 s) before the run is stopped.
@@ -167,20 +179,22 @@ At most three correction cycles.
 - `assert.Assert` is not handed out, and a test forbids `t.assert`, direct imports of `node:assert`, and hand-built AssertionErrors in test files.
 - Not bounded in time for a comparison Node itself cannot finish quickly: the comparison is Node's own.
 - The search for the first difference is limited to 64 levels, 50,000 comparisons and one second.
+- A raw ArrayBuffer, SharedArrayBuffer or DataView is not measured by its content; Node renders it as one long line. That cost is linear, not the runaway, and the guard stands behind it.
+- The import policy covers the test files directly under `tests/`. A few fixtures that run in child processes, and one worker body that is allowed by name, still import `node:assert`.
 
-Still open:
+Still open, all of it for Bryant:
 
-- The default deadline of 2400 s and the default limits were chosen from one full-suite run of the prototype and need confirming on the final head. CI passes `--deadline-seconds=2580`, just under the job's 45 minutes; the suite step took 35 min 47 s in the post-merge run on 885bb56.
-- The guard has not run this suite on CI yet. It needs `/usr/bin/python3` or `python3` on the runner.
+- CI time. On CI the suite used 2226 of the 2580 seconds the guard's deadline allows, and the job 37 min 42 s of its 45 minutes; before this change the same step took 35 min 47 s. Both final reviewers recommend raising the job timeout and the deadline together in an explicit change (about 60 minutes and about 3400 seconds, the deadline a few minutes under the timeout). Both values are pinned in `tests/release-artifact-policy.test.js`. Nothing was changed. Until it is, a slow runner or a few more tests can fail the required check with exit 124; that failure is loud and a rerun clears it.
+- The three-sample grace. A process of the run that the system lists but that answers "no such process", which is how a process reads while it is ending, is given three samples before the guard gives up on the run, and so is a runner that scans do not list. It is older than the `ps` round and is not one of the three exceptions Bryant accepted by name.
+- Whether to keep, as they are: the report text "NOT touched" for processes that can be frozen; the exit 125 after a stop when a process vanishes in the middle of the last scan; the `test:app-contents` script in package.json, which still calls `node --test` directly; the wall-clock bounds in some of the guard's tests; the unmeasured ArrayBuffer and DataView operands.
+- The default limits (2 GB, 4 GB, 40 minutes) fit the measured runs: 452 MB and 1.3 GB locally in 19 min 48 s, 487 MB and 1.1 GB on CI.
 
 ## Sequence from here
 
-1. Done: independent read-only review of the implementation (see Review record).
-2. Report "ready for heavy checks" on the head and wait for the coordinator. Then a live process preflight and the full serial suite through the guard, from a non-hidden workspace with the pinned Node and Chrome. Wait if another session's test, sampler or Chrome is active. Never signal a process another session started.
-3. Push, open a draft PR against v2.4.x, exact-head CI.
-4. Independent read-only reviews at that head, each in a fresh session: Claude Opus 5.5 high (in place of Astra, which Bryant ruled out for this work) and Claude Fable 5.2 high. This writer does not count as a reviewer. A finding that needs a fix goes to Bryant.
-5. Bryant's own approval for ready-for-review and for merge. Neither is authorized today.
-6. After a separately authorized merge: the post-merge acceptance below.
+1. Done: implementation review, heavy slot, full serial suite, push, draft PR #329, exact-head CI at f686401, both final reviews.
+2. Protected CI on the commit that carries this text.
+3. Bryant: the decisions under "Still open"; then ready-for-review and merge, which only he approves. Neither is authorized today.
+4. After a separately authorized merge: the post-merge acceptance below. It is required and has not been run.
 
 ## Required post-merge acceptance (Bryant, 2026-11-13)
 
@@ -220,5 +234,5 @@ Comparison to report: checks 2 and 3 side by side (after and before) for the fai
 Next exact action:
 
 ```text
-Read this taskflow, verify branch t3/test-memory-guard, its head and its working tree, and continue from "Sequence from here" at the first step that is not done. Do not push, open a PR or run a full suite before the implementation review and the coordinator's go. Do not run the post-merge acceptance before a separately authorized merge of this PR.
+Nothing is left for the writer before Bryant decides. Read "State" and "Still open". Verify branch t3/test-memory-guard, its head, its clean working tree, and that pull request #329 is still a draft with green CI on that head. Do not rerun the suite, push again, mark ready, merge or enable auto-merge without his word. If he asks for one of the open changes, make it as its own commit, wait for CI on the new head, and have it reviewed. After a separately authorized merge, run the post-merge acceptance in this file on the exact merged commit and report its measured results; until then list it as an open gate.
 ```

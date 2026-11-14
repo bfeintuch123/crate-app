@@ -41,8 +41,14 @@
 // processes behind its back. Then SIGKILL, and then it scans until every
 // process of the run has ended. A process it could not identify outside the
 // group is not signalled; if it is still running at the end, the guard says
-// so and exits 125. Every signal is sent by the sampler, which reads the
-// target's start time again and signals in the next system call.
+// so and exits 125. Signals to a single process, and to the group once one of
+// its members is identified, are sent by the sampler, which reads the target's
+// start time again and signals in the next system call. One kind of signal
+// this process sends itself: to the runner's group by its number alone, only
+// while it has not collected the runner, so that the number cannot have passed
+// to anyone else. That is how the group is reached when none of its members
+// can be identified, when no sampler works, and when the guard itself goes
+// down.
 // The same cleanup runs after a signal (once the run has had a few seconds to
 // stop by itself) and for anything a finished run leaves behind.
 //
@@ -89,8 +95,10 @@
 //   under load) plus the time to freeze it.
 // - Not able to see a process that never appears in a scan as part of the run:
 //   one that is started, leaves the runner's process group, and loses its
-//   parent, all between two samples. Such a process is not tracked, limited or
-//   cleaned up.
+//   parent, all between two samples. Or one that stays in the runner's group,
+//   loses its parent, and is first scanned when the runner has already ended:
+//   the group counts only in a scan that also shows the runner. Such a process
+//   is not tracked, limited or cleaned up.
 // - Not proof against pid reuse in the last instant. Between the sampler's
 //   check of a start time and its signal lie a few microseconds in which the
 //   target could end and its pid pass to another process. Nothing available to
@@ -114,11 +122,18 @@
 // - Not able to end the whole run when no sampler works any more (the one in
 //   use, the one standing by, and a newly started one all fail). It then kills
 //   the runner's process group, leaves whatever the run started outside that
-//   group running, lists it, and exits 125.
+//   group as it is, lists it, and exits 125. "As it is" is running, or frozen
+//   when the samplers failed after the freeze had begun; the report calls such
+//   processes "NOT touched" in both cases.
 // - Not a guard at all if it is itself killed with SIGKILL or frozen: the run
-//   then continues unwatched.
-// - macOS only. Elsewhere, or when the sampler cannot be started, it refuses
-//   to run the tests rather than run them unguarded.
+//   then continues unwatched. The run has its own session, so a SIGKILL sent
+//   to the guard's process group does not end the run either, as it would end
+//   a plain `node --test`. To end a guarded run, send the guard SIGINT,
+//   SIGTERM, SIGHUP or SIGQUIT: it then ends the run and cleans up.
+// - macOS only, and it needs a Python 3 for its sampler. Elsewhere, or when
+//   the sampler cannot be started, it refuses to run the tests rather than
+//   run them unguarded. There is no supported way to run these tests without
+//   it.
 //
 // Exit status: the test runner's own; or 137 when a memory limit was passed,
 // 124 when the deadline passed, 128+N after signal N; or 125 when the guard
@@ -910,8 +925,9 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
   } catch (error) {
     // No sampler works. Nothing can be matched by pid and start time any more,
     // so only the runner's process group can still be ended. Whatever the run
-    // started outside that group is left running: the guard is not able to
-    // stop the whole run in this case, and says so.
+    // started outside that group is left as it is (running, or frozen if the
+    // freeze had already reached it): the guard is not able to stop the whole
+    // run in this case, and says so.
     const outside = [...ownership.owned.values()].filter(row => !hasEnded(row) && !(row.infoError === 0 && row.pgid === runner.pid));
     report.push(`Cleanup could not be verified (${error.message}).`);
     report.push(signalGroupWhileHeld('SIGKILL')

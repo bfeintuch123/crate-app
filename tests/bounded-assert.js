@@ -14,7 +14,8 @@
 // two nodes allocated about 3 GB per second until the machine swapped. Large
 // Buffers and long strings hit the same path.
 //
-// Passing assertions are unaffected, and what passes or fails is unchanged. A
+// Passing assertions are unaffected, and what passes or fails is unchanged,
+// with the one exception named below for partialDeepStrictEqual. A
 // failing assertion still gets Node's own message and diff whenever both
 // operands are small enough to render. Larger operands fail with the same
 // AssertionError type and a compact description of the difference instead.
