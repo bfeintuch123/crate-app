@@ -72,6 +72,26 @@ async function rejected(t, mode, tool) {
   return { ...result, stoppedAfter: Number(seconds), samples: Number(samples) };
 }
 
+// The cases below take "nothing like the tool is running" from pgrep. That
+// means something only if pgrep can see such a tool when one is running, with
+// its arguments, although it runs as root.
+test('the check for leftover tools sees a running ps and a running top', { skip: !applies, timeout: 30000 }, async () => {
+  assert.deepEqual([running(STARTED.ps), running(STARTED.top)], [0, 0]);
+  const tools = [
+    spawn('/bin/ps', ['-axwwo', Array(16).fill('command=').join(',')], { stdio: ['ignore', 'pipe', 'ignore'] }),
+    spawn('/usr/bin/top', ['-l', '3', '-s', '1'], { stdio: 'ignore' }),
+  ];
+  const ended = tools.map(tool => new Promise(resolve => { tool.on('exit', resolve); }));
+  try {
+    await new Promise(resolve => { setTimeout(resolve, 500); });
+    assert.deepEqual([running(STARTED.ps), running(STARTED.top)], [1, 1]);
+  } finally {
+    for (const tool of tools) tool.kill('SIGKILL');
+    await Promise.all(ended);
+  }
+  assert.deepEqual([running(STARTED.ps), running(STARTED.top)], [0, 0]);
+});
+
 test('a real set-uid tool other than ps stops the run at once', { skip: !applies, timeout: 60000 }, async t => {
   const result = await rejected(t, 'top', 'top');
   assert.equal(result.samples, 1);

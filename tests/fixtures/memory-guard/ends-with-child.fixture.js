@@ -1,7 +1,8 @@
 'use strict';
 // Run only by tests/run-tests-memory-guard.test.js. Starts one idle child,
-// waits until the memory guard has seen it, and passes while the child is
-// still running. CRATE_GUARD_FIXTURE_MODE says how long the child lives:
+// waits long enough for the memory guard to have seen it (300 ms, about six
+// samples), and passes while the child is still running.
+// CRATE_GUARD_FIXTURE_MODE says how long the child lives:
 //
 //   brief     1.5 seconds: it ends by itself soon after the run
 //   lasting   20 seconds: the run leaves it behind
