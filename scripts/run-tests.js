@@ -20,7 +20,9 @@
 // footprint (macOS's own accounting, which includes compressed memory). From
 // that it works out which processes belong to the run, and it stops the run
 // when one of them, or all of them together, passes a limit, or when the
-// deadline passes. It reads from outside the test processes, so it
+// deadline passes. A process that has ended and only waits for its parent to
+// collect it is not running any more: the guard does not count it, signal it
+// or wait for it. It reads from outside the test processes, so it
 // works while a test is stuck in a synchronous loop, and it changes nothing
 // about the environment the tests run in.
 //
@@ -630,11 +632,14 @@ function createGuard({
 }
 
 // What the run holds in one scan: all of it, and its largest process. A system
-// tool that was let through counts at its assumed size.
+// tool that was let through counts at its assumed size. A process that has
+// ended is left out: the system still reports the resident size it had at the
+// end, with a footprint of zero.
 function measureRun(owned) {
   let total = 0;
   let largest = null;
   for (const row of owned.values()) {
+    if (hasEnded(row)) continue;
     total += row.megabytes;
     if (largest === null || row.megabytes > largest.megabytes) largest = row;
   }

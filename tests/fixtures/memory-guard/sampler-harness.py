@@ -8,7 +8,8 @@ test decides what that should have been.
   scripted <json>   every read is answered from a script; see scripted()
   decoding          process records as sysctl could hand them back
   records           process records against libproc, for every live process
-  ended             a real set-uid ps, ended and not collected, and collected
+  ended             a real ordinary child and a real set-uid ps, alive, ended
+                    and not collected, and collected
   scan              two scans with a real ps that is new, then already seen
 
 Whatever it starts ends by itself within seconds and is collected here.
@@ -230,13 +231,21 @@ def observe(sampler, pid):
 
 def ended():
     sampler = module.Sampler()
-    # Nothing collects it until wait() below.
+    # Holds 48 MB until its input closes. Nothing collects either child until wait() below.
+    holds = "import sys\nheld = bytearray(48 * 1024 * 1024)\nfor at in range(0, len(held), 4096): held[at] = 1\nsys.stdout.write('held\\n')\nsys.stdout.flush()\nsys.stdin.read()\n"
+    ordinary = subprocess.Popen([sys.executable, "-I", "-B", "-c", holds], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    ordinary.stdout.readline()
+    result = {"self": {"pid": os.getpid(), "group": os.getpgrp(), "uid": os.getuid()}, "ordinary": {"pid": ordinary.pid}, "ps": {}}
+    result["ordinary"]["alive"] = observe(sampler, ordinary.pid)
+    ordinary.stdin.close()
     ps = subprocess.Popen(["/bin/ps", "-axo", "pid="], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    result = {"self": {"pid": os.getpid(), "group": os.getpgrp(), "uid": os.getuid()}, "ps": {"pid": ps.pid}}
+    result["ps"]["pid"] = ps.pid
     time.sleep(0.6)
-    result["ps"]["ended"] = observe(sampler, ps.pid)
-    ps.wait()
-    result["ps"]["collected"] = observe(sampler, ps.pid)
+    for name, child in (("ordinary", ordinary), ("ps", ps)):
+        result[name]["ended"] = observe(sampler, child.pid)
+    for name, child in (("ordinary", ordinary), ("ps", ps)):
+        child.wait()
+        result[name]["collected"] = observe(sampler, child.pid)
     return result
 
 

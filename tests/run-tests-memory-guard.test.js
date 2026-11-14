@@ -444,6 +444,24 @@ test('a process that has ended teaches the guard no identity, and one known befo
   assert.deepEqual(stillUnclear.readFailure(), unreadable(110, 2));
 });
 
+test('a process that has ended is left out of what the run holds, whatever size the system still reports for it', () => {
+  const ownership = newOwnership();
+  ownership.update(withPs(row(110, 101, RUNNER, { megabytes: 3000 }), row(111, 110, RUNNER, { megabytes: 70 })), true);
+  // Ended, not collected: the same start time, and the resident size it had at the end. What it started lives on.
+  const endedRow = row(110, 101, RUNNER, { status: ZOMBIE, megabytes: 3000 });
+  const owned = ownership.update(withPs(endedRow, row(111, 1, RUNNER, { megabytes: 70 })), true);
+  assert.deepEqual(pids(owned), [100, 101, 102, 103, 104, 110, 111]);
+  assert.equal(ownership.readFailure(), null);
+  assert.deepEqual([measureRun(owned).total, measureRun(owned).largest.pid], [5 * 10 + 70, 111]);
+  // Nothing but ended processes: nothing held, and no largest process.
+  assert.deepEqual(measureRun(new Map([[110, endedRow], [112, psRow(112, 101, RUNNER, { status: ZOMBIE, path: null })]])), { total: 0, largest: null });
+  // Alive, it counts in full. So does a row that says "ended" where the state could not be read at all.
+  assert.equal(measureRun(ownership.update(withPs(row(110, 101, RUNNER, { megabytes: 3000 })), true)).largest.pid, 110);
+  assert.equal(measureRun(new Map([[110, { ...endedRow, infoError: ESRCH }]])).total, 3000);
+  // A ps that is let through still counts at its assumed size.
+  assert.equal(measureRun(newOwnership().update(withPs(psRow(110, 101, RUNNER)), true)).total, 5 * 10 + SYSTEM_TOOL.assumedMegabytes);
+});
+
 test('what an unreadable process started stays in the run when that process has ended', () => {
   // Scan 1: a ps started by the detached process, let through.
   const ownership = newOwnership();
@@ -1158,31 +1176,41 @@ test('the sampler reports who a process runs as, and an executable path only for
   await new Promise(resolve => { ps.on('exit', resolve); });
 });
 
-// A process that starts a `ps`, which ends by itself at once, and then does
-// not collect it: it prints the child's pid and blocks.
+// A process that starts one child, which ends by itself at once, and then
+// does not collect it: it prints the child's pid and blocks. The child is `ps`
+// or an ordinary tool.
 const HOLDER = `
-  const child = require('node:child_process').spawn('/bin/ps', ['-axo', 'pid='], { stdio: 'ignore' });
+  const { spawn } = require('node:child_process');
+  const child = process.argv[1] === 'ps' ? spawn('/bin/ps', ['-axo', 'pid='], { stdio: 'ignore' }) : spawn('/bin/echo', [], { stdio: 'ignore' });
   require('node:fs').writeSync(1, child.pid + '\\n');
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20000);`;
 
-test('a scan reports a set-uid process that has ended and is not collected as ended, with its parent, group and owners', { timeout: 60000 }, async t => {
+test('a scan reports a process that has ended and is not collected as ended, with its parent, group and owners', { timeout: 60000 }, async t => {
   const sampler = await startCheckedSampler();
-  const holder = spawn(process.execPath, ['-e', HOLDER], { stdio: ['ignore', 'pipe', 'ignore'] });
-  t.after(() => { holder.kill('SIGKILL'); sampler.stop(); });
-  const childPid = await new Promise(resolve => { holder.stdout.setEncoding('utf8').once('data', text => resolve(Number(text))); });
+  const holders = ['echo', 'ps'].map(tool => spawn(process.execPath, ['-e', HOLDER, tool], { stdio: ['ignore', 'pipe', 'ignore'] }));
+  t.after(() => { for (const holder of holders) holder.kill('SIGKILL'); sampler.stop(); });
+  const childPids = await Promise.all(holders.map(holder => new Promise(resolve => {
+    holder.stdout.setEncoding('utf8').once('data', text => resolve(Number(text)));
+  })));
   await new Promise(resolve => { setTimeout(resolve, 500); });
   const rows = await sampler.scan();
-  const ps = rows.find(item => item.pid === childPid);
+  const own = process.getuid();
+  const [ordinary, ps] = childPids.map(pid => rows.find(item => item.pid === pid));
   const group = rows.find(item => item.pid === process.pid).pgid;
+  // The ordinary one still has its start time; its usage stays readable.
+  assert.deepEqual([ordinary.infoError, ordinary.status, ordinary.ppid, ordinary.pgid, ordinary.uid, ordinary.ruid, ordinary.usageError, ordinary.path],
+    [0, ZOMBIE, holders[0].pid, group, own, own, 0, null]);
+  assert.notEqual(ordinary.start, '0');
+  // The set-uid one: its usage stays denied, and nothing of it is in the row.
   if (psIsSetUid) {
     assert.deepEqual([ps.infoError, ps.status, ps.ppid, ps.pgid, ps.uid, ps.ruid, ps.usageError, ps.start, ps.megabytes, ps.path],
-      [0, ZOMBIE, holder.pid, group, 0, process.getuid(), EPERM, '0', 0, null]);
+      [0, ZOMBIE, holders[1].pid, group, 0, own, EPERM, '0', 0, null]);
   }
-  // Once its parent is gone the system collects it, and it is not listed as that process any more.
-  holder.kill('SIGKILL');
+  // Once the parents are gone the system collects them, and they are not listed as those processes any more.
+  for (const holder of holders) holder.kill('SIGKILL');
   await new Promise(resolve => { setTimeout(resolve, 500); });
   const later = await sampler.scan();
-  assert.deepEqual(later.filter(item => item.pid === childPid && (item.status === ZOMBIE || item.infoError === ESRCH)), []);
+  assert.deepEqual(later.filter(item => childPids.includes(item.pid) && (item.status === ZOMBIE || item.infoError === ESRCH)), []);
 });
 
 // Runs the sampler's own code under tests/fixtures/memory-guard/sampler-harness.py,
@@ -1223,19 +1251,34 @@ test('the sampler takes a process record only whole and only for the pid it aske
   assert.deepEqual([live.differ, live.checked, live.free], [0, true, null]);
 });
 
-test('the sampler tells an ended set-uid process from an unreadable one by the process table, and from nothing else', { timeout: 60000 }, () => {
-  const { self, ps } = inSampler('ended');
-  // Ended and not collected: libproc says there is no such process; the
-  // process table says "ended", with the right parent, group and owners.
+test('the sampler tells an ended process from a missing or unreadable one by the process table, and from nothing else', { timeout: 60000 }, () => {
+  const { self, ordinary, ps } = inSampler('ended');
+  const facts = uid => [self.pid, self.group, uid, self.uid];
+  // Alive, the ordinary child holds its 48 MB and reads like any process.
+  assert.deepEqual([ordinary.alive.info, ordinary.alive.usage, ordinary.alive.record], [0, 0, [...facts(self.uid), 2]]);
+  assert.ok(ordinary.alive.megabytes[1] >= 48, `footprint ${ordinary.alive.megabytes[1]} MB`);
+  // Ended and not collected: libproc says there is no such process, of both;
+  // the process table says "ended", with the right parent, group and owners.
+  assert.deepEqual([ordinary.ended.info, ordinary.ended.usage, ordinary.ended.record], [ESRCH, 0, [...facts(self.uid), ZOMBIE]]);
   assert.equal(ps.ended.info, ESRCH);
+  // What the ordinary one held is released: the footprint is zero, and the resident size is still what it was at the end.
+  assert.equal(ordinary.ended.megabytes[1], 0);
+  assert.ok(ordinary.ended.megabytes[0] >= 48, `resident ${ordinary.ended.megabytes[0]} MB`);
+  // Its row says ended, keeps the start time it had, and is not read again.
+  const ordinaryRow = parseRow(ordinary.ended.row);
+  assert.deepEqual([ordinaryRow.infoError, ordinaryRow.status, ordinaryRow.ppid, ordinaryRow.pgid, ordinaryRow.uid, ordinaryRow.ruid, ordinaryRow.usageError, ordinaryRow.path],
+    [0, ZOMBIE, self.pid, self.group, self.uid, self.uid, 0, null]);
+  assert.deepEqual([ordinaryRow.start, ordinary.ended.transition], [parseRow(ordinary.alive.row).start, false]);
   if (psIsSetUid) {
-    assert.deepEqual([ps.ended.usage, ps.ended.record], [EPERM, [self.pid, self.group, 0, self.uid, ZOMBIE]]);
-    // Its row says ended, carries nothing of its usage, and is not read again.
+    assert.deepEqual([ps.ended.usage, ps.ended.record], [EPERM, [...facts(0), ZOMBIE]]);
+    // The set-uid one's row carries nothing of its usage.
     assert.deepEqual([ps.ended.row, ps.ended.transition], [`${ps.pid} ${self.pid} ${self.group} 0 ${ZOMBIE} 0 0 0 0 ${EPERM} ${self.uid} -`, false]);
   }
   // Collected: no record, and nothing to report but that it is not there.
-  assert.deepEqual([ps.collected.info, ps.collected.usage, ps.collected.record, ps.collected.row],
-    [ESRCH, ESRCH, null, `${ps.pid} 0 0 0 0 0 0 0 ${ESRCH} ${ESRCH} 0 -`]);
+  for (const child of [ordinary, ps]) {
+    assert.deepEqual([child.collected.info, child.collected.usage, child.collected.record, child.collected.row],
+      [ESRCH, ESRCH, null, `${child.pid} 0 0 0 0 0 0 0 ${ESRCH} ${ESRCH} 0 -`]);
+  }
 });
 
 // Scripted reads for the sampler: what one reading of a process is made of, in
@@ -1290,8 +1333,13 @@ test('a row holds one pid\'s own reads, taken in an order that cannot hand an en
     23: [read.noInfo(ESRCH), read.noUsage(EPERM), read.record(1, 23, 0, 0, 2)],
     // The same with no record at all.
     24: [read.noInfo(ESRCH), read.noUsage(EPERM), read.record()],
-    // Not there, but usage answers: an ordinary ended process, or a new holder of the pid. As libproc gives it.
-    25: [read.noInfo(ESRCH), read.usage(9, 60 * MB, 0)],
+    // Not there, but usage answers, and the process table says ended: an ordinary ended process.
+    25: [read.noInfo(ESRCH), read.usage(9, 60 * MB, 0), read.record(101, 100, OWNER, OWNER, ZOMBIE)],
+    // The same reads where the pid passed to a new process in between: the
+    // usage is the new one's, and the process table shows it running. Not ended.
+    30: [read.noInfo(ESRCH), read.usage(77, 300 * MB, 280 * MB), read.record(1, 30, OWNER, OWNER, 2)],
+    // And where nothing holds the pid by the time the process table is asked.
+    31: [read.noInfo(ESRCH), read.usage(9, 60 * MB, 0), read.record()],
     // There, with usage that says it is not: on its way out.
     26: [read.info(101, 100, OWNER, OWNER), read.noUsage(ESRCH)],
     // Gone between being listed and being read. Read right after two readable ones: nothing of theirs shows.
@@ -1299,24 +1347,26 @@ test('a row holds one pid\'s own reads, taken in an order that cannot hand an en
     // Unreadable for other reasons: the process table is not asked.
     28: [read.noInfo(EPERM), read.noUsage(EPERM)],
     29: [read.noInfo(ESRCH), read.noUsage(13)],
-  });
+  }, { scans: [[21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]] });
   assert.deepEqual(result.scans[0].rows, [
     rowOf.created(21),
     rowOf.ended(22),
     `23 0 0 0 0 0 0 0 ${ESRCH} ${EPERM} 0 -`,
     `24 0 0 0 0 0 0 0 ${ESRCH} ${EPERM} 0 -`,
-    `25 0 0 0 0 9 ${60 * MB} 0 ${ESRCH} 0 0 -`,
+    `25 101 100 ${OWNER} ${ZOMBIE} 9 ${60 * MB} 0 0 0 ${OWNER} -`,
     `26 101 100 ${OWNER} 2 0 0 0 0 ${ESRCH} ${OWNER} -`,
     rowOf.gone(27),
     `28 0 0 0 0 0 0 0 ${EPERM} ${EPERM} 0 -`,
     `29 0 0 0 0 0 0 0 ${ESRCH} 13 0 -`,
+    `30 0 0 0 0 77 ${300 * MB} ${280 * MB} ${ESRCH} 0 0 -`,
+    `31 0 0 0 0 9 ${60 * MB} 0 ${ESRCH} 0 0 -`,
   ]);
-  assert.deepEqual([21, 22, 23, 24, 25, 26, 27, 28, 29].map(pid => readsOf(result, pid)),
-    ['info usage', 'info usage record', 'info usage record', 'info usage record', 'info usage', 'info usage', 'info usage', 'info usage', 'info usage']);
+  assert.deepEqual([21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31].map(pid => readsOf(result, pid)), ['info usage', 'info usage record', 'info usage record',
+    'info usage record', 'info usage record', 'info usage', 'info usage', 'info usage', 'info usage', 'info usage record', 'info usage record']);
   // None of these can be in transition, so nothing was read twice and nothing is remembered.
   assert.deepEqual([result.scans[0].pauses, result.scans[0].remembered], [[], {}]);
-  // The guard takes exactly one of these rows as ended.
-  assert.deepEqual(result.scans[0].rows.map(parseRow).filter(item => item.infoError === 0 && item.status === ZOMBIE).map(item => item.pid), [22]);
+  // The guard takes exactly two of these rows as ended.
+  assert.deepEqual(result.scans[0].rows.map(parseRow).filter(item => item.infoError === 0 && item.status === ZOMBIE).map(item => item.pid), [22, 25]);
 });
 
 test('the sampler reads a process in transition again until two readings agree, and reports the last one whatever it is', { timeout: 60000 }, () => {
@@ -1401,15 +1451,17 @@ test('the sampler reads a process in transition again until two readings agree, 
   }
 });
 
-test('a run in which a system ps that the guard has seen ends and waits to be collected passes', { timeout: 60000 }, async t => {
-  const { bystanderSurvived } = scenario(t);
-  const result = await startGuard([uncollected], { CRATE_GUARD_FIXTURE_MODE: 'ps' }).done;
-  assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stdout, /^ok 1 - an ended ps waits to be collected$/m);
-  assert.doesNotMatch(result.stderr, /CANNOT READ|LOST SIGHT|INCOMPLETE|EXCEEDED|left \d+ of its processes/);
-  assert.equal(/assumed 32 MB/.test(result.stderr), psIsSetUid);
-  assert.equal(bystanderSurvived(), true);
-});
+for (const [mode, what] of [['sleep', 'an ordinary child'], ['ps', 'a system ps']]) {
+  test(`a run in which ${what} that the guard has seen ends and waits to be collected passes`, { timeout: 60000 }, async t => {
+    const { bystanderSurvived } = scenario(t);
+    const result = await startGuard([uncollected], { CRATE_GUARD_FIXTURE_MODE: mode }).done;
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, new RegExp(`^ok 1 - an ended ${mode} waits to be collected$`, 'm'));
+    assert.doesNotMatch(result.stderr, /CANNOT READ|LOST SIGHT|INCOMPLETE|EXCEEDED|left \d+ of its processes/);
+    assert.equal(/assumed 32 MB/.test(result.stderr), mode === 'ps' && psIsSetUid);
+    assert.equal(bystanderSurvived(), true);
+  });
+}
 
 test('a run whose tests start the system ps over and over passes, and the summary says what was assumed', { timeout: 60000 }, async t => {
   const { bystanderSurvived } = scenario(t);

@@ -20,10 +20,10 @@ much memory it holds. libproc gives them directly:
 
 libproc does not describe a process that has ended and waits for its parent to
 collect it: proc_pidinfo says there is no such process, which is also what it
-says of a pid that is free, or that passed to a new process a moment ago. For
-an ordinary process the usage read still works then. For a set-uid tool it
-does not, and nothing is left to tell an ended one from one that cannot be
-read at all. In that one case the sampler asks the system's process table
+says of a pid that is free, or that passed to a new process a moment ago. The
+usage read still answers for an ordinary ended process (with the resident size
+it had at the end and a footprint of zero) and is denied for a set-uid one. In
+those two cases the sampler asks the system's process table
 
   sysctl kern.proc.pid.<pid>              state, parent, group and owners
 
@@ -56,10 +56,11 @@ Protocol, one request per line on stdin, one answer on stdout.
     facts is nothing: the guard decides.
 
     A row is one reading, made of separate reads in a fixed order: parent,
-    group, owners and state; then usage; then, for the one case above, the
-    process table, which is the last word on that pid in the row; then the
-    path, never for a process that has ended. The reads are not atomic. Each
-    is true of whatever held the pid at its own instant.
+    group, owners and state; then usage; then, in the cases above, the process
+    table, which is the last word on that pid in the row; then the path, never
+    for a process that has ended. The reads are not atomic. Each is true of
+    whatever held the pid at its own instant, so the start time and sizes in
+    the row of an ended process are older than the word "ended".
 
     A process that is just becoming a set-uid tool, or just ending as one,
     changes between those reads for a fraction of a millisecond, and a reading
@@ -286,11 +287,11 @@ class Sampler:
         if not usage_errno:
             usage = self.usage
             start, resident, footprint = usage.ri_proc_start_abstime, usage.ri_resident_size, usage.ri_phys_footprint
-        # Not there for libproc, and not readable for this user: ended, or
+        # Not there for libproc, while usage answers or is denied: ended, or
         # something else. The process table is asked last, so that "ended" is
         # the latest thing this row knows about the pid, and it is believed
         # only when it says ended.
-        if info_errno == errno.ESRCH and usage_errno == errno.EPERM:
+        if info_errno == errno.ESRCH and usage_errno in (0, errno.EPERM):
             record = self.read_record(pid)
             if record and record[4] == ENDED:
                 info_errno = 0
