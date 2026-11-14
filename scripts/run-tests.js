@@ -60,10 +60,11 @@
 // The one exception is the system's own `ps`. Tests start it, and macOS
 // installs it set-uid root, so this user may not read its memory. A process is
 // let through as that tool only when the system reports its executable as
-// exactly /bin/ps, it runs as root for this user (real owner this user), it
-// was started by a process of the run or is in the run's process group in the
-// same scan, and it has been there for no longer than two seconds or forty
-// samples, with no more than eight at once. It is counted at an assumed 32 MB,
+// exactly /bin/ps, it runs as root for this user (real owner this user), the
+// same scan shows that it was started by a process of the run or is in the
+// runner's process group together with the runner, and it has been there for
+// no longer than two seconds or forty samples, with no more than eight at
+// once. It is counted at an assumed 32 MB,
 // which is an estimate and not a measurement, and it is never signalled by
 // pid. Once it has ended it is neither counted nor waited for, even while its
 // parent has not collected it. Anything else the guard cannot read, including
@@ -106,6 +107,10 @@
 //   its parent, and when one stays between two states (starting or ending)
 //   for longer than the few milliseconds the sampler waits for it to settle,
 //   which can happen when the machine is too busy to let it finish starting.
+//   One more, a matter of microseconds: a `ps` that has ended is collected by
+//   its parent after the sampler was denied its usage and before it asks the
+//   process table. The row then says "not there" and "denied" and nothing
+//   says "ended", and the guard stops the run.
 // - Not able to end the whole run when no sampler works any more (the one in
 //   use, the one standing by, and a newly started one all fail). It then kills
 //   the runner's process group, leaves whatever the run started outside that
@@ -206,6 +211,13 @@ function parseArguments(argv, env) {
 
 function formatSize(megabytes) {
   return megabytes >= 1024 ? `${(megabytes / 1024).toFixed(1)} GB` : `${Math.round(megabytes)} MB`;
+}
+
+// A size that passed a limit, to be shown next to that limit: whole megabytes,
+// rounded up. Rounded to the nearest, 128.3 MB over a limit of 128 MB read
+// "reached 128 MB (limit 128 MB)".
+function formatOver(megabytes) {
+  return `${Math.ceil(megabytes)} MB`;
 }
 
 // One line of a scan. `start` stays text: it identifies the process and must
@@ -809,11 +821,11 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
       } else if (largest && largest.megabytes > limits.process) {
         reason = 'memory';
         offender = largest.pid;
-        report = [`MEMORY LIMIT EXCEEDED after ${seconds()} s: process ${largest.pid} reached ${formatSize(largest.megabytes)} (limit ${formatSize(limits.process)} per process).`];
+        report = [`MEMORY LIMIT EXCEEDED after ${seconds()} s: process ${largest.pid} reached ${formatOver(largest.megabytes)} (limit ${limits.process} MB per process).`];
       } else if (total > limits.total) {
         reason = 'memory';
         offender = largest.pid;
-        report = [`MEMORY LIMIT EXCEEDED after ${seconds()} s: the run reached ${formatSize(total)} across ${owned.size} processes (limit ${formatSize(limits.total)} in total).`];
+        report = [`MEMORY LIMIT EXCEEDED after ${seconds()} s: the run reached ${formatOver(total)} across ${owned.size} processes (limit ${limits.total} MB in total).`];
       } else if (Date.now() - started > limits.deadlineSeconds * 1000) {
         reason = 'deadline';
         report = [`DEADLINE PASSED after ${seconds()} s (limit ${limits.deadlineSeconds} s).`];
@@ -957,6 +969,7 @@ module.exports = {
   createOwnership,
   createGuard,
   measureRun,
+  formatOver,
   UsageError,
   TIMING,
   DEFAULT_PROCESS_LIMIT_MB,

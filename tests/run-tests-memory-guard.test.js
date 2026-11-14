@@ -6,7 +6,7 @@ const path = require('node:path');
 const { spawn, execFileSync } = require('node:child_process');
 const assert = require('./bounded-assert');
 const {
-  parseArguments, parseRow, createOwnership, createGuard, measureRun, startCheckedSampler, UsageError, TIMING,
+  parseArguments, parseRow, createOwnership, createGuard, measureRun, formatOver, startCheckedSampler, UsageError, TIMING,
   DEFAULT_PROCESS_LIMIT_MB, DEFAULT_TOTAL_LIMIT_MB, DEFAULT_DEADLINE_SECONDS, UNREADABLE_SAMPLES,
   EXIT_MEMORY_LIMIT, EXIT_DEADLINE, EXIT_GUARD_FAILURE, ZOMBIE, ESRCH, EPERM, SYSTEM_TOOL,
 } = require('../scripts/run-tests');
@@ -995,6 +995,17 @@ test('an ordinary run reports its results and exit status unchanged', { timeout:
   assert.equal(filtered.code, 0, filtered.stderr);
   assert.match(filtered.stdout, /^# pass 1$/m);
   assert.equal(bystanderSurvived(), true);
+});
+
+test('a size that passed a limit is never reported as the limit itself', () => {
+  // The guard stops a run for anything above the limit, 128.01 MB as much as
+  // 140. Rounded to the nearest megabyte the first read "reached 128 MB (limit
+  // 128 MB)", and the test below, which insists on a figure above the limit,
+  // failed about once in twenty runs.
+  assert.deepEqual([128.01, 128.3, 128.5, 129, 139.2, 2048.4].map(formatOver), ['129 MB', '129 MB', '129 MB', '129 MB', '140 MB', '2049 MB']);
+  for (const [megabytes, limit] of [[128.0001, 128], [200.2, 200], [2048.01, 2048], [4096.9, 4096]]) {
+    assert.ok(Number.parseInt(formatOver(megabytes), 10) > limit, `${megabytes} over ${limit}`);
+  }
 });
 
 test('a process that passes the per-process limit is stopped, named, and the run confirmed gone', { timeout: 60000 }, async t => {
