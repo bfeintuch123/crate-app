@@ -83,7 +83,7 @@ Matt Pocock's shared skills drive routine workflow (see Agent skills). `.codex/R
 
 Supporting workflow references:
 - `WORKSPACE.md` maps crate-app, crate-web, and mission-control boundaries.
-- `.codex/state/current-workstream.md` records the compact active Crate state and next prompt.
+- `.codex/state/current-workstream.md` is a historical snapshot. It is not maintained and is not a source of current task state or authority; take the current task from Bryant's request and its verified branch or worktree.
 - `.codex/playbooks/_shared-gates.md` contains common repo, mutation, release, dependency, privacy, review, and final-report gates.
 - `.codex/checks/crate-check-suites.md` defines named docs, focused QA, provenance, Figma, package-parser, and release-gate check suites.
 - `.codex/ops/crate-ops-improvement-plan.md` maps the Crate ops layer: standing orders, taskflows, memory, proof bundles, skill registry, doctor, Cloudflare deploy, and tester archive.
@@ -132,7 +132,7 @@ When using a playbook, state which playbook is active, confirm the current branc
 
 ## Ops Layer
 
-The ops layer (`.codex/ops/`, taskflows, state ledgers, `.codex/tools/crate_doctor.py`, and the proof-bundle template) remains available for Crate-specific procedures. Use it when a selected playbook or the task requires it, for example `CRATE_REPO=<this checkout> python3 .codex/tools/crate_doctor.py` before release, deploy, long-running QA, or external-control work. It does not route or gate routine work.
+The ops layer (`.codex/ops/`, taskflows, state ledgers, `.codex/tools/crate_doctor.py`, and the proof-bundle template) remains available for Crate-specific procedures. Use it when a selected playbook or the task requires it. Before release, deploy, long-running QA, or external-control work, always run `CRATE_REPO=<this checkout> python3 .codex/tools/crate_doctor.py` and resolve or report any failure before continuing. Apart from that preflight, the ops layer does not route or gate routine work.
 
 ## PR Review Rules
 Before merge:
