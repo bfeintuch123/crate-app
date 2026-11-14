@@ -1528,7 +1528,7 @@ test('a process that reads as the system ps and outlives the run outside its gro
 for (const [fault, mode, what] of [
   ['unreadable-then-gone:nested', 'brief', 'and that is gone before the guard looks again'],
   ['unreadable-as-run-ends:nested', 'lasting', 'and that the run leaves behind'],
-  ['unreadable-once-after-run:nested', 'lasting', 'in the one scan right after the run has ended'],
+  ['unreadable-right-after-run:nested', 'lasting', 'in the one scan it makes right after the run has ended'],
 ]) {
   test(`a process the guard cannot read as the run ends, ${what}, turns a passing run into exit 125`, { timeout: 60000 }, async t => {
     const { environment, allGone, bystanderSurvived } = scenario(t);

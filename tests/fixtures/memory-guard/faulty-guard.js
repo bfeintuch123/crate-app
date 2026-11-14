@@ -8,11 +8,13 @@
 //   CRATE_GUARD_FAULT=undeliverable:<role>         signals to that process are reported sent but never delivered
 //   CRATE_GUARD_FAULT=unreadable:<role>            that process's start time and memory cannot be read
 //   CRATE_GUARD_FAULT=unreadable-after-run:<role>  the same, but only once the test run has ended
-//   CRATE_GUARD_FAULT=unreadable-once-after-run:<role>  the same, in the first scan after the test run has ended and in no other
 //   CRATE_GUARD_FAULT=unreadable-as-run-ends:<role>     one scan made while the run is alive cannot read that process, and its
 //                                                       answer reaches the guard only when the test run has ended
 //   CRATE_GUARD_FAULT=unreadable-then-gone:<role>       the same, and that process has ended as well by then
 //   CRATE_GUARD_FAULT=unreadable-as-signal-arrives:<role>  the same, but the answer arrives when the guard has received SIGTERM
+//   CRATE_GUARD_FAULT=unreadable-right-after-run:<role>  one scan made while the run is alive reaches the guard, as it is, only
+//                                                       when the test run has ended; the scan the guard makes next, which is
+//                                                       the one it makes for a run that has ended, cannot read that process
 //   CRATE_GUARD_FAULT=unreadable-runner            the test runner itself cannot be read, from the first scan
 //   CRATE_GUARD_FAULT=system-tool:<role>           that process reads exactly as the system's set-uid ps does, for as long as it lives
 //   CRATE_GUARD_FAULT=other-tool:<role>            the same, but its executable is another set-uid tool
@@ -25,7 +27,7 @@ const guard = require('../../../scripts/run-tests');
 
 const [kind, role] = String(process.env.CRATE_GUARD_FAULT).split(':');
 const EPERM = 1;
-const HELD = ['unreadable-as-run-ends', 'unreadable-then-gone', 'unreadable-as-signal-arrives'];
+const HELD = ['unreadable-as-run-ends', 'unreadable-then-gone', 'unreadable-as-signal-arrives', 'unreadable-right-after-run'];
 const sleep = milliseconds => new Promise(resolve => { setTimeout(resolve, milliseconds); });
 const recorded = () => new Map(fs.readFileSync(process.env.CRATE_GUARD_FIXTURE_PIDS, 'utf8').split('\n').filter(Boolean)
   .map(line => line.split(' ')).map(([name, pid]) => [name, Number(pid)]));
@@ -39,8 +41,8 @@ let opened = 0;
 // while it is up: the test file is the parent of the role `nested`.
 let testFilePid = null;
 let runnerPid = null;
-let misreadOnce = false;
 let held = false;
+let misreadNext = false;
 
 function misread(rows) {
   if (kind === 'unreadable-runner') {
@@ -61,23 +63,26 @@ function misread(rows) {
     runnerPid = testFile.ppid;
   }
   const runEnded = runnerPid !== null && !rows.some(row => row.pid === testFilePid || row.pid === runnerPid);
-  if ((kind === 'unreadable-after-run' || kind === 'unreadable-once-after-run') && !runEnded) return rows;
-  if (kind === 'unreadable-once-after-run') {
-    if (misreadOnce) return rows;
-    misreadOnce = true;
-  }
+  if (kind === 'unreadable-after-run' && !runEnded) return rows;
   return rows.map(row => (row.pid === target ? cannotRead(row) : row));
 }
 
-// One scan, made with the run alive and its tree up, in which the target
-// cannot be read. The guard gets it late: when the test run has ended (and the
-// target too, for unreadable-then-gone), or when a SIGTERM has arrived.
+// One scan, made with the run alive and its tree up, that the guard gets
+// late: when the test run has ended (and the target too, for
+// unreadable-then-gone), or when a SIGTERM has arrived. The target cannot be
+// read in it, or, for unreadable-right-after-run, in the scan that follows it.
 async function holdBack(rows, real) {
   const target = recorded().get(role);
+  const unread = scan => scan.map(row => (row.pid === target ? cannotRead(row) : row));
+  if (misreadNext) {
+    misreadNext = false;
+    return unread(rows);
+  }
   const runner = rows.find(row => row.ppid === process.pid && !samplerPids.has(row.pid));
   if (held || !recorded().has('ready') || !runner || !rows.some(row => row.pid === target)) return rows;
   held = true;
-  const answer = rows.map(row => (row.pid === target ? cannotRead(row) : row));
+  misreadNext = kind === 'unreadable-right-after-run';
+  const answer = misreadNext ? rows : unread(rows);
   if (kind === 'unreadable-as-signal-arrives') {
     await new Promise(resolve => { process.once('SIGTERM', resolve); });
   } else {
