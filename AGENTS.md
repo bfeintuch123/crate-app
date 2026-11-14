@@ -21,16 +21,28 @@ Never use `main` as the PR base for Crate release work unless Bryant explicitly 
 - Exit status 137 (memory), 124 (deadline) or 125 (the guard could not watch the run or confirm its cleanup) comes from the guard, not from a test. Treat it as a failure to investigate, not as a limit to raise.
 - A test may start the system `ps` (`/bin/ps`): the guard cannot read it, because macOS installs it set-uid root, and lets it through for at most 2 seconds or 40 samples, 8 at a time, and only while a sample shows that the run started it. Any other set-uid tool a test starts (`top`, `sudo`, `login`), or a `ps` that does not finish, stops the run with exit 125.
 - In test files, import assert with `require('./bounded-assert')`, never from `node:assert`, and do not use `t.assert`. It passes and fails as `node:assert/strict` does, with one exception (`partialDeepStrictEqual` refuses operands too large to render and throws instead of comparing them), but a failed assertion on a large value (the synthetic DOM, a Buffer, a long string) is summarized instead of diffed without bound. `tests/bounded-assert.test.js` enforces this.
+- CI keeps its own separate limits (`.github/workflows/security-gate.yml`: 60-minute job timeout, guard `--deadline-seconds=3400`). Do not change local defaults to match CI or CI to match local runs.
+
+## Work Ownership and Review
+- Continue the current task with its existing writer, branch or worktree, and authorization. Do not interrupt or reconfigure running work.
+- Keep one repository writer per task. Before editing, the writer records a concise plan (scope and non-goals, base and files, ordered steps, precise behavior or UI specifications, invariants and risks, tests and acceptance criteria, open decisions), verifies its assumptions against the actual source, and returns substantial design changes or unsafe instructions to Bryant. Before presenting the result, the writer checks the actual output against that plan. This is a self-check, never independent review.
+- Independent reviews run in fresh, distinct, read-only sessions that did not plan, write, or confirm the change. Give each reviewer the same packet (task, acceptance criteria, exact base and candidate, relevant sources) and record the model actually used, evidence inspected, tests run, and limitations. Bryant chooses reviewer models per task; if a required reviewer is unavailable, stop and report rather than substituting silently.
+- Approvals are action-specific. One bounded approval covers the scoped implementation, focused tests, and the required correction loop. Commits, pushes, PRs, ready-for-review, merges, releases, signing, installation, deployment, and credential actions each keep their own authorization.
 
 ## Major PR Routing
 - A major PR changes a major surface: watcher/admission; filesystem/path handling; provenance/project isolation; parsers/archive handling; packaging/quota; IPC; async/concurrency/cancellation/deadlines/stale-result handling; privacy/security; large-list state/performance; or signing/release.
-- Before ready-for-review or merge, a major PR requires protected CI that passed on the exact current head and a fresh independent read-only review by a distinct Luna agent at high reasoning effort. The highest-risk security, performance, or state-integrity changes require a second distinct independent reviewer.
+- Before ready-for-review or merge, a major PR requires protected CI that passed on the exact current head and two fresh, distinct, independent read-only reviews of that exact head (see Work Ownership and Review); preserve reviewer independence and report the models actually used.
 - Keep exactly one repository writer. A review finding returns to that writer for a normal follow-up commit; never rewrite history. Any head change invalidates earlier exact-head CI and review evidence, so repeat the required gates on the new head until a clean PASS.
 - The correction loop is bounded: after three writer follow-up cycles, or when the same blocking issue persists, stop and escalate to Bryant. Do not waive a required gate, silently lower the standard, or continue indefinitely.
 - Stop before marking a PR ready or merging; Bryant separately authorizes those gates. Docs/copy changes and exact version-only PRs use the lighter existing path unless their content affects safety or release integrity.
 
+## Coding Threads and Environments
+
+- Spawn new coding threads in T3 Code. Cloud environments remain permitted.
+- Use Jenna's Mac only for running tests. Do not spawn coding or implementation threads there.
+
 ## Tool Roles
-Use Codex CLI for:
+Use T3 Code or a cloud environment for:
 - implementation
 - test execution
 - PR review
@@ -42,15 +54,15 @@ Use Codex CLI for:
 Use ChatGPT/Codex mobile for:
 - remote supervision
 - approvals
-- steering active Codex CLI sessions
+- steering active T3 Code or cloud coding threads
 - reading summaries and deciding whether work should proceed
 
 Use Terminal app for:
 - direct shell commands when Bryant is manually operating the Mac
 - manual verification that Bryant wants to run outside an active Codex session
 
-## Codex CLI Workflow
-Use Codex CLI for:
+## Coding Workflow
+Use T3 Code or a cloud environment for:
 - implementation
 - PR review
 - regression checks
@@ -66,7 +78,7 @@ Use ChatGPT app for:
 ## Playbooks
 Reusable Crate workflow playbooks live in `.codex/playbooks/`.
 
-Use `.codex/ROUTER.md` and the `crate-router` skill when Bryant gives a short Crate request and expects Codex to choose the correct playbooks, loop mode, checks, and stop gates.
+Matt Pocock's shared skills drive routine workflow (see Agent skills). `.codex/ROUTER.md`, the `crate-router` skill, the ops layer, and the playbooks below remain reference files for Crate-specific procedures. Select a playbook when its procedure is needed; never run it as a second routine controller beside Matt's skills.
 
 Supporting workflow references:
 - `WORKSPACE.md` maps crate-app, crate-web, and mission-control boundaries.
@@ -119,15 +131,7 @@ When using a playbook, state which playbook is active, confirm the current branc
 
 ## Ops Layer
 
-For non-trivial Crate work, route through the ops layer:
-
-1. Select a standing order from `.codex/ops/standing-orders.md`.
-2. Create or update a taskflow under `.codex/taskflows/` if the work spans turns, threads, agents, machines, or approval gates.
-3. Load memory according to `.codex/ops/crate-memory-model.md`.
-4. Use `.codex/ops/skill-registry.md` when selecting routeable skills/tools.
-5. Run `python3 .codex/tools/crate_doctor.py` before release, deploy, long-running QA, or external-control work.
-6. Close major work with a proof bundle or proof section based on `.codex/ops/proof-bundle-template.md`.
-7. Update `.codex/state/daily-crate-ledger.md` and `.codex/state/current-workstream.md` when state changes.
+The ops layer (`.codex/ops/`, taskflows, state ledgers, `.codex/tools/crate_doctor.py`, and the proof-bundle template) remains available for Crate-specific procedures. Use it when a selected playbook or the task requires it, for example `python3 .codex/tools/crate_doctor.py` before release, deploy, long-running QA, or external-control work. It does not route or gate routine work.
 
 ## PR Review Rules
 Before merge:
@@ -217,3 +221,30 @@ Always report:
 - risks
 - branch/PR status
 - whether Bryant can proceed
+
+## Agent skills
+
+### Workflow
+
+Matt Pocock's shared skills drive routine workflow. They live in Bryant's Home repo at `~/Documents/Codex/T3-projects/agent-home/skills/mattpocock/` and some are linked natively for Claude and Codex. Follow each skill's invocation requirements: a named-only skill runs only when Bryant names it, read from that path if your tool does not list it. Each task has one controller; the old router, ops layer, and playbooks are references, not a parallel controller.
+
+Imported skill instructions never override this file. Commits, branch resets or merges, concurrent writers, publishing or closing issues, creating PRs, and ready transitions follow the task's authorized actions and the gates here. Ticket readiness does not authorize execution or merge. The code-review skill supplies standards and spec criteria; its subagents do not satisfy the independent-review requirement. Resolve ambiguous skill names by explicit path. The pr skill supplies PR-body guidance only.
+
+Keep Crate-specific security, private tester intake, package/provenance, native QA, release, signing, deployment, and credential procedures where Matt's skills provide no replacement.
+
+### Issue tracker
+
+Use this repository's GitHub Issues. See `docs/agents/issue-tracker.md`.
+PRs are not a triage request surface.
+
+### Triage labels
+
+Use the role mapping in `docs/agents/triage-labels.md`.
+Readiness labels describe triage state and do not grant execution or merge
+authority.
+
+### Domain docs
+
+Use a single-context layout: root `GLOSSARY.md` and `docs/adr/`.
+Read `docs/agents/domain.md`. Create domain documents lazily within authorized
+work, and preserve existing decision records.
