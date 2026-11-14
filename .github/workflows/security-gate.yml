@@ -17,7 +17,7 @@ jobs:
   source-security:
     name: Source security and regression suite
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       CI: 'true'
       NODE_OPTIONS: ''
@@ -112,7 +112,7 @@ jobs:
           npm_config_cache: ${{ runner.temp }}/crate-npm-cache
           CRATE_UI_TEST_BROWSER_PIN: '1'
           CRATE_UI_TEST_BROWSER: ${{ runner.temp }}/crate-ci-chrome/payload/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
-        run: node scripts/run-tests.js --deadline-seconds=2580 --test-concurrency=1 tests/*.test.js
+        run: node scripts/run-tests.js --deadline-seconds=3400 --test-concurrency=1 tests/*.test.js
 
       - name: Verify fixed Chrome for Testing remained unchanged
         if: always()

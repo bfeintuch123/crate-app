@@ -36,11 +36,11 @@ Forbidden:
 
 ## State
 
-- current phase: implemented, checked, pushed and reviewed. The full serial suite passed through the guard, the draft pull request #329 is open, protected CI passed, and both final independent reviews returned PASS WITH NOTES with no blocker. What is left is Bryant's: the decisions listed under "Still open", and the merge.
-- last completed checkpoint: the two commits after f686401, which are 678f96f and the one that carries this text. They change records and comments only (this file, the header comments of `scripts/run-tests.js` and `tests/bounded-assert.js`, and the test section of AGENTS.md), to bring this record up to date and to correct statements the final reviews and their follow-up found inexact. No behavior, message, test, limit, deadline or timeout changes with them.
-- next action: none for the writer until Bryant decides. Protected CI has to pass on the commit that carries this text, like on every head.
+- current phase: implemented, checked, pushed and reviewed. The full serial suite passed through the guard, the draft pull request #329 is open, protected CI passed on every head so far, and both final independent reviews returned PASS WITH NOTES with no blocker. Bryant has since made two decisions: he accepted the existing three-sample allowance by name, and he approved the CI timing change that the commit carrying this text makes. What is left is his: the remaining choices under "Still open", and the merge.
+- last completed checkpoint: the commit that carries this text. It raises the CI job's time limit from 45 to 60 minutes and the guard's deadline for the suite from 2580 to 3400 seconds in `.github/workflows/security-gate.yml`, updates the pinned suite command in `tests/release-artifact-policy.test.js`, pins the time limit there too, and records both decisions here. Nothing else changes: the guard, the sampler, the allowance, the default limits and deadline for local runs, and every other test are as at f686401.
+- next action: protected CI on the commit that carries this text, and a narrow independent review of this one change. Then nothing for the writer until Bryant decides.
 - blocker: none in the code.
-- approval state: Bryant approved the three guard changes and this records-and-comments correction. No approval to merge, mark ready, enable auto-merge, or release.
+- approval state: Bryant approved the three guard changes, the records-and-comments corrections, the existing three-sample allowance by name ("Yes keep it", 2026-11-14), and the CI timing change (60 minutes and 3400 seconds, 2026-11-14). No approval to merge, mark ready, enable auto-merge, or release.
 - preferences applied: one writer, read-only reviewers, no concurrent heavy Mac tests, every run through the guard, pinned Node, live process preflight before each run
 - routing decision: major PR (shared test infrastructure and CI); exact-head protected CI and two independent read-only final reviews, each in a fresh session: Claude Opus 5.5 at high effort, which replaces Astra for this work on Bryant's instruction, and Claude Fable 5.2 at high effort
 - workflow eval suite/result: full serial suite through the guard at f686401, locally and on CI, see Evidence
@@ -80,8 +80,11 @@ Running the accommodation against real processes raised three questions that wer
 - [x] independent final reviews at f686401, fresh read-only sessions: Claude Opus 5.5 high and Claude Fable 5.2 high, both PASS WITH NOTES
 - [x] narrow follow-up by the Fable 5.2 reviewer at 678f96f: pass with notes
 - [x] exact-head CI at 678f96f (records and comments only): passed on the first attempt (run 43560820877)
-- [ ] exact-head CI on the commit that carries this text (records and comments only)
-- [ ] Bryant's decisions under "Still open", and his approval to mark ready and to merge
+- [x] exact-head CI at e640d73 (records and comments only): passed on the first attempt (run 43563678953)
+- [x] Bryant's decision on the three-sample allowance: accepted by name, kept as it is
+- [x] Bryant's decision on CI time: job limit 60 minutes, guard deadline 3400 seconds; made in the commit that carries this text
+- [ ] exact-head CI on the commit that carries this text, and a narrow independent review of it
+- [ ] Bryant's remaining choices under "Still open", and his approval to mark ready and to merge
 - [ ] REQUIRED post-merge acceptance on the exact merged commit (see below; not run)
 
 ## How the guard works
@@ -127,6 +130,8 @@ Bounded synthetic tests only. Allocators stop by themselves at 256 MB and let go
 | 2026-11-14 | Full serial suite through the guard at f686401, the CI command (`node scripts/run-tests.js --deadline-seconds=2580 --test-concurrency=1 tests/*.test.js`), pinned Node 22.23.1 and Chrome, from a non-hidden workspace after a live process preflight | private log | Exit 0. 4340 tests, 4338 pass, 0 fail, 2 skipped (one needs an Electron ZIP supplied explicitly, one is CI-only). 19 min 48 s. Guard summary: 20600 samples, peak 452 MB in one process and 1.3 GB in total; a `ps` let through 43 times. Nothing left running. |
 | 2026-11-14 | Protected CI on f686401, first attempt | https://github.com/bfeintuch123/crate-app/actions/runs/43554660920 | Passed. Suite step: 4340 tests, 4338 pass, 0 fail, 2 skipped, 37 min 6 s. Guard summary: 37392 samples, peak 487 MB in one process and 1.1 GB in total. The base ran 4254 tests; the 86 more are the 19 bounded-assert and 67 guard tests. First run of the guard on the CI runner. |
 | 2026-11-14 | Protected CI on 678f96f (records and comments only; executable code as at f686401), first attempt | https://github.com/bfeintuch123/crate-app/actions/runs/43560820877 | Passed. Suite step: 4340 tests, 4338 pass, 0 fail, 2 skipped, 33 min 44 s. Guard summary: 33932 samples, peak 507 MB in one process and 1.1 GB in total. The same code took 37 min 6 s in the run before: the runner varies by minutes. |
+| 2026-11-14 | Protected CI on e640d73 (records and comments only; executable code as at f686401), first attempt | https://github.com/bfeintuch123/crate-app/actions/runs/43563678953 | Passed. Suite step: 4340 tests, 4338 pass, 0 fail, 2 skipped, 39 min 15 s. Job 39 min 53 s of its 45 minutes. Guard summary: 40211 samples, peak 485 MB in one process and 1.1 GB in total. Three runs of the same executable code took 2226, 2024 and 2355 seconds for the suite step against a deadline of 2580: 225 seconds to spare on the slowest. |
+| 2026-11-14 | CI timing change, checked locally: the workflow parsed before and after; the policy test file through the guard; the new pins against deliberate wrong values on a scratch copy | terminal | The workflow parses to the same structure with exactly two values changed: the job time limit, 45 to 60 minutes, and the deadline in the suite command, 2580 to 3400 seconds. `tests/release-artifact-policy.test.js` through the guard: 58 of 58. Seven deliberate wrong values, each caught by that test: the job limit at 45 and at 59; the deadline at 2580, at 3500, and removed; a second, step-level time limit; and both pins moved to 3500 together, which only the two-minute rule catches. The full suite was not rerun locally; CI runs it on this head. |
 
 Real-process scenarios covered by the tests: pass and fail passed through; per-process and total limit; a memory stop that takes nested, detached and adopted processes with it; leftovers of a finished run, including one that ignores SIGTERM; SIGTERM, SIGINT and a second signal; deadline; both samplers killed and both frozen; a leftover that cannot be ended and one that cannot be identified, both turning a passing run into exit 125; a process of the run that cannot be read stopping the run; a runner that cannot be read stopped at the first scan before the fixture starts anything; the sampler in use failing with no new one available, where the standby stops the whole run; no sampler working at all, where only the runner's group is ended; bad options; a run that calls `ps` over and over, several at once, and with a parent too busy to collect them; a process that reads as `ps` but does not end, and one that reads as another set-uid tool; an ordinary child and a `ps` that end and wait to be collected; a process that cannot be read just as the run ends, as a signal arrives, and in the scan after the run. In each scenario that starts one, a process outside the guarded run survives.
 
@@ -171,7 +176,7 @@ At most three correction cycles.
 - There is no supported way to run these tests off macOS or without a Python 3: the guard refuses with exit 125, and AGENTS.md forbids calling `node --test` directly.
 - Compressed memory is read through footprint at every sample. Not tested under real memory pressure.
 - macOS only. Needs `/usr/bin/python3` or `python3` on the path; without a working sampler the guard refuses to run the tests.
-- A process of the run for which the system answers "no such process" (it is ending, or was collected between two of the sampler's reads), and a runner that scans do not list, are tolerated for three samples in a row, about 0.2 s, before the run is stopped. Most such rows count as zero meanwhile; one whose usage still answers counts at its last size. One readable sample resets the count. A process whose usage is denied gets no such allowance.
+- A process of the run for which the system answers "no such process" (it is ending, or was collected between two of the sampler's reads), and a runner that scans do not list, are tolerated for three samples in a row, about 0.2 s, before the run is stopped. Most such rows count as zero meanwhile; one whose usage still answers counts at its last size. One readable sample resets the count. A process whose usage is denied gets no such allowance. Bryant accepted this allowance by name on 2026-11-14, as it is; it stands beside the three exceptions he accepted before.
 - The guard's own waits are bounded: 5 s grace after a signal, 2 s for leftovers, 5 s to confirm a kill, 1 s per sampler request, at most 3 s without a sample.
 
 ## What the bounded assert covers
@@ -185,18 +190,22 @@ At most three correction cycles.
 - A raw ArrayBuffer, SharedArrayBuffer or DataView is not measured by its content; Node renders it as one long line. That cost is linear, not the runaway, and the guard stands behind it.
 - The import policy covers the test files directly under `tests/`. A few fixtures that run in child processes, and one worker body that is allowed by name, still import `node:assert`.
 
+Decided by Bryant on 2026-11-14:
+
+- The three-sample allowance stays as it is, accepted by name. A process of the run for which the system answers "no such process", and a runner that scans do not list, are given three samples in a row before the guard gives up on the run. Its implementation was not touched.
+- CI time. Three runs of the same code had taken 2226, 2024 and 2355 seconds for the suite step against a deadline of 2580, and the slowest job 39 min 53 s of 45 minutes. The job's time limit is now 60 minutes and the guard's deadline for the suite 3400 seconds, 200 seconds inside the limit so that the guard reports first. Both values are pinned in `tests/release-artifact-policy.test.js` from this commit on, together with the rule that the deadline stays at least two minutes inside the limit. The default deadline for local runs (2400 seconds) is unchanged.
+
 Still open, all of it for Bryant:
 
-- CI time. On CI the suite used 2226 of the 2580 seconds the guard's deadline allows, and the job 37 min 42 s of its 45 minutes; a second run of the same code used 2024 seconds; before this change the same step took 35 min 47 s. Both final reviewers recommend raising the job timeout and the deadline together in an explicit change (about 60 minutes and about 3400 seconds, the deadline a few minutes under the timeout). The deadline is pinned in `tests/release-artifact-policy.test.js`, as part of the pinned suite command; the job timeout is not pinned by any test (an earlier version of this record said both were). Nothing was changed. Until it is, a slow runner or a few more tests can fail the required check with exit 124; that failure is loud and a rerun clears it.
-- The three-sample grace. A process of the run that the system lists but that answers "no such process", which is how a process reads while it is ending, is given three samples before the guard gives up on the run, and so is a runner that scans do not list. It is older than the `ps` round and is not one of the three exceptions Bryant accepted by name. The follow-up review read it from the source: it counts samples, not time; a process cannot put itself into this state while it runs; the exposure is one process uncounted for about 0.2 s; with no allowance at all nearly every full suite would be stopped, and nobody has measured what one or two samples would do. It would keep the allowance as it is. Bryant has not decided; nothing was changed.
 - Whether to keep, as they are: the report text "NOT touched" for processes that can be frozen; the exit 125 after a stop when a process vanishes in the middle of the last scan; the `test:app-contents` script in package.json, which still calls `node --test` directly; the wall-clock bounds in some of the guard's tests; the unmeasured ArrayBuffer and DataView operands.
-- The default limits (2 GB, 4 GB, 40 minutes) fit the measured runs: 452 MB and 1.3 GB locally in 19 min 48 s, 487 MB and 1.1 GB on CI.
+- The default limits (2 GB, 4 GB, 40 minutes) fit the measured runs: 452 MB and 1.3 GB locally in 19 min 48 s, at most 507 MB and 1.1 GB on CI.
+- Ready-for-review and merge.
 
 ## Sequence from here
 
-1. Done: implementation review, heavy slot, full serial suite, push, draft PR #329, exact-head CI at f686401, both final reviews.
-2. Protected CI on the commit that carries this text.
-3. Bryant: the decisions under "Still open"; then ready-for-review and merge, which only he approves. Neither is authorized today.
+1. Done: implementation review, heavy slot, full serial suite, push, draft PR #329, exact-head CI at f686401, 678f96f and e640d73, both final reviews and the follow-up, Bryant's decisions on the allowance and on CI time.
+2. Protected CI on the commit that carries this text, and a narrow independent review of it.
+3. Bryant: the remaining choices under "Still open"; then ready-for-review and merge, which only he approves. Neither is authorized today.
 4. After a separately authorized merge: the post-merge acceptance below. It is required and has not been run.
 
 ## Required post-merge acceptance (Bryant, 2026-11-13)

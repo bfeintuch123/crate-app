@@ -3945,6 +3945,17 @@ test('CI source gate is least privilege, pinned, serial, and release inert', () 
   assert.match(workflow, /runs-on: macos-15/u);
   assert.match(workflow, /node-version: 22\.23\.1/u);
   assert.match(workflow, /^  source-security:\n    name: Source security and regression suite$/mu);
+  // The job's time limit and the memory guard's deadline for the suite are set
+  // together. The deadline stays at least two minutes inside the limit, which
+  // covers the steps before the suite and the guard's own cleanup, so that a
+  // suite that takes too long ends with the guard's report (exit 124) and not
+  // with a cancelled job.
+  assert.equal([...workflow.matchAll(/timeout-minutes:/gu)].length, 1);
+  const jobTimeoutMinutes = Number(/^    timeout-minutes: (\d+)$/mu.exec(workflow)[1]);
+  const suiteDeadlines = [...workflow.matchAll(/--deadline-seconds=(\d+)/gu)].map(match => Number(match[1]));
+  assert.equal(jobTimeoutMinutes, 60);
+  assert.deepEqual(suiteDeadlines, [3400]);
+  assert.ok(jobTimeoutMinutes * 60 - suiteDeadlines[0] >= 120);
   assert.doesNotMatch(workflow, /^\s{4}(?:if|continue-on-error):/mu);
   assert.match(workflow, /NODE_OPTIONS: ''/u);
   assert.match(workflow, /NODE_PATH: ''/u);
@@ -4088,7 +4099,7 @@ test('CI source gate is least privilege, pinned, serial, and release inert', () 
   }
   assert.deepEqual(
     runs.get('Run complete serial source suite'),
-    ['node scripts/run-tests.js --deadline-seconds=2580 --test-concurrency=1 tests/*.test.js']
+    ['node scripts/run-tests.js --deadline-seconds=3400 --test-concurrency=1 tests/*.test.js']
   );
   assert.equal(workflowStepBlock(workflow, 'Check security verifier syntax'), [
     '      - name: Check security verifier syntax',
@@ -4134,7 +4145,7 @@ test('CI source gate is least privilege, pinned, serial, and release inert', () 
     '          npm_config_cache: ${{ runner.temp }}/crate-npm-cache',
     "          CRATE_UI_TEST_BROWSER_PIN: '1'",
     '          CRATE_UI_TEST_BROWSER: ${{ runner.temp }}/crate-ci-chrome/payload/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
-    '        run: node scripts/run-tests.js --deadline-seconds=2580 --test-concurrency=1 tests/*.test.js',
+    '        run: node scripts/run-tests.js --deadline-seconds=3400 --test-concurrency=1 tests/*.test.js',
     '',
   ].join('\n'));
   assert.equal(workflowStepBlock(workflow, 'Verify fixed Chrome for Testing remained unchanged'), [
