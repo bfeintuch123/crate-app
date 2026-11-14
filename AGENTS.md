@@ -79,7 +79,7 @@ Use ChatGPT app for:
 ## Playbooks
 Reusable Crate workflow playbooks live in `.codex/playbooks/`.
 
-Matt Pocock's shared skills drive routine workflow (see Agent skills). `.codex/ROUTER.md`, the `crate-router` skill, the ops layer, and the playbooks below remain reference files for Crate-specific procedures. Select a playbook when its procedure is needed; never run it as a second routine controller beside Matt's skills. Where a playbook, `.codex/ROUTER.md`, the `crate-router` skill, or an ops-layer file conflicts with this file on reviewer count or model names, mandatory standing-order or taskflow routing, repository paths, or approval gates, this file controls. Never weaken a gate stated here.
+Matt Pocock's shared skills drive routine workflow (see Agent skills). `.codex/ROUTER.md`, the `crate-router` skill, the ops layer, and the playbooks below remain reference files for Crate-specific procedures. Select a playbook when its procedure is needed; never run it as a second routine controller beside Matt's skills. Where a playbook, `.codex/ROUTER.md`, the `crate-router` skill, `WORKSPACE.md`, or an ops-layer file conflicts with this file on reviewer model names, mandatory standing-order or taskflow routing, or repository paths, this file controls. On any other gate, including reviewer count, apply whichever of this file and the referenced file is stricter; never weaken a gate stated here. Run tests only through the guarded command in Running Tests, even where an older file shows a direct `node` test command.
 
 Supporting workflow references:
 - `WORKSPACE.md` maps crate-app, crate-web, and mission-control boundaries.
@@ -132,7 +132,7 @@ When using a playbook, state which playbook is active, confirm the current branc
 
 ## Ops Layer
 
-The ops layer (`.codex/ops/`, taskflows, state ledgers, `.codex/tools/crate_doctor.py`, and the proof-bundle template) remains available for Crate-specific procedures. Use it when a selected playbook or the task requires it. Before release, deploy, long-running QA, or external-control work, always run `CRATE_REPO=<this checkout> python3 .codex/tools/crate_doctor.py` and resolve or report any failure before continuing. Apart from that preflight, the ops layer does not route or gate routine work.
+The ops layer (`.codex/ops/`, taskflows, state ledgers, `.codex/tools/crate_doctor.py`, and the proof-bundle template) remains available for Crate-specific procedures. Use it when a selected playbook or the task requires it. Before release, deploy, long-running QA, or external-control work, always run `CRATE_REPO=<this checkout> python3 .codex/tools/crate_doctor.py`. Stop on any failure and continue only after it is fixed or Bryant accepts it. Apart from that preflight, the ops layer does not route or gate routine work.
 
 ## PR Review Rules
 Before merge:
