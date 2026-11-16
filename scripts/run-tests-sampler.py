@@ -16,7 +16,9 @@ much memory it holds. libproc gives them directly:
                                           now runs as another user (a set-uid
                                           tool such as /bin/ps), which is the
                                           one kind of process whose usage this
-                                          user may not read
+                                          user may not read; and, for a
+                                          report, for the one pid a describe
+                                          request names
 
 libproc does not describe a process that has ended and waits for its parent to
 collect it: proc_pidinfo says there is no such process, which is also what it
@@ -84,6 +86,18 @@ Protocol, one request per line on stdin, one answer on stdout.
   group <id> <NAME> <pgid> <pid>:<start>
       signalled <id> <result>
     Signals process group <pgid> if <pid>, with that start time, is in it now.
+
+  describe <id> <pid>
+      described <id> <listed> <info-errno> <usage-errno> <record> <path> <numer>/<denom>
+    For a report, never for a decision: what the system says of one pid right
+    now. <listed> is 1 or 0 for whether proc_listallpids lists it ("-" if the
+    list cannot be read); <info-errno> and <usage-errno> are those of the two
+    reads a scan makes; <record> is "<ppid>,<pgid>,<uid>,<ruid>,<status>" from
+    the process table, or "-" when it has no record of that pid; <path> is the
+    percent-encoded executable path, read for any process here, or "-"; and
+    <numer>/<denom> is mach_timebase_info, which converts the start times in
+    scan rows to nanoseconds ("0/0" if it cannot be read). Nothing else of the
+    process is read: no arguments, no environment.
 
   <NAME> is STOP, CONT, KILL, TERM, INT or HUP. A <result> is
     sent        the start time matched and the signal was sent
@@ -177,6 +191,11 @@ class RusageInfoV2(ctypes.Structure):
         ("ri_diskio_bytesread", ctypes.c_uint64),
         ("ri_diskio_byteswritten", ctypes.c_uint64),
     ]
+
+
+class TimebaseInfo(ctypes.Structure):
+    # struct mach_timebase_info, <mach/mach_time.h>
+    _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
 
 
 class Sampler:
@@ -341,6 +360,25 @@ class Sampler:
         self.settle(readings)
         return [row for _, row, _ in readings]
 
+    def describe(self, pid):
+        """One line of facts about <pid> for a report; see the protocol above."""
+        try:
+            listed = "1" if pid in self.list_pids() else "0"
+        except OSError:
+            listed = "-"
+        info_errno = self.read_info(pid)
+        usage_errno = self.read_usage(pid)
+        record = self.read_record(pid)
+        path = self.read_path(pid)
+        timebase = TimebaseInfo()
+        self.libc.mach_timebase_info.argtypes = [ctypes.POINTER(TimebaseInfo)]
+        self.libc.mach_timebase_info.restype = ctypes.c_int
+        if self.libc.mach_timebase_info(ctypes.byref(timebase)) != 0:
+            timebase = TimebaseInfo(0, 0)
+        return "%s %d %d %s %s %d/%d" % (
+            listed, info_errno, usage_errno, ",".join(str(value) for value in record) if record else "-",
+            path, timebase.numer, timebase.denom)
+
     def check(self, pid, start):
         """None when <pid> is the process that started at <start>, else why not."""
         usage_errno = self.read_usage(pid)
@@ -397,6 +435,8 @@ def answer(sampler, words):
     if len(words) == 2 and words[0] == "scan" and words[1].isdigit():
         rows = sampler.scan()
         return "begin %s %d\n%s%send %s\n" % (words[1], len(rows), "\n".join(rows), "\n" if rows else "", words[1])
+    if len(words) == 3 and words[0] == "describe" and words[1].isdigit() and words[2].isdigit() and int(words[2]) > 1:
+        return "described %s %s\n" % (words[1], sampler.describe(int(words[2])))
     if len(words) >= 4 and words[0] == "signal" and words[1].isdigit() and words[2] in SIGNALS:
         targets = [parse_target(word) for word in words[3:]]
         results = [sampler.signal_process(pid, start, SIGNALS[words[2]]) for pid, start in targets]

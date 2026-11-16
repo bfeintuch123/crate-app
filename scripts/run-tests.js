@@ -69,6 +69,15 @@
 // too closely for "three samples" to mean anything; a process it cannot read
 // then counts only if it is still running at the end.
 //
+// When a process that answers "no such process" stops the run, the report
+// also says what the guard knew of it: when it was last read in full (parent,
+// group, start time, memory), how long and in which scans it was unreadable,
+// what the sampler says of it once while the run is frozen (whether it is
+// listed, both reads, the process table's record and the executable path, never
+// its arguments or environment), what each scan of the cleanup showed of it,
+// and how long the last scans took. That is for diagnosis only: the stop, its
+// timing and the exit status are the same with or without it.
+//
 // The one exception is the system's own `ps`. Tests start it, and macOS
 // installs it set-uid root, so this user may not read its memory. A process is
 // let through as that tool only when the system reports its executable as
@@ -172,6 +181,13 @@ const TIMING = {
 // cannot watch it.
 const UNREADABLE_SAMPLES = 3;
 const MAX_FREEZE_ROUNDS = 50;
+// How many recent scans the report of an unreadable process lists, at most,
+// how many changes of its state during a cleanup, and how long the guard waits
+// for the sampler to describe it while the run is frozen.
+const REPORTED_SCANS = 8;
+const REPORTED_CHANGES = 8;
+const DESCRIBE_TIMEOUT_MS = 500;
+const REPORTED_PATH_LENGTH = 300;
 const EXIT_MEMORY_LIMIT = 137;
 const EXIT_DEADLINE = 124;
 const EXIT_GUARD_FAILURE = 125;
@@ -269,6 +285,38 @@ function parseRow(line) {
   };
 }
 
+// The sampler's answer about one pid, for the report only (see the sampler's
+// `describe`): null when it is not the expected shape. Never throws, so that
+// an odd answer cannot take the sampler down.
+function parseDescription(words) {
+  if (words.length !== 6) return null;
+  const [listed, info, usage, record, encodedPath, timebase] = words;
+  const base = /^(\d+)\/(\d+)$/.exec(timebase);
+  if (!/^[01-]$/.test(listed) || !/^\d+$/.test(info) || !/^\d+$/.test(usage) || !base) return null;
+  let fields = null;
+  if (record !== '-') {
+    fields = record.split(',').map(Number);
+    if (fields.length !== 5 || !fields.every(Number.isInteger)) return null;
+  }
+  let executable = null;
+  if (encodedPath !== '-') {
+    try {
+      executable = decodeURIComponent(encodedPath);
+    } catch {
+      return null;
+    }
+  }
+  const [ppid, pgid, uid, ruid, status] = fields || [];
+  return {
+    listed: listed === '-' ? null : listed === '1',
+    info: Number(info),
+    usage: Number(usage),
+    record: fields && { ppid, pgid, uid, ruid, status },
+    path: executable,
+    timebase: { numer: Number(base[1]), denom: Number(base[2]) },
+  };
+}
+
 const hasEnded = row => row.infoError === 0 && row.status === ZOMBIE;
 const isIdentified = row => row.usageError === 0;
 
@@ -359,6 +407,11 @@ function startSampler(command, requestTimeoutMs = TIMING.requestTimeoutMs) {
     }
     return results;
   };
+  const describeReader = id => line => {
+    const words = line.split(' ');
+    if (words[0] !== 'described' || Number(words[1]) !== id) return undefined;
+    return parseDescription(words.slice(2));
+  };
   const target = row => `${row.pid}:${row.start}`;
   const short = name => name.replace(/^SIG/, '');
 
@@ -367,6 +420,10 @@ function startSampler(command, requestTimeoutMs = TIMING.requestTimeoutMs) {
     // Gone for good, as opposed to slow to answer.
     get dead() { return failure !== null; },
     scan: (timeoutMs = requestTimeoutMs) => request(['scan'], scanReader, timeoutMs),
+    // What the system says about one pid right now, for a report.
+    // Never sent for a pid the sampler would refuse, which would end it.
+    describe: (pid, timeoutMs = requestTimeoutMs) => (Number.isInteger(pid) && pid > 1
+      ? request(['describe', String(pid)], describeReader, timeoutMs) : Promise.resolve(null)),
     // Sends `name` to each process that still has the start time in its row.
     signalProcesses: (name, rows) => request(['signal', short(name), ...rows.map(target)], signalReader(rows.length), requestTimeoutMs),
     // Sends `name` to process group `pgid` if `member` is still in it.
@@ -419,11 +476,17 @@ function createOwnership({ guardPid, guardUid, helperPids = [], runnerPid, now =
   let latest = new Map();
   const identified = new Map(); // pid -> start time under which that pid was last identified as the run's
   // Processes of the run that cannot be read: pid -> { errno, samples, since,
-  // ending, allowed }. `samples` counts the scans in a row that could not read
-  // it and `since` is the time of the first; `ending` counts those in a row
-  // that said it no longer exists; `allowed` marks the system tool while it is
-  // let through.
+  // ending, allowed, info, usage, times }. `samples` counts the scans in a row
+  // that could not read it and `since` is the time of the first; `ending`
+  // counts those in a row that said it no longer exists; `allowed` marks the
+  // system tool while it is let through. `info` and `usage` are the two errnos
+  // of the latest of those scans and `times` the times of the last few: they
+  // are only reported, never decided on.
   const unread = new Map();
+  // For the report only: pid -> { row, at }, the latest scan that read that
+  // process of the run in full, and when.
+  let lastRead = new Map();
+  let latestTime = null;
 
   return {
     get owned() { return owned; },
@@ -433,6 +496,17 @@ function createOwnership({ guardPid, guardUid, helperPids = [], runnerPid, now =
     get toolStats() { return toolStats; },
     // False once a scan showed the runner outside the group it was started to lead.
     get groupUsable() { return anchored !== false; },
+    // What is known about a process of the run that cannot be read, for the
+    // report. Nothing the guard decides depends on it.
+    unreadDetails(pid) {
+      const entry = unread.get(pid);
+      if (!entry) return null;
+      const read = lastRead.get(pid);
+      return {
+        errno: entry.errno, samples: entry.samples, ending: entry.ending, info: entry.info, usage: entry.usage,
+        since: entry.since, times: [...entry.times], at: latestTime, lastRead: read ? { ...read.row, at: read.at } : null,
+      };
+    },
     row(pid) { return latest.get(pid) || null; },
     addHelper(pid) { helpers.add(pid); },
     // An identified process of the run that is in the runner's group right
@@ -538,9 +612,13 @@ function createOwnership({ guardPid, guardUid, helperPids = [], runnerPid, now =
       }
       descend();
       const time = now();
+      latestTime = time;
       let allowed = 0;
+      const readNow = new Map();
       for (const pid of [...unread.keys()]) if (!next.has(pid)) unread.delete(pid);
       for (const row of next.values()) {
+        if (isIdentified(row) && row.infoError === 0 && !hasEnded(row)) readNow.set(row.pid, { row, at: time });
+        else if (lastRead.has(row.pid)) readNow.set(row.pid, lastRead.get(row.pid));
         // Never learned from a process that has ended: its start time and its
         // state come from two reads, and only a live process is worth knowing again.
         if (isIdentified(row) && !hasEnded(row)) identified.set(row.pid, row.start);
@@ -549,8 +627,11 @@ function createOwnership({ guardPid, guardUid, helperPids = [], runnerPid, now =
           continue;
         }
         const errno = row.usageError || row.infoError;
-        const earlier = unread.get(row.pid) || { samples: 0, since: time, ending: 0 };
-        const entry = { errno, samples: earlier.samples + 1, since: earlier.since, ending: errno === ESRCH ? earlier.ending + 1 : 0, allowed: false };
+        const earlier = unread.get(row.pid) || { samples: 0, since: time, ending: 0, times: [] };
+        const entry = {
+          errno, samples: earlier.samples + 1, since: earlier.since, ending: errno === ESRCH ? earlier.ending + 1 : 0, allowed: false,
+          info: row.infoError, usage: row.usageError, times: [...earlier.times.slice(1 - REPORTED_SCANS), time],
+        };
         unread.set(row.pid, entry);
         // The system tool (see the header). Every condition is read from this
         // scan; a remembered pid is not enough, and neither is the runner's pid.
@@ -569,6 +650,7 @@ function createOwnership({ guardPid, guardUid, helperPids = [], runnerPid, now =
           toolStats.longestMilliseconds = Math.max(toolStats.longestMilliseconds, time - entry.since);
         }
       }
+      lastRead = readNow;
       owned = next;
       return owned;
     },
@@ -685,6 +767,88 @@ function measureRun(owned) {
   return { total, largest };
 }
 
+// One word or phrase for what a scan shows of `pid`, for the report.
+function stateIn(rows, pid) {
+  const row = rows.find(item => item.pid === pid);
+  if (!row) return 'not listed';
+  if (hasEnded(row)) return 'ended';
+  if (isIdentified(row) && row.infoError === 0) return 'readable';
+  return `listed, unreadable (process info errno ${row.infoError}, usage errno ${row.usageError})`;
+}
+
+// Notes one scan of a cleanup in `runs`, a list of { state, count, first, last }.
+function noteState(record, state, at) {
+  const last = record.runs[record.runs.length - 1];
+  record.scans += 1;
+  if (last && last.state === state) {
+    last.count += 1;
+    last.last = at;
+  } else if (record.runs.length < REPORTED_CHANGES) {
+    record.runs.push({ state, count: 1, first: at, last: at });
+  } else {
+    record.dropped += 1;
+  }
+}
+
+// The report of a process of the run that stopped the run by answering "no
+// such process" for too many scans in a row: what the guard and its sampler
+// knew of it. Facts only, bounded, without arguments or environment.
+// Times are in milliseconds on one clock.
+function describeUnreadable({ pid, runnerPid, runnerStart, details, scans, frozen, cleanup }) {
+  const ms = value => `${Math.round(value)} ms`;
+  const lines = [`About process ${pid}, which stopped the run (for diagnosis; it changes nothing about the stop):`];
+  if (details) {
+    const offsets = details.times.map(time => Math.round(time - details.since)).join(', +');
+    lines.push(`  unreadable in ${details.samples} scans in a row over ${ms(details.at - details.since)}, ${details.ending} of them in a row `
+      + `answering "no such process"; the last one: process info errno ${details.info}, usage errno ${details.usage}; `
+      + `the last ${details.times.length} of those scans at +${offsets} ms`);
+    const read = details.lastRead;
+    if (read) {
+      let started = '';
+      const base = frozen && frozen.timebase;
+      if (base && base.numer > 0 && base.denom > 0 && runnerStart && /^\d+$/.test(runnerStart) && /^[1-9]\d*$/.test(read.start)) {
+        const nanoseconds = (BigInt(read.start) - BigInt(runnerStart)) * BigInt(base.numer) / BigInt(base.denom);
+        started = `, ${(Number(nanoseconds) / 1e9).toFixed(3)} s after the test runner started`;
+      }
+      lines.push(`  last read in full ${ms(details.at - read.at)} before the stop: parent ${read.ppid}, process group ${read.pgid}`
+        + `${read.pgid === runnerPid ? ' (the test runner\'s)' : ''}, uid ${read.uid}, ${read.megabytes.toFixed(1)} MB, `
+        + `start ${read.start} (Mach absolute time)${started}`);
+    } else {
+      lines.push('  never read in full while it was a process of the run');
+    }
+  }
+  lines.push('  session: not known (the sampler does not read it)');
+  if (!frozen) {
+    lines.push('  while the run was frozen: not asked');
+  } else if (frozen.error) {
+    lines.push(`  while the run was frozen: the sampler did not describe it (${frozen.error})`);
+  } else {
+    const listed = frozen.listed === null ? 'listing unknown' : frozen.listed ? 'listed' : 'not listed';
+    const record = frozen.record
+      ? `state ${frozen.record.status}, parent ${frozen.record.ppid}, group ${frozen.record.pgid}, uid ${frozen.record.uid}, real uid ${frozen.record.ruid}`
+      : 'no record';
+    const executable = frozen.path === null ? 'not readable'
+      : frozen.path.length > REPORTED_PATH_LENGTH ? `${frozen.path.slice(0, REPORTED_PATH_LENGTH)}...` : frozen.path;
+    lines.push(`  while the run was frozen: ${listed}, process info errno ${frozen.info}, usage errno ${frozen.usage}; `
+      + `process table: ${record}; executable: ${executable}`);
+  }
+  if (cleanup && cleanup.scans > 0 && details) {
+    const runs = cleanup.runs.map(run => `${run.state} in ${run.count} (+${Math.round(run.first - details.at)} to +${Math.round(run.last - details.at)} ms)`);
+    lines.push(`  in the ${cleanup.scans} scans of the cleanup: ${runs.join('; ')}`
+      + `${cleanup.dropped > 0 ? `; ${cleanup.dropped} more scans after ${REPORTED_CHANGES} changes not itemized` : ''}`);
+  } else {
+    lines.push('  in the scans of the cleanup: none recorded');
+  }
+  if (scans.length > 0) {
+    const durations = scans.map(scan => scan.ms);
+    const gaps = scans.slice(1).map((scan, index) => scan.begun - scans[index].begun);
+    const range = values => `${Math.min(...values).toFixed(1)} to ${Math.max(...values).toFixed(1)} ms`;
+    lines.push(`  the last ${scans.length} scans before the stop took ${range(durations)}`
+      + `${gaps.length > 0 ? ` and began ${range(gaps)} apart` : ''}`);
+  }
+  return lines;
+}
+
 function describeProcess(pid) {
   try {
     return execFileSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8', timeout: 1000 }).trim() || '(no command)';
@@ -771,10 +935,23 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
   const ownership = createOwnership({
     guardPid: process.pid, guardUid: process.getuid(), helperPids: [sampler.pid, standby.pid], runnerPid: runner.pid,
   });
+  // For the report only: how long the last scans took, and, once a process
+  // that answers "no such process" has stopped the run, what each later scan
+  // showed of it. Nothing the guard decides depends on these.
+  const recentScans = [];
+  let diagnosis = null;
   const guard = createGuard({
     ownership,
     runnerPid: runner.pid,
-    scan: () => sampler.scan(),
+    scan: async () => {
+      const begun = performance.now();
+      const rows = await sampler.scan();
+      const done = performance.now();
+      recentScans.push({ begun, ms: done - begun });
+      if (recentScans.length > REPORTED_SCANS) recentScans.shift();
+      if (diagnosis) noteState(diagnosis.cleanup, stateIn(rows, diagnosis.pid), done);
+      return rows;
+    },
     signalProcesses: (name, rows) => sampler.signalProcesses(name, rows),
     signalGroup: (name, pgid, member) => sampler.signalGroup(name, pgid, member),
     signalGroupWhileHeld,
@@ -793,6 +970,17 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
   // cannot read, and what that does to a result the run already has.
   const notWatched = unreadable => {
     unreadablePid = unreadable.problem === 'unreadable' ? unreadable.pid : null;
+    if (unreadable.problem === 'unreadable' && unreadable.errno === ESRCH && !diagnosis) {
+      diagnosis = {
+        pid: unreadable.pid,
+        runnerPid: runner.pid,
+        runnerStart: ownership.runnerStart,
+        details: ownership.unreadDetails(unreadable.pid),
+        scans: recentScans.map(scan => ({ ...scan })),
+        frozen: null,
+        cleanup: { scans: 0, runs: [], dropped: 0 },
+      };
+    }
     const lines = [{
       unreadable: `GUARD CANNOT READ PROCESS ${unreadable.pid} OF THE RUN after ${seconds()} s (errno ${unreadable.errno}, ${unreadable.samples} samples in a row). Its memory is unknown.`,
       missing: `GUARD CANNOT FIND THE TEST RUNNER after ${seconds()} s: process ${unreadable.pid} exists and ${unreadable.samples} scans in a row did not list it. The run's memory is unknown.`,
@@ -884,9 +1072,20 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
       }
     }
   };
-  const announceStop = frozen => {
+  // One question to the sampler while the run is frozen, for the report. Any
+  // failure is only reported; the stop goes on exactly as without it.
+  const describeFrozen = async pid => {
+    if (typeof sampler.describe !== 'function') return { error: 'this sampler cannot be asked' };
+    try {
+      return (await sampler.describe(pid, DESCRIBE_TIMEOUT_MS)) || { error: 'its answer was not understood' };
+    } catch (error) {
+      return { error: error.message };
+    }
+  };
+  const announceStop = async frozen => {
     if (offender) report.push(`  ${describeProcess(offender)}`);
     if (unreadablePid) report.push(`  ${describeProcess(unreadablePid)}`);
+    if (diagnosis && !diagnosis.frozen && unreadablePid === diagnosis.pid) diagnosis.frozen = await describeFrozen(diagnosis.pid);
     offender = null;
     unreadablePid = null;
     report.push(`Stopping the test run (${frozen.length} processes).`);
@@ -960,6 +1159,7 @@ async function runGuard({ argv, env, startSampler: openSampler = startCheckedSam
   } else if (reason !== 'exit' || leftovers > 0) {
     report.push('Every process of the run has ended.');
   }
+  if (diagnosis) report.push(...describeUnreadable(diagnosis));
   if (reason === 'memory') {
     report.push('A test that needs this much memory is almost always a bug: rerun the file with --test-name-pattern to find the test, or pass a higher limit if the need is real.');
   }
@@ -992,6 +1192,8 @@ module.exports = {
   createGuard,
   measureRun,
   formatOver,
+  describeUnreadable,
+  parseDescription,
   UsageError,
   TIMING,
   DEFAULT_PROCESS_LIMIT_MB,

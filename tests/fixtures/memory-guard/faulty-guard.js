@@ -16,6 +16,8 @@
 //                                                       when the test run has ended; the scan the guard makes next, which is
 //                                                       the one it makes for a run that has ended, cannot read that process
 //   CRATE_GUARD_FAULT=unreadable-runner            the test runner itself cannot be read, from the first scan
+//   CRATE_GUARD_FAULT=no-such-process:<role>       once the fixture's tree is up, that process is still listed but both reads
+//                                                  answer "no such process", as the sampler reports it, for as long as it lives
 //   CRATE_GUARD_FAULT=system-tool:<role>           that process reads exactly as the system's set-uid ps does, for as long as it lives
 //   CRATE_GUARD_FAULT=other-tool:<role>            the same, but its executable is another set-uid tool
 //   CRATE_GUARD_FAULT=primary-fails                the sampler in use fails once the tree is up, and no new one can be started
@@ -27,11 +29,16 @@ const guard = require('../../../scripts/run-tests');
 
 const [kind, role] = String(process.env.CRATE_GUARD_FAULT).split(':');
 const EPERM = 1;
+const ESRCH = 3;
 const HELD = ['unreadable-as-run-ends', 'unreadable-then-gone', 'unreadable-as-signal-arrives', 'unreadable-right-after-run'];
 const sleep = milliseconds => new Promise(resolve => { setTimeout(resolve, milliseconds); });
 const recorded = () => new Map(fs.readFileSync(process.env.CRATE_GUARD_FIXTURE_PIDS, 'utf8').split('\n').filter(Boolean)
   .map(line => line.split(' ')).map(([name, pid]) => [name, Number(pid)]));
 const cannotRead = row => ({ ...row, start: '0', megabytes: 0, usageError: EPERM });
+// The row the sampler writes for a listed pid whose info and usage reads both answer ESRCH.
+const noSuchProcess = row => ({
+  ...row, ppid: 0, pgid: 0, uid: 0, ruid: 0, status: 0, start: '0', megabytes: 0, infoError: ESRCH, usageError: ESRCH, path: null,
+});
 // What the sampler reports for a set-uid root tool this user started.
 const asTool = (row, path) => ({ ...cannotRead(row), uid: 0, ruid: process.getuid(), path });
 
@@ -52,6 +59,12 @@ function misread(rows) {
   if (kind === 'system-tool' || kind === 'other-tool') {
     const target = recorded().get(role);
     return rows.map(row => (row.pid === target ? asTool(row, kind === 'system-tool' ? '/bin/ps' : '/usr/bin/top') : row));
+  }
+  if (kind === 'no-such-process') {
+    // Only after the guard has read it in full: the tree is up.
+    if (!recorded().has('ready')) return rows;
+    const target = recorded().get(role);
+    return rows.map(row => (row.pid === target ? noSuchProcess(row) : row));
   }
   if (!kind.startsWith('unreadable') || HELD.includes(kind)) return rows;
   const pids = recorded();
@@ -134,6 +147,7 @@ async function startFaultySampler() {
     // above do not change what it reads.
     signalGroup: (...args) => use(() => real.signalGroup(...args)),
     signalProcesses: (name, rows) => use(() => signalProcesses(name, rows)),
+    describe: (...args) => use(() => real.describe(...args)),
   };
 }
 
