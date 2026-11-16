@@ -3982,6 +3982,8 @@ test('CI source gate is least privilege, pinned, serial, and release inert', () 
   assert.deepEqual(stepNames, [
     'Check out source',
     'Scrub checkout credentials and map legacy gitlinks',
+    'Reject pull-request whitespace errors',
+    'Reject pushed whitespace errors',
     'Reject repository package-manager configuration',
     'Prepare isolated npm configuration',
     'Set up Node.js',
@@ -3993,8 +3995,6 @@ test('CI source gate is least privilege, pinned, serial, and release inert', () 
     'Authenticate installed release verifier toolchain',
     'Run complete serial source suite',
     'Verify fixed Chrome for Testing remained unchanged',
-    'Reject pull-request whitespace errors',
-    'Reject pushed whitespace errors',
   ]);
   assert.doesNotMatch(workflow, /^\s{6}- (?!name:)/mu);
   assert.equal(
