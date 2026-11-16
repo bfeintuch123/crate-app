@@ -62,6 +62,14 @@ The CI guard deadline is 3,400 s and the job limit is 60 minutes.
 
 Sum of per-test durations: 2,027 s over 4,333 parsed tests.
 
+The 4,340 tests in "Suite growth" for this run come from the runner's own
+`# tests` summary line. The 4,333 parsed tests are the top-level `ok` and
+`not ok` result lines that carry a `duration_ms`, and the TAP plan line is
+`1..4333`. The suite step log also holds 7 nested subtest results, which
+`# tests` counts and this audit did not parse: 4 under "invalid encrypted
+credential entries do not ask Keychain about encryption" and 3 under "archive
+stream completion follows terminal stream events".
+
 | Test | File | Duration |
 | --- | --- | --- |
 | large Add Files source scans use bounded concurrency and report per-file failures | tests/provenance-dual-write.test.js | 354 s |
@@ -87,11 +95,16 @@ Sum of per-test durations: 2,027 s over 4,333 parsed tests.
 17 failed attempts:
 
 - 12 in the suite step.
-- 3 in "Reject high-severity dependency findings", about 20 s into the job.
-- 1 in "Reject pull-request whitespace errors", 1,944 s into the job
-  (run 43300041932), because that step ran after the suite.
-- 1 guard exit 125 in the suite step, 186 s into the job (run 43629082221).
-  Cause not diagnosed.
+- 3 in "Reject high-severity dependency findings", in jobs that took 17 s to
+  20 s in total. The step failed 13 s to 17 s after the job started.
+- 1 in "Reject pull-request whitespace errors" (run 43300041932), because
+  that step ran after the suite. The step failed about 1,932 s after the job
+  started (20:24:51Z to 20:57:03.8Z). The whole job took 1,944 s.
+- 1 guard exit 125 in the suite step (run 43629082221). The guard's message
+  was logged about 181 s after the job started (18:53:50Z to 18:56:51Z). The
+  whole job took 186 s. Cause not diagnosed. The same guard message recurred
+  in run 43879768695 on 2026-11-16 (after 130.1 s, a Chrome process, errno 3,
+  four samples in a row). Diagnosis is in progress.
 
 Three attempts failed in the suite and passed when the same commit was re-run:
 
