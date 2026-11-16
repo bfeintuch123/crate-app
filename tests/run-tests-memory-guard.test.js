@@ -7,7 +7,7 @@ const { spawn, execFileSync } = require('node:child_process');
 const assert = require('./bounded-assert');
 const {
   parseArguments, parseRow, createOwnership, createGuard, measureRun, formatOver, startCheckedSampler, UsageError, TIMING,
-  describeUnreadable, parseDescription,
+  describeUnreadable, parseDescription, EXITING,
   DEFAULT_PROCESS_LIMIT_MB, DEFAULT_TOTAL_LIMIT_MB, DEFAULT_DEADLINE_SECONDS, UNREADABLE_SAMPLES,
   EXIT_MEMORY_LIMIT, EXIT_DEADLINE, EXIT_GUARD_FAILURE, ZOMBIE, ESRCH, EPERM, SYSTEM_TOOL,
 } = require('../scripts/run-tests');
@@ -334,10 +334,10 @@ test('a process that is ending may be unreadable for a few samples, and no longe
 // What the sampler writes for a listed pid whose info and usage reads both answer ESRCH.
 const noSuchProcessRow = pid => row(pid, 0, 0, { uid: 0, ruid: 0, status: 0, start: '0', megabytes: 0, infoError: ESRCH, usageError: ESRCH });
 
-test('a process that answers "no such process" stops the run as before, and what the guard knew of it is kept for the report', () => {
+test('a process that answers "no such process" to both reads stops the run as before, and what the guard knew of it is kept for the report', () => {
   const clock = { now: 0 };
   const ownership = newOwnership(clock);
-  ownership.update([...system, ...run.slice(0, 2), row(102, 101, RUNNER, { start: 'started-102', megabytes: 87 })], true);
+  ownership.update([...system, ...run.slice(0, 2), row(102, 101, RUNNER, { start: 'started-102', megabytes: 87, resident: 87, footprint: 80 })], true);
   const stuck = [...system, ...run.slice(0, 2), noSuchProcessRow(102)];
   for (let sample = 1; sample <= UNREADABLE_SAMPLES; sample += 1) {
     clock.now += 51;
@@ -349,51 +349,170 @@ test('a process that answers "no such process" stops the run as before, and what
   // The rule, its sample count and its answer are those of the guard before this report existed.
   assert.deepEqual(ownership.readFailure(), { pid: 102, problem: 'unreadable', errno: ESRCH, samples: UNREADABLE_SAMPLES + 1 });
   const details = ownership.unreadDetails(102);
+  const unreadScan = at => ({ at, info: ESRCH, usage: ESRCH, exiting: false, resident: null, footprint: null });
   assert.deepEqual(details, {
-    errno: ESRCH, samples: UNREADABLE_SAMPLES + 1, ending: UNREADABLE_SAMPLES + 1, info: ESRCH, usage: ESRCH,
-    since: 51, times: [51, 102, 153, 205], at: 205,
-    lastRead: { ...row(102, 101, RUNNER, { start: 'started-102', megabytes: 87 }), at: 0 },
+    errno: ESRCH, samples: UNREADABLE_SAMPLES + 1, ending: UNREADABLE_SAMPLES + 1, info: ESRCH, usage: ESRCH, exitingSince: null,
+    since: 51, scans: [51, 102, 153, 205].map(unreadScan), at: 205,
+    lastRead: { ...row(102, 101, RUNNER, { start: 'started-102', megabytes: 87, resident: 87, footprint: 80 }), at: 0 },
   });
+  assert.deepEqual(ownership.exitingStats, { processes: 0, longestMilliseconds: 0, largest: null });
   assert.equal(ownership.unreadDetails(101), null, 'a process that can be read has nothing to report');
 
   const runnerStart = '1000000000';
   const lines = describeUnreadable({
     pid: 102, runnerPid: RUNNER, runnerStart, details: { ...details, lastRead: { ...details.lastRead, start: '1240000000' } },
     scans: [{ begun: 0, ms: 2.4 }, { begun: 53.1, ms: 3.9 }, { begun: 104.6, ms: 2.2 }],
-    frozen: { listed: true, info: ESRCH, usage: ESRCH, record: { ppid: 101, pgid: RUNNER, uid: OWNER, ruid: OWNER, status: 2 },
-      path: `/Applications/${'x'.repeat(400)}`, timebase: { numer: 125, denom: 3 } },
+    after: { at: 290, listed: false, info: ESRCH, usage: ESRCH, record: 'none', path: `/Applications/${'x'.repeat(400)}`, timebase: { numer: 125, denom: 3 } },
     cleanup: { scans: 7, runs: [{ state: 'listed, unreadable (process info errno 3, usage errno 3)', count: 3, first: 230, last: 330 },
       { state: 'not listed', count: 4, first: 380, last: 520 }], dropped: 0 },
   });
-  assert.deepEqual(lines.slice(0, 4), [
+  assert.deepEqual(lines, [
     'About process 102, which stopped the run (for diagnosis; it changes nothing about the stop):',
-    '  unreadable in 4 scans in a row over 154 ms, 4 of them in a row answering "no such process"; the last one: process info errno 3, usage errno 3; the last 4 of those scans at +0, +51, +102, +154 ms',
-    '  last read in full 205 ms before the stop: parent 101, process group 100 (the test runner\'s), uid 501, 87.0 MB, start 1240000000 (Mach absolute time), 10.000 s after the test runner started',
+    '  unreadable in 4 scans in a row over 154 ms; never shown exiting; the last 4, from the first:',
+    '    +0 ms: process info errno 3, usage errno 3',
+    '    +51 ms: process info errno 3, usage errno 3',
+    '    +102 ms: process info errno 3, usage errno 3',
+    '    +154 ms: process info errno 3, usage errno 3',
+    '  last read in full 205 ms before the stop: parent 101, process group 100 (the test runner\'s), uid 501, 87.0 MB (87.0 MB resident, 80.0 MB footprint), start 1240000000 (Mach absolute time), 10.000 s after the test runner started',
     '  session: not known (the sampler does not read it)',
-  ]);
-  assert.equal(lines[4], `  while the run was frozen: listed, process info errno 3, usage errno 3; process table: state 2, parent 101, group 100, uid 501, real uid 501; executable: /Applications/${'x'.repeat(286)}...`);
-  assert.deepEqual(lines.slice(5), [
-    '  in the 7 scans of the cleanup: listed, unreadable (process info errno 3, usage errno 3) in 3 (+25 to +125 ms); not listed in 4 (+175 to +315 ms)',
+    '  in the 7 scans from the stop to the end of the cleanup (freeze, kill, confirmation): listed, unreadable (process info errno 3, usage errno 3) in 3 (+25 to +125 ms); not listed in 4 (+175 to +315 ms)',
+    `  after the cleanup (+85 ms): not listed, process info errno 3, usage errno 3; process table: no record; executable: /Applications/${'x'.repeat(286)}...`,
     '  the last 3 scans before the stop took 2.2 to 3.9 ms and began 51.5 to 53.1 ms apart',
   ]);
-  // Without a reading in full, an answer from the sampler or a cleanup, it says so.
-  assert.deepEqual(describeUnreadable({ pid: 102, runnerPid: RUNNER, runnerStart: null, details: { ...details, lastRead: null },
-    scans: [], frozen: { error: 'sampler did not answer within 500 ms' }, cleanup: { scans: 0, runs: [], dropped: 0 } }).slice(2), [
+  // A record that could not be read is not "no record"; the sampler not answering is said as such; text from the system is shown escaped.
+  const other = describeUnreadable({ pid: 102, runnerPid: RUNNER, runnerStart: null, details: { ...details, lastRead: null },
+    scans: [], after: { at: 290, listed: true, info: ESRCH, usage: 0, record: 'unreadable', path: '/tmp/a\nrun-tests: forged', timebase: { numer: 0, denom: 0 } },
+    cleanup: { scans: 0, runs: [], dropped: 0 } });
+  assert.deepEqual(other.slice(6), [
     '  never read in full while it was a process of the run',
     '  session: not known (the sampler does not read it)',
-    '  while the run was frozen: the sampler did not describe it (sampler did not answer within 500 ms)',
-    '  in the scans of the cleanup: none recorded',
+    '  in the scans from the stop to the end of the cleanup: none recorded',
+    '  after the cleanup (+85 ms): listed, process info errno 3, usage errno 0; process table: no whole record of that pid could be read; executable: /tmp/a\\u000arun-tests: forged',
   ]);
-  // The sampler's answer is read strictly, and an odd one is dropped, never thrown.
+  assert.equal(describeUnreadable({ pid: 102, runnerPid: RUNNER, runnerStart: null, details, scans: [], after: { at: 290, error: 'no answer within 500 ms' },
+    cleanup: { scans: 0, runs: [], dropped: 0 } })[9], '  after the cleanup (+85 ms): the sampler did not describe it (no answer within 500 ms)');
+  assert.equal(describeUnreadable({ pid: 102, runnerPid: RUNNER, runnerStart: null, details, scans: [], after: null,
+    cleanup: { scans: 0, runs: [], dropped: 0 } })[9], '  after the cleanup: not asked');
+  // The sampler's answer is read strictly; an odd one, numbers out of range included, is dropped and never thrown.
   assert.deepEqual(parseDescription('1 3 3 101,100,501,501,2 /Applications/Google%20Chrome 125/3'.split(' ')), {
     listed: true, info: 3, usage: 3, record: { ppid: 101, pgid: 100, uid: 501, ruid: 501, status: 2 },
     path: '/Applications/Google Chrome', timebase: { numer: 125, denom: 3 },
   });
   assert.deepEqual(parseDescription('- 3 3 - - 0/0'.split(' ')),
-    { listed: null, info: 3, usage: 3, record: null, path: null, timebase: { numer: 0, denom: 0 } });
-  for (const bad of ['1 3 3 - - 125/3 extra', '2 3 3 - - 125/3', '1 x 3 - - 125/3', '1 3 3 1,2,3 - 125/3', '1 3 3 - %E0%A4%A 125/3', '1 3 3 - - 125']) {
-    assert.equal(parseDescription(bad.split(' ')), null, bad);
+    { listed: null, info: 3, usage: 3, record: 'none', path: null, timebase: { numer: 0, denom: 0 } });
+  assert.equal(parseDescription('0 3 3 ? - 4294967295/1'.split(' ')).record, 'unreadable');
+  for (const bad of ['1 3 3 - - 125/3 extra', '2 3 3 - - 125/3', '1 x 3 - - 125/3', '1 3 3 1,2,3 - 125/3', '1 3 3 - %E0%A4%A 125/3', '1 3 3 - - 125',
+    `1 3 3 - - ${'9'.repeat(400)}/3`, '1 3 3 - - 4294967296/3', '1 3 3 - - 125/4294967296', `1 ${'9'.repeat(20)} 3 - - 125/3`,
+    `1 3 3 ${'9'.repeat(30)},1,1,1,1 - 125/3`, '1 3 3 1.5,1,1,1,1 - 125/3']) {
+    assert.equal(parseDescription(bad.split(' ')), null, bad.slice(0, 60));
   }
+  assert.equal(parseDescription(null), null);
+});
+
+// An exiting process as the sampler reports it: libproc has no info, its usage
+// answers with the start time it had, its resident size, no footprint and an exit time.
+const exitingRow = (pid, ppid, pgid, extra = {}) => row(pid, 0, 0, {
+  uid: 0, ruid: 0, status: 0, megabytes: 60, resident: 60, footprint: 0, infoError: ESRCH, usageError: 0, exiting: true, ...extra,
+});
+const tree = (...extra) => [...system, ...run.slice(0, 2), ...extra];
+const full102 = row(102, 101, RUNNER, { megabytes: 87, resident: 87, footprint: 80 });
+
+test('a process of the run that is exiting is let through for a second, counted at its last full reading or more', () => {
+  const clock = { now: 0 };
+  const ownership = newOwnership(clock);
+  ownership.update(tree(full102), true);
+  // Six scans, more than the three a process that answers "no such process" to both reads gets.
+  for (let scan = 1; scan <= 6; scan += 1) {
+    clock.now += 55;
+    const owned = ownership.update(tree(exitingRow(102, 101, RUNNER, { start: 'started-102' })), true);
+    assert.equal(ownership.readFailure(), null, `scan ${scan}`);
+    // Counted at the larger of its last full reading (87 MB) and what its usage says now (60 MB).
+    assert.equal(owned.get(102).megabytes, 87);
+    assert.equal(measureRun(owned).total, 87 + 10 + 10);
+  }
+  // Then gone: the run goes on, and the summary knows of it.
+  clock.now += 55;
+  ownership.update(tree(), true);
+  assert.equal(ownership.readFailure(), null);
+  assert.deepEqual(ownership.exitingStats, { processes: 1, longestMilliseconds: 275, largest: { megabytes: 60, resident: 60, footprint: 0, lastFull: 87 } });
+
+  // What it holds while exiting counts when it is more than its last full reading.
+  const larger = newOwnership(clock);
+  larger.update(tree(full102), true);
+  const owned = larger.update(tree(exitingRow(102, 101, RUNNER, { start: 'started-102', megabytes: 120, resident: 120 })), true);
+  assert.equal(owned.get(102).megabytes, 120);
+});
+
+test('an exiting process that is still exiting after a second stops the run, as one the guard cannot read', () => {
+  const clock = { now: 0 };
+  const ownership = newOwnership(clock);
+  ownership.update(tree(full102), true);
+  clock.now = 10;
+  const exiting = tree(exitingRow(102, 101, RUNNER, { start: 'started-102' }));
+  ownership.update(exiting, true);
+  // Measured in time, not samples: a second from the first scan that showed it exiting, and not a moment more.
+  clock.now = 10 + EXITING.milliseconds;
+  ownership.update(exiting, true);
+  assert.equal(ownership.readFailure(), null);
+  clock.now += 1;
+  ownership.update(exiting, true);
+  assert.deepEqual(ownership.readFailure(), { pid: 102, problem: 'unreadable', errno: ESRCH, samples: 3, exitingMilliseconds: EXITING.milliseconds + 1 });
+  // A scan in between that answers "no such process" to both reads does not restart the second; it gets its own three samples.
+  const mixed = newOwnership(clock);
+  clock.now = 0;
+  mixed.update(tree(full102), true);
+  clock.now = 10;
+  mixed.update(exiting, true);
+  for (let sample = 1; sample <= UNREADABLE_SAMPLES; sample += 1) {
+    clock.now += 55;
+    mixed.update(tree(noSuchProcessRow(102)), true);
+    assert.equal(mixed.readFailure(), null, `sample ${sample}`);
+  }
+  clock.now += 55;
+  mixed.update(tree(noSuchProcessRow(102)), true);
+  assert.deepEqual(mixed.readFailure(), { pid: 102, problem: 'unreadable', errno: ESRCH, samples: UNREADABLE_SAMPLES + 2 });
+  const late = newOwnership(clock);
+  clock.now = 0;
+  late.update(tree(full102), true);
+  clock.now = 10;
+  late.update(exiting, true);
+  clock.now = 900;
+  late.update(tree(noSuchProcessRow(102)), true);
+  assert.equal(late.readFailure(), null);
+  clock.now = 1011;
+  late.update(tree(noSuchProcessRow(102)), true);
+  assert.equal(late.readFailure().exitingMilliseconds, 1001);
+});
+
+test('nothing but an exiting process of the run, read in full before with that start time, and not the runner, gets the allowance', () => {
+  // Each of these stops the run exactly as it would without the allowance:
+  // `cases` gives the scans, and the samples after which the guard gives up.
+  const stopsAfter = (label, first, then, expected) => {
+    const clock = { now: 0 };
+    const ownership = newOwnership(clock);
+    ownership.update(first, true);
+    for (let sample = 1; ; sample += 1) {
+      clock.now += 55;
+      const owned = ownership.update(then, true);
+      const failure = ownership.readFailure();
+      if (failure || sample > 10) return { failure, owned: pids(owned), sample, label, expected };
+    }
+  };
+  // The runner itself.
+  const runner = stopsAfter('runner', tree(), [...system, exitingRow(RUNNER, GUARD, RUNNER, { start: `started-${RUNNER}` }), row(101, RUNNER, RUNNER)]);
+  assert.deepEqual([runner.failure, runner.sample], [{ pid: RUNNER, problem: 'unreadable', errno: ESRCH, samples: UNREADABLE_SAMPLES + 1 }, UNREADABLE_SAMPLES + 1]);
+  // Without an exit time in its usage.
+  const noExit = stopsAfter('no exit time', tree(full102), tree(exitingRow(102, 101, RUNNER, { start: 'started-102', exiting: false })));
+  assert.deepEqual([noExit.failure, noExit.sample], [{ pid: 102, problem: 'unreadable', errno: ESRCH, samples: UNREADABLE_SAMPLES + 1 }, UNREADABLE_SAMPLES + 1]);
+  // Another start time: not the process the guard read, so not the run's at all.
+  const other = stopsAfter('other start', tree(full102), tree(exitingRow(102, 101, RUNNER, { start: 'someone-else' })));
+  assert.deepEqual([other.failure, other.owned.includes(102), other.sample], [null, false, 11]);
+  // Never read in full: a pid first seen exiting is not the run's.
+  const never = stopsAfter('never read', tree(), tree(exitingRow(102, 101, RUNNER, { start: 'started-102' })));
+  assert.deepEqual([never.failure, never.owned.includes(102), never.sample], [null, false, 11]);
+  // Its usage denied, whatever else: no allowance.
+  const denied = stopsAfter('denied', tree(full102), tree(exitingRow(102, 101, RUNNER, { start: '0', usageError: EPERM, exiting: false })));
+  assert.deepEqual(denied.failure, { pid: 102, problem: 'unreadable', errno: EPERM, samples: 1 });
 });
 
 // --- the system's own ps, which this user cannot read
@@ -896,20 +1015,27 @@ test('a failing scan stops a cleanup instead of letting it act on stale knowledg
 });
 
 test('sampler rows are read strictly', () => {
-  assert.deepEqual(parseRow('4242 100 100 501 2 98765432109876543210 1048576 3145728 0 0 501 -'), {
-    pid: 4242, ppid: 100, pgid: 100, uid: 501, ruid: 501, status: 2, start: '98765432109876543210', megabytes: 3, infoError: 0, usageError: 0, path: null,
+  assert.deepEqual(parseRow('4242 100 100 501 2 98765432109876543210 1048576 3145728 0 0 501 0 -'), {
+    pid: 4242, ppid: 100, pgid: 100, uid: 501, ruid: 501, status: 2, start: '98765432109876543210', megabytes: 3, resident: 1, footprint: 3,
+    infoError: 0, usageError: 0, exiting: false, path: null,
   });
-  assert.equal(parseRow('4242 100 100 501 2 5 9437184 1048576 0 0 501 -').megabytes, 9);
-  assert.deepEqual(parseRow('4242 0 0 0 0 0 0 0 3 1 0 -'), {
-    pid: 4242, ppid: 0, pgid: 0, uid: 0, ruid: 0, status: 0, start: '0', megabytes: 0, infoError: 3, usageError: 1, path: null,
+  assert.equal(parseRow('4242 100 100 501 2 5 9437184 1048576 0 0 501 0 -').megabytes, 9);
+  assert.deepEqual(parseRow('4242 0 0 0 0 0 0 0 3 1 0 0 -'), {
+    pid: 4242, ppid: 0, pgid: 0, uid: 0, ruid: 0, status: 0, start: '0', megabytes: 0, resident: 0, footprint: 0, infoError: 3, usageError: 1, exiting: false, path: null,
+  });
+  // An exiting process: its usage answers with an exit time while libproc no longer describes it.
+  assert.deepEqual(parseRow('4242 0 0 0 0 5 9437184 0 3 0 0 1 -'), {
+    pid: 4242, ppid: 0, pgid: 0, uid: 0, ruid: 0, status: 0, start: '5', megabytes: 9, resident: 9, footprint: 0, infoError: 3, usageError: 0, exiting: true, path: null,
   });
   // The executable path arrives percent-encoded and is decoded exactly.
-  assert.equal(parseRow('4242 100 100 0 2 0 0 0 0 1 501 /bin/ps').path, '/bin/ps');
-  assert.equal(parseRow('4242 100 100 0 2 0 0 0 0 1 501 /Users/someone/My%20Tools/ps').path, '/Users/someone/My Tools/ps');
-  assert.equal(parseRow('4242 100 100 0 2 0 0 0 0 1 501 /bin/ps%0A').path, '/bin/ps\n');
-  for (const bad of ['', '4242 100 100 501 2 5 1 2 0 0 501 ', '4242 100 100 501 2 5 1 2 0 0 501', '4242 100 100 501 2 5 1 2 0 0', '4242 100 100 501 2 5 1 2 0 0 501 - -',
-    'pid 100 100 501 2 5 1 2 0 0 501 -', '-1 100 100 501 2 5 1 2 0 0 501 -', '4242  100 100 501 2 5 1 2 0 0 501 -', '4242 100 100 501 2 5 1 2 0 0 501 -\r',
-    '4242 100 100 0 2 0 0 0 0 1 501 /bin/ps extra', '4242 100 100 0 2 0 0 0 0 1 501 /bin/%E0%A4%A', '4242 100 100 0 2 0 0 0 0 1 501 /bin/p"s']) {
+  assert.equal(parseRow('4242 100 100 0 2 0 0 0 0 1 501 0 /bin/ps').path, '/bin/ps');
+  assert.equal(parseRow('4242 100 100 0 2 0 0 0 0 1 501 0 /Users/someone/My%20Tools/ps').path, '/Users/someone/My Tools/ps');
+  assert.equal(parseRow('4242 100 100 0 2 0 0 0 0 1 501 0 /bin/ps%0A').path, '/bin/ps\n');
+  for (const bad of ['', '4242 100 100 501 2 5 1 2 0 0 501 0 ', '4242 100 100 501 2 5 1 2 0 0 501 0', '4242 100 100 501 2 5 1 2 0 0 501', '4242 100 100 501 2 5 1 2 0 0 501 0 - -',
+    'pid 100 100 501 2 5 1 2 0 0 501 0 -', '-1 100 100 501 2 5 1 2 0 0 501 0 -', '4242  100 100 501 2 5 1 2 0 0 501 0 -', '4242 100 100 501 2 5 1 2 0 0 501 0 -\r',
+    '4242 100 100 0 2 0 0 0 0 1 501 0 /bin/ps extra', '4242 100 100 0 2 0 0 0 0 1 501 0 /bin/%E0%A4%A', '4242 100 100 0 2 0 0 0 0 1 501 0 /bin/p"s',
+    // The row of the sampler before the exiting field, and an exiting field that is not 0 or 1.
+    '4242 100 100 501 2 5 1 2 0 0 501 -', '4242 100 100 501 2 5 1 2 0 0 501 2 -', '4242 100 100 501 2 5 1 2 0 0 501 10 -']) {
     assert.equal(parseRow(bad), null, JSON.stringify(bad));
   }
 });
@@ -1173,7 +1299,30 @@ test('a process of the run that cannot be read stops the run: its memory would b
   assert.equal(bystanderSurvived(), true);
 });
 
-test('a process that answers "no such process" for too long stops the run after the same samples, and the report says what was known of it', { timeout: 60000 }, async t => {
+// What the guard's report says of a process that stopped the run by answering
+// "no such process", checked line by line. `scans` is how many scans it lists.
+function assertReport(result, pid, { scans, exiting }) {
+  const report = result.stderr.slice(result.stderr.indexOf(`run-tests: About process ${pid}, which stopped the run`));
+  assert.ok(report.startsWith('run-tests: About'), result.stderr);
+  assert.ok(result.stderr.indexOf('Every process of the run has ended.') < result.stderr.indexOf('About process'));
+  const lines = report.split('\n').filter(line => line.startsWith('run-tests:   ') || line.startsWith('run-tests: About'));
+  assert.match(lines[1], new RegExp(`^run-tests:   unreadable in \\d+ scans in a row over \\d+ ms; ${exiting ? 'shown exiting from \\d+ ms after the first \\(1000 ms allowed\\)' : 'never shown exiting'}; the last ${scans}, from the first:$`));
+  const scanLine = exiting ? 'process info errno 3, usage errno 0, [\\d.]+ MB resident, 0\\.0 MB footprint, exiting' : 'process info errno 3, usage errno 3';
+  for (const line of lines.slice(2, 2 + scans)) assert.match(line, new RegExp(`^run-tests:     \\+\\d+ ms: ${scanLine}$`));
+  const rest = lines.slice(2 + scans);
+  assert.match(rest[0], new RegExp(`^run-tests:   last read in full \\d+ ms before the stop: parent \\d+, process group \\d+ \\(the test runner's\\), uid ${process.getuid()}, [\\d.]+ MB \\([\\d.]+ MB resident, [\\d.]+ MB footprint\\), start \\d+ \\(Mach absolute time\\), [\\d.]+ s after the test runner started$`));
+  assert.equal(rest[1], 'run-tests:   session: not known (the sampler does not read it)');
+  assert.match(rest[2], /^run-tests:   in the \d+ scans from the stop to the end of the cleanup \(freeze, kill, confirmation\): .+ in \d+ \(\+\d+ to \+\d+ ms\)/);
+  // Asked after the cleanup: here the process was killed with the run, and is gone or about to be collected.
+  assert.match(rest[3], /^run-tests:   after the cleanup \(\+\d+ ms\): (not )?listed, process info errno \d+, usage errno \d+; process table: (no record|state \d+, parent -?\d+, group -?\d+, uid \d+, real uid \d+); executable: \S.*$/);
+  assert.match(rest[4], /^run-tests:   the last 8 scans before the stop took [\d.]+ to [\d.]+ ms and began [\d.]+ to [\d.]+ ms apart$/);
+  assert.equal(rest.length, 5);
+  assert.ok(lines.every(line => line.length < 700));
+  assert.doesNotMatch(report, /CRATE_GUARD|crate-guard-|pids/);
+  return report;
+}
+
+test('a process that answers "no such process" to both reads for too long stops the run after the same samples, and the report says what was known of it', { timeout: 60000 }, async t => {
   const { environment, recorded, allGone, bystanderSurvived } = scenario(t);
   const result = await startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'no-such-process:nested' }, faultyGuard).done;
   const nested = recorded().get('nested');
@@ -1182,25 +1331,71 @@ test('a process that answers "no such process" for too long stops the run after 
   assert.match(result.stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${ESRCH}, ${UNREADABLE_SAMPLES + 1} samples in a row\\)\\. Its memory is unknown\\.\\nrun-tests:   .*\\nrun-tests: Stopping the test run \\(\\d+ processes\\)\\.`));
   assert.match(result.stderr, /run-tests: Every process of the run has ended\./);
   assert.ok(result.seconds < 15, `took ${result.seconds} s`);
-  // The report, after everything the guard already said.
-  const report = result.stderr.slice(result.stderr.indexOf(`run-tests: About process ${nested}, which stopped the run`));
-  assert.ok(report.startsWith('run-tests: About'), result.stderr);
-  assert.ok(result.stderr.indexOf('Every process of the run has ended.') < result.stderr.indexOf('About process'));
-  assert.match(report, new RegExp(`run-tests:   unreadable in ${UNREADABLE_SAMPLES + 1} scans in a row over \\d+ ms, ${UNREADABLE_SAMPLES + 1} of them in a row answering "no such process"; the last one: process info errno 3, usage errno 3; the last ${UNREADABLE_SAMPLES + 1} of those scans at \\+0(, \\+\\d+){${UNREADABLE_SAMPLES}} ms\\n`));
-  assert.match(report, new RegExp(`run-tests:   last read in full \\d+ ms before the stop: parent \\d+, process group \\d+ \\(the test runner's\\), uid ${process.getuid()}, [\\d.]+ MB, start \\d+ \\(Mach absolute time\\), [\\d.]+ s after the test runner started\\n`));
-  assert.match(report, /run-tests:   session: not known \(the sampler does not read it\)\n/);
-  // The process is in fact alive here, and the sampler's own answer says so: frozen with the run.
-  assert.match(report, new RegExp(`run-tests:   while the run was frozen: listed, process info errno 0, usage errno 0; process table: state \\d, parent \\d+, group \\d+, uid ${process.getuid()}, real uid ${process.getuid()}; executable: ${fs.realpathSync(process.execPath).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n`));
-  assert.match(report, /run-tests:   in the \d+ scans of the cleanup: listed, unreadable \(process info errno 3, usage errno 3\) in \d+ \(\+\d+ to \+\d+ ms\)(; not listed in \d+ \(\+\d+ to \+\d+ ms\))?\n/);
-  assert.match(report, /run-tests:   the last 8 scans before the stop took [\d.]+ to [\d.]+ ms and began [\d.]+ to [\d.]+ ms apart\n/);
-  // Bounded, and nothing of the command line or the environment.
-  const lines = report.split('\n').filter(line => line.startsWith('run-tests:   ') || line.startsWith('run-tests: About'));
-  assert.equal(lines.length, 7);
-  assert.ok(lines.every(line => line.length < 700));
-  assert.doesNotMatch(report, /CRATE_GUARD|crate-guard-|pids/);
+  assertReport(result, nested, { scans: UNREADABLE_SAMPLES + 1, exiting: false });
+  assert.doesNotMatch(result.stderr, /let through while exiting/);
   await allGone(['nested', 'nested-child', 'short-lived', 'ready']);
   assert.equal(bystanderSurvived(), true);
 });
+
+test('a process that is exiting and gone within a second does not stop the run, and the summary says so', { timeout: 60000 }, async t => {
+  const { environment, allGone, bystanderSurvived } = scenario(t);
+  // Six scans exiting, more than the three samples a process answering "no such process" to both reads gets.
+  const result = await startGuard([descendants], { ...environment('short'), CRATE_GUARD_FAULT: 'exiting-then-gone:nested' }, faultyGuard).done;
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /^# pass 1$/m);
+  assert.doesNotMatch(result.stderr, /CANNOT READ|EXCEEDED|INCOMPLETE|About process/);
+  assert.match(result.stderr, /^run-tests: memory guard: \d+ samples, peak \d+ MB in one process and \d+ MB in total \(limits [\d.]+ GB, [\d.]+ GB, \d+ s\)$/m);
+  assert.match(result.stderr, /^run-tests: memory guard: 1 processes were let through while exiting, the longest seen exiting for \d+ ms \(1000 ms allowed\); the largest usage read while exiting was [\d.]+ MB resident and 0\.0 MB footprint, against [\d.]+ MB at its last full reading$/m);
+  const longest = Number(/seen exiting for (\d+) ms/.exec(result.stderr)[1]);
+  assert.ok(longest > 0 && longest <= EXITING.milliseconds, `${longest} ms`);
+  // The fault hides `nested` from every scan once it is "gone", so the guard never saw it to end it; the scenario does.
+  await allGone(treeRoles.filter(role => role !== 'nested'));
+  assert.equal(bystanderSurvived(), true);
+});
+
+test('a process that is still exiting after a second stops the run as before, saying how long and at what it was counted', { timeout: 60000 }, async t => {
+  const { environment, recorded, allGone, bystanderSurvived } = scenario(t);
+  const result = await startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'exiting:nested' }, faultyGuard).done;
+  const nested = recorded().get('nested');
+  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+  assert.match(result.stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${ESRCH}, \\d+ samples in a row\\)\\. It had been exiting for (\\d+) ms, longer than the 1000 ms allowed; it was counted at \\d+ MB meanwhile\\.\\nrun-tests:   .*\\nrun-tests: Stopping the test run \\(\\d+ processes\\)\\.`));
+  assert.ok(Number(/exiting for (\d+) ms, longer/.exec(result.stderr)[1]) > EXITING.milliseconds);
+  assert.match(result.stderr, /run-tests: Every process of the run has ended\./);
+  const samples = Number(new RegExp(`PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno 3, (\\d+) samples`).exec(result.stderr)[1]);
+  assertReport(result, nested, { scans: Math.min(samples, 8), exiting: true });
+  assert.match(result.stderr, /^run-tests: memory guard: 1 processes were let through while exiting/m);
+  await allGone(['nested', 'nested-child', 'short-lived', 'ready']);
+  assert.equal(bystanderSurvived(), true);
+});
+
+test('an exiting process still counts at its last full reading: over a limit, the run is stopped for memory', { timeout: 60000 }, async t => {
+  const { environment, allGone, bystanderSurvived } = scenario(t);
+  // 1300 MB at its last full reading, nothing while exiting, and another process 1100 MB larger:
+  // over 2400 MB in total only when the exiting one counts at its last full reading.
+  const result = await startGuard(['--total-memory-limit-mb=2400', descendants],
+    { ...environment('idle'), CRATE_GUARD_FAULT: 'exiting-over-limit:nested' }, faultyGuard).done;
+  assert.equal(result.code, EXIT_MEMORY_LIMIT, result.stderr);
+  assert.match(result.stderr, /run-tests: MEMORY LIMIT EXCEEDED after [\d.]+ s: the run reached \d+ MB across \d+ processes \(limit 2400 MB in total\)\./);
+  assert.doesNotMatch(result.stderr, /CANNOT READ/);
+  await allGone(['nested', 'nested-child', 'short-lived', 'ready']);
+  assert.equal(bystanderSurvived(), true);
+});
+
+for (const how of ['stall', 'die', 'throw']) {
+  test(`a describe request that ${how}s after the cleanup changes nothing about the stop, its cleanup or its exit status`, { timeout: 60000 }, async t => {
+    const { environment, recorded, allGone, bystanderSurvived } = scenario(t);
+    const result = await startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'no-such-process:nested', CRATE_GUARD_DESCRIBE: how }, faultyGuard).done;
+    const nested = recorded().get('nested');
+    assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+    assert.match(result.stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${ESRCH}, ${UNREADABLE_SAMPLES + 1} samples in a row\\)\\. Its memory is unknown\\.\\nrun-tests:   .*\\nrun-tests: Stopping the test run \\(\\d+ processes\\)\\.\\nrun-tests: Every process of the run has ended\\.\\nrun-tests: About process`));
+    assert.doesNotMatch(result.stderr, /sampler failed|continuing with|INCOMPLETE|faulty-guard:/);
+    assert.match(result.stderr, new RegExp(`run-tests:   after the cleanup \\(\\+\\d+ ms\\): the sampler did not describe it \\(${
+      { stall: 'no answer within 500 ms', die: 'sampler stopped', throw: 'describe failed \\(injected\\)' }[how]}\\)\\n`));
+    assert.ok(result.seconds < 15, `took ${result.seconds} s`);
+    await allGone(['nested', 'nested-child', 'short-lived', 'ready']);
+    assert.equal(bystanderSurvived(), true);
+  });
+}
 
 test('a test runner that cannot be read is stopped at the first scan, before its tests get anywhere', { timeout: 60000 }, async t => {
   const { environment, recorded, bystanderSurvived } = scenario(t);
@@ -1378,15 +1573,17 @@ test('the sampler tells an ended process from a missing or unreadable one by the
   assert.deepEqual([ordinaryRow.infoError, ordinaryRow.status, ordinaryRow.ppid, ordinaryRow.pgid, ordinaryRow.uid, ordinaryRow.ruid, ordinaryRow.usageError, ordinaryRow.path],
     [0, ZOMBIE, self.pid, self.group, self.uid, self.uid, 0, null]);
   assert.deepEqual([ordinaryRow.start, ordinary.ended.transition], [parseRow(ordinary.alive.row).start, false]);
+  // Its usage, cached by the kernel as it began to exit, carries an exit time; alive, it carried none.
+  assert.deepEqual([parseRow(ordinary.alive.row).exiting, ordinaryRow.exiting], [false, true]);
   if (psIsSetUid) {
     assert.deepEqual([ps.ended.usage, ps.ended.record], [EPERM, [...facts(0), ZOMBIE]]);
     // The set-uid one's row carries nothing of its usage.
-    assert.deepEqual([ps.ended.row, ps.ended.transition], [`${ps.pid} ${self.pid} ${self.group} 0 ${ZOMBIE} 0 0 0 0 ${EPERM} ${self.uid} -`, false]);
+    assert.deepEqual([ps.ended.row, ps.ended.transition], [`${ps.pid} ${self.pid} ${self.group} 0 ${ZOMBIE} 0 0 0 0 ${EPERM} ${self.uid} 0 -`, false]);
   }
   // Collected: no record, and nothing to report but that it is not there.
   for (const child of [ordinary, ps]) {
     assert.deepEqual([child.collected.info, child.collected.usage, child.collected.record, child.collected.row],
-      [ESRCH, ESRCH, null, `${child.pid} 0 0 0 0 0 0 0 ${ESRCH} ${ESRCH} 0 -`]);
+      [ESRCH, ESRCH, null, `${child.pid} 0 0 0 0 0 0 0 ${ESRCH} ${ESRCH} 0 0 -`]);
   }
 });
 
@@ -1397,6 +1594,7 @@ const read = {
   info: (ppid, pgid, uid, ruid, status = 2) => ['info', 0, [ppid, pgid, uid, ruid, status]],
   noInfo: errno => ['info', errno],
   usage: (start, resident, footprint) => ['usage', 0, [start, resident, footprint]],
+  exitingUsage: (start, resident, footprint, exitTime) => ['usage', 0, [start, resident, footprint, exitTime]],
   noUsage: errno => ['usage', errno],
   path: text => ['path', text],
   record: (...facts) => ['record', facts.length > 0 ? facts : null],
@@ -1414,14 +1612,14 @@ const reading = {
   otherTool: [read.info(101, 100, 0, OWNER), read.noUsage(EPERM), read.path('/usr/bin/top')],
 };
 const rowOf = {
-  created: pid => `${pid} 101 100 ${OWNER} 2 5 ${3 * MB} ${2 * MB} 0 0 ${OWNER} -`,
-  changingOwner: pid => `${pid} 101 100 ${OWNER} 2 0 0 0 0 ${EPERM} ${OWNER} -`,
-  starting: pid => `${pid} 101 100 0 2 0 0 0 0 ${EPERM} ${OWNER} ${NODE}`,
-  tool: pid => `${pid} 101 100 0 2 0 0 0 0 ${EPERM} ${OWNER} /bin/ps`,
-  ending: pid => `${pid} 101 100 0 2 0 0 0 0 ${EPERM} ${OWNER} -`,
-  ended: pid => `${pid} 101 100 0 ${ZOMBIE} 0 0 0 0 ${EPERM} ${OWNER} -`,
-  gone: pid => `${pid} 0 0 0 0 0 0 0 ${ESRCH} ${ESRCH} 0 -`,
-  otherTool: pid => `${pid} 101 100 0 2 0 0 0 0 ${EPERM} ${OWNER} /usr/bin/top`,
+  created: pid => `${pid} 101 100 ${OWNER} 2 5 ${3 * MB} ${2 * MB} 0 0 ${OWNER} 0 -`,
+  changingOwner: pid => `${pid} 101 100 ${OWNER} 2 0 0 0 0 ${EPERM} ${OWNER} 0 -`,
+  starting: pid => `${pid} 101 100 0 2 0 0 0 0 ${EPERM} ${OWNER} 0 ${NODE}`,
+  tool: pid => `${pid} 101 100 0 2 0 0 0 0 ${EPERM} ${OWNER} 0 /bin/ps`,
+  ending: pid => `${pid} 101 100 0 2 0 0 0 0 ${EPERM} ${OWNER} 0 -`,
+  ended: pid => `${pid} 101 100 0 ${ZOMBIE} 0 0 0 0 ${EPERM} ${OWNER} 0 -`,
+  gone: pid => `${pid} 0 0 0 0 0 0 0 ${ESRCH} ${ESRCH} 0 0 -`,
+  otherTool: pid => `${pid} 101 100 0 2 0 0 0 0 ${EPERM} ${OWNER} 0 /usr/bin/top`,
 };
 // Scans as scripted. Every read must be one the script expected next, and every scripted read must be asked for.
 function scripted(script, { scans = [Object.keys(script).map(Number)], known = {} } = {}) {
@@ -1449,6 +1647,10 @@ test('a row holds one pid\'s own reads, taken in an order that cannot hand an en
     30: [read.noInfo(ESRCH), read.usage(77, 300 * MB, 280 * MB), read.record(1, 30, OWNER, OWNER, 2)],
     // And where nothing holds the pid by the time the process table is asked.
     31: [read.noInfo(ESRCH), read.usage(9, 60 * MB, 0), read.record()],
+    // Exiting (see the sampler): the cached usage carries an exit time, the process table still shows it running.
+    32: [read.noInfo(ESRCH), read.exitingUsage(9, 60 * MB, 0, 12345), read.record(101, 100, OWNER, OWNER, 2)],
+    // Read right after it: nothing of its exit time shows.
+    33: reading.gone,
     // There, with usage that says it is not: on its way out.
     26: [read.info(101, 100, OWNER, OWNER), read.noUsage(ESRCH)],
     // Gone between being listed and being read. Read right after two readable ones: nothing of theirs shows.
@@ -1456,26 +1658,33 @@ test('a row holds one pid\'s own reads, taken in an order that cannot hand an en
     // Unreadable for other reasons: the process table is not asked.
     28: [read.noInfo(EPERM), read.noUsage(EPERM)],
     29: [read.noInfo(ESRCH), read.noUsage(13)],
-  }, { scans: [[21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]] });
+  }, { scans: [[21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33]] });
   assert.deepEqual(result.scans[0].rows, [
     rowOf.created(21),
     rowOf.ended(22),
-    `23 0 0 0 0 0 0 0 ${ESRCH} ${EPERM} 0 -`,
-    `24 0 0 0 0 0 0 0 ${ESRCH} ${EPERM} 0 -`,
-    `25 101 100 ${OWNER} ${ZOMBIE} 9 ${60 * MB} 0 0 0 ${OWNER} -`,
-    `26 101 100 ${OWNER} 2 0 0 0 0 ${ESRCH} ${OWNER} -`,
+    `23 0 0 0 0 0 0 0 ${ESRCH} ${EPERM} 0 0 -`,
+    `24 0 0 0 0 0 0 0 ${ESRCH} ${EPERM} 0 0 -`,
+    `25 101 100 ${OWNER} ${ZOMBIE} 9 ${60 * MB} 0 0 0 ${OWNER} 0 -`,
+    `26 101 100 ${OWNER} 2 0 0 0 0 ${ESRCH} ${OWNER} 0 -`,
     rowOf.gone(27),
-    `28 0 0 0 0 0 0 0 ${EPERM} ${EPERM} 0 -`,
-    `29 0 0 0 0 0 0 0 ${ESRCH} 13 0 -`,
-    `30 0 0 0 0 77 ${300 * MB} ${280 * MB} ${ESRCH} 0 0 -`,
-    `31 0 0 0 0 9 ${60 * MB} 0 ${ESRCH} 0 0 -`,
+    `28 0 0 0 0 0 0 0 ${EPERM} ${EPERM} 0 0 -`,
+    `29 0 0 0 0 0 0 0 ${ESRCH} 13 0 0 -`,
+    `30 0 0 0 0 77 ${300 * MB} ${280 * MB} ${ESRCH} 0 0 0 -`,
+    `31 0 0 0 0 9 ${60 * MB} 0 ${ESRCH} 0 0 0 -`,
+    // Exiting: libproc no longer describes it, its usage carries an exit time, and the process table does not say ended.
+    `32 0 0 0 0 9 ${60 * MB} 0 ${ESRCH} 0 0 1 -`,
+    // An exit time is reported only from this pid's own successful usage read.
+    `33 0 0 0 0 0 0 0 ${ESRCH} ${ESRCH} 0 0 -`,
   ]);
-  assert.deepEqual([21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31].map(pid => readsOf(result, pid)), ['info usage', 'info usage record', 'info usage record',
-    'info usage record', 'info usage record', 'info usage', 'info usage', 'info usage', 'info usage', 'info usage record', 'info usage record']);
+  assert.deepEqual([21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33].map(pid => readsOf(result, pid)), ['info usage', 'info usage record', 'info usage record',
+    'info usage record', 'info usage record', 'info usage', 'info usage', 'info usage', 'info usage', 'info usage record', 'info usage record',
+    'info usage record', 'info usage']);
   // None of these can be in transition, so nothing was read twice and nothing is remembered.
   assert.deepEqual([result.scans[0].pauses, result.scans[0].remembered], [[], {}]);
   // The guard takes exactly two of these rows as ended.
   assert.deepEqual(result.scans[0].rows.map(parseRow).filter(item => item.infoError === 0 && item.status === ZOMBIE).map(item => item.pid), [22, 25]);
+  // And exactly one as exiting, which is not ended.
+  assert.deepEqual(result.scans[0].rows.map(parseRow).filter(item => item.exiting).map(item => item.pid), [32]);
 });
 
 test('the sampler reads a process in transition again until two readings agree, and reports the last one whatever it is', { timeout: 60000 }, () => {
@@ -1510,8 +1719,8 @@ test('the sampler reads a process in transition again until two readings agree, 
   const moved = [read.info(1, 100, 0, OWNER), read.noUsage(EPERM), read.path('/bin/ps')];
   const regrouped = [read.info(101, 7, 0, OWNER), read.noUsage(EPERM), read.path('/bin/ps')];
   const otherOwner = [read.info(101, 100, 502, OWNER), read.noUsage(EPERM), read.path('/bin/ps')];
-  for (const [changed, text] of [[moved, `7 1 100 0 2 0 0 0 0 ${EPERM} ${OWNER} /bin/ps`], [regrouped, `7 101 7 0 2 0 0 0 0 ${EPERM} ${OWNER} /bin/ps`],
-    [otherOwner, `7 101 100 502 2 0 0 0 0 ${EPERM} ${OWNER} /bin/ps`]]) {
+  for (const [changed, text] of [[moved, `7 1 100 0 2 0 0 0 0 ${EPERM} ${OWNER} 0 /bin/ps`], [regrouped, `7 101 7 0 2 0 0 0 0 ${EPERM} ${OWNER} 0 /bin/ps`],
+    [otherOwner, `7 101 100 502 2 0 0 0 0 ${EPERM} ${OWNER} 0 /bin/ps`]]) {
     const result = scripted({ 7: [...reading.tool, ...changed, ...changed] });
     assert.deepEqual([result.scans[0].rows, result.scans[0].pauses], [[text], pauses.slice(0, 2)]);
   }
@@ -1520,10 +1729,10 @@ test('the sampler reads a process in transition again until two readings agree, 
   // again: the guard gets its first reading, unreadable or not.
   const runner = [read.info(GUARD, 7, 0, OWNER), read.noUsage(EPERM), read.path('/usr/bin/top')];
   const first = scripted({ 7: runner });
-  assert.deepEqual([first.scans[0].rows, first.scans[0].pauses, first.scans[0].remembered], [[`7 ${GUARD} 7 0 2 0 0 0 0 ${EPERM} ${OWNER} /usr/bin/top`], [], {}]);
+  assert.deepEqual([first.scans[0].rows, first.scans[0].pauses, first.scans[0].remembered], [[`7 ${GUARD} 7 0 2 0 0 0 0 ${EPERM} ${OWNER} 0 /usr/bin/top`], [], {}]);
   // Nor is a process another user started.
   const foreign = scripted({ 7: [read.info(101, 100, 0, 0), read.noUsage(EPERM)] });
-  assert.deepEqual([foreign.scans[0].rows, foreign.scans[0].pauses], [[`7 101 100 0 2 0 0 0 0 ${EPERM} 0 -`], []]);
+  assert.deepEqual([foreign.scans[0].rows, foreign.scans[0].pauses], [[`7 101 100 0 2 0 0 0 0 ${EPERM} 0 0 -`], []]);
 
   // Several at once share the waits, and each is read until it agrees with itself.
   const together = scripted({ 7: [...reading.tool, ...reading.tool], 8: [...reading.starting, ...reading.tool, ...reading.tool], 9: reading.created });

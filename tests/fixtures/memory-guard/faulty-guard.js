@@ -18,10 +18,19 @@
 //   CRATE_GUARD_FAULT=unreadable-runner            the test runner itself cannot be read, from the first scan
 //   CRATE_GUARD_FAULT=no-such-process:<role>       once the fixture's tree is up, that process is still listed but both reads
 //                                                  answer "no such process", as the sampler reports it, for as long as it lives
+//   CRATE_GUARD_FAULT=exiting:<role>               once the fixture's tree is up, that process reads as an exiting one does (see the
+//                                                  sampler): no process info, usage with its start time, resident size, no
+//                                                  footprint and an exit time, for as long as it lives
+//   CRATE_GUARD_FAULT=exiting-then-gone:<role>     the same for six scans, after which no scan lists it (it is still running)
+//   CRATE_GUARD_FAULT=exiting-over-limit:<role>    once the tree is up, one scan reads that process in full at 1300 MB; after that
+//                                                  it reads as exiting with no memory, and `nested-child` reads 1100 MB more than it holds
 //   CRATE_GUARD_FAULT=system-tool:<role>           that process reads exactly as the system's set-uid ps does, for as long as it lives
 //   CRATE_GUARD_FAULT=other-tool:<role>            the same, but its executable is another set-uid tool
 //   CRATE_GUARD_FAULT=primary-fails                the sampler in use fails once the tree is up, and no new one can be started
 //   CRATE_GUARD_FAULT=all-samplers-fail            the same, and the sampler standing by fails too
+//
+// With CRATE_GUARD_DESCRIBE=stall, die or throw, the sampler's describe request
+// never answers, finds the sampler ended, or throws.
 //
 // Everything else goes to the real sampler untouched.
 const fs = require('node:fs');
@@ -37,8 +46,15 @@ const recorded = () => new Map(fs.readFileSync(process.env.CRATE_GUARD_FIXTURE_P
 const cannotRead = row => ({ ...row, start: '0', megabytes: 0, usageError: EPERM });
 // The row the sampler writes for a listed pid whose info and usage reads both answer ESRCH.
 const noSuchProcess = row => ({
-  ...row, ppid: 0, pgid: 0, uid: 0, ruid: 0, status: 0, start: '0', megabytes: 0, infoError: ESRCH, usageError: ESRCH, path: null,
+  ...row, ppid: 0, pgid: 0, uid: 0, ruid: 0, status: 0, start: '0', megabytes: 0, resident: 0, footprint: 0, infoError: ESRCH, usageError: ESRCH,
+  exiting: false, path: null,
 });
+// The row the sampler writes for an exiting process (see the sampler).
+const exitingRow = (row, megabytes = row.resident) => ({
+  ...row, ppid: 0, pgid: 0, uid: 0, ruid: 0, status: 0, megabytes, resident: megabytes, footprint: 0, infoError: ESRCH, usageError: 0, exiting: true, path: null,
+});
+let exitingScans = 0;
+let inflated = false;
 // What the sampler reports for a set-uid root tool this user started.
 const asTool = (row, path) => ({ ...cannotRead(row), uid: 0, ruid: process.getuid(), path });
 
@@ -59,6 +75,26 @@ function misread(rows) {
   if (kind === 'system-tool' || kind === 'other-tool') {
     const target = recorded().get(role);
     return rows.map(row => (row.pid === target ? asTool(row, kind === 'system-tool' ? '/bin/ps' : '/usr/bin/top') : row));
+  }
+  if (kind === 'exiting' || kind === 'exiting-then-gone') {
+    if (!recorded().has('ready')) return rows;
+    const target = recorded().get(role);
+    if (!rows.some(row => row.pid === target)) return rows;
+    exitingScans += 1;
+    if (kind === 'exiting-then-gone' && exitingScans > 6) return rows.filter(row => row.pid !== target);
+    return rows.map(row => (row.pid === target ? exitingRow(row) : row));
+  }
+  if (kind === 'exiting-over-limit') {
+    if (!recorded().has('ready')) return rows;
+    const pids = recorded();
+    const target = pids.get(role);
+    const MB = 1300;
+    if (!inflated) {
+      inflated = true;
+      return rows.map(row => (row.pid === target ? { ...row, megabytes: MB, resident: MB } : row));
+    }
+    return rows.map(row => (row.pid === target ? exitingRow(row, 0)
+      : row.pid === pids.get('nested-child') ? { ...row, megabytes: row.megabytes + 1100, resident: row.resident + 1100 } : row));
   }
   if (kind === 'no-such-process') {
     // Only after the guard has read it in full: the tree is up.
@@ -147,7 +183,13 @@ async function startFaultySampler() {
     // above do not change what it reads.
     signalGroup: (...args) => use(() => real.signalGroup(...args)),
     signalProcesses: (name, rows) => use(() => signalProcesses(name, rows)),
-    describe: (...args) => use(() => real.describe(...args)),
+    describe: (...args) => {
+      const how = process.env.CRATE_GUARD_DESCRIBE;
+      if (how === 'stall') return new Promise(() => {});
+      if (how === 'throw') throw new Error('describe failed (injected)');
+      if (how === 'die') real.stop();
+      return use(() => real.describe(...args));
+    },
   };
 }
 
