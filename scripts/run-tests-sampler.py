@@ -41,10 +41,13 @@ threads are held or when its last thread ends) until proc_exit makes it a
 zombie. proc_pidinfo then also says there is no such process, and the usage
 read answers from the figures the kernel cached as the process began to exit:
 the same start time, the resident size it had then, a footprint of zero, and a
-non-zero exit time (ri_proc_exit_abstime). A process that is not exiting never
-carries an exit time: the kernel sets it to zero when it reads a live process.
-The row reports whether the usage read carried one (<exiting>); the guard
-decides what it means.
+non-zero exit time (ri_proc_exit_abstime). The kernel publishes those cached
+figures a moment before it marks the process dead, so for that moment a
+process libproc still describes reads with them as well. Before the cache
+exists, a usage read carries no exit time: the kernel sets it to zero when it
+gathers fresh figures. The row reports whether the usage read carried one
+(<exiting>); the guard decides what it means (see scripts/run-tests.js, which
+lets an exiting process through for one second by its own clock).
 
 It also sends the guard's signals, because a pid alone does not say which
 process will receive one: the system reuses pids. Each signal names the pid and

@@ -379,6 +379,13 @@ test('a process that answers "no such process" to both reads stops the run as be
     `  after the cleanup (+85 ms): not listed, process info errno 3, usage errno 3; process table: no record; executable: /Applications/${'x'.repeat(286)}...`,
     '  the last 3 scans before the stop took 2.2 to 3.9 ms and began 51.5 to 53.1 ms apart',
   ]);
+  // A stop the clock decided, after the last scan: times are counted from the stop, and the gap is said.
+  const byClock = describeUnreadable({ pid: 102, runnerPid: RUNNER, runnerStart: null, details, scans: [], stoppedAt: 1205,
+    after: { at: 1290, error: 'no answer within 500 ms' }, cleanup: { scans: 1, runs: [{ state: 'not listed', count: 1, first: 1230, last: 1230 }], dropped: 0 } });
+  assert.equal(byClock[1], '  unreadable in 4 scans in a row over 154 ms; never shown exiting; the stop came 1000 ms after the last of them; the last 4, from the first:');
+  assert.match(byClock[6], /^  last read in full 1205 ms before the stop: /);
+  assert.deepEqual(byClock.slice(8, 10), ['  in the 1 scans from the stop to the end of the cleanup (freeze, kill, confirmation): not listed in 1 (+25 to +25 ms)',
+    '  after the cleanup (+85 ms): the sampler did not describe it (no answer within 500 ms)']);
   // A record that could not be read is not "no record"; the sampler not answering is said as such; text from the system is shown escaped.
   const other = describeUnreadable({ pid: 102, runnerPid: RUNNER, runnerStart: null, details: { ...details, lastRead: null },
     scans: [], after: { at: 290, listed: true, info: ESRCH, usage: 0, record: 'unreadable', path: '/tmp/a\nrun-tests: forged', timebase: { numer: 0, denom: 0 } },
@@ -456,7 +463,8 @@ test('an exiting process that is still exiting after a second stops the run, as 
   assert.equal(ownership.readFailure(), null);
   clock.now += 1;
   ownership.update(exiting, true);
-  assert.deepEqual(ownership.readFailure(), { pid: 102, problem: 'unreadable', errno: ESRCH, samples: 3, exitingMilliseconds: EXITING.milliseconds + 1 });
+  assert.deepEqual(ownership.readFailure(),
+    { pid: 102, problem: 'unreadable', errno: ESRCH, samples: 3, exitingMilliseconds: EXITING.milliseconds + 1, countedMegabytes: 87 });
   // A scan in between that answers "no such process" to both reads does not restart the second; it gets its own three samples.
   const mixed = newOwnership(clock);
   clock.now = 0;
@@ -481,7 +489,81 @@ test('an exiting process that is still exiting after a second stops the run, as 
   assert.equal(late.readFailure(), null);
   clock.now = 1011;
   late.update(tree(noSuchProcessRow(102)), true);
-  assert.equal(late.readFailure().exitingMilliseconds, 1001);
+  // Ending on a scan that no longer shows it exiting, the stop still gives the figure it was counted at while exiting.
+  assert.deepEqual([late.readFailure().exitingMilliseconds, late.readFailure().countedMegabytes, late.row(102).megabytes], [1001, 87, 0]);
+});
+
+test('the exiting allowance ends by the clock, whether or not a scan comes back', () => {
+  const clock = { now: 0 };
+  const ownership = newOwnership(clock);
+  ownership.update(tree(full102), true);
+  assert.equal(ownership.exitingDeadline(), null, 'nothing exiting, nothing to keep time for');
+  clock.now = 10;
+  ownership.update(tree(exitingRow(102, 101, RUNNER, { start: 'started-102' })), true);
+  // From here on no scan comes back. The guard asks the clock, not a scan.
+  assert.equal(ownership.exitingDeadline(), 10 + EXITING.milliseconds);
+  assert.equal(ownership.expiredExiting(10 + EXITING.milliseconds), null);
+  assert.deepEqual(ownership.expiredExiting(10 + EXITING.milliseconds + 1),
+    { pid: 102, problem: 'unreadable', errno: ESRCH, samples: 1, exitingMilliseconds: EXITING.milliseconds + 1, countedMegabytes: 87 });
+  // Gone: no deadline left to keep.
+  clock.now = 500;
+  ownership.update(tree(), true);
+  assert.deepEqual([ownership.exitingDeadline(), ownership.expiredExiting(5000)], [null, null]);
+});
+
+test('a full reading that already carries the exit figures never lowers what an exiting process is counted at', () => {
+  // The kernel publishes its cached exit figures (footprint 0, an exit time) a
+  // moment before libproc stops describing the process: one full reading can carry them.
+  const clock = { now: 0 };
+  const ownership = newOwnership(clock);
+  ownership.update(tree(full102), true);
+  clock.now = 55;
+  const cached = row(102, 101, RUNNER, { start: 'started-102', megabytes: 60, resident: 60, footprint: 0, exiting: true });
+  assert.equal(ownership.update(tree(cached), true).get(102).megabytes, 60, 'a full reading is counted as read');
+  clock.now = 110;
+  const owned = ownership.update(tree(exitingRow(102, 101, RUNNER, { start: 'started-102', megabytes: 60, resident: 60 })), true);
+  assert.equal(owned.get(102).megabytes, 87, 'while exiting: the last full reading from before the exit figures');
+  assert.equal(ownership.exitingStats.largest.lastFull, 87);
+  // A full reading without exit figures replaces the one before it, as any reading does.
+  const fresh = newOwnership(clock);
+  fresh.update(tree(full102), true);
+  fresh.update(tree(row(102, 101, RUNNER, { start: 'started-102', megabytes: 50, resident: 50, footprint: 40 })), true);
+  assert.equal(fresh.update(tree(exitingRow(102, 101, RUNNER, { start: 'started-102', megabytes: 30, resident: 30 })), true).get(102).megabytes, 50);
+});
+
+test('one process gets one exiting allowance, however its readings come and go', () => {
+  const clock = { now: 0 };
+  const ownership = newOwnership(clock);
+  ownership.update(tree(full102), true);
+  clock.now = 10;
+  const exiting = tree(exitingRow(102, 101, RUNNER, { start: 'started-102' }));
+  ownership.update(exiting, true);
+  // Read as ended (the process table said so) and then, the table not answering, as exiting again.
+  clock.now = 500;
+  ownership.update(tree(row(102, 101, RUNNER, { status: ZOMBIE, start: 'started-102', megabytes: 60, resident: 60, footprint: 0, exiting: true })), true);
+  assert.equal(ownership.readFailure(), null);
+  clock.now = 900;
+  ownership.update(exiting, true);
+  assert.equal(ownership.readFailure(), null);
+  // The second still runs from the first scan that showed it exiting.
+  clock.now = 1011;
+  ownership.update(exiting, true);
+  assert.equal(ownership.readFailure()?.exitingMilliseconds, 1001);
+  assert.equal(ownership.exitingDeadline(), 10 + EXITING.milliseconds);
+  assert.equal(ownership.exitingStats.processes, 1);
+  // Its pid listed again with another start time is another process: a new allowance.
+  const reused = newOwnership(clock);
+  clock.now = 0;
+  reused.update(tree(full102), true);
+  clock.now = 10;
+  reused.update(exiting, true);
+  clock.now = 60;
+  reused.update(tree(), true);
+  clock.now = 100;
+  reused.update(tree(row(102, 101, RUNNER, { start: 'started-again', megabytes: 20 })), true);
+  clock.now = 900;
+  reused.update(tree(exitingRow(102, 101, RUNNER, { start: 'started-again' })), true);
+  assert.deepEqual([reused.exitingDeadline(), reused.exitingStats.processes], [900 + EXITING.milliseconds, 2]);
 });
 
 test('nothing but an exiting process of the run, read in full before with that start time, and not the runner, gets the allowance', () => {
@@ -1306,7 +1388,7 @@ function assertReport(result, pid, { scans, exiting }) {
   assert.ok(report.startsWith('run-tests: About'), result.stderr);
   assert.ok(result.stderr.indexOf('Every process of the run has ended.') < result.stderr.indexOf('About process'));
   const lines = report.split('\n').filter(line => line.startsWith('run-tests:   ') || line.startsWith('run-tests: About'));
-  assert.match(lines[1], new RegExp(`^run-tests:   unreadable in \\d+ scans in a row over \\d+ ms; ${exiting ? 'shown exiting from \\d+ ms after the first \\(1000 ms allowed\\)' : 'never shown exiting'}; the last ${scans}, from the first:$`));
+  assert.match(lines[1], new RegExp(`^run-tests:   unreadable in \\d+ scans in a row over \\d+ ms; ${exiting ? 'shown exiting from \\d+ ms after the first \\(1000 ms allowed\\)' : 'never shown exiting'}; the stop came \\d+ ms after the last of them; the last ${scans}, from the first:$`));
   const scanLine = exiting ? 'process info errno 3, usage errno 0, [\\d.]+ MB resident, 0\\.0 MB footprint, exiting' : 'process info errno 3, usage errno 3';
   for (const line of lines.slice(2, 2 + scans)) assert.match(line, new RegExp(`^run-tests:     \\+\\d+ ms: ${scanLine}$`));
   const rest = lines.slice(2 + scans);
@@ -1358,12 +1440,41 @@ test('a process that is still exiting after a second stops the run as before, sa
   const result = await startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'exiting:nested' }, faultyGuard).done;
   const nested = recorded().get('nested');
   assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
-  assert.match(result.stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${ESRCH}, \\d+ samples in a row\\)\\. It had been exiting for (\\d+) ms, longer than the 1000 ms allowed; it was counted at \\d+ MB meanwhile\\.\\nrun-tests:   .*\\nrun-tests: Stopping the test run \\(\\d+ processes\\)\\.`));
+  assert.match(result.stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${ESRCH}, \\d+ samples in a row\\)\\. It had been exiting for (\\d+) ms, longer than the 1000 ms allowed; while exiting it was counted at up to \\d+ MB\\.(?:\\nrun-tests: A scan was still in progress when the allowance ran out; the sampler standing by takes over\\.)?\\nrun-tests:   .*\\nrun-tests: Stopping the test run \\(\\d+ processes\\)\\.`));
   assert.ok(Number(/exiting for (\d+) ms, longer/.exec(result.stderr)[1]) > EXITING.milliseconds);
   assert.match(result.stderr, /run-tests: Every process of the run has ended\./);
   const samples = Number(new RegExp(`PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno 3, (\\d+) samples`).exec(result.stderr)[1]);
   assertReport(result, nested, { scans: Math.min(samples, 8), exiting: true });
   assert.match(result.stderr, /^run-tests: memory guard: 1 processes were let through while exiting/m);
+  await allGone(['nested', 'nested-child', 'short-lived', 'ready']);
+  assert.equal(bystanderSurvived(), true);
+});
+
+test('an exiting allowance ends by the clock while scans do not come back: stopped at the bound, with the usual cleanup', { timeout: 60000 }, async t => {
+  const { environment, recorded, allGone, bystanderSurvived } = scenario(t);
+  // Two scans show it exiting; then every scan of the sampler in use times out, as a sampler that does not answer does.
+  const result = await startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'exiting-then-stall:nested' }, faultyGuard).done;
+  const nested = recorded().get('nested');
+  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+  const stopped = new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${ESRCH}, 2 samples in a row\\)\\. `
+    + 'It had been exiting for (\\d+) ms, longer than the 1000 ms allowed; while exiting it was counted at up to \\d+ MB\\.\\n'
+    + 'run-tests: A scan was still in progress when the allowance ran out; the sampler standing by takes over\\.\\n'
+    + 'run-tests:   .*\\nrun-tests: Stopping the test run \\(\\d+ processes\\)\\.\\nrun-tests: Every process of the run has ended\\.').exec(result.stderr);
+  assert.ok(stopped, result.stderr);
+  // At the bound, by the clock: not when a scan next came back, and not at the 3 s blind limit.
+  const exitingFor = Number(stopped[1]);
+  assert.ok(exitingFor > EXITING.milliseconds && exitingFor < EXITING.milliseconds + 250, `stopped after ${exitingFor} ms exiting`);
+  assert.doesNotMatch(result.stderr, /LOST SIGHT|sampler failed|INCOMPLETE/);
+  await allGone(['nested', 'nested-child', 'short-lived', 'ready']);
+  assert.equal(bystanderSurvived(), true);
+});
+
+test('a sampler that stops answering with no process exiting is handled as before: the blind limit', { timeout: 60000 }, async t => {
+  const { environment, allGone, bystanderSurvived } = scenario(t);
+  const result = await startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'stall:nested' }, faultyGuard).done;
+  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+  assert.match(result.stderr, /run-tests: GUARD LOST SIGHT OF THE RUN after [\d.]+ s: sampler did not answer within 1000 ms \(injected\)\.\nrun-tests: Stopping the test run \(\d+ processes\)\.\nrun-tests: Every process of the run has ended\./);
+  assert.doesNotMatch(result.stderr, /CANNOT READ|allowance|let through while exiting/);
   await allGone(['nested', 'nested-child', 'short-lived', 'ready']);
   assert.equal(bystanderSurvived(), true);
 });

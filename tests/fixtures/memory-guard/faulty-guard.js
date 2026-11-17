@@ -22,6 +22,10 @@
 //                                                  sampler): no process info, usage with its start time, resident size, no
 //                                                  footprint and an exit time, for as long as it lives
 //   CRATE_GUARD_FAULT=exiting-then-gone:<role>     the same for six scans, after which no scan lists it (it is still running)
+//   CRATE_GUARD_FAULT=exiting-then-stall:<role>    the same for two scans, after which every scan of the sampler in use fails
+//                                                  as a real one does that does not answer: after the request timeout
+//   CRATE_GUARD_FAULT=stall:<role>                 once the tree is up (and that process listed), every scan of the sampler in
+//                                                  use fails in the same way; no process is exiting
 //   CRATE_GUARD_FAULT=exiting-over-limit:<role>    once the tree is up, one scan reads that process in full at 1300 MB; after that
 //                                                  it reads as exiting with no memory, and `nested-child` reads 1100 MB more than it holds
 //   CRATE_GUARD_FAULT=system-tool:<role>           that process reads exactly as the system's set-uid ps does, for as long as it lives
@@ -55,6 +59,11 @@ const exitingRow = (row, megabytes = row.resident) => ({
 });
 let exitingScans = 0;
 let inflated = false;
+let stalling = false;
+// What the guard sees of a scan the sampler does not answer: its own request timeout.
+const unanswered = () => new Promise((resolve, reject) => {
+  setTimeout(() => reject(new Error(`sampler did not answer within ${guard.TIMING.requestTimeoutMs} ms (injected)`)), guard.TIMING.requestTimeoutMs);
+});
 // What the sampler reports for a set-uid root tool this user started.
 const asTool = (row, path) => ({ ...cannotRead(row), uid: 0, ruid: process.getuid(), path });
 
@@ -76,13 +85,18 @@ function misread(rows) {
     const target = recorded().get(role);
     return rows.map(row => (row.pid === target ? asTool(row, kind === 'system-tool' ? '/bin/ps' : '/usr/bin/top') : row));
   }
-  if (kind === 'exiting' || kind === 'exiting-then-gone') {
+  if (kind === 'exiting' || kind === 'exiting-then-gone' || kind === 'exiting-then-stall') {
     if (!recorded().has('ready')) return rows;
     const target = recorded().get(role);
     if (!rows.some(row => row.pid === target)) return rows;
     exitingScans += 1;
     if (kind === 'exiting-then-gone' && exitingScans > 6) return rows.filter(row => row.pid !== target);
+    if (kind === 'exiting-then-stall' && exitingScans >= 2) stalling = true;
     return rows.map(row => (row.pid === target ? exitingRow(row) : row));
+  }
+  if (kind === 'stall') {
+    if (recorded().has('ready') && rows.some(row => row.pid === recorded().get(role))) stalling = true;
+    return rows;
   }
   if (kind === 'exiting-over-limit') {
     if (!recorded().has('ready')) return rows;
@@ -176,6 +190,7 @@ async function startFaultySampler() {
     get dead() { return failed || real.dead; },
     stop: () => real.stop(),
     scan: (...args) => use(async () => {
+      if (stalling && number === 1) return unanswered();
       const rows = misread(await real.scan(...args));
       return HELD.includes(kind) && number === 1 ? holdBack(rows, real) : rows;
     }),
