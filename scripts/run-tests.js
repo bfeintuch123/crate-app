@@ -69,11 +69,19 @@
 // first scan that showed it so, once per process (pid and start time) for as
 // long as its pid is listed; those scans do not count towards the three. It is
 // counted meanwhile at its last full reading, or at what it holds then if that
-// is more. The second is judged at the top of every pass of the guard's loop
-// and whenever a scan's result arrives, before that result is applied, so a
-// late result that no longer shows the process cannot erase it. When it has
-// run out, the run is stopped like any process the guard cannot read. In
-// short: 1 second while scans arrive; if the sampler is stalled, the stop
+// is more. Every scan reaches what the guard knows of the run through one
+// function, ownership.take(), which judges every exiting allowance against the
+// clock before it applies the scan, and returns the stop instead of applying
+// it when one has run out: a late result that shows the process gone, ended
+// or readable cannot erase it. That holds for the scans of the watch, for the
+// scan right after the run has ended (and its retry with another sampler),
+// and for the cleanup scans, where it has nothing left to decide once the
+// run's outcome is settled and so applies them as before. The guard also
+// judges the allowances, without a scan, at the top of every pass of its loop
+// and where it sees the end of the run or a signal after a scan has failed.
+// When one has run out, the run is stopped like any process the guard cannot
+// read, also when the run has just ended by itself. In short: 1 second while
+// scans arrive; if the sampler is stalled, the stop
 // comes when the scan times out or the existing blind limit fires, whichever
 // the existing code does first. Exactly, from the moment the guard applied the
 // first scan that showed the process exiting: while scans arrive, at most
@@ -85,8 +93,7 @@
 // the run at once as before. The blind limit cannot come first then: the last
 // good scan is the first exiting one or later. Neither the request timeout,
 // the blind limit nor the pause between scans is changed by this.
-// A process whose usage is denied gets no allowance, apart from the system
-// tool while it exits (below). All of that also holds
+// A process whose usage is denied gets no allowance. All of that also holds
 // when the same scan shows that the run has just ended by itself or that a
 // signal has arrived, and for the one scan the guard makes right after a run
 // has ended: a run that was not watched to its end does not get to report its
@@ -95,10 +102,11 @@
 // then counts only if it is still running at the end.
 //
 // When a process that answers "no such process", or whose usage is denied,
-// stops the run, the report also says what the guard knew of it: when it was last read in full (parent,
-// group, start time, memory), both errnos, the sizes, the executable path and
-// the allowance and sample count of the last scans that could not read it,
-// what each scan from the stop to the end of the cleanup
+// stops the run, the report also says what the guard knew of it: when it was
+// last read in full (parent, group, start time, memory), both errnos, the
+// sizes, the executable path, whether it was let through as the system tool,
+// and the sample count of the last scans that could not read it, what each
+// scan from the stop to the end of the cleanup
 // showed of it, what the sampler says of it once the cleanup is over and its
 // outcome settled (whether it is listed, both reads, the process table's
 // record and the executable path, never its arguments or environment), and
@@ -107,8 +115,7 @@
 // half a second, so it can delay the guard's own exit by that much and change
 // nothing else. When processes were let through as exiting, the summary at the
 // end says how many, the longest one was seen so, and the largest usage read
-// meanwhile against its last full reading; and, in a line of its own, how many
-// `ps` were let through while exiting and the longest one was.
+// meanwhile against its last full reading.
 //
 // The one exception is the system's own `ps`. Tests start it, and macOS
 // installs it set-uid root, so this user may not read its memory. A process is
@@ -120,16 +127,8 @@
 // once. It is counted at an assumed 32 MB,
 // which is an estimate and not a measurement, and it is never signalled by
 // pid. Once it has ended it is neither counted nor waited for, even while its
-// parent has not collected it. Between being killed and having ended, a `ps`
-// is exiting (see the sampler): the system no longer describes it, and its
-// usage, which the kernel still finds, is still denied. A pid let through as
-// that tool by the scan before, now read that way, is that `ps` exiting: it
-// stays let through on the same counts and bounds (forty samples and two
-// seconds from its first unreadable scan, eight at once, the same assumed
-// 32 MB, nothing restarted), and for at most one second in that state, judged
-// the way the exiting second above is. Anything else the guard cannot read,
-// including a `ps` that fails any of these conditions, a pid first seen in
-// that state, and any other set-uid tool, stops the run as before.
+// parent has not collected it. Anything else the guard cannot read, including
+// a `ps` that fails any of these conditions, stops the run as before.
 //
 // For a fraction of a millisecond while it starts, and again while it ends, a
 // `ps` is not that tool: it already runs as root while its executable is
@@ -225,9 +224,9 @@ const MAX_FREEZE_ROUNDS = 50;
 // more of its own code, but it is not yet a zombie (see the sampler). It is
 // let through for this long from the first scan that shows it so, once per
 // process, counted at its last full reading or more; longer, and it stops the
-// run as any process the guard cannot read. Judged at the top of every pass
-// and when a scan arrives, before it is applied (see the header for the exact
-// worst case). Only a process of the run that the guard has read in full, with
+// run as any process the guard cannot read. Judged by ownership.take() before
+// every scan is applied, and by the guard where it decides without a scan
+// (see the header for where, and for the exact worst case). Only a process of the run that the guard has read in full, with
 // the same start time, and not the runner.
 const EXITING = { milliseconds: 1000 };
 // How many recent scans the report of an unreadable process lists, at most,
@@ -252,10 +251,6 @@ const SYSTEM_TOOL = {
   milliseconds: 2000,
   atOnce: 8,
   assumedMegabytes: 32,
-  // Once let through, a ps the system no longer describes while its usage is
-  // still denied is that ps exiting: let through as well, on the same counts
-  // and bounds, and for at most this long in that state.
-  exitingMilliseconds: 1000,
 };
 const MB = 1024 * 1024;
 // The largest pid the system's pid type can hold; the sampler refuses larger.
@@ -548,11 +543,9 @@ function createOwnership({ guardPid, guardUid, helperPids = [], runnerPid, now =
   // apart from scans that showed it exiting; `allowed` marks the system tool
   // while it is let through. `exiting` marks a process that this scan shows
   // exiting, and `exitingSince` is the time of the first scan that did (see
-  // EXITING). `allowedAs` is how this scan let it through ('tool', or
-  // 'tool-exiting' for the system tool while it exits; null when it did not),
-  // and `toolExitingSince` the time of the first scan that let it through as
-  // the tool exiting. `info`, `usage` and `scans` (the last few scans' errnos,
-  // sizes, path and allowance) are only reported, never decided on.
+  // EXITING). `info`, `usage` and `scans` (the last few scans' errnos, sizes,
+  // path, and whether each let it through as the system tool) are only
+  // reported, never decided on.
   const unread = new Map();
   // pid -> { row, at }: the latest scan that read that process of the run in
   // full (parent, group, state, start time and memory), and when.
@@ -562,26 +555,202 @@ function createOwnership({ guardPid, guardUid, helperPids = [], runnerPid, now =
   // exiting, and the largest usage read while exiting with its last full
   // reading. Reported in the summary.
   const exitingStats = { processes: 0, longestMilliseconds: 0, largest: null };
-  // The system tool let through while exiting: how many, and the longest one was.
-  const toolExitingStats = { processes: 0, longestMilliseconds: 0 };
   // pid -> { start, since, counted }: each process of the run seen exiting, by
   // pid and start time, with the time of the first scan that showed it so and
   // the largest figure it was counted at meanwhile. Kept while the pid is
   // listed with that start time (or with no start time readable), so that one
   // process gets one second in all, however its readings come and go.
   const exitingIdentities = new Map();
-  // An entry's allowance as a stop, when it has run out by `time`, else null.
-  // The same for the system tool while it exits, whatever else let it through.
-  const lapsed = (pid, entry, time) => {
-    if (entry.toolExitingSince !== null && time - entry.toolExitingSince > SYSTEM_TOOL.exitingMilliseconds) {
-      return { pid, problem: 'unreadable', errno: entry.errno, samples: entry.samples, toolExitingMilliseconds: time - entry.toolExitingSince };
+  // An entry's exiting allowance as a stop, when it has run out by `time`,
+  // else null. Whatever else this scan let the process through as: once seen
+  // exiting, a process has one second, and nothing else extends it.
+  const lapsed = (pid, entry, time) => (entry.exitingSince !== null && time - entry.exitingSince > EXITING.milliseconds
+    ? { pid, problem: 'unreadable', errno: entry.errno, samples: entry.samples,
+      exitingMilliseconds: time - entry.exitingSince, countedMegabytes: entry.counted }
+    : null);
+  // The first exiting allowance that has run out by `time`, as a stop, or null.
+  const expiredAt = time => {
+    for (const [pid, entry] of unread) {
+      const stop = lapsed(pid, entry, time);
+      if (stop) return stop;
     }
-    if (entry.allowed) return null;
-    return entry.exitingSince !== null && time - entry.exitingSince > EXITING.milliseconds
-      ? { pid, problem: 'unreadable', errno: entry.errno, samples: entry.samples,
-        exitingMilliseconds: time - entry.exitingSince, countedMegabytes: entry.counted }
-      : null;
+    return null;
   };
+  // Once the guard has decided how the run ends, a scan has nothing left to
+  // decide: see take().
+  let judging = true;
+
+  function apply(rows, runnerExists) {
+    const before = owned;
+    latest = new Map();
+    const children = new Map();
+    for (const row of rows) {
+      latest.set(row.pid, row);
+      if (row.infoError !== 0) continue;
+      if (!children.has(row.ppid)) children.set(row.ppid, []);
+      children.get(row.ppid).push(row);
+    }
+    const next = new Map();
+    const queue = [];
+    // Pids whose place in the run this very scan shows: the runner, a process
+    // identified before, a member of the runner's group, or something one of
+    // those started. A process kept only because it was in the run a moment
+    // ago is in the run, but not in this set.
+    const shownInRun = new Set();
+    let carrying = false;
+    const adopt = row => {
+      if (!row || row.pid <= 1 || row.pid === guardPid || helpers.has(row.pid) || next.has(row.pid)) return;
+      next.set(row.pid, row);
+      if (!carrying) shownInRun.add(row.pid);
+      queue.push(row);
+    };
+    // Started by a process of the run, wherever it went afterwards.
+    const descend = () => {
+      while (queue.length > 0) {
+        const parent = queue.pop();
+        for (const child of children.get(parent.pid) || []) adopt(child);
+      }
+    };
+    // The runner. This process started it and has not collected it, so its
+    // pid cannot have passed to anyone else: whatever a scan lists under
+    // that pid is the runner, readable or not. It is the root of the run
+    // from the first scan on. A scan that does not list it, or shows it as
+    // something this guard did not start, cannot be trusted with the run.
+    const runner = latest.get(runnerPid);
+    let runnerSeen = false;
+    runnerProblem = null;
+    if (!runnerExists) {
+      runnerMissing = 0;
+    } else if (!runner) {
+      runnerMissing += 1;
+      if (runnerMissing > UNREADABLE_SAMPLES) runnerProblem = { problem: 'missing', errno: ESRCH, samples: runnerMissing };
+    } else {
+      runnerMissing = 0;
+      adopt(runner);
+      if (runner.infoError === 0 && isIdentified(runner) && !hasEnded(runner)) {
+        if (runnerStart === null && runner.ppid === guardPid) {
+          runnerStart = runner.start;
+          anchored = runner.pgid === runnerPid;
+        }
+        runnerSeen = runner.ppid === guardPid && runner.start === runnerStart && runner.pgid === runnerPid;
+        if (!runnerSeen) {
+          if (runner.pgid !== runnerPid) anchored = false;
+          runnerProblem = { problem: 'inconsistent', errno: 0, samples: 1 };
+        }
+      }
+    }
+    // Identified as the run's before: same pid and the same start time,
+    // however long ago and whether or not it showed up in every scan since.
+    for (const row of rows) {
+      if (isIdentified(row) && identified.get(row.pid) === row.start) adopt(row);
+    }
+    // In the runner's group, in a scan that shows the runner itself. Only the
+    // run's own session can put a process there while the runner holds the
+    // pid that names the group.
+    if (anchored === true && runnerSeen) {
+      for (const row of rows) if (row.infoError === 0 && row.pgid === runnerPid) adopt(row);
+    }
+    descend();
+    // In the run a moment ago and unreadable now. It cannot be shown to be
+    // the same process, and it must not be quietly dropped: it stays, counted
+    // as a process the guard cannot read. One that has ended stays too, for
+    // what it started: a scan is not one instant, and a child read while its
+    // parent was alive may have nothing else left that ties it to the run.
+    carrying = true;
+    for (const row of rows) {
+      if (before.has(row.pid) && !isIdentified(row)) adopt(row);
+    }
+    descend();
+    const time = now();
+    latestTime = time;
+    let allowed = 0;
+    const readNow = new Map();
+    for (const pid of [...unread.keys()]) if (!next.has(pid)) unread.delete(pid);
+    // An exiting process is one process from the first scan that shows it so
+    // to the end of its pid: forget it only when its pid is no longer listed,
+    // or is listed with another start time.
+    for (const [pid, identity] of [...exitingIdentities]) {
+      const row = latest.get(pid);
+      if (!row || (row.usageError === 0 && row.start !== identity.start)) exitingIdentities.delete(pid);
+    }
+    for (const row of next.values()) {
+      if (isIdentified(row) && row.infoError === 0 && !hasEnded(row)) {
+        // `megabytes` is what a full reading lets the process be counted at
+        // while exiting. The kernel publishes the figures it caches for an
+        // exiting process (footprint 0, resident size, an exit time) a moment
+        // before libproc stops describing it, so a full reading can already
+        // carry them: such a reading never lowers the figure.
+        const previous = lastRead.get(row.pid);
+        const keep = row.exiting && previous && previous.row.start === row.start;
+        readNow.set(row.pid, { row, at: time, megabytes: keep ? Math.max(previous.megabytes, row.megabytes) : row.megabytes });
+      } else if (lastRead.has(row.pid)) readNow.set(row.pid, lastRead.get(row.pid));
+      // Never learned from a process that has ended: its start time and its
+      // state come from two reads, and only a live process is worth knowing again.
+      if (isIdentified(row) && !hasEnded(row)) identified.set(row.pid, row.start);
+      if (hasEnded(row) || (isIdentified(row) && row.infoError === 0)) {
+        unread.delete(row.pid);
+        continue;
+      }
+      const errno = row.usageError || row.infoError;
+      const earlier = unread.get(row.pid) || { samples: 0, since: time, ending: 0, exitingSince: null, scans: [] };
+      // Exiting (see EXITING): not the runner; libproc no longer describes
+      // it, while its usage, read in this same row, carries an exit time and
+      // the start time of its last full reading.
+      const full = lastRead.get(row.pid);
+      const exiting = row.pid !== runnerPid && row.infoError === ESRCH && row.usageError === 0 && row.exiting === true
+        && full !== undefined && full.row.start === row.start;
+      const used = { megabytes: row.megabytes, resident: row.resident, footprint: row.footprint };
+      let identity = exitingIdentities.get(row.pid) || null;
+      if (exiting && identity === null) {
+        identity = { start: row.start, since: time, counted: 0 };
+        exitingIdentities.set(row.pid, identity);
+        exitingStats.processes += 1;
+      }
+      if (exiting) {
+        // Counted at its last full reading, or at what it holds now if that is more.
+        row.megabytes = Math.max(full.megabytes, row.megabytes);
+        identity.counted = Math.max(identity.counted, row.megabytes);
+      }
+      const entry = {
+        errno, samples: earlier.samples + 1, since: earlier.since, allowed: false,
+        ending: exiting ? earlier.ending : (errno === ESRCH ? earlier.ending + 1 : 0),
+        exiting, exitingSince: identity ? identity.since : null, counted: identity ? identity.counted : null,
+        info: row.infoError, usage: row.usageError,
+        scans: [...earlier.scans.slice(1 - REPORTED_SCANS), {
+          at: time, info: row.infoError, usage: row.usageError, exiting, path: row.path, allowedAs: null, sample: earlier.samples + 1,
+          resident: row.usageError === 0 ? row.resident : null, footprint: row.usageError === 0 ? row.footprint : null,
+        }],
+      };
+      unread.set(row.pid, entry);
+      if (exiting) {
+        exitingStats.longestMilliseconds = Math.max(exitingStats.longestMilliseconds, time - entry.exitingSince);
+        if (exitingStats.largest === null || used.megabytes > exitingStats.largest.megabytes) {
+          exitingStats.largest = { ...used, lastFull: full.megabytes };
+        }
+      }
+      // The system tool (see the header). Every condition is read from this
+      // scan; a remembered pid is not enough, and neither is the runner's pid.
+      const isTool = row.pid !== runnerPid && shownInRun.has(row.pid)
+        && row.infoError === 0 && row.usageError === EPERM && row.path === SYSTEM_TOOL.path
+        && row.ruid === guardUid && row.uid === SYSTEM_TOOL.effectiveUid && guardUid !== SYSTEM_TOOL.effectiveUid;
+      const withinBounds = entry.samples <= SYSTEM_TOOL.samples && time - entry.since <= SYSTEM_TOOL.milliseconds;
+      if (isTool && withinBounds && allowed < SYSTEM_TOOL.atOnce) {
+        allowed += 1;
+        entry.allowed = true;
+        // For the report only.
+        entry.scans[entry.scans.length - 1].allowedAs = 'tool';
+        // An estimate, because it cannot be measured. The row stays unidentified.
+        row.megabytes = SYSTEM_TOOL.assumedMegabytes;
+        row.assumed = true;
+        toolStats.samples += 1;
+        toolStats.longestSamples = Math.max(toolStats.longestSamples, entry.samples);
+        toolStats.longestMilliseconds = Math.max(toolStats.longestMilliseconds, time - entry.since);
+      }
+    }
+    lastRead = readNow;
+    owned = next;
+    return owned;
+  }
 
   return {
     get owned() { return owned; },
@@ -590,7 +759,6 @@ function createOwnership({ guardPid, guardUid, helperPids = [], runnerPid, now =
     // scans of a cleanup included), and the longest any one of them stayed.
     get toolStats() { return toolStats; },
     get exitingStats() { return exitingStats; },
-    get toolExitingStats() { return toolExitingStats; },
     // False once a scan showed the runner outside the group it was started to lead.
     get groupUsable() { return anchored !== false; },
     // What is known about a process of the run that cannot be read, for the
@@ -601,8 +769,7 @@ function createOwnership({ guardPid, guardUid, helperPids = [], runnerPid, now =
       const read = lastRead.get(pid);
       return {
         errno: entry.errno, samples: entry.samples, ending: entry.ending, info: entry.info, usage: entry.usage,
-        exitingSince: entry.exitingSince, toolExitingSince: entry.toolExitingSince, allowedAs: entry.allowedAs,
-        since: entry.since, scans: entry.scans.map(scan => ({ ...scan })), at: latestTime,
+        exitingSince: entry.exitingSince, since: entry.since, scans: entry.scans.map(scan => ({ ...scan })), at: latestTime,
         lastRead: read ? { ...read.row, at: read.at } : null,
       };
     },
@@ -628,208 +795,29 @@ function createOwnership({ guardPid, guardUid, helperPids = [], runnerPid, now =
         const stop = lapsed(pid, entry, latestTime);
         if (stop) return stop;
         if (entry.allowed || entry.exiting) continue;
-        if (entry.errno !== ESRCH || entry.ending > UNREADABLE_SAMPLES) {
-          return { pid, problem: 'unreadable', errno: entry.errno, samples: entry.samples,
-            ...(entry.toolExitingSince === null ? {} : { toolExitingMilliseconds: latestTime - entry.toolExitingSince }) };
-        }
+        if (entry.errno !== ESRCH || entry.ending > UNREADABLE_SAMPLES) return { pid, problem: 'unreadable', errno: entry.errno, samples: entry.samples };
       }
       return null;
     },
-    // The stop for an exiting allowance (a process's, or the system tool's)
-    // that has run out by `time`, as readFailure() gives it, or null. The
-    // guard asks this at the top of every pass and when a scan's result
-    // arrives, before it is applied.
-    expiredExiting(time) {
-      for (const [pid, entry] of unread) {
-        const stop = lapsed(pid, entry, time);
-        if (stop) return stop;
-      }
-      return null;
+    // The stop for an exiting allowance that has run out by `time`, as
+    // readFailure() gives it, or null. The guard asks this where it decides
+    // without a scan (the top of every pass, and the end of the run seen
+    // without one); take() asks it for every scan.
+    expiredExiting(time) { return expiredAt(time); },
+    // The one way a scan reaches ownership. Every exiting allowance is judged
+    // against the clock first: when one has run out, the scan is not applied
+    // and the stop is returned instead, so a late scan that no longer shows
+    // the process cannot erase the allowance. Returns { stop, owned }: stop is
+    // null when the scan was applied. Once the guard has decided how the run
+    // ends (endJudging()), a scan has no decision left to make and is applied
+    // as it comes, so the cleanup acts on the latest scan as it always has.
+    take(rows, runnerExists) {
+      const stop = judging ? expiredAt(now()) : null;
+      if (stop) return { stop, owned };
+      return { stop: null, owned: apply(rows, runnerExists) };
     },
-    update(rows, runnerExists) {
-      const before = owned;
-      latest = new Map();
-      const children = new Map();
-      for (const row of rows) {
-        latest.set(row.pid, row);
-        if (row.infoError !== 0) continue;
-        if (!children.has(row.ppid)) children.set(row.ppid, []);
-        children.get(row.ppid).push(row);
-      }
-      const next = new Map();
-      const queue = [];
-      // Pids whose place in the run this very scan shows: the runner, a process
-      // identified before, a member of the runner's group, or something one of
-      // those started. A process kept only because it was in the run a moment
-      // ago is in the run, but not in this set.
-      const shownInRun = new Set();
-      let carrying = false;
-      const adopt = row => {
-        if (!row || row.pid <= 1 || row.pid === guardPid || helpers.has(row.pid) || next.has(row.pid)) return;
-        next.set(row.pid, row);
-        if (!carrying) shownInRun.add(row.pid);
-        queue.push(row);
-      };
-      // Started by a process of the run, wherever it went afterwards.
-      const descend = () => {
-        while (queue.length > 0) {
-          const parent = queue.pop();
-          for (const child of children.get(parent.pid) || []) adopt(child);
-        }
-      };
-      // The runner. This process started it and has not collected it, so its
-      // pid cannot have passed to anyone else: whatever a scan lists under
-      // that pid is the runner, readable or not. It is the root of the run
-      // from the first scan on. A scan that does not list it, or shows it as
-      // something this guard did not start, cannot be trusted with the run.
-      const runner = latest.get(runnerPid);
-      let runnerSeen = false;
-      runnerProblem = null;
-      if (!runnerExists) {
-        runnerMissing = 0;
-      } else if (!runner) {
-        runnerMissing += 1;
-        if (runnerMissing > UNREADABLE_SAMPLES) runnerProblem = { problem: 'missing', errno: ESRCH, samples: runnerMissing };
-      } else {
-        runnerMissing = 0;
-        adopt(runner);
-        if (runner.infoError === 0 && isIdentified(runner) && !hasEnded(runner)) {
-          if (runnerStart === null && runner.ppid === guardPid) {
-            runnerStart = runner.start;
-            anchored = runner.pgid === runnerPid;
-          }
-          runnerSeen = runner.ppid === guardPid && runner.start === runnerStart && runner.pgid === runnerPid;
-          if (!runnerSeen) {
-            if (runner.pgid !== runnerPid) anchored = false;
-            runnerProblem = { problem: 'inconsistent', errno: 0, samples: 1 };
-          }
-        }
-      }
-      // Identified as the run's before: same pid and the same start time,
-      // however long ago and whether or not it showed up in every scan since.
-      for (const row of rows) {
-        if (isIdentified(row) && identified.get(row.pid) === row.start) adopt(row);
-      }
-      // In the runner's group, in a scan that shows the runner itself. Only the
-      // run's own session can put a process there while the runner holds the
-      // pid that names the group.
-      if (anchored === true && runnerSeen) {
-        for (const row of rows) if (row.infoError === 0 && row.pgid === runnerPid) adopt(row);
-      }
-      descend();
-      // In the run a moment ago and unreadable now. It cannot be shown to be
-      // the same process, and it must not be quietly dropped: it stays, counted
-      // as a process the guard cannot read. One that has ended stays too, for
-      // what it started: a scan is not one instant, and a child read while its
-      // parent was alive may have nothing else left that ties it to the run.
-      carrying = true;
-      for (const row of rows) {
-        if (before.has(row.pid) && !isIdentified(row)) adopt(row);
-      }
-      descend();
-      const time = now();
-      latestTime = time;
-      let allowed = 0;
-      const readNow = new Map();
-      for (const pid of [...unread.keys()]) if (!next.has(pid)) unread.delete(pid);
-      // An exiting process is one process from the first scan that shows it so
-      // to the end of its pid: forget it only when its pid is no longer listed,
-      // or is listed with another start time.
-      for (const [pid, identity] of [...exitingIdentities]) {
-        const row = latest.get(pid);
-        if (!row || (row.usageError === 0 && row.start !== identity.start)) exitingIdentities.delete(pid);
-      }
-      for (const row of next.values()) {
-        if (isIdentified(row) && row.infoError === 0 && !hasEnded(row)) {
-          // `megabytes` is what a full reading lets the process be counted at
-          // while exiting. The kernel publishes the figures it caches for an
-          // exiting process (footprint 0, resident size, an exit time) a moment
-          // before libproc stops describing it, so a full reading can already
-          // carry them: such a reading never lowers the figure.
-          const previous = lastRead.get(row.pid);
-          const keep = row.exiting && previous && previous.row.start === row.start;
-          readNow.set(row.pid, { row, at: time, megabytes: keep ? Math.max(previous.megabytes, row.megabytes) : row.megabytes });
-        } else if (lastRead.has(row.pid)) readNow.set(row.pid, lastRead.get(row.pid));
-        // Never learned from a process that has ended: its start time and its
-        // state come from two reads, and only a live process is worth knowing again.
-        if (isIdentified(row) && !hasEnded(row)) identified.set(row.pid, row.start);
-        if (hasEnded(row) || (isIdentified(row) && row.infoError === 0)) {
-          unread.delete(row.pid);
-          continue;
-        }
-        const errno = row.usageError || row.infoError;
-        const earlier = unread.get(row.pid) || { samples: 0, since: time, ending: 0, exitingSince: null, toolExitingSince: null, allowedAs: null, scans: [] };
-        // Exiting (see EXITING): not the runner; libproc no longer describes
-        // it, while its usage, read in this same row, carries an exit time and
-        // the start time of its last full reading.
-        const full = lastRead.get(row.pid);
-        const exiting = row.pid !== runnerPid && row.infoError === ESRCH && row.usageError === 0 && row.exiting === true
-          && full !== undefined && full.row.start === row.start;
-        const used = { megabytes: row.megabytes, resident: row.resident, footprint: row.footprint };
-        let identity = exitingIdentities.get(row.pid) || null;
-        if (exiting && identity === null) {
-          identity = { start: row.start, since: time, counted: 0 };
-          exitingIdentities.set(row.pid, identity);
-          exitingStats.processes += 1;
-        }
-        if (exiting) {
-          // Counted at its last full reading, or at what it holds now if that is more.
-          row.megabytes = Math.max(full.megabytes, row.megabytes);
-          identity.counted = Math.max(identity.counted, row.megabytes);
-        }
-        const entry = {
-          errno, samples: earlier.samples + 1, since: earlier.since, allowed: false,
-          ending: exiting ? earlier.ending : (errno === ESRCH ? earlier.ending + 1 : 0),
-          exiting, exitingSince: identity ? identity.since : null, counted: identity ? identity.counted : null,
-          toolExitingSince: null, allowedAs: null,
-          info: row.infoError, usage: row.usageError,
-          scans: [...earlier.scans.slice(1 - REPORTED_SCANS), {
-            at: time, info: row.infoError, usage: row.usageError, exiting, path: row.path, allowedAs: null, sample: earlier.samples + 1,
-            resident: row.usageError === 0 ? row.resident : null, footprint: row.usageError === 0 ? row.footprint : null,
-          }],
-        };
-        unread.set(row.pid, entry);
-        if (exiting) {
-          exitingStats.longestMilliseconds = Math.max(exitingStats.longestMilliseconds, time - entry.exitingSince);
-          if (exitingStats.largest === null || used.megabytes > exitingStats.largest.megabytes) {
-            exitingStats.largest = { ...used, lastFull: full.megabytes };
-          }
-        }
-        // The system tool (see the header). Every condition is read from this
-        // scan; a remembered pid is not enough, and neither is the runner's pid.
-        const isTool = row.pid !== runnerPid && shownInRun.has(row.pid)
-          && row.infoError === 0 && row.usageError === EPERM && row.path === SYSTEM_TOOL.path
-          && row.ruid === guardUid && row.uid === SYSTEM_TOOL.effectiveUid && guardUid !== SYSTEM_TOOL.effectiveUid;
-        const withinBounds = entry.samples <= SYSTEM_TOOL.samples && time - entry.since <= SYSTEM_TOOL.milliseconds;
-        // The system tool while it exits: let through as the tool, or as the
-        // tool exiting, by the scan before this one, and now no longer
-        // described while its usage is still denied. Same counts and bounds as
-        // the tool, no restart, and at most SYSTEM_TOOL.exitingMilliseconds so.
-        const toolExiting = row.pid !== runnerPid && earlier.allowedAs !== null
-          && row.infoError === ESRCH && row.usageError === EPERM;
-        if (toolExiting) entry.toolExitingSince = earlier.toolExitingSince === null ? time : earlier.toolExitingSince;
-        const toolExitingWithin = !toolExiting || time - entry.toolExitingSince <= SYSTEM_TOOL.exitingMilliseconds;
-        if ((isTool || toolExiting) && withinBounds && toolExitingWithin && allowed < SYSTEM_TOOL.atOnce) {
-          allowed += 1;
-          entry.allowed = true;
-          entry.allowedAs = isTool ? 'tool' : 'tool-exiting';
-          entry.scans[entry.scans.length - 1].allowedAs = entry.allowedAs;
-          if (toolExiting) {
-            if (earlier.toolExitingSince === null) toolExitingStats.processes += 1;
-            toolExitingStats.longestMilliseconds = Math.max(toolExitingStats.longestMilliseconds, time - entry.toolExitingSince);
-          }
-          // An estimate, because it cannot be measured. The row stays unidentified.
-          row.megabytes = SYSTEM_TOOL.assumedMegabytes;
-          row.assumed = true;
-          toolStats.samples += 1;
-          toolStats.longestSamples = Math.max(toolStats.longestSamples, entry.samples);
-          toolStats.longestMilliseconds = Math.max(toolStats.longestMilliseconds, time - entry.since);
-        }
-      }
-      lastRead = readNow;
-      owned = next;
-      return owned;
-    },
+    // Called once the run's outcome is decided; see take().
+    endJudging() { judging = false; },
   };
 }
 
@@ -842,7 +830,8 @@ function createGuard({
   const alive = () => [...ownership.owned.values()].filter(row => !hasEnded(row));
   const identifiedRows = () => alive().filter(isIdentified);
   const unidentifiedRows = () => alive().filter(row => !isIdentified(row));
-  const observe = async () => ownership.update(await scan(), !isRunnerGone());
+  // Through ownership.take(), the one way a scan reaches ownership: { stop, owned }.
+  const observe = async () => ownership.take(await scan(), !isRunnerGone());
 
   // Signals the runner's group in one call, and every identified process not
   // covered by that call one by one. Returns the rows whose signal was sent,
@@ -987,9 +976,6 @@ function describeUnreadable({ pid, runnerPid, runnerStart, details, scans, after
     lines.push(`  unreadable in ${details.samples} scans in a row over ${ms(details.at - details.since)}; `
       + (details.exitingSince === null ? 'never shown exiting'
         : `shown exiting from ${ms(details.exitingSince - details.since)} after the first (${EXITING.milliseconds} ms allowed)`)
-      + (details.toolExitingSince === null || details.toolExitingSince === undefined ? ''
-        : `; let through as the system tool exiting from ${ms(details.toolExitingSince - details.since)} after the first `
-          + `(${SYSTEM_TOOL.exitingMilliseconds} ms allowed, within ${SYSTEM_TOOL.samples} samples and ${SYSTEM_TOOL.milliseconds} ms in all)`)
       + (Number.isFinite(stoppedAt) ? `; the stop came ${ms(stoppedAt - details.at)} after the last of them` : '')
       + `; the last ${details.scans.length}, from the first:`);
     for (const scan of details.scans) {
@@ -998,7 +984,6 @@ function describeUnreadable({ pid, runnerPid, runnerStart, details, scans, after
         + (scan.exiting ? ', exiting' : '')
         + (scan.path ? `, executable ${printable(scan.path)}` : '')
         + (scan.allowedAs === 'tool' ? `, let through as the system tool (sample ${scan.sample})`
-          : scan.allowedAs === 'tool-exiting' ? `, let through as the system tool exiting (sample ${scan.sample})`
             : scan.usage === EPERM ? `, not let through (sample ${scan.sample})` : ''));
     }
     const read = details.lastRead;
@@ -1189,10 +1174,7 @@ async function runGuard({
     const memory = unreadable.exitingMilliseconds !== undefined
       ? `It had been exiting for ${Math.round(unreadable.exitingMilliseconds)} ms, longer than the ${EXITING.milliseconds} ms allowed; `
         + `while exiting it was counted at up to ${formatOver(unreadable.countedMegabytes)}.`
-      : unreadable.toolExitingMilliseconds !== undefined
-        ? `Its memory is unknown. It had been let through as ${SYSTEM_TOOL.path} and then as that tool exiting, for `
-          + `${Math.round(unreadable.toolExitingMilliseconds)} ms (${SYSTEM_TOOL.exitingMilliseconds} ms allowed), and is not let through any more.`
-        : 'Its memory is unknown.';
+      : 'Its memory is unknown.';
     const lines = [{
       unreadable: `GUARD CANNOT READ PROCESS ${unreadable.pid} OF THE RUN after ${seconds()} s (errno ${unreadable.errno}, ${unreadable.samples} samples in a row). ${memory}`,
       missing: `GUARD CANNOT FIND THE TEST RUNNER after ${seconds()} s: process ${unreadable.pid} exists and ${unreadable.samples} scans in a row did not list it. The run's memory is unknown.`,
@@ -1212,8 +1194,8 @@ async function runGuard({
 
   while (reason === null) {
     // An allowance for a process that is exiting (see EXITING) is judged by
-    // the clock at the top of every pass, and when a scan's result arrives,
-    // before that result is applied: a late result that no longer shows the
+    // the clock at the top of every pass, and for every scan by take(),
+    // before the scan is applied: a late result that no longer shows the
     // process cannot erase an allowance that has run out.
     const lapsedBefore = ownership.expiredExiting(clock());
     if (lapsedBefore) {
@@ -1223,14 +1205,13 @@ async function runGuard({
     }
     let owned = null;
     try {
-      const rows = await scan();
-      const lapsedOnArrival = ownership.expiredExiting(clock());
-      if (lapsedOnArrival) {
+      const taken = await guard.observe();
+      if (taken.stop) {
         reason = 'unreadable';
-        report = notWatched(lapsedOnArrival);
+        report = notWatched(taken.stop);
         break;
       }
-      owned = ownership.update(rows, !runnerCollected());
+      owned = taken.owned;
       lastGoodSample = Date.now();
       samples += 1;
     } catch (error) {
@@ -1268,10 +1249,16 @@ async function runGuard({
         reason = 'deadline';
         report = [`DEADLINE PASSED after ${seconds()} s (limit ${limits.deadlineSeconds} s).`];
       }
-    } else if (runnerExit) {
-      reason = 'exit';
-    } else if (received.length > 0) {
-      reason = 'signal';
+    } else if (runnerExit || received.length > 0) {
+      // The end of the run, or a signal, seen without a scan (this one failed):
+      // an allowance that has run out by now still outranks it.
+      const lapsedWithoutScan = ownership.expiredExiting(clock());
+      if (lapsedWithoutScan) {
+        reason = 'unreadable';
+        report = notWatched(lapsedWithoutScan);
+      } else {
+        reason = runnerExit ? 'exit' : 'signal';
+      }
     }
     if (reason === null) await sleep(timing.sampleIntervalMs);
   }
@@ -1280,7 +1267,9 @@ async function runGuard({
   // stand when the guard stops watching: what the cleanup scans show of them
   // after this is not an allowance.
   let exitingSeen = structuredClone(ownership.exitingStats);
-  let toolExitingSeen = structuredClone(ownership.toolExitingStats);
+  // Every outcome but the end of the run is decided here; the end of the run
+  // is decided by the scan right after it, below.
+  if (reason !== 'exit') ownership.endJudging();
   // From here on the run is being ended, and every step below is bounded.
   // Cleanup identifies processes by pid and start time, so it needs a working
   // sampler. When the current one fails, the one standing by takes over, and
@@ -1349,13 +1338,14 @@ async function runGuard({
       exitCode = runnerExit.code;
       if (runnerExit.error) report = [`Could not start ${process.execPath}: ${runnerExit.error.message}.`];
       cleanup = await withSight(async () => {
-        await guard.observe();
-        // The scan right after the end of the run is judged like every scan before it.
-        const unreadable = reason === 'exit' ? ownership.readFailure() : null;
-        if (reason === 'exit') {
-          exitingSeen = structuredClone(ownership.exitingStats);
-          toolExitingSeen = structuredClone(ownership.toolExitingStats);
-        }
+        // The scan right after the end of the run is judged like every scan
+        // before it: take() judges the exiting allowances before applying it,
+        // and readFailure() judges what it shows. Retried by withSight with
+        // another sampler, it is judged again the same way.
+        const taken = await guard.observe();
+        const unreadable = reason === 'exit' ? taken.stop || ownership.readFailure() : null;
+        if (reason === 'exit') exitingSeen = structuredClone(ownership.exitingStats);
+        ownership.endJudging();
         if (unreadable) {
           reason = 'unreadable';
           exitCode = EXIT_GUARD_FAILURE;
@@ -1426,10 +1416,6 @@ async function runGuard({
     say(`memory guard: ${exitingSeen.processes} processes were let through while exiting, the longest seen exiting for `
       + `${Math.round(exitingSeen.longestMilliseconds)} ms (${EXITING.milliseconds} ms allowed); the largest usage read while exiting was `
       + `${largest.resident.toFixed(1)} MB resident and ${largest.footprint.toFixed(1)} MB footprint, against ${largest.lastFull.toFixed(1)} MB at its last full reading`);
-  }
-  if (toolExitingSeen.processes > 0) {
-    say(`memory guard: ${toolExitingSeen.processes} ${SYSTEM_TOOL.path} processes were let through while exiting, the longest for `
-      + `${Math.round(toolExitingSeen.longestMilliseconds)} ms (${SYSTEM_TOOL.exitingMilliseconds} ms allowed), counted at the assumed ${SYSTEM_TOOL.assumedMegabytes} MB`);
   }
   return exitCode;
 }

@@ -134,7 +134,7 @@ function simulate(rows, { collected = false } = {}) {
 
 function guardFor(machine, { seed = null } = {}) {
   const ownership = createOwnership({ guardPid: GUARD, guardUid: OWNER, helperPids: [SAMPLER, STANDBY], runnerPid: RUNNER, now: () => 0 });
-  if (seed) ownership.update(seed, true);
+  if (seed) applied(ownership, seed, true);
   const anomalies = [];
   const guard = createGuard({
     ownership,
@@ -150,6 +150,9 @@ function guardFor(machine, { seed = null } = {}) {
   });
   return { ownership, guard, anomalies };
 }
+
+// A scan given to ownership through take(), the one way a scan reaches it; what the run is afterwards.
+const applied = (ownership, rows, runnerExists) => ownership.take(rows, runnerExists).owned;
 
 const system = [row(1, 0, 1), row(GUARD, 1, GUARD), row(SAMPLER, GUARD, GUARD), row(STANDBY, GUARD, GUARD), row(12, GUARD, GUARD)];
 // `clock.now` is the ownership's time in milliseconds; a test moves it.
@@ -169,7 +172,7 @@ const clean = { survivors: [], unverified: [] };
 test('the run is the runner, its group, everything they started and everything identified before; nobody else', () => {
   const ownership = newOwnership();
   const inGroupOrphan = row(105, 1, RUNNER); // lost its parent before any scan, still in the runner's group
-  assert.deepEqual(pids(ownership.update([...system, ...stranger, ...run, inGroupOrphan], true)), [100, 101, 102, 103, 104, 105]);
+  assert.deepEqual(pids(applied(ownership, [...system, ...stranger, ...run, inGroupOrphan], true)), [100, 101, 102, 103, 104, 105]);
   assert.equal(ownership.groupMember(true).pid, RUNNER);
   assert.equal(ownership.groupMember(false), null);
   assert.equal(ownership.runnerStart, 'started-100');
@@ -177,35 +180,35 @@ test('the run is the runner, its group, everything they started and everything i
   // The test file is gone. Its children now belong to pid 1, the detached ones
   // in a group of their own; they stay in the run because they were identified in it.
   const orphaned = [row(RUNNER, GUARD, RUNNER), row(102, 1, RUNNER), row(103, 1, 103), row(104, 103, 103), inGroupOrphan];
-  assert.deepEqual(pids(ownership.update([...system, ...stranger, ...orphaned], true)), [100, 102, 103, 104, 105]);
+  assert.deepEqual(pids(applied(ownership, [...system, ...stranger, ...orphaned], true)), [100, 102, 103, 104, 105]);
 
   // The runner is gone too. Its group id no longer shows anything: a process
   // in that group that was never identified is not taken to be the run's.
   const unseen = row(106, 1, RUNNER);
   const afterRunner = [row(102, 1, RUNNER), row(103, 1, 103), row(104, 103, 103), inGroupOrphan, unseen, row(107, 104, 103)];
-  assert.deepEqual(pids(ownership.update([...system, ...stranger, ...afterRunner], false)), [102, 103, 104, 105, 107]);
+  assert.deepEqual(pids(applied(ownership, [...system, ...stranger, ...afterRunner], false)), [102, 103, 104, 105, 107]);
   assert.equal(ownership.groupMember(false), null);
 });
 
 test('a process missing from one scan is still the run\'s when it shows up again with the same start time', () => {
   const ownership = newOwnership();
-  ownership.update([...system, ...run], true);
+  applied(ownership, [...system, ...run], true);
   // The detached pair is adopted by pid 1 and, for one scan, not listed at all.
-  assert.deepEqual(pids(ownership.update([...system, row(RUNNER, GUARD, RUNNER)], true)), [100]);
-  assert.deepEqual(pids(ownership.update([...system, row(RUNNER, GUARD, RUNNER), row(103, 1, 103), row(104, 1, 103)], true)), [100, 103, 104]);
+  assert.deepEqual(pids(applied(ownership, [...system, row(RUNNER, GUARD, RUNNER)], true)), [100]);
+  assert.deepEqual(pids(applied(ownership, [...system, row(RUNNER, GUARD, RUNNER), row(103, 1, 103), row(104, 1, 103)], true)), [100, 103, 104]);
 });
 
 test('a pid is the run\'s only together with its start time', () => {
   const ownership = newOwnership();
-  ownership.update([...system, ...run], true);
+  applied(ownership, [...system, ...run], true);
   // 103 ended and the system gave its pid to an unrelated process, which has a
   // child of its own. The run's old 104 passed to pid 1 and is still the run's.
   const reused = [row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), row(102, 101, RUNNER),
     row(103, 1, 103, { start: 'someone-else' }), row(300, 103, 103), row(104, 1, 104)];
-  assert.deepEqual(pids(ownership.update([...system, ...reused], true)), [100, 101, 102, 104]);
+  assert.deepEqual(pids(applied(ownership, [...system, ...reused], true)), [100, 101, 102, 104]);
   // The same for the runner's own pid once the runner is gone.
   const runnerReused = [row(RUNNER, 1, RUNNER, { start: 'someone-else' }), row(301, RUNNER, RUNNER), row(104, 1, 104)];
-  assert.deepEqual(pids(ownership.update([...system, ...runnerReused], false)), [104]);
+  assert.deepEqual(pids(applied(ownership, [...system, ...runnerReused], false)), [104]);
 });
 
 test('the runner is the root of the run by its own pid from the first scan, readable or not', () => {
@@ -213,7 +216,7 @@ test('the runner is the root of the run by its own pid from the first scan, read
   // everything it started, and the guard cannot watch the run.
   const unreadable = newOwnership();
   const fromTheStart = [...system, unreadableRow(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), row(103, 101, 103)];
-  assert.deepEqual(pids(unreadable.update(fromTheStart, true)), [100, 101, 103]);
+  assert.deepEqual(pids(applied(unreadable, fromTheStart, true)), [100, 101, 103]);
   assert.deepEqual(unreadable.readFailure(), { pid: RUNNER, problem: 'unreadable', errno: EPERM, samples: 1 });
   assert.equal(unreadable.runnerStart, null);
   assert.equal(unreadable.groupMember(true), null);
@@ -222,112 +225,112 @@ test('the runner is the root of the run by its own pid from the first scan, read
   // Nothing but its pid can be read.
   const opaque = newOwnership();
   const onlyPid = row(RUNNER, 0, 0, { status: 0, start: '0', megabytes: 0, infoError: EPERM, usageError: EPERM });
-  assert.deepEqual(pids(opaque.update([...system, onlyPid, row(101, RUNNER, RUNNER)], true)), [100, 101]);
+  assert.deepEqual(pids(applied(opaque, [...system, onlyPid, row(101, RUNNER, RUNNER)], true)), [100, 101]);
   assert.deepEqual(opaque.readFailure(), { pid: RUNNER, problem: 'unreadable', errno: EPERM, samples: 1 });
 
   // Unreadable the way an ending process is: tolerated for a few samples only.
   const ending = newOwnership();
   for (let sample = 1; sample <= UNREADABLE_SAMPLES; sample += 1) {
-    ending.update([...system, unreadableRow(RUNNER, GUARD, RUNNER, ESRCH)], true);
+    applied(ending, [...system, unreadableRow(RUNNER, GUARD, RUNNER, ESRCH)], true);
     assert.equal(ending.readFailure(), null, `sample ${sample}`);
   }
-  ending.update([...system, unreadableRow(RUNNER, GUARD, RUNNER, ESRCH)], true);
+  applied(ending, [...system, unreadableRow(RUNNER, GUARD, RUNNER, ESRCH)], true);
   assert.deepEqual(ending.readFailure(), { pid: RUNNER, problem: 'unreadable', errno: ESRCH, samples: UNREADABLE_SAMPLES + 1 });
 });
 
 test('a runner that exists and is not listed, or is listed as something this guard did not start, makes the guard give up', () => {
   const missing = newOwnership();
   for (let sample = 1; sample <= UNREADABLE_SAMPLES; sample += 1) {
-    assert.deepEqual(pids(missing.update([...system, ...stranger], true)), []);
+    assert.deepEqual(pids(applied(missing, [...system, ...stranger], true)), []);
     assert.equal(missing.readFailure(), null, `sample ${sample}`);
   }
-  missing.update([...system, ...stranger], true);
+  applied(missing, [...system, ...stranger], true);
   assert.deepEqual(missing.readFailure(), { pid: RUNNER, problem: 'missing', errno: ESRCH, samples: UNREADABLE_SAMPLES + 1 });
   // Listed again: watched again.
-  assert.deepEqual(pids(missing.update([...system, ...run], true)), [100, 101, 102, 103, 104]);
+  assert.deepEqual(pids(applied(missing, [...system, ...run], true)), [100, 101, 102, 103, 104]);
   assert.equal(missing.readFailure(), null);
 
   const inconsistent = { pid: RUNNER, problem: 'inconsistent', errno: 0, samples: 1 };
   const notOurChild = newOwnership();
-  notOurChild.update([...system, row(RUNNER, 1, RUNNER), row(101, RUNNER, RUNNER)], true);
+  applied(notOurChild, [...system, row(RUNNER, 1, RUNNER), row(101, RUNNER, RUNNER)], true);
   assert.deepEqual(notOurChild.readFailure(), inconsistent);
   assert.equal(notOurChild.groupMember(true), null);
 
   const otherGroup = newOwnership();
-  otherGroup.update([...system, row(RUNNER, GUARD, 555)], true);
+  applied(otherGroup, [...system, row(RUNNER, GUARD, 555)], true);
   assert.deepEqual(otherGroup.readFailure(), inconsistent);
   assert.equal(otherGroup.groupUsable, false, 'its group is not signalled by number');
 
   const restarted = newOwnership();
-  restarted.update([...system, ...run], true);
+  applied(restarted, [...system, ...run], true);
   assert.equal(restarted.readFailure(), null);
-  restarted.update([...system, row(RUNNER, GUARD, RUNNER, { start: 'another-start' })], true);
+  applied(restarted, [...system, row(RUNNER, GUARD, RUNNER, { start: 'another-start' })], true);
   assert.deepEqual(restarted.readFailure(), inconsistent);
 
   // A runner that has ended and waits to be collected is neither.
   const ended = newOwnership();
-  ended.update([...system, ...run], true);
-  ended.update([...system, row(RUNNER, GUARD, RUNNER, { status: ZOMBIE, start: '0', megabytes: 0, usageError: ESRCH })], true);
+  applied(ended, [...system, ...run], true);
+  applied(ended, [...system, row(RUNNER, GUARD, RUNNER, { status: ZOMBIE, start: '0', megabytes: 0, usageError: ESRCH })], true);
   assert.equal(ended.readFailure(), null);
 });
 
 test('once the guard has collected the runner, a process holding the runner\'s old pid is nothing to the run', () => {
   const ownership = newOwnership();
-  ownership.update([...system, ...run], true);
+  applied(ownership, [...system, ...run], true);
   const reused = [row(RUNNER, 1, RUNNER, { start: 'someone-else' }), row(301, RUNNER, RUNNER), unreadableRow(302, RUNNER, RUNNER)];
-  assert.deepEqual(pids(ownership.update([...system, ...reused], false)), []);
+  assert.deepEqual(pids(applied(ownership, [...system, ...reused], false)), []);
   assert.equal(ownership.readFailure(), null);
   assert.equal(ownership.groupMember(false), null);
   // Never having been listed is no failure either, once the runner is collected.
   const never = newOwnership();
-  for (let sample = 0; sample < UNREADABLE_SAMPLES + 2; sample += 1) never.update([...system], false);
+  for (let sample = 0; sample < UNREADABLE_SAMPLES + 2; sample += 1) applied(never, [...system], false);
   assert.equal(never.readFailure(), null);
   // The guard and its own helpers are not part of the run, whatever the table says.
   const odd = [row(1, 0, 1), row(GUARD, RUNNER, RUNNER), row(SAMPLER, RUNNER, RUNNER), row(STANDBY, RUNNER, RUNNER), row(RUNNER, GUARD, RUNNER)];
-  assert.deepEqual(pids(newOwnership().update(odd, true)), [100]);
+  assert.deepEqual(pids(newOwnership().take(odd, true).owned), [100]);
 });
 
 test('a process of the run that cannot be read is kept, counted, and makes the guard give up', () => {
   const ownership = newOwnership();
-  ownership.update([...system, ...run], true);
+  applied(ownership, [...system, ...run], true);
   assert.equal(ownership.readFailure(), null);
 
   // The detached process becomes unreadable for a reason other than ending.
   // It is not dropped, and neither is what it started.
   const blocked = [row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), unreadableRow(103, 1, 103), row(104, 103, 103)];
-  assert.deepEqual(pids(ownership.update([...system, ...blocked], true)), [100, 101, 103, 104]);
+  assert.deepEqual(pids(applied(ownership, [...system, ...blocked], true)), [100, 101, 103, 104]);
   assert.deepEqual(ownership.readFailure(), { pid: 103, problem: 'unreadable', errno: EPERM, samples: 1 });
   // Readable again: no failure.
-  ownership.update([...system, row(RUNNER, GUARD, RUNNER), row(103, 1, 103), row(104, 103, 103)], true);
+  applied(ownership, [...system, row(RUNNER, GUARD, RUNNER), row(103, 1, 103), row(104, 103, 103)], true);
   assert.equal(ownership.readFailure(), null);
 
   // Started by the run and never readable at all.
   const born = [row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), unreadableRow(108, 101, 108)];
-  assert.deepEqual(pids(ownership.update([...system, ...born], true)), [100, 101, 108]);
+  assert.deepEqual(pids(applied(ownership, [...system, ...born], true)), [100, 101, 108]);
   assert.deepEqual(ownership.readFailure(), { pid: 108, problem: 'unreadable', errno: EPERM, samples: 1 });
 
   // Nothing but the pid could be read (parent, group and state unknown too).
   const opaque = [row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), row(108, 0, 0, { status: 0, start: '0', megabytes: 0, infoError: EPERM, usageError: EPERM })];
-  assert.deepEqual(pids(ownership.update([...system, ...opaque], true)), [100, 101, 108]);
+  assert.deepEqual(pids(applied(ownership, [...system, ...opaque], true)), [100, 101, 108]);
   assert.deepEqual(ownership.readFailure(), { pid: 108, problem: 'unreadable', errno: EPERM, samples: 2 });
 });
 
 test('a process that is ending may be unreadable for a few samples, and no longer', () => {
   const ownership = newOwnership();
-  ownership.update([...system, ...run], true);
+  applied(ownership, [...system, ...run], true);
   const ending = [...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), unreadableRow(102, 101, RUNNER, ESRCH)];
   for (let sample = 1; sample <= UNREADABLE_SAMPLES; sample += 1) {
-    ownership.update(ending, true);
+    applied(ownership, ending, true);
     assert.equal(ownership.readFailure(), null, `sample ${sample}`);
   }
-  ownership.update(ending, true);
+  applied(ownership, ending, true);
   assert.deepEqual(ownership.readFailure(), { pid: 102, problem: 'unreadable', errno: ESRCH, samples: UNREADABLE_SAMPLES + 1 });
   // Gone: nothing to read, nothing wrong.
-  ownership.update([...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER)], true);
+  applied(ownership, [...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER)], true);
   assert.equal(ownership.readFailure(), null);
   // A process that has ended and waits to be collected has no memory to read.
-  ownership.update([...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER, { status: ZOMBIE, start: '0', megabytes: 0, usageError: ESRCH })], true);
-  ownership.update([...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER, { status: ZOMBIE, start: '0', megabytes: 0, usageError: EPERM })], true);
+  applied(ownership, [...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER, { status: ZOMBIE, start: '0', megabytes: 0, usageError: ESRCH })], true);
+  applied(ownership, [...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER, { status: ZOMBIE, start: '0', megabytes: 0, usageError: EPERM })], true);
   assert.equal(ownership.readFailure(), null);
 });
 
@@ -337,22 +340,22 @@ const noSuchProcessRow = pid => row(pid, 0, 0, { uid: 0, ruid: 0, status: 0, sta
 test('a process that answers "no such process" to both reads stops the run as before, and what the guard knew of it is kept for the report', () => {
   const clock = { now: 0 };
   const ownership = newOwnership(clock);
-  ownership.update([...system, ...run.slice(0, 2), row(102, 101, RUNNER, { start: 'started-102', megabytes: 87, resident: 87, footprint: 80 })], true);
+  applied(ownership, [...system, ...run.slice(0, 2), row(102, 101, RUNNER, { start: 'started-102', megabytes: 87, resident: 87, footprint: 80 })], true);
   const stuck = [...system, ...run.slice(0, 2), noSuchProcessRow(102)];
   for (let sample = 1; sample <= UNREADABLE_SAMPLES; sample += 1) {
     clock.now += 51;
-    ownership.update(stuck, true);
+    applied(ownership, stuck, true);
     assert.equal(ownership.readFailure(), null, `sample ${sample}`);
   }
   clock.now += 52;
-  ownership.update(stuck, true);
+  applied(ownership, stuck, true);
   // The rule, its sample count and its answer are those of the guard before this report existed.
   assert.deepEqual(ownership.readFailure(), { pid: 102, problem: 'unreadable', errno: ESRCH, samples: UNREADABLE_SAMPLES + 1 });
   const details = ownership.unreadDetails(102);
   const unreadScan = (at, sample) => ({ at, info: ESRCH, usage: ESRCH, exiting: false, path: null, allowedAs: null, sample, resident: null, footprint: null });
   assert.deepEqual(details, {
     errno: ESRCH, samples: UNREADABLE_SAMPLES + 1, ending: UNREADABLE_SAMPLES + 1, info: ESRCH, usage: ESRCH, exitingSince: null,
-    toolExitingSince: null, allowedAs: null, since: 51, scans: [51, 102, 153, 205].map((at, index) => unreadScan(at, index + 1)), at: 205,
+    since: 51, scans: [51, 102, 153, 205].map((at, index) => unreadScan(at, index + 1)), at: 205,
     lastRead: { ...row(102, 101, RUNNER, { start: 'started-102', megabytes: 87, resident: 87, footprint: 80 }), at: 0 },
   });
   assert.deepEqual(ownership.exitingStats, { processes: 0, longestMilliseconds: 0, largest: null });
@@ -427,11 +430,11 @@ const full102 = row(102, 101, RUNNER, { megabytes: 87, resident: 87, footprint: 
 test('a process of the run that is exiting is let through for a second, counted at its last full reading or more', () => {
   const clock = { now: 0 };
   const ownership = newOwnership(clock);
-  ownership.update(tree(full102), true);
+  applied(ownership, tree(full102), true);
   // Six scans, more than the three a process that answers "no such process" to both reads gets.
   for (let scan = 1; scan <= 6; scan += 1) {
     clock.now += 55;
-    const owned = ownership.update(tree(exitingRow(102, 101, RUNNER, { start: 'started-102' })), true);
+    const owned = applied(ownership, tree(exitingRow(102, 101, RUNNER, { start: 'started-102' })), true);
     assert.equal(ownership.readFailure(), null, `scan ${scan}`);
     // Counted at the larger of its last full reading (87 MB) and what its usage says now (60 MB).
     assert.equal(owned.get(102).megabytes, 87);
@@ -439,74 +442,74 @@ test('a process of the run that is exiting is let through for a second, counted 
   }
   // Then gone: the run goes on, and the summary knows of it.
   clock.now += 55;
-  ownership.update(tree(), true);
+  applied(ownership, tree(), true);
   assert.equal(ownership.readFailure(), null);
   assert.deepEqual(ownership.exitingStats, { processes: 1, longestMilliseconds: 275, largest: { megabytes: 60, resident: 60, footprint: 0, lastFull: 87 } });
 
   // What it holds while exiting counts when it is more than its last full reading.
   const larger = newOwnership(clock);
-  larger.update(tree(full102), true);
-  const owned = larger.update(tree(exitingRow(102, 101, RUNNER, { start: 'started-102', megabytes: 120, resident: 120 })), true);
+  applied(larger, tree(full102), true);
+  const owned = applied(larger, tree(exitingRow(102, 101, RUNNER, { start: 'started-102', megabytes: 120, resident: 120 })), true);
   assert.equal(owned.get(102).megabytes, 120);
 });
 
 test('an exiting process that is still exiting after a second stops the run, as one the guard cannot read', () => {
   const clock = { now: 0 };
   const ownership = newOwnership(clock);
-  ownership.update(tree(full102), true);
+  applied(ownership, tree(full102), true);
   clock.now = 10;
   const exiting = tree(exitingRow(102, 101, RUNNER, { start: 'started-102' }));
-  ownership.update(exiting, true);
+  applied(ownership, exiting, true);
   // Measured in time, not samples: a second from the first scan that showed it exiting, and not a moment more.
   clock.now = 10 + EXITING.milliseconds;
-  ownership.update(exiting, true);
+  applied(ownership, exiting, true);
   assert.equal(ownership.readFailure(), null);
   clock.now += 1;
-  ownership.update(exiting, true);
-  assert.deepEqual(ownership.readFailure(),
-    { pid: 102, problem: 'unreadable', errno: ESRCH, samples: 3, exitingMilliseconds: EXITING.milliseconds + 1, countedMegabytes: 87 });
+  // Judged before the scan is applied: the stop comes back and the scan is not applied (still two samples).
+  assert.deepEqual(ownership.take(exiting, true).stop,
+    { pid: 102, problem: 'unreadable', errno: ESRCH, samples: 2, exitingMilliseconds: EXITING.milliseconds + 1, countedMegabytes: 87 });
   // A scan in between that answers "no such process" to both reads does not restart the second; it gets its own three samples.
   const mixed = newOwnership(clock);
   clock.now = 0;
-  mixed.update(tree(full102), true);
+  applied(mixed, tree(full102), true);
   clock.now = 10;
-  mixed.update(exiting, true);
+  applied(mixed, exiting, true);
   for (let sample = 1; sample <= UNREADABLE_SAMPLES; sample += 1) {
     clock.now += 55;
-    mixed.update(tree(noSuchProcessRow(102)), true);
+    applied(mixed, tree(noSuchProcessRow(102)), true);
     assert.equal(mixed.readFailure(), null, `sample ${sample}`);
   }
   clock.now += 55;
-  mixed.update(tree(noSuchProcessRow(102)), true);
+  applied(mixed, tree(noSuchProcessRow(102)), true);
   assert.deepEqual(mixed.readFailure(), { pid: 102, problem: 'unreadable', errno: ESRCH, samples: UNREADABLE_SAMPLES + 2 });
   const late = newOwnership(clock);
   clock.now = 0;
-  late.update(tree(full102), true);
+  applied(late, tree(full102), true);
   clock.now = 10;
-  late.update(exiting, true);
+  applied(late, exiting, true);
   clock.now = 900;
-  late.update(tree(noSuchProcessRow(102)), true);
+  applied(late, tree(noSuchProcessRow(102)), true);
   assert.equal(late.readFailure(), null);
   clock.now = 1011;
-  late.update(tree(noSuchProcessRow(102)), true);
-  // Ending on a scan that no longer shows it exiting, the stop still gives the figure it was counted at while exiting.
-  assert.deepEqual([late.readFailure().exitingMilliseconds, late.readFailure().countedMegabytes, late.row(102).megabytes], [1001, 87, 0]);
+  // Ending after a scan that no longer showed it exiting, the stop still gives the figure it was counted at while exiting.
+  const { stop: lateStop } = late.take(tree(noSuchProcessRow(102)), true);
+  assert.deepEqual([lateStop.exitingMilliseconds, lateStop.countedMegabytes, late.row(102).megabytes], [1001, 87, 0]);
 });
 
 test('the exiting allowance is judged by the clock, as the guard asks before applying a scan', () => {
   const clock = { now: 0 };
   const ownership = newOwnership(clock);
-  ownership.update(tree(full102), true);
+  applied(ownership, tree(full102), true);
   assert.equal(ownership.expiredExiting(5000), null, 'nothing exiting, nothing to judge');
   clock.now = 10;
-  ownership.update(tree(exitingRow(102, 101, RUNNER, { start: 'started-102' })), true);
+  applied(ownership, tree(exitingRow(102, 101, RUNNER, { start: 'started-102' })), true);
   // Asked at any time, before the next scan is applied: a second from the first scan that showed it exiting, and not a moment more.
   assert.equal(ownership.expiredExiting(10 + EXITING.milliseconds), null);
   assert.deepEqual(ownership.expiredExiting(10 + EXITING.milliseconds + 1),
     { pid: 102, problem: 'unreadable', errno: ESRCH, samples: 1, exitingMilliseconds: EXITING.milliseconds + 1, countedMegabytes: 87 });
   // Applied before the second is over, a scan that no longer lists it ends the allowance.
   clock.now = 500;
-  ownership.update(tree(), true);
+  applied(ownership, tree(), true);
   assert.equal(ownership.expiredExiting(5000), null);
 });
 
@@ -515,52 +518,51 @@ test('a full reading that already carries the exit figures never lowers what an 
   // moment before libproc stops describing the process: one full reading can carry them.
   const clock = { now: 0 };
   const ownership = newOwnership(clock);
-  ownership.update(tree(full102), true);
+  applied(ownership, tree(full102), true);
   clock.now = 55;
   const cached = row(102, 101, RUNNER, { start: 'started-102', megabytes: 60, resident: 60, footprint: 0, exiting: true });
-  assert.equal(ownership.update(tree(cached), true).get(102).megabytes, 60, 'a full reading is counted as read');
+  assert.equal(applied(ownership, tree(cached), true).get(102).megabytes, 60, 'a full reading is counted as read');
   clock.now = 110;
-  const owned = ownership.update(tree(exitingRow(102, 101, RUNNER, { start: 'started-102', megabytes: 60, resident: 60 })), true);
+  const owned = applied(ownership, tree(exitingRow(102, 101, RUNNER, { start: 'started-102', megabytes: 60, resident: 60 })), true);
   assert.equal(owned.get(102).megabytes, 87, 'while exiting: the last full reading from before the exit figures');
   assert.equal(ownership.exitingStats.largest.lastFull, 87);
   // A full reading without exit figures replaces the one before it, as any reading does.
   const fresh = newOwnership(clock);
-  fresh.update(tree(full102), true);
-  fresh.update(tree(row(102, 101, RUNNER, { start: 'started-102', megabytes: 50, resident: 50, footprint: 40 })), true);
-  assert.equal(fresh.update(tree(exitingRow(102, 101, RUNNER, { start: 'started-102', megabytes: 30, resident: 30 })), true).get(102).megabytes, 50);
+  applied(fresh, tree(full102), true);
+  applied(fresh, tree(row(102, 101, RUNNER, { start: 'started-102', megabytes: 50, resident: 50, footprint: 40 })), true);
+  assert.equal(applied(fresh, tree(exitingRow(102, 101, RUNNER, { start: 'started-102', megabytes: 30, resident: 30 })), true).get(102).megabytes, 50);
 });
 
 test('one process gets one exiting allowance, however its readings come and go', () => {
   const clock = { now: 0 };
   const ownership = newOwnership(clock);
-  ownership.update(tree(full102), true);
+  applied(ownership, tree(full102), true);
   clock.now = 10;
   const exiting = tree(exitingRow(102, 101, RUNNER, { start: 'started-102' }));
-  ownership.update(exiting, true);
+  applied(ownership, exiting, true);
   // Read as ended (the process table said so) and then, the table not answering, as exiting again.
   clock.now = 500;
-  ownership.update(tree(row(102, 101, RUNNER, { status: ZOMBIE, start: 'started-102', megabytes: 60, resident: 60, footprint: 0, exiting: true })), true);
+  applied(ownership, tree(row(102, 101, RUNNER, { status: ZOMBIE, start: 'started-102', megabytes: 60, resident: 60, footprint: 0, exiting: true })), true);
   assert.equal(ownership.readFailure(), null);
   clock.now = 900;
-  ownership.update(exiting, true);
+  applied(ownership, exiting, true);
   assert.equal(ownership.readFailure(), null);
   // The second still runs from the first scan that showed it exiting.
   clock.now = 1011;
-  ownership.update(exiting, true);
-  assert.equal(ownership.readFailure()?.exitingMilliseconds, 1001);
+  assert.equal(ownership.take(exiting, true).stop?.exitingMilliseconds, 1001);
   assert.equal(ownership.exitingStats.processes, 1);
   // Its pid listed again with another start time is another process: a new allowance.
   const reused = newOwnership(clock);
   clock.now = 0;
-  reused.update(tree(full102), true);
+  applied(reused, tree(full102), true);
   clock.now = 10;
-  reused.update(exiting, true);
+  applied(reused, exiting, true);
   clock.now = 60;
-  reused.update(tree(), true);
+  applied(reused, tree(), true);
   clock.now = 100;
-  reused.update(tree(row(102, 101, RUNNER, { start: 'started-again', megabytes: 20 })), true);
+  applied(reused, tree(row(102, 101, RUNNER, { start: 'started-again', megabytes: 20 })), true);
   clock.now = 900;
-  reused.update(tree(exitingRow(102, 101, RUNNER, { start: 'started-again' })), true);
+  applied(reused, tree(exitingRow(102, 101, RUNNER, { start: 'started-again' })), true);
   assert.deepEqual([reused.expiredExiting(900 + EXITING.milliseconds), reused.expiredExiting(901 + EXITING.milliseconds)?.exitingMilliseconds,
     reused.exitingStats.processes], [null, EXITING.milliseconds + 1, 2]);
 });
@@ -572,10 +574,10 @@ test('nothing but an exiting process of the run, read in full before with that s
   const stopsAfter = (label, first, then, expected) => {
     const clock = { now: 0 };
     const ownership = newOwnership(clock);
-    ownership.update(first, true);
+    applied(ownership, first, true);
     for (let sample = 1; ; sample += 1) {
       clock.now += 55;
-      const owned = ownership.update(then, true);
+      const owned = applied(ownership, then, true);
       const failure = ownership.readFailure();
       if (failure || sample > 10) return { failure, owned: pids(owned), sample, label, expected };
     }
@@ -602,106 +604,90 @@ test('nothing but an exiting process of the run, read in full before with that s
 const withPs = (...extra) => [...system, ...stranger, ...run, ...extra];
 const unreadable = (pid, samples = 1, errno = EPERM) => ({ pid, problem: 'unreadable', errno, samples });
 
-// The system's ps as the sampler reports it alive (let through as the tool) and exiting.
+// The system's ps as the sampler reports it alive (let through as the tool), and once killed and
+// before it has ended: no process info, usage denied.
 const toolRow = (pid, ppid, pgid, extra = {}) => psRow(pid, ppid, pgid, extra);
-const toolExitingRow = pid => row(pid, 0, 0, { uid: 0, ruid: 0, status: 0, start: '0', megabytes: 0, infoError: ESRCH, usageError: EPERM });
+const killedPsRow = pid => row(pid, 0, 0, { uid: 0, ruid: 0, status: 0, start: '0', megabytes: 0, infoError: ESRCH, usageError: EPERM });
 
-test('a ps let through as the system tool, then read as exiting, stays let through on the same counts, at 32 MB', () => {
-  const clock = { now: 0 };
-  const ownership = newOwnership(clock);
-  ownership.update(withPs(), true);
-  for (const at of [55, 110]) {
-    clock.now = at;
-    ownership.update(withPs(toolRow(110, 101, RUNNER)), true);
-    assert.equal(ownership.readFailure(), null);
-  }
-  for (const at of [165, 220, 275]) {
-    clock.now = at;
-    const owned = ownership.update(withPs(toolExitingRow(110)), true);
-    assert.equal(ownership.readFailure(), null, `at ${at} ms`);
-    assert.deepEqual([owned.get(110).megabytes, owned.get(110).assumed], [SYSTEM_TOOL.assumedMegabytes, true]);
-  }
-  // The same counters as the tool: five samples let through, none restarted.
-  assert.deepEqual(ownership.toolStats, { samples: 5, longestSamples: 5, longestMilliseconds: 220 });
-  assert.equal(ownership.unreadDetails(110).samples, 5);
-  clock.now = 330;
-  ownership.update(withPs(), true);
-  assert.equal(ownership.readFailure(), null);
-  assert.deepEqual(ownership.toolExitingStats, { processes: 1, longestMilliseconds: 110 });
-});
-
-test('a ps exiting for longer than a second, or past the tool\'s own bounds, stops the run; nothing is restarted', () => {
-  const clock = { now: 0 };
-  const persisting = newOwnership(clock);
-  persisting.update(withPs(toolRow(110, 101, RUNNER)), true);
-  clock.now = 10;
-  persisting.update(withPs(toolExitingRow(110)), true);
-  // Judged by the clock before the next scan is applied, as the exiting second is.
-  assert.equal(persisting.expiredExiting(10 + SYSTEM_TOOL.exitingMilliseconds), null);
-  assert.deepEqual(persisting.expiredExiting(11 + SYSTEM_TOOL.exitingMilliseconds),
-    { pid: 110, problem: 'unreadable', errno: EPERM, samples: 2, toolExitingMilliseconds: SYSTEM_TOOL.exitingMilliseconds + 1 });
-  clock.now = 11 + SYSTEM_TOOL.exitingMilliseconds;
-  persisting.update(withPs(toolExitingRow(110)), true);
-  assert.deepEqual(persisting.readFailure(),
-    { pid: 110, problem: 'unreadable', errno: EPERM, samples: 3, toolExitingMilliseconds: SYSTEM_TOOL.exitingMilliseconds + 1 });
-  // The tool's two seconds run from its first unreadable scan and go on running while it exits.
-  const late = newOwnership(clock);
-  clock.now = 0;
-  late.update(withPs(toolRow(110, 101, RUNNER)), true);
-  clock.now = 1700;
-  late.update(withPs(toolRow(110, 101, RUNNER)), true);
-  clock.now = 1990;
-  late.update(withPs(toolExitingRow(110)), true);
-  assert.equal(late.readFailure(), null);
-  clock.now = SYSTEM_TOOL.milliseconds + 1;
-  late.update(withPs(toolExitingRow(110)), true);
-  assert.deepEqual(late.readFailure(), { pid: 110, problem: 'unreadable', errno: EPERM, samples: 4, toolExitingMilliseconds: 11 });
-  // And so do its forty samples.
-  const many = newOwnership(clock);
-  clock.now = 0;
-  for (let sample = 1; sample < SYSTEM_TOOL.samples; sample += 1) {
-    clock.now += 10;
-    many.update(withPs(toolRow(110, 101, RUNNER)), true);
-  }
-  clock.now += 10;
-  many.update(withPs(toolExitingRow(110)), true);
-  assert.equal(many.readFailure(), null, 'the fortieth sample');
-  clock.now += 10;
-  many.update(withPs(toolExitingRow(110)), true);
-  assert.deepEqual(many.readFailure(), { pid: 110, problem: 'unreadable', errno: EPERM, samples: SYSTEM_TOOL.samples + 1, toolExitingMilliseconds: 10 });
-});
-
-test('nothing but a ps let through the scan before gets the ps exiting allowance', () => {
+test('a ps or another process whose usage is denied is handled as on the base: no allowance for one that was killed', () => {
   const clock = { now: 0 };
   const stopsAt = (first, then) => {
     const ownership = newOwnership(clock);
-    for (const rows of first) ownership.update(rows, true);
-    ownership.update(then, true);
+    for (const rows of first) applied(ownership, rows, true);
+    applied(ownership, then, true);
     return ownership.readFailure();
   };
-  // First seen in that state: as before, a process of the run whose usage is denied.
-  assert.deepEqual(stopsAt([withPs(row(110, 101, RUNNER))], withPs(toolExitingRow(110))), unreadable(110));
-  // Another set-uid tool before: never let through, so neither is its exit.
+  // Let through as the tool, then read as a killed ps: stopped at once, as on the base (the CI stop).
+  assert.deepEqual(stopsAt([withPs(toolRow(110, 101, RUNNER))], withPs(killedPsRow(110))), unreadable(110, 2));
+  // First seen in that state.
+  assert.deepEqual(stopsAt([withPs(row(110, 101, RUNNER))], withPs(killedPsRow(110))), unreadable(110));
+  // Another set-uid tool.
   assert.deepEqual(stopsAt([withPs(row(110, 101, RUNNER))], withPs(psRow(110, 101, RUNNER, { path: '/usr/bin/top' }))), unreadable(110));
-  // Both reads "no such process" after the tool: the three-sample rule, as before.
+  // Both reads "no such process" after the tool (info ESRCH and usage ESRCH): the three-sample rule, as on the base.
   const both = newOwnership(clock);
-  both.update(withPs(toolRow(110, 101, RUNNER)), true);
+  applied(both, withPs(toolRow(110, 101, RUNNER)), true);
   for (let sample = 1; sample <= UNREADABLE_SAMPLES; sample += 1) {
-    both.update(withPs(unreadableRow(110, 0, 0, ESRCH)), true);
+    applied(both, withPs(noSuchProcessRow(110)), true);
     assert.equal(both.readFailure(), null);
   }
-  both.update(withPs(unreadableRow(110, 0, 0, ESRCH)), true);
+  const bothRow = applied(both, withPs(noSuchProcessRow(110)), true).get(110);
+  assert.deepEqual([bothRow.infoError, bothRow.usageError], [ESRCH, ESRCH]);
   assert.deepEqual(both.readFailure(), unreadable(110, UNREADABLE_SAMPLES + 2, ESRCH));
-  // The runner is never the tool, so never the tool exiting.
+  // The runner.
   const runner = newOwnership(clock);
-  runner.update([...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER)], true);
-  runner.update([...system, toolExitingRow(RUNNER), row(101, RUNNER, RUNNER)], true);
+  applied(runner, [...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER)], true);
+  applied(runner, [...system, killedPsRow(RUNNER), row(101, RUNNER, RUNNER)], true);
   assert.deepEqual(runner.readFailure(), unreadable(RUNNER));
+});
+
+test('an exiting process\'s second is not skipped because a later scan lets its pid through as the system tool', () => {
+  const clock = { now: 0 };
+  const ownership = newOwnership(clock);
+  applied(ownership, withPs(row(110, 101, RUNNER, { start: 'started-110', megabytes: 50 })), true);
+  clock.now = 10;
+  applied(ownership, withPs(exitingRow(110, 101, RUNNER, { start: 'started-110' })), true);
+  clock.now = 500;
+  applied(ownership, withPs(toolRow(110, 101, RUNNER)), true);
+  assert.equal(ownership.readFailure(), null, 'let through as the tool, inside the second');
+  // Past the second, judged before the next scan is applied: stopped, whatever that scan would let through.
+  clock.now = 10 + EXITING.milliseconds + 1;
+  const { stop, owned } = ownership.take(withPs(toolRow(110, 101, RUNNER)), true);
+  assert.deepEqual(stop, { pid: 110, problem: 'unreadable', errno: EPERM, samples: 2, exitingMilliseconds: EXITING.milliseconds + 1, countedMegabytes: 60 });
+  assert.equal(owned.get(110).assumed, true, 'the scan that would have let it through was not applied');
+  assert.deepEqual(ownership.expiredExiting(clock.now)?.exitingMilliseconds, EXITING.milliseconds + 1);
+});
+
+test('a scan reaches ownership only through take(), which judges every exiting allowance before applying it', () => {
+  // Nothing else is exposed that applies a scan.
+  const ownership = newOwnership();
+  assert.deepEqual(Object.keys(ownership).filter(key => typeof ownership[key] === 'function').sort(),
+    ['addHelper', 'endJudging', 'expiredExiting', 'groupMember', 'readFailure', 'row', 'take', 'unreadDetails']);
+  // And in the guard's own source, the private apply() is called from take() alone, and nothing calls an update().
+  const source = fs.readFileSync(runTests, 'utf8');
+  assert.equal(source.match(/\bapply\(rows, runnerExists\)/g).length, 2, 'the definition and the one call in take()');
+  assert.doesNotMatch(source, /\.update\(/);
+  // An allowance that has run out: the scan is not applied, and the stop comes back instead.
+  const clock = { now: 0 };
+  const judged = newOwnership(clock);
+  applied(judged, tree(full102), true);
+  clock.now = 10;
+  applied(judged, tree(exitingRow(102, 101, RUNNER, { start: 'started-102' })), true);
+  clock.now = 10 + EXITING.milliseconds + 1;
+  for (const late of [tree(), tree(row(102, 101, RUNNER, { start: 'started-102', status: ZOMBIE, megabytes: 0 })), tree(full102)]) {
+    const before = judged.owned;
+    const { stop, owned } = judged.take(late, true);
+    assert.equal(stop?.exitingMilliseconds, EXITING.milliseconds + 1);
+    assert.equal(owned, before, 'not applied');
+  }
+  // Once the outcome is settled (the cleanup), the same function applies scans as they come, as before.
+  judged.endJudging();
+  const { stop, owned } = judged.take(tree(), true);
+  assert.deepEqual([stop, pids(owned)], [null, [100, 101]]);
 });
 
 test('the system ps, started by the run, is let through and counted at an assumed size', () => {
   const ownership = newOwnership();
-  const owned = ownership.update(withPs(psRow(110, 101, RUNNER)), true);
+  const owned = applied(ownership, withPs(psRow(110, 101, RUNNER)), true);
   assert.deepEqual(pids(owned), [100, 101, 102, 103, 104, 110]);
   assert.equal(ownership.readFailure(), null);
   assert.equal(owned.get(110).megabytes, SYSTEM_TOOL.assumedMegabytes);
@@ -716,17 +702,17 @@ test('the system ps, started by the run, is let through and counted at an assume
   assert.equal(total, 5 * 10 + SYSTEM_TOOL.assumedMegabytes);
   assert.equal(largest.pid, 110);
   // Started detached by a process of the run: parentage in this scan is enough.
-  assert.equal(newOwnership().update(withPs(psRow(110, 104, 110)), true).get(110).assumed, true);
+  assert.equal(newOwnership().take(withPs(psRow(110, 104, 110)), true).owned.get(110).assumed, true);
   // An ordinary run has none.
   const plain = newOwnership();
-  plain.update(withPs(), true);
+  applied(plain, withPs(), true);
   assert.deepEqual(plain.toolStats, { samples: 0, longestSamples: 0, longestMilliseconds: 0 });
 });
 
 test('anything that is not exactly the system ps for this user stops the run as before', () => {
   const failsClosed = (label, rows, errno = EPERM, pid = 110) => {
     const ownership = newOwnership();
-    const owned = ownership.update(rows, true);
+    const owned = applied(ownership, rows, true);
     assert.deepEqual(ownership.readFailure(), unreadable(pid, 1, errno), label);
     assert.notEqual(owned.get(pid).assumed, true, label);
     assert.equal(owned.get(pid).megabytes, 0, label);
@@ -744,37 +730,37 @@ test('anything that is not exactly the system ps for this user stops the run as 
   failsClosed('runs as the guard\'s own user and is still unreadable', withPs(psRow(110, 101, RUNNER, { uid: OWNER })));
   // A guard that itself runs as root can read everything, so nothing is let through for it.
   const asRoot = createOwnership({ guardPid: GUARD, guardUid: 0, helperPids: [SAMPLER, STANDBY], runnerPid: RUNNER, now: () => 0 });
-  asRoot.update(withPs(psRow(110, 101, RUNNER, { ruid: 0 })), true);
+  applied(asRoot, withPs(psRow(110, 101, RUNNER, { ruid: 0 })), true);
   assert.deepEqual(asRoot.readFailure(), unreadable(110));
   // Unreadable for exactly the reason a set-uid tool is, and otherwise readable.
   failsClosed('usage fails for another reason', withPs(psRow(110, 101, RUNNER, { usageError: 13 })), 13);
   // Parent, group and owners unreadable as well: such a row cannot be placed in
   // the run by this scan at all, only kept from the one before.
   const opaque = newOwnership();
-  opaque.update(withPs(row(110, 101, RUNNER)), true);
-  opaque.update(withPs(psRow(110, 101, RUNNER, { infoError: EPERM })), true);
+  applied(opaque, withPs(row(110, 101, RUNNER)), true);
+  applied(opaque, withPs(psRow(110, 101, RUNNER, { infoError: EPERM })), true);
   assert.deepEqual(opaque.readFailure(), unreadable(110));
   // The runner itself is never the tool.
   const asRunner = newOwnership();
-  asRunner.update([...system, psRow(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER)], true);
+  applied(asRunner, [...system, psRow(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER)], true);
   assert.deepEqual(asRunner.readFailure(), unreadable(RUNNER));
   // A ps that is ending (no such process) is not let through as the tool; it is the ordinary short grace.
   const ending = newOwnership();
-  const gone = ending.update(withPs(psRow(110, 101, RUNNER, { usageError: ESRCH })), true);
+  const gone = applied(ending, withPs(psRow(110, 101, RUNNER, { usageError: ESRCH })), true);
   assert.equal(ending.readFailure(), null);
   assert.notEqual(gone.get(110).assumed, true);
-  ending.update(withPs(psRow(110, 101, RUNNER)), true);
+  applied(ending, withPs(psRow(110, 101, RUNNER)), true);
   for (let sample = 1; sample <= UNREADABLE_SAMPLES; sample += 1) {
-    ending.update(withPs(psRow(110, 101, RUNNER, { usageError: ESRCH })), true);
+    applied(ending, withPs(psRow(110, 101, RUNNER, { usageError: ESRCH })), true);
     assert.equal(ending.readFailure(), null, 'let through, then ending: the grace counts the samples that said it was ending');
   }
-  ending.update(withPs(psRow(110, 101, RUNNER, { usageError: ESRCH })), true);
+  applied(ending, withPs(psRow(110, 101, RUNNER, { usageError: ESRCH })), true);
   assert.deepEqual(ending.readFailure(), unreadable(110, UNREADABLE_SAMPLES + 3, ESRCH));
   // A ps that has ended and waits to be collected counts for nothing, for as long as that takes.
   const collected = newOwnership();
-  collected.update(withPs(psRow(110, 101, RUNNER)), true);
+  applied(collected, withPs(psRow(110, 101, RUNNER)), true);
   for (let sample = 0; sample < 3 * SYSTEM_TOOL.samples; sample += 1) {
-    const ended = collected.update(withPs(psRow(110, 101, RUNNER, { status: ZOMBIE, path: null })), true);
+    const ended = applied(collected, withPs(psRow(110, 101, RUNNER, { status: ZOMBIE, path: null })), true);
     assert.equal(collected.readFailure(), null);
     assert.notEqual(ended.get(110).assumed, true);
     assert.equal(measureRun(ended).total, 5 * 10);
@@ -785,59 +771,59 @@ test('anything that is not exactly the system ps for this user stops the run as 
 test('a process that has ended teaches the guard no identity, and one known before stays known', () => {
   // An ended child of the run that no scan saw alive. Its row carries a start time.
   const ownership = newOwnership();
-  assert.deepEqual(pids(ownership.update(withPs(row(110, 101, RUNNER, { status: ZOMBIE, start: 'someone' })), true)), [100, 101, 102, 103, 104, 110]);
+  assert.deepEqual(pids(applied(ownership, withPs(row(110, 101, RUNNER, { status: ZOMBIE, start: 'someone' })), true)), [100, 101, 102, 103, 104, 110]);
   assert.equal(ownership.readFailure(), null);
   // Collected. A process that is tied to the run by nothing now holds that pid, with that very start time.
   const unrelated = row(110, 200, 200, { start: 'someone' });
-  assert.deepEqual(pids(ownership.update(withPs(unrelated), true)), [100, 101, 102, 103, 104]);
+  assert.deepEqual(pids(applied(ownership, withPs(unrelated), true)), [100, 101, 102, 103, 104]);
 
   // A process the guard knew alive is still the run's when it has ended, wherever it now hangs.
   const known = newOwnership();
-  known.update(withPs(row(110, 103, 110)), true);
-  const ended = known.update([...system, ...stranger, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), row(110, 1, 110, { status: ZOMBIE })], true);
+  applied(known, withPs(row(110, 103, 110)), true);
+  const ended = applied(known, [...system, ...stranger, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), row(110, 1, 110, { status: ZOMBIE })], true);
   assert.deepEqual(pids(ended), [100, 101, 110]);
   assert.equal(known.readFailure(), null);
 
   // What reads as ended is taken as ended only when its parent, group and state could be read.
   const unclear = newOwnership();
-  unclear.update(withPs(unreadableRow(110, 101, RUNNER, ESRCH)), true);
-  unclear.update(withPs(unreadableRow(110, 0, 0, EPERM)), true);
+  applied(unclear, withPs(unreadableRow(110, 101, RUNNER, ESRCH)), true);
+  applied(unclear, withPs(unreadableRow(110, 0, 0, EPERM)), true);
   assert.deepEqual(unclear.readFailure(), unreadable(110, 2));
   const stillUnclear = newOwnership();
-  stillUnclear.update(withPs(unreadableRow(110, 101, RUNNER, ESRCH)), true);
-  stillUnclear.update(withPs({ ...unreadableRow(110, 0, 0, EPERM), status: ZOMBIE, infoError: ESRCH }), true);
+  applied(stillUnclear, withPs(unreadableRow(110, 101, RUNNER, ESRCH)), true);
+  applied(stillUnclear, withPs({ ...unreadableRow(110, 0, 0, EPERM), status: ZOMBIE, infoError: ESRCH }), true);
   assert.deepEqual(stillUnclear.readFailure(), unreadable(110, 2));
 });
 
 test('a process that has ended is left out of what the run holds, whatever size the system still reports for it', () => {
   const ownership = newOwnership();
-  ownership.update(withPs(row(110, 101, RUNNER, { megabytes: 3000 }), row(111, 110, RUNNER, { megabytes: 70 })), true);
+  applied(ownership, withPs(row(110, 101, RUNNER, { megabytes: 3000 }), row(111, 110, RUNNER, { megabytes: 70 })), true);
   // Ended, not collected: the same start time, and the resident size it had at the end. What it started lives on.
   const endedRow = row(110, 101, RUNNER, { status: ZOMBIE, megabytes: 3000 });
-  const owned = ownership.update(withPs(endedRow, row(111, 1, RUNNER, { megabytes: 70 })), true);
+  const owned = applied(ownership, withPs(endedRow, row(111, 1, RUNNER, { megabytes: 70 })), true);
   assert.deepEqual(pids(owned), [100, 101, 102, 103, 104, 110, 111]);
   assert.equal(ownership.readFailure(), null);
   assert.deepEqual([measureRun(owned).total, measureRun(owned).largest.pid], [5 * 10 + 70, 111]);
   // Nothing but ended processes: nothing held, and no largest process.
   assert.deepEqual(measureRun(new Map([[110, endedRow], [112, psRow(112, 101, RUNNER, { status: ZOMBIE, path: null })]])), { total: 0, largest: null });
   // Alive, it counts in full. So does a row that says "ended" where the state could not be read at all.
-  assert.equal(measureRun(ownership.update(withPs(row(110, 101, RUNNER, { megabytes: 3000 })), true)).largest.pid, 110);
+  assert.equal(measureRun(applied(ownership, withPs(row(110, 101, RUNNER, { megabytes: 3000 })), true)).largest.pid, 110);
   assert.equal(measureRun(new Map([[110, { ...endedRow, infoError: ESRCH }]])).total, 3000);
   // A ps that is let through still counts at its assumed size.
-  assert.equal(measureRun(newOwnership().update(withPs(psRow(110, 101, RUNNER)), true)).total, 5 * 10 + SYSTEM_TOOL.assumedMegabytes);
+  assert.equal(measureRun(newOwnership().take(withPs(psRow(110, 101, RUNNER)), true).owned).total, 5 * 10 + SYSTEM_TOOL.assumedMegabytes);
 });
 
 test('what an unreadable process started stays in the run when that process has ended', () => {
   // Scan 1: a ps started by the detached process, let through.
   const ownership = newOwnership();
-  assert.equal(ownership.update(withPs(psRow(110, 103, 103)), true).get(110).assumed, true);
+  assert.equal(applied(ownership, withPs(psRow(110, 103, 103)), true).get(110).assumed, true);
   // Scan 2 is not one instant. It read a new process while its parent, the
   // ps, was alive, and the ps after it had ended and after its own parent had
   // gone: the ps now hangs under pid 1, outside the runner's group. Nothing
   // but the ended ps ties the new process to the run.
   const rest = [...system, ...stranger, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), row(102, 101, RUNNER)];
   const endedPs = psRow(110, 1, 103, { status: ZOMBIE, path: null });
-  const owned = ownership.update([...rest, endedPs, row(111, 110, 111, { megabytes: 70 })], true);
+  const owned = applied(ownership, [...rest, endedPs, row(111, 110, 111, { megabytes: 70 })], true);
   assert.deepEqual(pids(owned), [100, 101, 102, 110, 111]);
   assert.equal(ownership.readFailure(), null);
   assert.equal(measureRun(owned).largest.pid, 111);
@@ -845,63 +831,63 @@ test('what an unreadable process started stays in the run when that process has 
   assert.equal(ownership.toolStats.samples, 1);
   // The ended ps is no evidence for letting another ps through.
   const strict = newOwnership();
-  strict.update(withPs(psRow(110, 103, 103)), true);
-  strict.update([...rest, endedPs, psRow(112, 110, 103)], true);
+  applied(strict, withPs(psRow(110, 103, 103)), true);
+  applied(strict, [...rest, endedPs, psRow(112, 110, 103)], true);
   assert.deepEqual(strict.readFailure(), unreadable(112));
 
   // Scan 3: the ps has been collected. The new process is known by now, whoever holds pid 110.
-  assert.deepEqual(pids(ownership.update([...rest, row(111, 1, 111)], true)), [100, 101, 102, 111]);
-  assert.deepEqual(pids(ownership.update([...rest, row(110, 200, 200, { start: 'someone-else' }), row(111, 1, 111)], true)), [100, 101, 102, 111]);
+  assert.deepEqual(pids(applied(ownership, [...rest, row(111, 1, 111)], true)), [100, 101, 102, 111]);
+  assert.deepEqual(pids(applied(ownership, [...rest, row(110, 200, 200, { start: 'someone-else' }), row(111, 1, 111)], true)), [100, 101, 102, 111]);
   // An unreadable stranger at that pid right after the ps is not assumed to be a stranger.
   const reused = newOwnership();
-  reused.update(withPs(psRow(110, 103, 103)), true);
-  reused.update([...rest, endedPs, row(111, 110, 111)], true);
-  assert.deepEqual(pids(reused.update([...rest, unreadableRow(110, 200, 200), row(111, 1, 111)], true)), [100, 101, 102, 110, 111]);
+  applied(reused, withPs(psRow(110, 103, 103)), true);
+  applied(reused, [...rest, endedPs, row(111, 110, 111)], true);
+  assert.deepEqual(pids(applied(reused, [...rest, unreadableRow(110, 200, 200), row(111, 1, 111)], true)), [100, 101, 102, 110, 111]);
   assert.deepEqual(reused.readFailure(), unreadable(110));
 });
 
 test('the system ps is let through only on this scan\'s own evidence that it belongs to the run', () => {
   // Scan 1: started by the detached process, in that process's group. Let through.
   const ownership = newOwnership();
-  assert.equal(ownership.update(withPs(psRow(110, 103, 103)), true).get(110).assumed, true);
+  assert.equal(applied(ownership, withPs(psRow(110, 103, 103)), true).get(110).assumed, true);
   // Scan 2: its parent is gone. It belongs to pid 1 now and is outside the
   // runner's group. All that ties it to the run is that pid 110 was in the run
   // a moment ago, and that is not enough: it stays in the run, unread.
   const orphaned = [...system, ...stranger, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), row(102, 101, RUNNER), psRow(110, 1, 103)];
-  assert.deepEqual(pids(ownership.update(orphaned, true)), [100, 101, 102, 110]);
+  assert.deepEqual(pids(applied(ownership, orphaned, true)), [100, 101, 102, 110]);
   assert.deepEqual(ownership.readFailure(), unreadable(110, 2));
 
   // Left behind inside the runner's group, in a scan that shows the runner: the group is evidence.
   const inGroup = newOwnership();
-  inGroup.update(withPs(psRow(110, 102, RUNNER)), true);
+  applied(inGroup, withPs(psRow(110, 102, RUNNER)), true);
   const stillGrouped = [...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), psRow(110, 1, RUNNER)];
-  assert.equal(inGroup.update(stillGrouped, true).get(110).assumed, true);
+  assert.equal(applied(inGroup, stillGrouped, true).get(110).assumed, true);
   assert.equal(inGroup.readFailure(), null);
   // The same once the runner has been collected: the group shows nothing any more.
-  assert.deepEqual(pids(inGroup.update([...system, psRow(110, 1, RUNNER)], false)), [110]);
+  assert.deepEqual(pids(applied(inGroup, [...system, psRow(110, 1, RUNNER)], false)), [110]);
   assert.deepEqual(inGroup.readFailure(), unreadable(110, 3));
 
   // A pid the run held, now held by an unrelated ps of the same user.
   const reused = newOwnership();
-  reused.update(withPs(), true);
+  applied(reused, withPs(), true);
   const sameUsersPs = psRow(103, 1, 103);
-  assert.deepEqual(pids(reused.update([...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), row(104, 1, 104), sameUsersPs], true)), [100, 101, 103, 104]);
+  assert.deepEqual(pids(applied(reused, [...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), row(104, 1, 104), sameUsersPs], true)), [100, 101, 103, 104]);
   assert.deepEqual(reused.readFailure(), unreadable(103), 'in consecutive scans the guard cannot tell, and does not assume');
   // After a scan without that pid, it is simply somebody else's process.
   const later = newOwnership();
-  later.update(withPs(), true);
-  later.update([...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER)], true);
-  assert.deepEqual(pids(later.update([...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), sameUsersPs, psRow(301, 200, 200)], true)), [100, 101]);
+  applied(later, withPs(), true);
+  applied(later, [...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER)], true);
+  assert.deepEqual(pids(applied(later, [...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER), sameUsersPs, psRow(301, 200, 200)], true)), [100, 101]);
   assert.equal(later.readFailure(), null);
   assert.deepEqual(later.toolStats.samples, 0);
 
   // A process the run started that then became the system ps, as every ps does between being started and running.
   const becomes = newOwnership();
-  becomes.update(withPs(row(110, 101, RUNNER)), true);
-  assert.equal(becomes.update(withPs(psRow(110, 101, RUNNER)), true).get(110).assumed, true);
+  applied(becomes, withPs(row(110, 101, RUNNER)), true);
+  assert.equal(applied(becomes, withPs(psRow(110, 101, RUNNER)), true).get(110).assumed, true);
   assert.equal(becomes.readFailure(), null);
   // And one that was the system ps and now reports another executable.
-  becomes.update(withPs(psRow(110, 101, RUNNER, { path: '/usr/bin/top' })), true);
+  applied(becomes, withPs(psRow(110, 101, RUNNER, { path: '/usr/bin/top' })), true);
   assert.deepEqual(becomes.readFailure(), unreadable(110, 2));
 });
 
@@ -911,11 +897,11 @@ test('the system ps is let through for a bounded time, a bounded number of sampl
   const bySamples = newOwnership(clock);
   for (let sample = 1; sample <= SYSTEM_TOOL.samples; sample += 1) {
     clock.now += 1;
-    assert.equal(bySamples.update(withPs(psRow(110, 101, RUNNER)), true).get(110).assumed, true, `sample ${sample}`);
+    assert.equal(applied(bySamples, withPs(psRow(110, 101, RUNNER)), true).get(110).assumed, true, `sample ${sample}`);
     assert.equal(bySamples.readFailure(), null, `sample ${sample}`);
   }
   clock.now += 1;
-  assert.notEqual(bySamples.update(withPs(psRow(110, 101, RUNNER)), true).get(110).assumed, true);
+  assert.notEqual(applied(bySamples, withPs(psRow(110, 101, RUNNER)), true).get(110).assumed, true);
   assert.deepEqual(bySamples.readFailure(), unreadable(110, SYSTEM_TOOL.samples + 1));
   assert.deepEqual(bySamples.toolStats, { samples: SYSTEM_TOOL.samples, longestSamples: SYSTEM_TOOL.samples, longestMilliseconds: SYSTEM_TOOL.samples - 1 });
 
@@ -924,25 +910,25 @@ test('the system ps is let through for a bounded time, a bounded number of sampl
   const byTime = newOwnership(slow);
   for (const at of [5000, 5900, 6800, 7000]) {
     slow.now = at;
-    byTime.update(withPs(psRow(110, 101, RUNNER)), true);
+    applied(byTime, withPs(psRow(110, 101, RUNNER)), true);
     assert.equal(byTime.readFailure(), null, `at ${at} ms`);
   }
   slow.now = 7001;
-  byTime.update(withPs(psRow(110, 101, RUNNER)), true);
+  applied(byTime, withPs(psRow(110, 101, RUNNER)), true);
   assert.deepEqual(byTime.readFailure(), unreadable(110, 5));
   // Scans that fail produce no sample, and give no extra time: the clock is not theirs to stop.
   const blind = { now: 0 };
   const acrossFailures = newOwnership(blind);
-  acrossFailures.update(withPs(psRow(110, 101, RUNNER)), true);
+  applied(acrossFailures, withPs(psRow(110, 101, RUNNER)), true);
   blind.now = SYSTEM_TOOL.milliseconds + 500; // several scans failed in between
-  acrossFailures.update(withPs(psRow(110, 101, RUNNER)), true);
+  applied(acrossFailures, withPs(psRow(110, 101, RUNNER)), true);
   assert.deepEqual(acrossFailures.readFailure(), unreadable(110, 2));
   // Each ps has its own allowance; a new one does not inherit the old one's.
   const fresh = { now: 0 };
   const oneAfterAnother = newOwnership(fresh);
   for (let pid = 300; pid < 300 + 3 * SYSTEM_TOOL.samples; pid += 1) {
     fresh.now += 60;
-    oneAfterAnother.update(withPs(psRow(pid, 101, RUNNER)), true);
+    applied(oneAfterAnother, withPs(psRow(pid, 101, RUNNER)), true);
     assert.equal(oneAfterAnother.readFailure(), null);
   }
   assert.deepEqual(oneAfterAnother.toolStats, { samples: 3 * SYSTEM_TOOL.samples, longestSamples: 1, longestMilliseconds: 0 });
@@ -950,24 +936,24 @@ test('the system ps is let through for a bounded time, a bounded number of sampl
   // At once: eight, not nine.
   const several = count => Array.from({ length: count }, (_, index) => psRow(400 + index, 101, RUNNER));
   const eight = newOwnership();
-  const ownedEight = eight.update(withPs(...several(SYSTEM_TOOL.atOnce)), true);
+  const ownedEight = applied(eight, withPs(...several(SYSTEM_TOOL.atOnce)), true);
   assert.equal(eight.readFailure(), null);
   assert.equal(measureRun(ownedEight).total, 5 * 10 + SYSTEM_TOOL.atOnce * SYSTEM_TOOL.assumedMegabytes);
   const nine = newOwnership();
-  nine.update(withPs(...several(SYSTEM_TOOL.atOnce + 1)), true);
+  applied(nine, withPs(...several(SYSTEM_TOOL.atOnce + 1)), true);
   assert.deepEqual(nine.readFailure(), unreadable(400 + SYSTEM_TOOL.atOnce));
 });
 
 test('what the system ps started is judged on its own, like any other process of the run', () => {
   const heavy = newOwnership();
-  const owned = heavy.update(withPs(psRow(110, 101, RUNNER), row(111, 110, RUNNER, { megabytes: 5000 })), true);
+  const owned = applied(heavy, withPs(psRow(110, 101, RUNNER), row(111, 110, RUNNER, { megabytes: 5000 })), true);
   assert.equal(heavy.readFailure(), null);
   assert.deepEqual([measureRun(owned).largest.pid, measureRun(owned).largest.megabytes], [111, 5000]);
   const unread = newOwnership();
-  unread.update(withPs(psRow(110, 101, RUNNER), unreadableRow(111, 110, RUNNER)), true);
+  applied(unread, withPs(psRow(110, 101, RUNNER), unreadableRow(111, 110, RUNNER)), true);
   assert.deepEqual(unread.readFailure(), unreadable(111));
   const another = newOwnership();
-  another.update(withPs(psRow(110, 101, RUNNER), psRow(111, 110, RUNNER, { path: '/usr/bin/top' })), true);
+  applied(another, withPs(psRow(110, 101, RUNNER), psRow(111, 110, RUNNER, { path: '/usr/bin/top' })), true);
   assert.deepEqual(another.readFailure(), unreadable(111));
 });
 
@@ -1582,22 +1568,20 @@ test('a sampler that stops answering with no process exiting is handled as befor
 for (const late of ['gone', 'ended', 'readable']) {
   test(`a scan that arrives after the exiting second, showing the process ${late}, stops the run and is not applied`, { timeout: 60000 }, async t => {
     const { environment, recorded, allGone, bystanderSurvived } = scenario(t);
-    // One scan shows it exiting; the next arrives with the guard's clock 1100 ms on.
+    // One scan shows it exiting and the guard's clock stands still; the next arrives with it exactly 1100 ms on.
     const result = await startGuard([descendants], { ...environment('short'), CRATE_GUARD_FAULT: 'exiting-then-late:nested', CRATE_GUARD_LATE: late }, faultyGuard).done;
     const nested = recorded().get('nested');
     assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
     // Still one sample: the late scan was judged before it was applied, and not applied.
-    const stopped = new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${ESRCH}, 1 samples in a row\\)\\. `
-      + 'It had been exiting for (\\d+) ms, longer than the 1000 ms allowed').exec(result.stderr);
-    assert.ok(stopped, result.stderr);
-    assert.ok(Number(stopped[1]) >= 1100, stopped[1]);
+    assert.match(result.stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${ESRCH}, 1 samples in a row\\)\\. `
+      + 'It had been exiting for 1100 ms, longer than the 1000 ms allowed'));
     assert.doesNotMatch(result.stdout, /^# pass 1$/m, 'stopped before the run could finish');
     await allGone(treeRoles.filter(role => role !== 'nested'));
     assert.equal(bystanderSurvived(), true);
   });
 }
 
-test('a scan that arrives just inside the exiting second, no longer listing the process, lets the run go on', { timeout: 60000 }, async t => {
+test('a scan that arrives inside the exiting second (exactly 900 ms), no longer listing the process, lets the run go on', { timeout: 60000 }, async t => {
   const { environment, allGone, bystanderSurvived } = scenario(t);
   const result = await startGuard([descendants], { ...environment('short'), CRATE_GUARD_FAULT: 'exiting-then-late:nested', CRATE_GUARD_LATE: 'early-gone' }, faultyGuard).done;
   assert.equal(result.code, 0, result.stderr);
@@ -1608,66 +1592,66 @@ test('a scan that arrives just inside the exiting second, no longer listing the 
   assert.equal(bystanderSurvived(), true);
 });
 
-test('a ps let through as the system tool and then exiting, gone within its bounds, does not stop the run', { timeout: 60000 }, async t => {
-  const { environment, allGone, bystanderSurvived } = scenario(t);
-  const result = await startGuard([descendants], { ...environment('short'), CRATE_GUARD_FAULT: 'tool-exiting:nested', CRATE_GUARD_TOOL_EXIT: 'gone' }, faultyGuard).done;
-  assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stdout, /^# pass 1$/m);
-  assert.doesNotMatch(result.stderr, /CANNOT READ|LOST SIGHT/);
-  // Counted as the tool: the same assumed 32 MB, the same counters.
-  assert.match(result.stderr, /^run-tests: memory guard: .*these figures include an assumed 32 MB, not a measurement, for each \/bin\/ps the guard could not read \(let through \d+ times, at most \d+ samples in a row/m);
-  assert.match(result.stderr, /^run-tests: memory guard: 1 \/bin\/ps processes were let through while exiting, the longest for \d+ ms \(1000 ms allowed\), counted at the assumed 32 MB$/m);
-  await allGone(treeRoles.filter(role => role !== 'nested'));
-  assert.equal(bystanderSurvived(), true);
-});
-
-const toolStop = (pid, samples) => new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${pid} OF THE RUN after [\\d.]+ s \\(errno ${EPERM}, ${samples} samples in a row\\)\\. Its memory is unknown\\.`
-  + '(?: It had been let through as /bin/ps and then as that tool exiting, for (\\d+) ms \\(1000 ms allowed\\), and is not let through any more\\.)?\\n');
-
-for (const [how, check] of [
-  ['persist', (stopped, samples) => {
-    assert.ok(Number(stopped[1]) > SYSTEM_TOOL.exitingMilliseconds, stopped[1]);
-    assert.ok(samples > 3, String(samples));
-  }],
-  // The tool's two seconds run on while it exits: stopped at that bound, well inside its exiting second.
-  ['bounds', stopped => assert.ok(Number(stopped[1]) < SYSTEM_TOOL.exitingMilliseconds, stopped[1])],
-  // The scan after it arrives 1100 ms late and no longer lists it: judged before it is applied, so still three samples.
-  ['late', (stopped, samples) => assert.deepEqual([Number(stopped[1]) > SYSTEM_TOOL.exitingMilliseconds, samples], [true, 3])],
-]) {
-  test(`a ps exiting past its bounds (${how}) stops the run, and the report shows each scan with its allowance`, { timeout: 60000 }, async t => {
-    const { environment, recorded, allGone, bystanderSurvived } = scenario(t);
-    const result = await startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'tool-exiting:nested', CRATE_GUARD_TOOL_EXIT: how }, faultyGuard).done;
-    const nested = recorded().get('nested');
+// The end of the run. The test run passes after 2.5 s and leaves its tree; the
+// guard sees the end of the run in a scan inside the exiting second, and then
+// takes one more scan, which is judged before it is applied.
+const endedThen = (nested, stderr) => {
+  const stopped = new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${ESRCH}, \\d+ samples in a row\\)\\. `
+    + 'It had been exiting for 1100 ms, longer than the 1000 ms allowed; while exiting it was counted at up to \\d+ MB\\.\\n'
+    + 'run-tests: The test run had ended by then, with exit status 0\\. Exit status 125 replaces it\\.\\n').test(stderr);
+  assert.ok(stopped, stderr);
+};
+for (const late of ['gone', 'ended', 'readable']) {
+  test(`the scan after the end of the run, arriving after the exiting second and showing the process ${late}, ends it 125, not with the run's own status`, { timeout: 60000 }, async t => {
+    const { environment, recorded, bystanderSurvived } = scenario(t);
+    const result = await startGuard([descendants], { ...environment('short'), CRATE_GUARD_FAULT: 'exiting-at-exit:nested', CRATE_GUARD_POST: 'late', CRATE_GUARD_LATE: late }, faultyGuard).done;
+    assert.match(result.stdout, /^# pass 1$/m);
     assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
-    const stopped = toolStop(nested, '(\\d+)').exec(result.stderr);
-    assert.ok(stopped, result.stderr);
-    // Group 1 is the sample count in the pattern above; the exiting time follows it.
-    const [, samples, exitingFor] = stopped;
-    assert.ok(exitingFor !== undefined, result.stderr);
-    check([null, exitingFor], Number(samples));
-    // The report: each recent scan, with the executable, the allowance and the sample count.
-    assert.match(result.stderr, new RegExp(`run-tests: About process ${nested}, which stopped the run`));
-    // The report lists the last eight scans: the scans as the live tool are among them unless it was exiting longer.
-    if (how !== 'persist') {
-      assert.match(result.stderr, /run-tests:     \+\d+ ms: process info errno 0, usage errno 1, executable \/bin\/ps, let through as the system tool \(sample 1\)\n/);
-    }
-    if (how !== 'bounds') {
-      assert.match(result.stderr, /run-tests:     \+\d+ ms: process info errno 3, usage errno 1, let through as the system tool exiting \(sample \d+\)\n/);
-    }
-    assert.match(result.stderr, /let through as the system tool exiting from \d+ ms after the first \(1000 ms allowed, within 40 samples and 2000 ms in all\)/);
-    assert.match(result.stderr, /run-tests: Every process of the run has ended\./);
-    await allGone(['nested', 'nested-child', 'short-lived', 'ready']);
+    endedThen(recorded().get('nested'), result.stderr);
     assert.equal(bystanderSurvived(), true);
   });
 }
 
-test('a ps first seen already exiting, never let through as the tool, stops the run as before', { timeout: 60000 }, async t => {
+test('the end of the run seen after a scan failed, with the exiting second over by then, ends it 125', { timeout: 60000 }, async t => {
+  const { environment, recorded, bystanderSurvived } = scenario(t);
+  const result = await startGuard([descendants], { ...environment('short'), CRATE_GUARD_FAULT: 'exiting-at-exit:nested', CRATE_GUARD_POST: 'timeout', CRATE_GUARD_LATE: 'gone' }, faultyGuard).done;
+  assert.match(result.stdout, /^# pass 1$/m);
+  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+  endedThen(recorded().get('nested'), result.stderr);
+  assert.equal(bystanderSurvived(), true);
+});
+
+test('the scan after the end of the run, retried with the sampler standing by after the exiting second, ends it 125', { timeout: 60000 }, async t => {
+  const { environment, recorded, bystanderSurvived } = scenario(t);
+  const result = await startGuard([descendants], { ...environment('short'), CRATE_GUARD_FAULT: 'exiting-at-exit:nested', CRATE_GUARD_POST: 'retry', CRATE_GUARD_LATE: 'gone' }, faultyGuard).done;
+  assert.match(result.stdout, /^# pass 1$/m);
+  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+  assert.match(result.stderr, /run-tests: the sampler failed \(sampler exited \(injected\)\); continuing with the one standing by/);
+  endedThen(recorded().get('nested'), result.stderr);
+  assert.equal(bystanderSurvived(), true);
+});
+
+test('the scan after the end of the run, arriving inside the exiting second and no longer listing the process, keeps the run\'s own status', { timeout: 60000 }, async t => {
+  const { environment, bystanderSurvived } = scenario(t);
+  const result = await startGuard([descendants], { ...environment('short'), CRATE_GUARD_FAULT: 'exiting-at-exit:nested', CRATE_GUARD_POST: 'inside', CRATE_GUARD_LATE: 'gone' }, faultyGuard).done;
+  assert.match(result.stdout, /^# pass 1$/m);
+  assert.equal(result.code, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /CANNOT READ|LOST SIGHT|INCOMPLETE/);
+  assert.equal(bystanderSurvived(), true);
+});
+
+test('a ps let through as the system tool and then read as killed stops the run as on the base, and the report shows each scan', { timeout: 60000 }, async t => {
   const { environment, recorded, allGone, bystanderSurvived } = scenario(t);
-  const result = await startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'tool-exiting:nested', CRATE_GUARD_TOOL_EXIT: 'first-seen' }, faultyGuard).done;
+  // The shape of the CI stops: two scans as the live ps, then no process info with usage still denied.
+  const result = await startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'tool-exiting:nested' }, faultyGuard).done;
   const nested = recorded().get('nested');
   assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
-  assert.match(result.stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${EPERM}, 1 samples in a row\\)\\. Its memory is unknown\\.\\n`));
-  assert.doesNotMatch(result.stderr, /let through as \/bin\/ps and then|processes were let through while exiting/);
+  assert.match(result.stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${EPERM}, 3 samples in a row\\)\\. Its memory is unknown\\.\\n`));
+  assert.match(result.stderr, new RegExp(`run-tests: About process ${nested}, which stopped the run`));
+  assert.match(result.stderr, /run-tests:     \+0 ms: process info errno 0, usage errno 1, executable \/bin\/ps, let through as the system tool \(sample 1\)\n/);
+  assert.match(result.stderr, /run-tests:     \+\d+ ms: process info errno 0, usage errno 1, executable \/bin\/ps, let through as the system tool \(sample 2\)\n/);
+  assert.match(result.stderr, /run-tests:     \+\d+ ms: process info errno 3, usage errno 1, not let through \(sample 3\)\n/);
+  assert.doesNotMatch(result.stderr, /processes were let through while exiting/);
   await allGone(['nested', 'nested-child', 'short-lived', 'ready']);
   assert.equal(bystanderSurvived(), true);
 });
