@@ -4071,7 +4071,7 @@ test('CI source gate is least privilege, pinned, serial, and release inert', () 
   ].join('\n'));
   assert.deepEqual(
     runs.get('Reject high-severity dependency findings'),
-    ['npm audit --audit-level=high --registry=https://registry.npmjs.org/']
+    ['node scripts/verify-dependency-audit.js']
   );
   assert.equal(
     workflow.indexOf('- name: Install frozen dependencies') <
@@ -4086,7 +4086,7 @@ test('CI source gate is least privilege, pinned, serial, and release inert', () 
   ]) {
     const command = stepName === 'Install frozen dependencies'
       ? 'npm ci --ignore-scripts --registry=https://registry.npmjs.org/'
-      : 'npm audit --audit-level=high --registry=https://registry.npmjs.org/';
+      : 'node scripts/verify-dependency-audit.js';
     assert.equal(workflowStepBlock(workflow, stepName), [
       `      - name: ${stepName}`,
       '        env:',
@@ -4119,6 +4119,7 @@ test('CI source gate is least privilege, pinned, serial, and release inert', () 
     '          node --check scripts/install-approved-canvas-prebuild.js',
     '          node --check scripts/run-tests.js',
     '          node --check scripts/verify-app-contents.js',
+    '          node --check scripts/verify-dependency-audit.js',
     '          node --check scripts/verify-install-scripts.js',
     '          node --check scripts/verify-macos-release-app.js',
     '          node --check scripts/run-macos-release-proof.js',

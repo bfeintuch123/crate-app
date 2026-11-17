@@ -820,6 +820,7 @@
                   <span class="asset-panel-count" id="pending-assets-count"></span>
                   <span class="pending-package-note">Not in the package</span>
                 </div>
+                <div id="needs-save-alert" class="needs-save-alert" role="status" aria-live="polite" aria-atomic="true"></div>
                 <div id="pending-batch-slot"></div>
                 <div id="pending-file-list" class="missing-asset-grid"></div>
               </section>
@@ -888,6 +889,14 @@
             </div>
             <label class="toggle">
               <input type="checkbox" id="toggle-existing-assets-notifications" aria-labelledby="setting-existing-assets-notifications-label">
+              <span class="toggle-slider"></span>
+            </label>
+          </div><div class="settings-row">
+            <div class="settings-label-wrap">
+              <div class="settings-label" id="setting-needs-save-notifications-label">Assets need save (requires Package Alerts)</div>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="toggle-needs-save-notifications" aria-labelledby="setting-needs-save-notifications-label">
               <span class="toggle-slider"></span>
             </label>
           </div><div class="settings-row">
@@ -1044,6 +1053,7 @@
           <div id="modal-figma-warning" role="status" aria-live="polite" aria-atomic="true" style="font-size:12px;color:#f59e0b;margin-bottom:8px;"></div>
           <section id="source-continuation-choices" class="source-continuation-choices hidden" aria-label="Working file choices"></section>
           <div class="modal-review-message hidden" id="modal-package-review-message" role="status" aria-live="polite" aria-atomic="true" tabindex="-1"></div>
+          <div class="modal-reminder is-thin hidden" id="modal-needs-save-reminder"></div>
           <div class="modal-reminder hidden" id="modal-presentation-reminder">
             <div class="modal-reminder-title">Save before packaging</div>
             <div class="modal-reminder-copy">Unsaved changes are not included.</div>
