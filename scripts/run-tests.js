@@ -65,41 +65,71 @@
 // none of its own code any more; see the sampler): a process of the run other
 // than the runner, read in full before, that libproc no longer describes while
 // its usage still answers with the same start time and an exit time. It is let
-// through for up to one second, measured from the moment the guard took in the
+// through for up to one second, measured from the moment the guard applied the
 // first scan that showed it so, once per process (pid and start time) for as
 // long as its pid is listed; those scans do not count towards the three. It is
 // counted meanwhile at its last full reading, or at what it holds then if that
-// is more. Every scan reaches what the guard knows of the run through one
-// function, ownership.take(), which judges every exiting allowance against the
-// clock before it applies the scan, and returns the stop instead of applying
-// it when one has run out: a late result that shows the process gone, ended
-// or readable cannot erase it. That holds for the scans of the watch, for the
-// scan right after the run has ended (and its retry with another sampler),
-// and for the cleanup scans, where it has nothing left to decide once the
-// run's outcome is settled and so applies them as before. The guard also
-// judges the allowances, without a scan, at the top of every pass of its loop
-// and where it sees the end of the run or a signal after a scan has failed.
-// When one has run out, the run is stopped like any process the guard cannot
-// read, also when the run has just ended by itself. In short: 1 second while
-// scans arrive; if the sampler is stalled, the stop
+// is more. When the second has run out, the run is stopped like any process
+// the guard cannot read: exit 125, the usual cleanup, never the run's own
+// status.
+//
+// How the second is kept. A scan reaches what the guard knows of the run only
+// through ownership.take(). While the guard is watching, take() judges every
+// exiting allowance against the clock first and, when one has run out,
+// returns the stop instead of applying the scan, so a late scan that shows the
+// process gone, ended or readable cannot erase it. The guard also judges the
+// allowances without a scan: at the top of every pass of its loop, and where
+// it sees the end of the run or a signal after a scan has failed. The scan it
+// takes after the end of the run is judged the same way. If that scan leaves
+// a process inside its second, the guard settles before it cleans up: it goes
+// on taking scans at the usual pace, each judged by take() before it is
+// applied and then as the scan after the end of the run is (readFailure(), so
+// a process it cannot read stops the run there as it would on that scan; this
+// applies only while an allowance is outstanding), until no allowance is
+// outstanding (every such process has gone, ended or been read in full in a
+// scan inside its second) or one has run out. The watch ends there, as a
+// rule: the guard stops judging at the first scan after the runner has exited
+// that leaves no exiting allowance outstanding. A process first seen exiting
+// after that point is one the cleanup is ending, and the cleanup's existing
+// confirm-or-125 covers it. The cleanup (stopRun, endRun) is the base's,
+// unchanged; it never applies a scan while an allowance is outstanding, and
+// when its sampler fails and withSight retries, the retry does not settle
+// again. The settling is capped at TIMING.leftoverGraceMs (2000 ms) from its
+// first pass, on the allowances' clock, and a retry does not restart it. The
+// cap exists only so that processes that keep starting to exit after the end
+// of the run cannot hold the guard there; reaching it stops the run with 125,
+// and it is never the way a run passes. The three-sample rule on the scan
+// after the end of the run is the base's, unchanged, apart from also being
+// applied to the settling scans.
+//
+// In short: 1 second while scans arrive; if the sampler is stalled, the stop
 // comes when the scan times out or the existing blind limit fires, whichever
 // the existing code does first. Exactly, from the moment the guard applied the
-// first scan that showed the process exiting: while scans arrive, at most
-// 1000 ms plus the longer of one pause between scans (50 ms) and the scan in
-// progress at that moment, plus the delay of the guard's own timers; with the
-// sampler stalled, that scan fails at its request timeout (1000 ms after it was
-// sent), and the stop follows at the top of the next pass, at most 2050 ms plus
-// timer delay in all (at once, without the pause, when the end of the run or a
-// signal is seen there); and when it is the scan after the end of the run that
-// fails, the sampler standing by takes that scan over at once and the stop
-// comes with it, at most 2000 ms plus that one scan. Unless the sampler has
-// ended, when the blind rule stops the run at once as before. The blind limit cannot come first then: the last
-// good scan is the first exiting one or later. Neither the request timeout,
-// the blind limit nor the pause between scans is changed by this.
+// first scan that showed the process exiting:
+// - while scans arrive (watching or settling): at most 1000 ms plus the longer
+//   of one pause between scans (50 ms) and the scan in progress at that
+//   moment, plus the delay of the guard's own timers;
+// - with the sampler stalled during the watch: that scan fails at its request
+//   timeout (1000 ms after it was sent) and the stop follows at the top of the
+//   next pass, at most 2050 ms plus timer delay, or at once when the end of
+//   the run or a signal is seen there;
+// - when a scan after the end of the run fails (the first one or a settling
+//   one): withSight hands the attempt to the sampler standing by at once, and
+//   the retried scan is judged before it is applied, at most 2000 ms plus that
+//   one scan, while the standby answers. If the standby fails too, withSight
+//   first starts a new sampler, which proves itself with up to two scans of up
+//   to 5000 ms each (one for each Python it tries) before the retry: later,
+//   and still 125. When no sampler can be started, the cleanup cannot be
+//   verified and the guard exits 125, as before;
+// - when the sampler has ended during the watch: the blind rule stops the run
+//   at once, as before. Otherwise the blind limit cannot come first: the last
+//   good scan is the first exiting one or later.
+// Neither the request timeout, the blind limit nor the pause between scans is
+// changed by this.
 // A process whose usage is denied gets no allowance. All of that also holds
 // when the same scan shows that the run has just ended by itself or that a
-// signal has arrived, and for the one scan the guard makes right after a run
-// has ended: a run that was not watched to its end does not get to report its
+// signal has arrived, and for the scans the guard makes right after a run has
+// ended (above): a run that was not watched to its end does not get to report its
 // own result. While the guard is ending a run, its scans follow each other
 // too closely for "three samples" to mean anything; a process it cannot read
 // then counts only if it is still running at the end.
@@ -227,9 +257,10 @@ const MAX_FREEZE_ROUNDS = 50;
 // more of its own code, but it is not yet a zombie (see the sampler). It is
 // let through for this long from the first scan that shows it so, once per
 // process, counted at its last full reading or more; longer, and it stops the
-// run as any process the guard cannot read. Judged by ownership.take() before
-// every scan is applied, and by the guard where it decides without a scan
-// (see the header for where, and for the exact worst case). Only a process of the run that the guard has read in full, with
+// run as any process the guard cannot read. Judged by ownership.take() before a
+// scan is applied while the guard is watching or settling, and by the guard
+// where it decides without a scan (see the header for where, for the settling
+// after the end of the run, and for the exact worst cases). Only a process of the run that the guard has read in full, with
 // the same start time, and not the runner.
 const EXITING = { milliseconds: 1000 };
 // How many recent scans the report of an unreadable process lists, at most,
@@ -805,8 +836,24 @@ function createOwnership({ guardPid, guardUid, helperPids = [], runnerPid, now =
     // The stop for an exiting allowance that has run out by `time`, as
     // readFailure() gives it, or null. The guard asks this where it decides
     // without a scan (the top of every pass, and the end of the run seen
-    // without one); take() asks it for every scan.
+    // without one); take() asks it for every scan while the guard is watching.
     expiredExiting(time) { return expiredAt(time); },
+    // Whether a process of the run is still inside its exiting allowance:
+    // seen exiting, and not since read in full, as ended, or gone.
+    exitingOutstanding() {
+      for (const entry of unread.values()) if (entry.exitingSince !== null) return true;
+      return false;
+    },
+    // The stop for a process still exiting when the guard has waited `waited`
+    // ms after the end of the run for such processes to finish (see runGuard).
+    unsettled(waited) {
+      for (const [pid, entry] of unread) {
+        if (entry.exitingSince !== null) {
+          return { pid, problem: 'unreadable', errno: entry.errno, samples: entry.samples, settlingMilliseconds: waited, countedMegabytes: entry.counted };
+        }
+      }
+      return null;
+    },
     // The one way a scan reaches ownership. Every exiting allowance is judged
     // against the clock first: when one has run out, the scan is not applied
     // and the stop is returned instead, so a late scan that no longer shows
@@ -1177,7 +1224,10 @@ async function runGuard({
     const memory = unreadable.exitingMilliseconds !== undefined
       ? `It had been exiting for ${Math.round(unreadable.exitingMilliseconds)} ms, longer than the ${EXITING.milliseconds} ms allowed; `
         + `while exiting it was counted at up to ${formatOver(unreadable.countedMegabytes)}.`
-      : 'Its memory is unknown.';
+      : unreadable.settlingMilliseconds !== undefined
+        ? `It was still exiting when the guard had waited ${Math.round(unreadable.settlingMilliseconds)} ms after the end of the run `
+          + `for exiting processes to finish (at most ${TIMING.leftoverGraceMs} ms); while exiting it was counted at up to ${formatOver(unreadable.countedMegabytes)}.`
+        : 'Its memory is unknown.';
     const lines = [{
       unreadable: `GUARD CANNOT READ PROCESS ${unreadable.pid} OF THE RUN after ${seconds()} s (errno ${unreadable.errno}, ${unreadable.samples} samples in a row). ${memory}`,
       missing: `GUARD CANNOT FIND THE TEST RUNNER after ${seconds()} s: process ${unreadable.pid} exists and ${unreadable.samples} scans in a row did not list it. The run's memory is unknown.`,
@@ -1340,14 +1390,49 @@ async function runGuard({
     } else if (reason === 'exit') {
       exitCode = runnerExit.code;
       if (runnerExit.error) report = [`Could not start ${process.execPath}: ${runnerExit.error.message}.`];
+      // Kept outside the retried callback: when the settling below began, on
+      // the allowances' clock (a retry does not restart it), and whether the
+      // outcome is settled (a retry after that does not settle again).
+      let settlingSince = null;
+      let settled = false;
       cleanup = await withSight(async () => {
-        // The scan right after the end of the run is judged like every scan
-        // before it: take() judges the exiting allowances before applying it,
+        // The scan right after the end of the run is judged like the scans of
+        // the watch before it: take() judges the exiting allowances before applying it,
         // and readFailure() judges what it shows. Retried by withSight with
         // another sampler, it is judged again the same way.
         const taken = await guard.observe();
-        const unreadable = reason === 'exit' ? taken.stop || ownership.readFailure() : null;
-        if (reason === 'exit') exitingSeen = structuredClone(ownership.exitingStats);
+        let unreadable = reason === 'exit' ? taken.stop || ownership.readFailure() : null;
+        // Settle the exiting allowances before the cleanup: while a process is
+        // still inside its second, go on taking scans the same way as the
+        // watch, judged before they are applied, until none is left (each has
+        // gone, ended or been read in full in a scan inside its second) or one
+        // has run out. Only then does the cleanup start, so it never meets an
+        // exiting process. Capped, failing closed, at TIMING.leftoverGraceMs
+        // from the first pass, in case processes keep starting to exit after
+        // the end of the run; reaching the cap stops the run, it never lets
+        // it pass. Each settling scan is judged as the scan above is: an
+        // unreadable process there stops the run as it would there. A failed
+        // scan goes to withSight like any other, and the retry comes back here
+        // with the allowances still judged. Once the outcome is settled, a
+        // retry (when the cleanup's sampler fails) does not settle again: a
+        // process the cleanup has just put into its exit is the cleanup's.
+        while (!settled && reason === 'exit' && !unreadable && ownership.exitingOutstanding()) {
+          if (settlingSince === null) settlingSince = clock();
+          if (clock() - settlingSince > TIMING.leftoverGraceMs) {
+            unreadable = ownership.unsettled(clock() - settlingSince);
+            break;
+          }
+          await sleep(timing.sampleIntervalMs);
+          const lapsedBetween = ownership.expiredExiting(clock());
+          if (lapsedBetween) {
+            unreadable = lapsedBetween;
+            break;
+          }
+          const settling = await guard.observe();
+          unreadable = settling.stop || ownership.readFailure();
+        }
+        if (reason === 'exit' && !settled) exitingSeen = structuredClone(ownership.exitingStats);
+        settled = true;
         ownership.endJudging();
         if (unreadable) {
           reason = 'unreadable';

@@ -39,7 +39,24 @@
 //                                                  first scan instead fails at the request timeout, with the clock 1100 ms on),
 //                                                  retry (the next scan fails as a sampler that ends does, and the one taken
 //                                                  with the sampler standing by arrives 1100 ms on). What those scans show of
-//                                                  the process: CRATE_GUARD_LATE, gone, ended or readable, as above
+//                                                  the process: CRATE_GUARD_LATE, gone, ended or readable, as above.
+//                                                  Settling: settle-late (the scan after the end of the run arrives 500 ms on,
+//                                                  still exiting; the next one 1100 ms on, as CRATE_GUARD_LATE says),
+//                                                  settle-inside (500 ms, still exiting; then 900 ms, gone), settle-retry (500 ms,
+//                                                  still exiting; the next scan fails as a sampler that ends does; the one taken
+//                                                  with the sampler standing by arrives 1100 ms on, gone), settle-cap (100 ms,
+//                                                  still exiting; then every 600 ms the process before is gone and the next of
+//                                                  nested-child, detached, detached-child, adopted is exiting), none (no process
+//                                                  is ever shown exiting), settle-new-inside / settle-new-late (500 ms, still
+//                                                  exiting; then 600 ms, gone, while nested-child is first shown exiting; then
+//                                                  nested-child is gone at 1500 ms, or 1700 ms), settle-retry-cap (as settle-cap,
+//                                                  with the third scan failing as a sampler that ends does), settled-retry (500 ms,
+//                                                  exiting; 900 ms, gone; the next scan fails as a sampler that ends does, and from
+//                                                  the retry on nested-child is shown exiting), post-eperm / settle-eperm
+//                                                  (nested-child cannot be read, usage denied, on the scan after the end of the
+//                                                  run, or on the settling scan after it). At exit it prints how many scans the
+//                                                  guard took after the end of the run before its first signal, how many on a
+//                                                  retry before its first signal then, and what it injected
 //   CRATE_GUARD_FAULT=tool-exiting:<role>          once the tree is up, two scans read that process as the system's ps; after
 //                                                  that it reads as that ps does once killed and before it has ended (no
 //                                                  process info, usage denied)
@@ -80,10 +97,24 @@ let stalling = false;
 // The guard's clock for exiting allowances, which these faults may stop and set.
 let fixed = null;
 const clock = () => (fixed === null ? performance.now() : fixed);
+// Where `fixed` started, for what this fixture reports.
+let firstFixed = null;
 let lateScans = 0;
 let toolScans = 0;
 let afterExit = 0;
-let postDelivered = false;
+let delivered = 0;
+let signalled = false;
+let scansBeforeSignal = 0;
+let retried = false;
+let signalledAfterRetry = false;
+let retryScansBeforeSignal = 0;
+const injected = [];
+if (kind === 'exiting-at-exit') {
+  process.on('exit', () => {
+    process.stderr.write(`faulty-guard: after the end of the run, ${scansBeforeSignal} scans before the first signal; `
+      + `after the retry, ${retried ? retryScansBeforeSignal : 'no retry'} scans before the next; injected: ${injected.join(', ') || 'nothing'}\n`);
+  });
+}
 const deadSamplers = new Set();
 // What a scan shows of `target` after the end of the run, by CRATE_GUARD_LATE.
 const shownAs = (rows, target) => {
@@ -221,7 +252,8 @@ async function holdBack(rows, real) {
 // CRATE_GUARD_FAULT=exiting-at-exit (see the top).
 async function atExit(number, rows) {
   if (!recorded().has('ready')) return rows;
-  const target = recorded().get(role);
+  const pids = recorded();
+  const target = pids.get(role);
   const how = process.env.CRATE_GUARD_POST;
   // The runner is the guard's only child that is not a sampler. A scan can
   // list it and still reach the guard after it has been collected, when the
@@ -231,28 +263,110 @@ async function atExit(number, rows) {
   const runner = rows.find(row => row.ppid === process.pid && !samplerPids.has(row.pid));
   const collected = pid => { try { process.kill(pid, 0); return false; } catch { return true; } };
   const runnerRunning = runner !== undefined && !collected(runner.pid);
+  const exitingAs = (scan, pid) => scan.map(row => (row.pid === pid ? exitingRow(row) : row));
   if (runnerRunning || afterExit === 0) {
-    if (!rows.some(row => row.pid === target)) return rows;
-    if (fixed === null) fixed = performance.now();
-    if (!runnerRunning) {
-      afterExit = 1;
-      if (how === 'timeout') {
-        fixed += 1100;
-        return unanswered();
-      }
+    if (!runnerRunning) afterExit = 1;
+    if (how === 'none' || !rows.some(row => row.pid === target)) return rows;
+    if (fixed === null) firstFixed = fixed = performance.now();
+    if (!runnerRunning && how === 'timeout') {
+      fixed += 1100;
+      injected.push('the scan the end of the run was seen in failed, 1100 ms on');
+      return unanswered();
     }
-    return rows.map(row => (row.pid === target ? exitingRow(row) : row));
+    return exitingAs(rows, target);
   }
+  // A scan the guard takes after the one it saw the end of the run in.
   afterExit += 1;
-  if (how === 'retry' && number === 1) {
+  if (!signalled) scansBeforeSignal += 1;
+  if (retried && !signalledAfterRetry) retryScansBeforeSignal += 1;
+  if (how === 'none') return rows;
+  const failsAt = { retry: 0, 'settle-retry': 1, 'settle-retry-cap': 2, 'settled-retry': 2 }[how];
+  if (number === 1 && delivered === failsAt) {
     deadSamplers.add(number);
+    retried = true;
+    injected.push('a scan failed as a sampler that ends does');
     throw new Error('sampler exited (injected)');
   }
-  if (!postDelivered) {
-    postDelivered = true;
-    if (how !== 'timeout') fixed += how === 'inside' ? 900 : 1100;
+  delivered += 1;
+  const at = () => Math.round(fixed - firstFixed);
+  if (how === 'late' || how === 'inside' || how === 'retry' || how === 'timeout') {
+    if (delivered === 1 && how !== 'timeout') {
+      fixed += how === 'inside' ? 900 : 1100;
+      injected.push(`the scan after the end of the run at ${at()} ms`);
+    }
+    return shownAs(rows, target);
   }
-  return shownAs(rows, target);
+  if (how === 'settle-late' || how === 'settle-inside' || how === 'settle-retry') {
+    if (delivered === 1) {
+      fixed += 500;
+      injected.push(`the scan after the end of the run at ${at()} ms, still exiting`);
+      return exitingAs(rows, target);
+    }
+    if (delivered === 2) {
+      fixed += how === 'settle-inside' ? 400 : 600;
+      injected.push(`a settling scan at ${at()} ms`);
+    }
+    return how === 'settle-late' ? shownAs(rows, target) : rows.filter(row => row.pid !== target);
+  }
+  if (how === 'settle-new-inside' || how === 'settle-new-late') {
+    const second = pids.get('nested-child');
+    if (delivered === 1) {
+      fixed += 500;
+      injected.push(`the scan after the end of the run at ${at()} ms, still exiting`);
+      return exitingAs(rows, target);
+    }
+    if (delivered === 2) {
+      fixed += 100;
+      injected.push(`a settling scan at ${at()} ms, the first exiting process gone and another first shown exiting`);
+      return exitingAs(rows.filter(row => row.pid !== target), second);
+    }
+    if (delivered === 3) {
+      fixed += how === 'settle-new-inside' ? 900 : 1100;
+      injected.push(`a settling scan at ${at()} ms, the other one gone`);
+    }
+    return rows.filter(row => row.pid !== target && row.pid !== second);
+  }
+  if (how === 'settled-retry') {
+    if (delivered === 1) {
+      fixed += 500;
+      return exitingAs(rows, target);
+    }
+    if (delivered === 2) {
+      fixed += 400;
+      injected.push(`a settling scan at ${at()} ms, gone`);
+      return rows.filter(row => row.pid !== target);
+    }
+    // From the retry on, as when the cleanup has just put a process into its exit.
+    return exitingAs(rows.filter(row => row.pid !== target), pids.get('nested-child'));
+  }
+  if (how === 'post-eperm' || how === 'settle-eperm') {
+    const second = pids.get('nested-child');
+    const cannotBeRead = scan => scan.map(row => (row.pid === second ? cannotRead(row) : row));
+    if (delivered === 1) {
+      fixed += 500;
+      if (how === 'post-eperm') injected.push(`the scan after the end of the run at ${at()} ms, with a process whose usage is denied`);
+      return how === 'post-eperm' ? cannotBeRead(exitingAs(rows, target)) : exitingAs(rows, target);
+    }
+    if (delivered === 2 && how === 'settle-eperm') {
+      fixed += 100;
+      injected.push(`a settling scan at ${at()} ms, with a process whose usage is denied`);
+      return cannotBeRead(exitingAs(rows, target));
+    }
+    return rows;
+  }
+  if (how === 'settle-cap' || how === 'settle-retry-cap') {
+    const order = [role, 'nested-child', 'detached', 'detached-child', 'adopted'].map(name => pids.get(name));
+    fixed += delivered === 1 ? 100 : 600;
+    const next = Math.min(delivered - 1, order.length - 1);
+    injected.push(`a scan at ${at()} ms with process ${next + 1} of ${order.length} exiting`);
+    return exitingAs(rows.filter(row => !order.slice(0, next).includes(row.pid)), order[next]);
+  }
+  return rows;
+}
+
+function noteSignal() {
+  if (afterExit > 0) signalled = true;
+  if (retried) signalledAfterRetry = true;
 }
 
 async function startFaultySampler() {
@@ -291,8 +405,8 @@ async function startFaultySampler() {
     }),
     // The real sampler signals the group through a readable member; the faults
     // above do not change what it reads.
-    signalGroup: (...args) => use(() => real.signalGroup(...args)),
-    signalProcesses: (name, rows) => use(() => signalProcesses(name, rows)),
+    signalGroup: (...args) => use(() => { noteSignal(); return real.signalGroup(...args); }),
+    signalProcesses: (name, rows) => use(() => { noteSignal(); return signalProcesses(name, rows); }),
     describe: (...args) => {
       const how = process.env.CRATE_GUARD_DESCRIBE;
       if (how === 'stall') return new Promise(() => {});
