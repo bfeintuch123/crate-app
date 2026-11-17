@@ -827,6 +827,38 @@ function cases() {
     assert.equal((await f.resolve(ws.workingFileChoices.choices[0])).success,true);
     roundTripFakeStore();assert.equal((await f.workspace()).workingFileChoices.blocked,false);
   });
+  choiceTest('presentation resolves a shared predecessor a fixed number of times, however many cards list it', async () => {
+    // Every card lists each earlier selected source, so one presentation call
+    // used to repeat the same file's work once per card. Counts path
+    // resolutions of the shared predecessor A; makes no timing claim.
+    const f = await setup();
+    const resolvedA = () => {
+      const original = fs.realpathSync.native; let calls = 0;
+      fs.realpathSync.native = function countedRealpath(target, ...rest) {
+        if (path.resolve(String(target)) === path.resolve(f.a)) calls += 1;
+        return original.call(this, target, ...rest);
+      };
+      try {
+        const presentation = metadataTestHooks.getWorkingFileChoicePresentation(f.stored());
+        return { calls, presentation };
+      } finally { fs.realpathSync.native = original; }
+    };
+    const admit = names => {
+      const paths = names.map(name => path.join(TEST_HOME,'Desktop',name));
+      for (const target of paths) writeSyntheticAiFile(target, 'saved source');
+      manualDialogFor(paths);
+      return callIpcRaw('projects:add-files',f.id);
+    };
+    await admit(['Shared-0.ai','Shared-1.ai','Shared-2.ai']);
+    const few = resolvedA();
+    await admit(['Shared-3.ai','Shared-4.ai','Shared-5.ai','Shared-6.ai','Shared-7.ai','Shared-8.ai']);
+    const many = resolvedA();
+    const listsA = presentation => presentation.choices.every(card => card.predecessors.some(item => item.name === 'A.ai'));
+    assert.equal(few.presentation.choices.length, 3); assert.equal(many.presentation.choices.length, 9);
+    assert.ok(listsA(few.presentation) && listsA(many.presentation), 'A is a predecessor on every card');
+    assert.ok(few.calls > 0, 'the count observes path resolution');
+    assert.equal(many.calls, few.calls, `A resolved ${few.calls} times with 3 cards and ${many.calls} with 9`);
+  });
   for (const corruption of ['legacy-overflow','null','array','bad-version','bad-record','duplicate-event']) {
     choiceTest(`canonical malformed or ${corruption} state blocks tokens and explicitly recovers`, async () => {
       const f=await setup(); const token=(await callIpcRaw('projects:prepare-package-review',f.id)).token;

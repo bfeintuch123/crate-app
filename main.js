@@ -5369,18 +5369,34 @@ function getWorkingFileChoicePresentation(project) {
       .sort((a, b) => createProjectFileVisualIdentity(project.id, a).localeCompare(createProjectFileVisualIdentity(project.id, b)));
     return collisions.length > 1 ? `${label} · File ${collisions.indexOf(file) + 1}` : label;
   };
-  const present = file => ({ visualIdentity: createProjectFileVisualIdentity(project.id, file),
-    name: sanitizeWorkingFileChoiceName(file.name || path.basename(file.path)),
-    folder: folderLabel(file),
-    selectionRevision: getWorkingSourceSelection(project, file).revision });
+  // Each card lists every earlier selected source, so one call meets the same
+  // file once per card. Compute its presentation and predecessor check once per
+  // call. This function never awaits, so neither map outlives the call; each
+  // card gets its own copy of the presentation (all fields are primitives).
+  const presentations = new Map();
+  const present = file => {
+    if (!presentations.has(file)) {
+      presentations.set(file, { visualIdentity: createProjectFileVisualIdentity(project.id, file),
+        name: sanitizeWorkingFileChoiceName(file.name || path.basename(file.path)),
+        folder: folderLabel(file),
+        selectionRevision: getWorkingSourceSelection(project, file).revision });
+    }
+    return { ...presentations.get(file) };
+  };
+  const predecessorChecks = new Map();
+  const isSelectedExplicitPredecessor = file => {
+    if (!predecessorChecks.has(file)) {
+      predecessorChecks.set(file, getWorkingSourceSelection(project, file).state === 'selected' && getExplicitWorkingFileIdentity(project, file));
+    }
+    return predecessorChecks.get(file);
+  };
   const choices = [];
   const recoveryChoiceHolds = getWorkingSourceRecoveryChoiceHolds(project);
   for (const [key, event] of obligations.pending) {
     if (choices.length >= 128) break;
     const source = find(key);
     if (!source || getWorkingSourceSelection(project, source).state !== 'selected') continue;
-    const predecessors = event.priorKeys.map(find).filter(file => file && file !== source &&
-      getWorkingSourceSelection(project, file).state === 'selected' && getExplicitWorkingFileIdentity(project, file));
+    const predecessors = event.priorKeys.map(find).filter(file => file && file !== source && isSelectedExplicitPredecessor(file));
     const receipt = getWorkingSourceVerification(project, source);
     const identity = getExplicitWorkingFileIdentity(project, source);
     const inDesignDependenciesAvailable = path.extname(source.path || '').toLowerCase() !== '.indd' ||
