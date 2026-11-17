@@ -45,6 +45,14 @@ jobs:
           git config --local --unset-all http.https://github.com/.extraheader
           ! git config --local --name-only --get-regexp '^http\..*\.extraheader$' >/dev/null
 
+      - name: Reject pull-request whitespace errors
+        if: github.event_name == 'pull_request'
+        run: git diff --check "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
+
+      - name: Reject pushed whitespace errors
+        if: github.event_name == 'push'
+        run: git diff --check "${{ github.event.before }}..${{ github.sha }}"
+
       - name: Reject repository package-manager configuration
         run: test ! -e .npmrc && test ! -L .npmrc && test ! -e npm-shrinkwrap.json && test ! -L npm-shrinkwrap.json
 
@@ -70,7 +78,7 @@ jobs:
           npm_config_cache: ${{ runner.temp }}/crate-npm-cache
           npm_config_globalconfig: ${{ runner.temp }}/crate-global-npmrc
           npm_config_userconfig: ${{ runner.temp }}/crate-user-npmrc
-        run: npm audit --audit-level=high --registry=https://registry.npmjs.org/
+        run: node scripts/verify-dependency-audit.js
 
       - name: Verify dependency lifecycle policy
         run: node scripts/verify-install-scripts.js
@@ -92,6 +100,7 @@ jobs:
           node --check scripts/install-approved-canvas-prebuild.js
           node --check scripts/run-tests.js
           node --check scripts/verify-app-contents.js
+          node --check scripts/verify-dependency-audit.js
           node --check scripts/verify-install-scripts.js
           node --check scripts/verify-macos-release-app.js
           node --check scripts/run-macos-release-proof.js
@@ -117,11 +126,3 @@ jobs:
       - name: Verify fixed Chrome for Testing remained unchanged
         if: always()
         run: node scripts/ci-chrome.js verify "$RUNNER_TEMP/crate-ci-chrome"
-
-      - name: Reject pull-request whitespace errors
-        if: github.event_name == 'pull_request'
-        run: git diff --check "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
-
-      - name: Reject pushed whitespace errors
-        if: github.event_name == 'push'
-        run: git diff --check "${{ github.event.before }}..${{ github.sha }}"

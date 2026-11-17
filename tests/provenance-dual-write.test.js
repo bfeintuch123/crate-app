@@ -25343,7 +25343,8 @@ test('Opus correction: actual pending projections preserve capture copy across r
       const workspace=await callIpcRaw('projects:get-asset-workspace',project.id),current=await getProject(project.id);
       assert.equal(Object.hasOwn(workspace.pendingFiles[0],'captureState'),false);
       const f=require('./opus-renderer-helpers').loadProjectedWorkspace(current,workspace);
-      assert.match(f.elements['project-review-detail'].textContent,captureState==='observed'?/Opened.*Pending/:/Save to make package-ready/,ext);
+      // A single Needs Save row with no source or app uses the shared Needs Save sentence.
+      assert.match(f.elements['project-review-detail'].textContent,captureState==='observed'?/Opened.*Pending/:/^Save your working file to add it to the package\.$/,ext);
     }
   } finally {fs.rmSync(root,{recursive:true,force:true});}
 });
