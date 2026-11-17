@@ -26,6 +26,16 @@
 //                                                  as a real one does that does not answer: after the request timeout
 //   CRATE_GUARD_FAULT=stall:<role>                 once the tree is up (and that process listed), every scan of the sampler in
 //                                                  use fails in the same way; no process is exiting
+//   CRATE_GUARD_FAULT=exiting-then-late:<role>     once the tree is up, one scan reads that process as exiting; the next one
+//                                                  arrives after the guard's clock has moved 1100 ms on (900 ms with
+//                                                  CRATE_GUARD_LATE=early-gone) and from then on shows it as CRATE_GUARD_LATE
+//                                                  says: gone (not listed), ended (a zombie), readable (as it is), early-gone
+//   CRATE_GUARD_FAULT=tool-exiting:<role>          once the tree is up, two scans read that process as the system's ps; after
+//                                                  that it reads as that ps exiting (no process info, usage denied), and then as
+//                                                  CRATE_GUARD_TOOL_EXIT says: gone (not listed after three such scans), persist,
+//                                                  bounds (the guard's clock moves 1700 ms on before the first exiting scan),
+//                                                  late (one exiting scan, then the next arrives 1100 ms later on the guard's
+//                                                  clock, not listing it), first-seen (never read as the ps at all)
 //   CRATE_GUARD_FAULT=exiting-over-limit:<role>    once the tree is up, one scan reads that process in full at 1300 MB; after that
 //                                                  it reads as exiting with no memory, and `nested-child` reads 1100 MB more than it holds
 //   CRATE_GUARD_FAULT=system-tool:<role>           that process reads exactly as the system's set-uid ps does, for as long as it lives
@@ -60,6 +70,16 @@ const exitingRow = (row, megabytes = row.resident) => ({
 let exitingScans = 0;
 let inflated = false;
 let stalling = false;
+// The guard's clock for exiting allowances, which these faults may move on.
+let skew = 0;
+const clock = () => performance.now() + skew;
+let lateScans = 0;
+let toolScans = 0;
+// The row the sampler writes for a set-uid process that is exiting (see the sampler).
+const toolExitingRow = row => ({
+  ...row, ppid: 0, pgid: 0, uid: 0, ruid: 0, status: 0, start: '0', megabytes: 0, resident: 0, footprint: 0, infoError: ESRCH, usageError: EPERM,
+  exiting: false, path: null,
+});
 // What the guard sees of a scan the sampler does not answer: its own request timeout.
 const unanswered = () => new Promise((resolve, reject) => {
   setTimeout(() => reject(new Error(`sampler did not answer within ${guard.TIMING.requestTimeoutMs} ms (injected)`)), guard.TIMING.requestTimeoutMs);
@@ -84,6 +104,32 @@ function misread(rows) {
   if (kind === 'system-tool' || kind === 'other-tool') {
     const target = recorded().get(role);
     return rows.map(row => (row.pid === target ? asTool(row, kind === 'system-tool' ? '/bin/ps' : '/usr/bin/top') : row));
+  }
+  if (kind === 'exiting-then-late') {
+    if (!recorded().has('ready')) return rows;
+    const target = recorded().get(role);
+    const how = process.env.CRATE_GUARD_LATE;
+    lateScans += 1;
+    if (lateScans === 1) return rows.map(row => (row.pid === target ? exitingRow(row) : row));
+    if (lateScans === 2) skew += how === 'early-gone' ? 900 : 1100;
+    if (how === 'gone' || how === 'early-gone') return rows.filter(row => row.pid !== target);
+    if (how === 'ended') return rows.map(row => (row.pid === target ? { ...row, status: guard.ZOMBIE, megabytes: 0, footprint: 0, exiting: true } : row));
+    return rows;
+  }
+  if (kind === 'tool-exiting') {
+    if (!recorded().has('ready')) return rows;
+    const target = recorded().get(role);
+    if (!rows.some(row => row.pid === target)) return rows;
+    const how = process.env.CRATE_GUARD_TOOL_EXIT;
+    toolScans += 1;
+    if (how !== 'first-seen' && toolScans <= 2) return rows.map(row => (row.pid === target ? asTool(row, '/bin/ps') : row));
+    if (how === 'bounds' && toolScans === 3) skew += 1700;
+    if (how === 'gone' && toolScans > 5) return rows.filter(row => row.pid !== target);
+    if (how === 'late' && toolScans >= 4) {
+      if (toolScans === 4) skew += 1100;
+      return rows.filter(row => row.pid !== target);
+    }
+    return rows.map(row => (row.pid === target ? toolExitingRow(row) : row));
   }
   if (kind === 'exiting' || kind === 'exiting-then-gone' || kind === 'exiting-then-stall') {
     if (!recorded().has('ready')) return rows;
@@ -213,6 +259,7 @@ guard.runGuard({
   env: process.env,
   startSampler: startFaultySampler,
   timing: { confirmMs: 600, leftoverGraceMs: 300 },
+  clock,
 }).then(code => process.exit(code), error => {
   process.stderr.write(`faulty-guard: ${error && error.stack ? error.stack : error}\n`);
   process.exit(99);

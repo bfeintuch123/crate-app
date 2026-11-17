@@ -47,7 +47,15 @@ process libproc still describes reads with them as well. Before the cache
 exists, a usage read carries no exit time: the kernel sets it to zero when it
 gathers fresh figures. The row reports whether the usage read carried one
 (<exiting>); the guard decides what it means (see scripts/run-tests.js, which
-lets an exiting process through for one second by its own clock).
+lets an exiting process through for one second, judged as each scan arrives
+and between scans). A set-uid process that is exiting, such as the system's
+ps after a test has killed it, reads the same way except that its usage is
+denied: the kernel finds it as an exiting process (proc_find_zombref in
+proc_pid_rusage, bsd/kern/proc_info.c) and then refuses to show another
+user's process (proc_security_policy). Its row then says no process info
+(ESRCH) and usage denied (EPERM), and the process table does not yet say
+ended; the guard lets that through only for a ps it let through the scan
+before.
 
 It also sends the guard's signals, because a pid alone does not say which
 process will receive one: the system reuses pids. Each signal names the pid and

@@ -349,10 +349,10 @@ test('a process that answers "no such process" to both reads stops the run as be
   // The rule, its sample count and its answer are those of the guard before this report existed.
   assert.deepEqual(ownership.readFailure(), { pid: 102, problem: 'unreadable', errno: ESRCH, samples: UNREADABLE_SAMPLES + 1 });
   const details = ownership.unreadDetails(102);
-  const unreadScan = at => ({ at, info: ESRCH, usage: ESRCH, exiting: false, resident: null, footprint: null });
+  const unreadScan = (at, sample) => ({ at, info: ESRCH, usage: ESRCH, exiting: false, path: null, allowedAs: null, sample, resident: null, footprint: null });
   assert.deepEqual(details, {
     errno: ESRCH, samples: UNREADABLE_SAMPLES + 1, ending: UNREADABLE_SAMPLES + 1, info: ESRCH, usage: ESRCH, exitingSince: null,
-    since: 51, scans: [51, 102, 153, 205].map(unreadScan), at: 205,
+    toolExitingSince: null, allowedAs: null, since: 51, scans: [51, 102, 153, 205].map((at, index) => unreadScan(at, index + 1)), at: 205,
     lastRead: { ...row(102, 101, RUNNER, { start: 'started-102', megabytes: 87, resident: 87, footprint: 80 }), at: 0 },
   });
   assert.deepEqual(ownership.exitingStats, { processes: 0, longestMilliseconds: 0, largest: null });
@@ -493,22 +493,21 @@ test('an exiting process that is still exiting after a second stops the run, as 
   assert.deepEqual([late.readFailure().exitingMilliseconds, late.readFailure().countedMegabytes, late.row(102).megabytes], [1001, 87, 0]);
 });
 
-test('the exiting allowance ends by the clock, whether or not a scan comes back', () => {
+test('the exiting allowance is judged by the clock, as the guard asks before applying a scan', () => {
   const clock = { now: 0 };
   const ownership = newOwnership(clock);
   ownership.update(tree(full102), true);
-  assert.equal(ownership.exitingDeadline(), null, 'nothing exiting, nothing to keep time for');
+  assert.equal(ownership.expiredExiting(5000), null, 'nothing exiting, nothing to judge');
   clock.now = 10;
   ownership.update(tree(exitingRow(102, 101, RUNNER, { start: 'started-102' })), true);
-  // From here on no scan comes back. The guard asks the clock, not a scan.
-  assert.equal(ownership.exitingDeadline(), 10 + EXITING.milliseconds);
+  // Asked at any time, before the next scan is applied: a second from the first scan that showed it exiting, and not a moment more.
   assert.equal(ownership.expiredExiting(10 + EXITING.milliseconds), null);
   assert.deepEqual(ownership.expiredExiting(10 + EXITING.milliseconds + 1),
     { pid: 102, problem: 'unreadable', errno: ESRCH, samples: 1, exitingMilliseconds: EXITING.milliseconds + 1, countedMegabytes: 87 });
-  // Gone: no deadline left to keep.
+  // Applied before the second is over, a scan that no longer lists it ends the allowance.
   clock.now = 500;
   ownership.update(tree(), true);
-  assert.deepEqual([ownership.exitingDeadline(), ownership.expiredExiting(5000)], [null, null]);
+  assert.equal(ownership.expiredExiting(5000), null);
 });
 
 test('a full reading that already carries the exit figures never lowers what an exiting process is counted at', () => {
@@ -549,7 +548,6 @@ test('one process gets one exiting allowance, however its readings come and go',
   clock.now = 1011;
   ownership.update(exiting, true);
   assert.equal(ownership.readFailure()?.exitingMilliseconds, 1001);
-  assert.equal(ownership.exitingDeadline(), 10 + EXITING.milliseconds);
   assert.equal(ownership.exitingStats.processes, 1);
   // Its pid listed again with another start time is another process: a new allowance.
   const reused = newOwnership(clock);
@@ -563,8 +561,10 @@ test('one process gets one exiting allowance, however its readings come and go',
   reused.update(tree(row(102, 101, RUNNER, { start: 'started-again', megabytes: 20 })), true);
   clock.now = 900;
   reused.update(tree(exitingRow(102, 101, RUNNER, { start: 'started-again' })), true);
-  assert.deepEqual([reused.exitingDeadline(), reused.exitingStats.processes], [900 + EXITING.milliseconds, 2]);
+  assert.deepEqual([reused.expiredExiting(900 + EXITING.milliseconds), reused.expiredExiting(901 + EXITING.milliseconds)?.exitingMilliseconds,
+    reused.exitingStats.processes], [null, EXITING.milliseconds + 1, 2]);
 });
+
 
 test('nothing but an exiting process of the run, read in full before with that start time, and not the runner, gets the allowance', () => {
   // Each of these stops the run exactly as it would without the allowance:
@@ -601,6 +601,103 @@ test('nothing but an exiting process of the run, read in full before with that s
 
 const withPs = (...extra) => [...system, ...stranger, ...run, ...extra];
 const unreadable = (pid, samples = 1, errno = EPERM) => ({ pid, problem: 'unreadable', errno, samples });
+
+// The system's ps as the sampler reports it alive (let through as the tool) and exiting.
+const toolRow = (pid, ppid, pgid, extra = {}) => psRow(pid, ppid, pgid, extra);
+const toolExitingRow = pid => row(pid, 0, 0, { uid: 0, ruid: 0, status: 0, start: '0', megabytes: 0, infoError: ESRCH, usageError: EPERM });
+
+test('a ps let through as the system tool, then read as exiting, stays let through on the same counts, at 32 MB', () => {
+  const clock = { now: 0 };
+  const ownership = newOwnership(clock);
+  ownership.update(withPs(), true);
+  for (const at of [55, 110]) {
+    clock.now = at;
+    ownership.update(withPs(toolRow(110, 101, RUNNER)), true);
+    assert.equal(ownership.readFailure(), null);
+  }
+  for (const at of [165, 220, 275]) {
+    clock.now = at;
+    const owned = ownership.update(withPs(toolExitingRow(110)), true);
+    assert.equal(ownership.readFailure(), null, `at ${at} ms`);
+    assert.deepEqual([owned.get(110).megabytes, owned.get(110).assumed], [SYSTEM_TOOL.assumedMegabytes, true]);
+  }
+  // The same counters as the tool: five samples let through, none restarted.
+  assert.deepEqual(ownership.toolStats, { samples: 5, longestSamples: 5, longestMilliseconds: 220 });
+  assert.equal(ownership.unreadDetails(110).samples, 5);
+  clock.now = 330;
+  ownership.update(withPs(), true);
+  assert.equal(ownership.readFailure(), null);
+  assert.deepEqual(ownership.toolExitingStats, { processes: 1, longestMilliseconds: 110 });
+});
+
+test('a ps exiting for longer than a second, or past the tool\'s own bounds, stops the run; nothing is restarted', () => {
+  const clock = { now: 0 };
+  const persisting = newOwnership(clock);
+  persisting.update(withPs(toolRow(110, 101, RUNNER)), true);
+  clock.now = 10;
+  persisting.update(withPs(toolExitingRow(110)), true);
+  // Judged by the clock before the next scan is applied, as the exiting second is.
+  assert.equal(persisting.expiredExiting(10 + SYSTEM_TOOL.exitingMilliseconds), null);
+  assert.deepEqual(persisting.expiredExiting(11 + SYSTEM_TOOL.exitingMilliseconds),
+    { pid: 110, problem: 'unreadable', errno: EPERM, samples: 2, toolExitingMilliseconds: SYSTEM_TOOL.exitingMilliseconds + 1 });
+  clock.now = 11 + SYSTEM_TOOL.exitingMilliseconds;
+  persisting.update(withPs(toolExitingRow(110)), true);
+  assert.deepEqual(persisting.readFailure(),
+    { pid: 110, problem: 'unreadable', errno: EPERM, samples: 3, toolExitingMilliseconds: SYSTEM_TOOL.exitingMilliseconds + 1 });
+  // The tool's two seconds run from its first unreadable scan and go on running while it exits.
+  const late = newOwnership(clock);
+  clock.now = 0;
+  late.update(withPs(toolRow(110, 101, RUNNER)), true);
+  clock.now = 1700;
+  late.update(withPs(toolRow(110, 101, RUNNER)), true);
+  clock.now = 1990;
+  late.update(withPs(toolExitingRow(110)), true);
+  assert.equal(late.readFailure(), null);
+  clock.now = SYSTEM_TOOL.milliseconds + 1;
+  late.update(withPs(toolExitingRow(110)), true);
+  assert.deepEqual(late.readFailure(), { pid: 110, problem: 'unreadable', errno: EPERM, samples: 4, toolExitingMilliseconds: 11 });
+  // And so do its forty samples.
+  const many = newOwnership(clock);
+  clock.now = 0;
+  for (let sample = 1; sample < SYSTEM_TOOL.samples; sample += 1) {
+    clock.now += 10;
+    many.update(withPs(toolRow(110, 101, RUNNER)), true);
+  }
+  clock.now += 10;
+  many.update(withPs(toolExitingRow(110)), true);
+  assert.equal(many.readFailure(), null, 'the fortieth sample');
+  clock.now += 10;
+  many.update(withPs(toolExitingRow(110)), true);
+  assert.deepEqual(many.readFailure(), { pid: 110, problem: 'unreadable', errno: EPERM, samples: SYSTEM_TOOL.samples + 1, toolExitingMilliseconds: 10 });
+});
+
+test('nothing but a ps let through the scan before gets the ps exiting allowance', () => {
+  const clock = { now: 0 };
+  const stopsAt = (first, then) => {
+    const ownership = newOwnership(clock);
+    for (const rows of first) ownership.update(rows, true);
+    ownership.update(then, true);
+    return ownership.readFailure();
+  };
+  // First seen in that state: as before, a process of the run whose usage is denied.
+  assert.deepEqual(stopsAt([withPs(row(110, 101, RUNNER))], withPs(toolExitingRow(110))), unreadable(110));
+  // Another set-uid tool before: never let through, so neither is its exit.
+  assert.deepEqual(stopsAt([withPs(row(110, 101, RUNNER))], withPs(psRow(110, 101, RUNNER, { path: '/usr/bin/top' }))), unreadable(110));
+  // Both reads "no such process" after the tool: the three-sample rule, as before.
+  const both = newOwnership(clock);
+  both.update(withPs(toolRow(110, 101, RUNNER)), true);
+  for (let sample = 1; sample <= UNREADABLE_SAMPLES; sample += 1) {
+    both.update(withPs(unreadableRow(110, 0, 0, ESRCH)), true);
+    assert.equal(both.readFailure(), null);
+  }
+  both.update(withPs(unreadableRow(110, 0, 0, ESRCH)), true);
+  assert.deepEqual(both.readFailure(), unreadable(110, UNREADABLE_SAMPLES + 2, ESRCH));
+  // The runner is never the tool, so never the tool exiting.
+  const runner = newOwnership(clock);
+  runner.update([...system, row(RUNNER, GUARD, RUNNER), row(101, RUNNER, RUNNER)], true);
+  runner.update([...system, toolExitingRow(RUNNER), row(101, RUNNER, RUNNER)], true);
+  assert.deepEqual(runner.readFailure(), unreadable(RUNNER));
+});
 
 test('the system ps, started by the run, is let through and counted at an assumed size', () => {
   const ownership = newOwnership();
@@ -1440,7 +1537,7 @@ test('a process that is still exiting after a second stops the run as before, sa
   const result = await startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'exiting:nested' }, faultyGuard).done;
   const nested = recorded().get('nested');
   assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
-  assert.match(result.stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${ESRCH}, \\d+ samples in a row\\)\\. It had been exiting for (\\d+) ms, longer than the 1000 ms allowed; while exiting it was counted at up to \\d+ MB\\.(?:\\nrun-tests: A scan was still in progress when the allowance ran out; the sampler standing by takes over\\.)?\\nrun-tests:   .*\\nrun-tests: Stopping the test run \\(\\d+ processes\\)\\.`));
+  assert.match(result.stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${ESRCH}, \\d+ samples in a row\\)\\. It had been exiting for (\\d+) ms, longer than the 1000 ms allowed; while exiting it was counted at up to \\d+ MB\\.\\nrun-tests:   .*\\nrun-tests: Stopping the test run \\(\\d+ processes\\)\\.`));
   assert.ok(Number(/exiting for (\d+) ms, longer/.exec(result.stderr)[1]) > EXITING.milliseconds);
   assert.match(result.stderr, /run-tests: Every process of the run has ended\./);
   const samples = Number(new RegExp(`PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno 3, (\\d+) samples`).exec(result.stderr)[1]);
@@ -1450,7 +1547,7 @@ test('a process that is still exiting after a second stops the run as before, sa
   assert.equal(bystanderSurvived(), true);
 });
 
-test('an exiting allowance ends by the clock while scans do not come back: stopped at the bound, with the usual cleanup', { timeout: 60000 }, async t => {
+test('an exiting process, then a sampler that does not answer: the stop comes when a scan times out after the second, before the blind limit', { timeout: 60000 }, async t => {
   const { environment, recorded, allGone, bystanderSurvived } = scenario(t);
   // Two scans show it exiting; then every scan of the sampler in use times out, as a sampler that does not answer does.
   const result = await startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'exiting-then-stall:nested' }, faultyGuard).done;
@@ -1458,13 +1555,16 @@ test('an exiting allowance ends by the clock while scans do not come back: stopp
   assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
   const stopped = new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${ESRCH}, 2 samples in a row\\)\\. `
     + 'It had been exiting for (\\d+) ms, longer than the 1000 ms allowed; while exiting it was counted at up to \\d+ MB\\.\\n'
-    + 'run-tests: A scan was still in progress when the allowance ran out; the sampler standing by takes over\\.\\n'
     + 'run-tests:   .*\\nrun-tests: Stopping the test run \\(\\d+ processes\\)\\.\\nrun-tests: Every process of the run has ended\\.').exec(result.stderr);
   assert.ok(stopped, result.stderr);
-  // At the bound, by the clock: not when a scan next came back, and not at the 3 s blind limit.
+  // No timer of its own: the second is judged at the top of the pass after a scan fails at its request
+  // timeout (1000 ms after it was sent), so at most 1000 + 1000 + 50 ms after the first exiting scan;
+  // the blind limit (3000 ms after the last good scan) does not come first.
   const exitingFor = Number(stopped[1]);
-  assert.ok(exitingFor > EXITING.milliseconds && exitingFor < EXITING.milliseconds + 250, `stopped after ${exitingFor} ms exiting`);
-  assert.doesNotMatch(result.stderr, /LOST SIGHT|sampler failed|INCOMPLETE/);
+  assert.ok(exitingFor > EXITING.milliseconds && exitingFor <= 2 * EXITING.milliseconds + 50 + 300, `stopped after ${exitingFor} ms exiting`);
+  assert.doesNotMatch(result.stderr, /LOST SIGHT|INCOMPLETE|scan was still in progress/);
+  // The cleanup meets the same sampler that does not answer, and goes on with the one standing by, as it always has.
+  assert.match(result.stderr, /run-tests: the sampler failed \(sampler did not answer within 1000 ms \(injected\)\); continuing with the one standing by/);
   await allGone(['nested', 'nested-child', 'short-lived', 'ready']);
   assert.equal(bystanderSurvived(), true);
 });
@@ -1475,6 +1575,99 @@ test('a sampler that stops answering with no process exiting is handled as befor
   assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
   assert.match(result.stderr, /run-tests: GUARD LOST SIGHT OF THE RUN after [\d.]+ s: sampler did not answer within 1000 ms \(injected\)\.\nrun-tests: Stopping the test run \(\d+ processes\)\.\nrun-tests: Every process of the run has ended\./);
   assert.doesNotMatch(result.stderr, /CANNOT READ|allowance|let through while exiting/);
+  await allGone(['nested', 'nested-child', 'short-lived', 'ready']);
+  assert.equal(bystanderSurvived(), true);
+});
+
+for (const late of ['gone', 'ended', 'readable']) {
+  test(`a scan that arrives after the exiting second, showing the process ${late}, stops the run and is not applied`, { timeout: 60000 }, async t => {
+    const { environment, recorded, allGone, bystanderSurvived } = scenario(t);
+    // One scan shows it exiting; the next arrives with the guard's clock 1100 ms on.
+    const result = await startGuard([descendants], { ...environment('short'), CRATE_GUARD_FAULT: 'exiting-then-late:nested', CRATE_GUARD_LATE: late }, faultyGuard).done;
+    const nested = recorded().get('nested');
+    assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+    // Still one sample: the late scan was judged before it was applied, and not applied.
+    const stopped = new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${ESRCH}, 1 samples in a row\\)\\. `
+      + 'It had been exiting for (\\d+) ms, longer than the 1000 ms allowed').exec(result.stderr);
+    assert.ok(stopped, result.stderr);
+    assert.ok(Number(stopped[1]) >= 1100, stopped[1]);
+    assert.doesNotMatch(result.stdout, /^# pass 1$/m, 'stopped before the run could finish');
+    await allGone(treeRoles.filter(role => role !== 'nested'));
+    assert.equal(bystanderSurvived(), true);
+  });
+}
+
+test('a scan that arrives just inside the exiting second, no longer listing the process, lets the run go on', { timeout: 60000 }, async t => {
+  const { environment, allGone, bystanderSurvived } = scenario(t);
+  const result = await startGuard([descendants], { ...environment('short'), CRATE_GUARD_FAULT: 'exiting-then-late:nested', CRATE_GUARD_LATE: 'early-gone' }, faultyGuard).done;
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /^# pass 1$/m);
+  assert.doesNotMatch(result.stderr, /CANNOT READ|LOST SIGHT/);
+  assert.match(result.stderr, /^run-tests: memory guard: 1 processes were let through while exiting/m);
+  await allGone(treeRoles.filter(role => role !== 'nested'));
+  assert.equal(bystanderSurvived(), true);
+});
+
+test('a ps let through as the system tool and then exiting, gone within its bounds, does not stop the run', { timeout: 60000 }, async t => {
+  const { environment, allGone, bystanderSurvived } = scenario(t);
+  const result = await startGuard([descendants], { ...environment('short'), CRATE_GUARD_FAULT: 'tool-exiting:nested', CRATE_GUARD_TOOL_EXIT: 'gone' }, faultyGuard).done;
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /^# pass 1$/m);
+  assert.doesNotMatch(result.stderr, /CANNOT READ|LOST SIGHT/);
+  // Counted as the tool: the same assumed 32 MB, the same counters.
+  assert.match(result.stderr, /^run-tests: memory guard: .*these figures include an assumed 32 MB, not a measurement, for each \/bin\/ps the guard could not read \(let through \d+ times, at most \d+ samples in a row/m);
+  assert.match(result.stderr, /^run-tests: memory guard: 1 \/bin\/ps processes were let through while exiting, the longest for \d+ ms \(1000 ms allowed\), counted at the assumed 32 MB$/m);
+  await allGone(treeRoles.filter(role => role !== 'nested'));
+  assert.equal(bystanderSurvived(), true);
+});
+
+const toolStop = (pid, samples) => new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${pid} OF THE RUN after [\\d.]+ s \\(errno ${EPERM}, ${samples} samples in a row\\)\\. Its memory is unknown\\.`
+  + '(?: It had been let through as /bin/ps and then as that tool exiting, for (\\d+) ms \\(1000 ms allowed\\), and is not let through any more\\.)?\\n');
+
+for (const [how, check] of [
+  ['persist', (stopped, samples) => {
+    assert.ok(Number(stopped[1]) > SYSTEM_TOOL.exitingMilliseconds, stopped[1]);
+    assert.ok(samples > 3, String(samples));
+  }],
+  // The tool's two seconds run on while it exits: stopped at that bound, well inside its exiting second.
+  ['bounds', stopped => assert.ok(Number(stopped[1]) < SYSTEM_TOOL.exitingMilliseconds, stopped[1])],
+  // The scan after it arrives 1100 ms late and no longer lists it: judged before it is applied, so still three samples.
+  ['late', (stopped, samples) => assert.deepEqual([Number(stopped[1]) > SYSTEM_TOOL.exitingMilliseconds, samples], [true, 3])],
+]) {
+  test(`a ps exiting past its bounds (${how}) stops the run, and the report shows each scan with its allowance`, { timeout: 60000 }, async t => {
+    const { environment, recorded, allGone, bystanderSurvived } = scenario(t);
+    const result = await startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'tool-exiting:nested', CRATE_GUARD_TOOL_EXIT: how }, faultyGuard).done;
+    const nested = recorded().get('nested');
+    assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+    const stopped = toolStop(nested, '(\\d+)').exec(result.stderr);
+    assert.ok(stopped, result.stderr);
+    // Group 1 is the sample count in the pattern above; the exiting time follows it.
+    const [, samples, exitingFor] = stopped;
+    assert.ok(exitingFor !== undefined, result.stderr);
+    check([null, exitingFor], Number(samples));
+    // The report: each recent scan, with the executable, the allowance and the sample count.
+    assert.match(result.stderr, new RegExp(`run-tests: About process ${nested}, which stopped the run`));
+    // The report lists the last eight scans: the scans as the live tool are among them unless it was exiting longer.
+    if (how !== 'persist') {
+      assert.match(result.stderr, /run-tests:     \+\d+ ms: process info errno 0, usage errno 1, executable \/bin\/ps, let through as the system tool \(sample 1\)\n/);
+    }
+    if (how !== 'bounds') {
+      assert.match(result.stderr, /run-tests:     \+\d+ ms: process info errno 3, usage errno 1, let through as the system tool exiting \(sample \d+\)\n/);
+    }
+    assert.match(result.stderr, /let through as the system tool exiting from \d+ ms after the first \(1000 ms allowed, within 40 samples and 2000 ms in all\)/);
+    assert.match(result.stderr, /run-tests: Every process of the run has ended\./);
+    await allGone(['nested', 'nested-child', 'short-lived', 'ready']);
+    assert.equal(bystanderSurvived(), true);
+  });
+}
+
+test('a ps first seen already exiting, never let through as the tool, stops the run as before', { timeout: 60000 }, async t => {
+  const { environment, recorded, allGone, bystanderSurvived } = scenario(t);
+  const result = await startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'tool-exiting:nested', CRATE_GUARD_TOOL_EXIT: 'first-seen' }, faultyGuard).done;
+  const nested = recorded().get('nested');
+  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+  assert.match(result.stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${EPERM}, 1 samples in a row\\)\\. Its memory is unknown\\.\\n`));
+  assert.doesNotMatch(result.stderr, /let through as \/bin\/ps and then|processes were let through while exiting/);
   await allGone(['nested', 'nested-child', 'short-lived', 'ready']);
   assert.equal(bystanderSurvived(), true);
 });
