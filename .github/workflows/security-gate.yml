@@ -45,6 +45,14 @@ jobs:
           git config --local --unset-all http.https://github.com/.extraheader
           ! git config --local --name-only --get-regexp '^http\..*\.extraheader$' >/dev/null
 
+      - name: Reject pull-request whitespace errors
+        if: github.event_name == 'pull_request'
+        run: git diff --check "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
+
+      - name: Reject pushed whitespace errors
+        if: github.event_name == 'push'
+        run: git diff --check "${{ github.event.before }}..${{ github.sha }}"
+
       - name: Reject repository package-manager configuration
         run: test ! -e .npmrc && test ! -L .npmrc && test ! -e npm-shrinkwrap.json && test ! -L npm-shrinkwrap.json
 
@@ -117,11 +125,3 @@ jobs:
       - name: Verify fixed Chrome for Testing remained unchanged
         if: always()
         run: node scripts/ci-chrome.js verify "$RUNNER_TEMP/crate-ci-chrome"
-
-      - name: Reject pull-request whitespace errors
-        if: github.event_name == 'pull_request'
-        run: git diff --check "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
-
-      - name: Reject pushed whitespace errors
-        if: github.event_name == 'push'
-        run: git diff --check "${{ github.event.before }}..${{ github.sha }}"

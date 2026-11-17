@@ -5,6 +5,7 @@
 //
 //   allocate   hold memory up to this file's own 256 MB ceiling, then pass
 //   idle       wait, for at most 20 seconds, then pass
+//   short      wait 2.5 seconds, then pass and leave the tree running
 //   leave      pass at once and leave the tree running
 //
 // The tree: a child with a child of its own; a detached child (own session and
@@ -25,6 +26,7 @@ const STEP_MB = 8;
 const STEP_PAUSE_MS = 40;
 const CEILING_MB = 256;
 const HOLD_MS = 1500;
+const SHORT_MS = 2500;
 
 const leaf = (role, extra = {}) => ({ role, life: LIFE_MS, children: [], ...extra });
 const tree = [
@@ -60,5 +62,7 @@ test('starts its process tree', async () => {
     held.length = 0;
   } else if (mode === 'idle') {
     await new Promise(resolve => { setTimeout(resolve, LIFE_MS); });
+  } else if (mode === 'short') {
+    await new Promise(resolve => { setTimeout(resolve, SHORT_MS); });
   }
 });
