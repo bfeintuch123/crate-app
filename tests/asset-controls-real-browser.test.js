@@ -481,6 +481,57 @@ test('in flight: row, record and batch controls are disabled, double clicks are 
   });
 });
 
+test('Needs Save alert: thin amber box at the top of Needs Review, one line at 1100x760, hidden with its section, gone when no Needs Save row remains', { skip, timeout: 60000 }, async () => {
+  for (const [width, height] of [[1100, 760], [1440, 900]]) {
+    await withPage({ width, height }, async page => {
+      // The bootstrap always adds Saved.png as a Needs Save row observed in InDesign.
+      await start(page, ['Alpha.png']);
+      await page.evaluate(settleStyles);
+      const where = `${width}x${height}`;
+      const layout = await page.evaluate(`(() => {
+        const alert = document.querySelector('#needs-save-alert'), section = document.querySelector('#pending-section');
+        const header = section.querySelector('.asset-panel-header'), batch = document.querySelector('#pending-batch-slot');
+        const title = alert.querySelector('.modal-reminder-title'), copy = alert.querySelector('.modal-reminder-copy');
+        const box = alert.getBoundingClientRect(), style = getComputedStyle(alert);
+        return {
+          text: alert.textContent, role: alert.getAttribute('role'), live: alert.getAttribute('aria-live'),
+          order: header.getBoundingClientRect().bottom <= box.top + 1 && box.bottom <= batch.getBoundingClientRect().top + 1,
+          inSection: section.contains(alert), oneLine: Math.abs(title.getBoundingClientRect().top - copy.getBoundingClientRect().top) < 4 && box.height < 40,
+          border: style.borderTopColor, padding: [style.paddingTop, style.paddingLeft], overflow: document.documentElement.scrollWidth - innerWidth,
+        };
+      })()`);
+      assert.equal(layout.text, 'Needs SaveSave your file in InDesign to add this linked asset to the package.', where);
+      assert.deepEqual([layout.role, layout.live], ['status', 'polite'], where);
+      assert.equal(layout.inSection, true, where);
+      assert.equal(layout.order, true, `between the Needs Review header and the batch controls ${where}`);
+      assert.equal(layout.oneLine, true, `title and sentence on one thin line ${where}: ${json(layout)}`);
+      assert.equal(layout.border, 'rgb(252, 211, 77)', where);
+      assert.deepEqual(layout.padding, ['7px', '12px'], where);
+      assert.ok(layout.overflow <= 0, `no horizontal page overflow ${where}`);
+      // A 120-character unbroken source name wraps inside the box instead of spilling out.
+      const longName = 'A'.repeat(117) + '.ai';
+      await page.evaluate(`(() => { const row = window.__bridge.pending.find(file => file.captureState === 'needs-save');
+        row.captureEvidence = { appFamily: 'indesign', sourceName: ${json(longName)} };
+        state.projects = [window.__bridge.project()]; return renderFiles(); })()`);
+      await idle(page);
+      const wrap = await page.evaluate(`(() => { const alert = document.querySelector('#needs-save-alert'), copy = alert.querySelector('.modal-reminder-copy');
+        const box = alert.getBoundingClientRect(), text = copy.getBoundingClientRect(), section = document.querySelector('#pending-section').getBoundingClientRect();
+        return { named: copy.textContent.includes(${json(longName)}), inside: text.right <= box.right + 1 && box.right <= section.right + 1,
+          spill: copy.scrollWidth - copy.clientWidth, pageOverflow: document.documentElement.scrollWidth - innerWidth }; })()`);
+      assert.equal(wrap.named, true, where);
+      assert.ok(wrap.inside && wrap.spill <= 1 && wrap.pageOverflow <= 0, `long name stays inside the alert ${where}: ${json(wrap)}`);
+      // Another filter hides the section, and the alert with it.
+      await clickSelector(page, '[data-asset-filter="existing"]');
+      assert.equal(await page.evaluate("document.querySelector('#needs-save-alert').getClientRects().length"), 0, where);
+      await clickSelector(page, '[data-asset-filter="all"]');
+      // The row leaves Needs Review (as after Crate sees the save): the alert empties.
+      await page.evaluate("window.__bridge.pending = window.__bridge.pending.filter(file => file.captureState !== 'needs-save'); state.projects = [window.__bridge.project()]; renderFiles()");
+      await idle(page);
+      assert.deepEqual(await page.evaluate("[document.querySelector('#needs-save-alert').textContent, document.querySelector('#needs-save-alert').classList.contains('modal-reminder')]"), ['', false], where);
+    });
+  }
+});
+
 test('virtual list boundary and filtered views: one call per key, focus follows to the next row, the filtered last row and remembered rows fall back to a heading', { skip, timeout: 120000 }, async () => {
   await withPage({}, async page => {
     const names = Array.from({ length: 40 }, (_, index) => `Asset_${String(index + 1).padStart(2, '0')}.png`);
