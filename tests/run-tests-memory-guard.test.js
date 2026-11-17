@@ -661,7 +661,7 @@ test('a scan reaches ownership only through take(), which judges every exiting a
   // Nothing else is exposed that applies a scan.
   const ownership = newOwnership();
   assert.deepEqual(Object.keys(ownership).filter(key => typeof ownership[key] === 'function').sort(),
-    ['addHelper', 'endJudging', 'exitingOutstanding', 'expiredExiting', 'groupMember', 'readFailure', 'row', 'take', 'unreadDetails', 'unsettled']);
+    ['addHelper', 'endJudging', 'expiredExiting', 'groupMember', 'readFailure', 'row', 'take', 'unreadDetails']);
   // And in the guard's own source, the private apply() is called from take() alone, and nothing calls an update().
   const source = fs.readFileSync(runTests, 'utf8');
   assert.equal(source.match(/\bapply\(rows, runnerExists\)/g).length, 2, 'the definition and the one call in take()');
@@ -1637,123 +1637,8 @@ test('the scan after the end of the run, arriving inside the exiting second and 
   assert.match(result.stdout, /^# pass 1$/m);
   assert.equal(result.code, 0, result.stderr);
   assert.doesNotMatch(result.stderr, /CANNOT READ|LOST SIGHT|INCOMPLETE/);
-  // The fault fired: the scan after the end of the run came with the clock exactly 900 ms on.
-  assert.match(result.stderr, /faulty-guard: after the end of the run, \d+ scans before the first signal; .*injected: the scan after the end of the run at 900 ms\n/);
   assert.equal(bystanderSurvived(), true);
 });
-
-// Settling: the scan after the end of the run finds a process still inside
-// its second; the guard goes on judging scans until none is, before cleanup.
-const atExitRun = (environment, how, late = 'gone') => startGuard([descendants],
-  { ...environment('short'), CRATE_GUARD_FAULT: 'exiting-at-exit:nested', CRATE_GUARD_POST: how, CRATE_GUARD_LATE: late }, faultyGuard).done;
-const seam = stderr => {
-  const line = /faulty-guard: after the end of the run, (\d+) scans before the first signal; after the retry, (\d+|no retry) scans before the next; injected: (.*)\n/.exec(stderr);
-  assert.ok(line, stderr);
-  return { beforeSignal: Number(line[1]), afterRetry: line[2], injected: line[3] };
-};
-const stoppedAfterEnd = (stderr, pid, why) => assert.match(stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${pid} OF THE RUN after [\\d.]+ s \\(errno \\d, \\d+ samples in a row\\)\\. ${why}\\n`
-  + 'run-tests: The test run had ended by then, with exit status 0\\. Exit status 125 replaces it\\.\\n'));
-const exitingTooLong = 'It had been exiting for 1100 ms, longer than the 1000 ms allowed; while exiting it was counted at up to \\d+ MB\\.';
-
-for (const late of ['gone', 'ended', 'readable']) {
-  test(`a process still exiting after the end of the run, then ${late} on a scan past its second, ends the run 125: the scan is not applied`, { timeout: 60000 }, async t => {
-    const { environment, recorded, bystanderSurvived } = scenario(t);
-    const result = await atExitRun(environment, 'settle-late', late);
-    assert.match(result.stdout, /^# pass 1$/m);
-    assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
-    stoppedAfterEnd(result.stderr, recorded().get('nested'), exitingTooLong);
-    assert.match(seam(result.stderr).injected, /still exiting, a settling scan at 1100 ms/);
-    assert.equal(bystanderSurvived(), true);
-  });
-}
-
-test('a process still exiting after the end of the run and gone inside its second keeps the run\'s own status, after settling scans', { timeout: 60000 }, async t => {
-  const { environment, bystanderSurvived } = scenario(t);
-  const result = await atExitRun(environment, 'settle-inside');
-  assert.match(result.stdout, /^# pass 1$/m);
-  assert.equal(result.code, 0, result.stderr);
-  assert.doesNotMatch(result.stderr, /CANNOT READ|LOST SIGHT|INCOMPLETE/);
-  const { beforeSignal, injected } = seam(result.stderr);
-  // The settling ran: more scans before the cleanup's first signal than the two it takes without it.
-  assert.ok(beforeSignal >= 3, String(beforeSignal));
-  assert.match(injected, /at 500 ms, still exiting, a settling scan at 900 ms$/);
-  assert.equal(bystanderSurvived(), true);
-});
-
-test('with no process exiting at the end of the run, nothing settles: the scan after the end, then the cleanup', { timeout: 60000 }, async t => {
-  const { environment, bystanderSurvived } = scenario(t);
-  const result = await atExitRun(environment, 'none');
-  assert.match(result.stdout, /^# pass 1$/m);
-  assert.equal(result.code, 0, result.stderr);
-  // As before: the scan after the end of the run, and the cleanup's first scan, then its signal.
-  assert.deepEqual(seam(result.stderr), { beforeSignal: 2, afterRetry: 'no retry', injected: 'nothing' });
-  assert.equal(bystanderSurvived(), true);
-});
-
-test('a process first seen exiting on a settling scan gets its own second: gone inside it, the run\'s own status', { timeout: 60000 }, async t => {
-  const { environment, bystanderSurvived } = scenario(t);
-  const result = await atExitRun(environment, 'settle-new-inside');
-  assert.equal(result.code, 0, result.stderr);
-  assert.doesNotMatch(result.stderr, /CANNOT READ/);
-  const { beforeSignal, injected } = seam(result.stderr);
-  assert.match(injected, /another first shown exiting, a settling scan at 1500 ms, the other one gone$/);
-  // The scan after the end of the run, two settling scans, then the cleanup's first scan: the second process was settled, not left to the cleanup.
-  assert.ok(beforeSignal >= 4, String(beforeSignal));
-  assert.equal(bystanderSurvived(), true);
-});
-
-test('a process first seen exiting on a settling scan gets its own second: past it, 125', { timeout: 60000 }, async t => {
-  const { environment, recorded, bystanderSurvived } = scenario(t);
-  const result = await atExitRun(environment, 'settle-new-late');
-  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
-  stoppedAfterEnd(result.stderr, recorded().get('nested-child'), exitingTooLong);
-  assert.equal(bystanderSurvived(), true);
-});
-
-test('a settling scan that fails is retried with the allowances still judged: past the second, 125', { timeout: 60000 }, async t => {
-  const { environment, recorded, bystanderSurvived } = scenario(t);
-  const result = await atExitRun(environment, 'settle-retry');
-  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
-  assert.match(result.stderr, /run-tests: the sampler failed \(sampler exited \(injected\)\); continuing with the one standing by/);
-  stoppedAfterEnd(result.stderr, recorded().get('nested'), exitingTooLong);
-  assert.equal(bystanderSurvived(), true);
-});
-
-for (const how of ['settle-cap', 'settle-retry-cap']) {
-  test(`settling that does not end within 2000 ms stops the run (${how === 'settle-cap' ? 'allowances chained' : 'with a failed scan retried'}): the cap is not restarted`, { timeout: 60000 }, async t => {
-    const { environment, recorded, bystanderSurvived } = scenario(t);
-    const result = await atExitRun(environment, how);
-    assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
-    // Five processes, each inside its own second; settling began at 100 ms, the last arrived at 2500 ms: 2400 ms waited, in all.
-    stoppedAfterEnd(result.stderr, recorded().get('adopted'),
-      'It was still exiting when the guard had waited 2400 ms after the end of the run for exiting processes to finish \\(at most 2000 ms\\); while exiting it was counted at up to \\d+ MB\\.');
-    if (how === 'settle-retry-cap') assert.match(result.stderr, /run-tests: the sampler failed \(sampler exited \(injected\)\); continuing with the one standing by/);
-    assert.equal(bystanderSurvived(), true);
-  });
-}
-
-test('a retry after the outcome is settled does not settle again: the cleanup goes on as before', { timeout: 60000 }, async t => {
-  const { environment, bystanderSurvived } = scenario(t);
-  const result = await atExitRun(environment, 'settled-retry');
-  assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stderr, /run-tests: the sampler failed \(sampler exited \(injected\)\); continuing with the one standing by/);
-  assert.doesNotMatch(result.stderr, /CANNOT READ/);
-  // On the retry: the scan after the end of the run and the cleanup's first scan, then its signal; no settling scans
-  // although a process (one the cleanup is ending) now reads as exiting.
-  assert.equal(seam(result.stderr).afterRetry, '2');
-  assert.equal(bystanderSurvived(), true);
-});
-
-for (const how of ['post-eperm', 'settle-eperm']) {
-  test(`a process whose usage is denied on ${how === 'post-eperm' ? 'the scan after the end of the run' : 'a settling scan'} stops the run the same way`, { timeout: 60000 }, async t => {
-    const { environment, recorded, bystanderSurvived } = scenario(t);
-    const result = await atExitRun(environment, how);
-    assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
-    stoppedAfterEnd(result.stderr, recorded().get('nested-child'), 'Its memory is unknown\\.');
-    assert.match(result.stderr, new RegExp(`\\(errno ${EPERM}, 1 samples in a row\\)`));
-    assert.equal(bystanderSurvived(), true);
-  });
-}
 
 test('a ps let through as the system tool and then read as killed stops the run as on the base, and the report shows each scan', { timeout: 60000 }, async t => {
   const { environment, recorded, allGone, bystanderSurvived } = scenario(t);
