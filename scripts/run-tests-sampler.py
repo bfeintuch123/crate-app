@@ -10,13 +10,17 @@ much memory it holds. libproc gives them directly:
   proc_pidinfo(PROC_PIDT_SHORTBSDINFO)    parent, process group, owners, state
   proc_pid_rusage(RUSAGE_INFO_V2)         ri_proc_start_abstime, ri_resident_size
                                           and ri_phys_footprint, which counts
-                                          compressed memory
+                                          compressed memory; and
+                                          ri_proc_exit_abstime, which only a
+                                          process that is exiting carries
   proc_pidpath                            the path of the executable, read only
                                           for a process this user started that
                                           now runs as another user (a set-uid
                                           tool such as /bin/ps), which is the
                                           one kind of process whose usage this
-                                          user may not read
+                                          user may not read; and, for a
+                                          report, for the one pid a describe
+                                          request names
 
 libproc does not describe a process that has ended and waits for its parent to
 collect it: proc_pidinfo says there is no such process, which is also what it
@@ -31,6 +35,20 @@ and reports the process as ended only when the table says so in so many words
 (state 5, awaiting collection by its parent). A record that shows the pid as
 anything else changes nothing in the row.
 
+Before that, a process is exiting: from the moment the kernel marks it dead
+(P_REF_DEAD, set in proc_prepareexit in bsd/kern/kern_exit.c, after its other
+threads are held or when its last thread ends) until proc_exit makes it a
+zombie. proc_pidinfo then also says there is no such process, and the usage
+read answers from the figures the kernel cached as the process began to exit:
+the same start time, the resident size it had then, a footprint of zero, and a
+non-zero exit time (ri_proc_exit_abstime). The kernel publishes those cached
+figures a moment before it marks the process dead, so for that moment a
+process libproc still describes reads with them as well. Before the cache
+exists, a usage read carries no exit time: the kernel sets it to zero when it
+gathers fresh figures. The row reports whether the usage read carried one
+(<exiting>); the guard decides what it means (see scripts/run-tests.js, which
+lets an exiting process of the run through for one second).
+
 It also sends the guard's signals, because a pid alone does not say which
 process will receive one: the system reuses pids. Each signal names the pid and
 the start time of the process it is meant for; the start time is read again
@@ -43,16 +61,17 @@ Protocol, one request per line on stdin, one answer on stdout.
 
   scan <id>
       begin <id> <rows>
-      <pid> <ppid> <pgid> <uid> <status> <start> <resident> <footprint> <info-errno> <usage-errno> <ruid> <path>
+      <pid> <ppid> <pgid> <uid> <status> <start> <resident> <footprint> <info-errno> <usage-errno> <ruid> <exiting> <path>
       end <id>
     Every listed pid gets a row. <uid> is the effective and <ruid> the real
     owner. <status> 5 means the process has ended and waits to be collected.
     <start> is in Mach absolute time units, <resident> and <footprint> are
     bytes. A non-zero <info-errno> means parent, group, owners and state could
     not be read (they are 0); a non-zero <usage-errno> means start time and
-    memory could not be read (they are 0). <path> is the percent-encoded path
-    of the executable where it was read and could be read, and "-" everywhere
-    else. Nothing is left out or guessed, and what the sampler does with these
+    memory could not be read (they are 0). <exiting> is 1 when the usage read
+    succeeded and carried an exit time, and 0 otherwise. <path> is the
+    percent-encoded path of the executable where it was read and could be
+    read, and "-" everywhere else. Nothing is left out or guessed, and what the sampler does with these
     facts is nothing: the guard decides.
 
     A row is one reading, made of separate reads in a fixed order: parent,
@@ -84,6 +103,23 @@ Protocol, one request per line on stdin, one answer on stdout.
   group <id> <NAME> <pgid> <pid>:<start>
       signalled <id> <result>
     Signals process group <pgid> if <pid>, with that start time, is in it now.
+
+  describe <id> <pid>
+      described <id> <listed> <info-errno> <usage-errno> <record> <path> <numer>/<denom>
+    For a report, never for a decision: what the system says of one pid right
+    now. <listed> is 1 or 0 for whether proc_listallpids lists it ("-" if the
+    list cannot be read); <info-errno> and <usage-errno> are those of the two
+    reads a scan makes; <record> is "<ppid>,<pgid>,<uid>,<ruid>,<status>" from
+    the process table, "-" when the table answered and has no record of that
+    pid, and "?" when no record could be read or it was not whole or not that
+    pid's; <path> is the
+    percent-encoded executable path, read for any process here, or "-"; and
+    <numer>/<denom> is mach_timebase_info, which converts the start times in
+    scan rows to nanoseconds ("0/0" if it cannot be read). Nothing else of the
+    process is read: no arguments, no environment.
+
+  A <pid> or <pgid> in a request must be greater than 1 and fit the system's
+  pid type (at most 2147483647); anything else is not understood.
 
   <NAME> is STOP, CONT, KILL, TERM, INT or HUP. A <result> is
     sent        the start time matched and the signal was sent
@@ -177,6 +213,11 @@ class RusageInfoV2(ctypes.Structure):
         ("ri_diskio_bytesread", ctypes.c_uint64),
         ("ri_diskio_byteswritten", ctypes.c_uint64),
     ]
+
+
+class TimebaseInfo(ctypes.Structure):
+    # struct mach_timebase_info, <mach/mach_time.h>
+    _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
 
 
 class Sampler:
@@ -283,10 +324,11 @@ class Sampler:
             info = self.info
             ppid, pgid, effective_uid, real_uid, status = info.pbsi_ppid, info.pbsi_pgid, info.pbsi_uid, info.pbsi_ruid, info.pbsi_status
         usage_errno = self.read_usage(pid)
-        start = resident = footprint = 0
+        start = resident = footprint = exiting = 0
         if not usage_errno:
             usage = self.usage
             start, resident, footprint = usage.ri_proc_start_abstime, usage.ri_resident_size, usage.ri_phys_footprint
+            exiting = 1 if usage.ri_proc_exit_abstime else 0
         # Not there for libproc, while usage answers or is denied: ended, or
         # something else. The process table is asked last, so that "ended" is
         # the latest thing this row knows about the pid, and it is believed
@@ -298,8 +340,8 @@ class Sampler:
                 ppid, pgid, effective_uid, real_uid, status = record
         denied = usage_errno == errno.EPERM and not info_errno and status != ENDED and real_uid == self.uid
         path = self.read_path(pid) if denied and effective_uid != self.uid else "-"
-        row = "%d %d %d %d %d %d %d %d %d %d %d %s" % (
-            pid, ppid, pgid, effective_uid, status, start, resident, footprint, info_errno, usage_errno, real_uid, path)
+        row = "%d %d %d %d %d %d %d %d %d %d %d %d %s" % (
+            pid, ppid, pgid, effective_uid, status, start, resident, footprint, info_errno, usage_errno, real_uid, exiting, path)
         return row, denied and ppid != self.guard
 
     def settle(self, readings):
@@ -340,6 +382,38 @@ class Sampler:
         readings = [[pid, *self.read_row(pid)] for pid in self.list_pids()]
         self.settle(readings)
         return [row for _, row, _ in readings]
+
+    def describe(self, pid):
+        """One line of facts about <pid> for a report; see the protocol above."""
+        try:
+            listed = "1" if pid in self.list_pids() else "0"
+        except OSError:
+            listed = "-"
+        info_errno = self.read_info(pid)
+        usage_errno = self.read_usage(pid)
+        record = self.describe_record(pid)
+        path = self.read_path(pid)
+        timebase = TimebaseInfo()
+        self.libc.mach_timebase_info.argtypes = [ctypes.POINTER(TimebaseInfo)]
+        self.libc.mach_timebase_info.restype = ctypes.c_int
+        if self.libc.mach_timebase_info(ctypes.byref(timebase)) != 0:
+            timebase = TimebaseInfo(0, 0)
+        return "%s %d %d %s %s %d/%d" % (listed, info_errno, usage_errno, record, path, timebase.numer, timebase.denom)
+
+    def describe_record(self, pid):
+        """The process table's record of <pid> as text for describe: the five
+        values read_record gives, "-" when the call succeeds and reports no
+        record, "?" for anything else (a failed call, a part of a record, or
+        the record of another pid)."""
+        name = (ctypes.c_int * 4)(*SYSCTL_PROCESS, pid)
+        record = ctypes.create_string_buffer(KINFO_PROC_SIZE)
+        size = ctypes.c_size_t(KINFO_PROC_SIZE)
+        if self.libc.sysctl(name, 4, record, ctypes.byref(size), None, 0) != 0:
+            return "?"
+        if size.value == 0:
+            return "-"
+        values = self.read_record(pid)
+        return ",".join(str(value) for value in values) if values else "?"
 
     def check(self, pid, start):
         """None when <pid> is the process that started at <start>, else why not."""
@@ -386,26 +460,37 @@ class Sampler:
         return "sent"
 
 
+# The largest pid the system's pid type can hold. libproc takes a C int, so a
+# larger number would arrive as another pid.
+MAX_PID = 2147483647
+
+
+def parse_pid(text):
+    if not text.isdigit() or not 1 < int(text) <= MAX_PID:
+        raise ValueError(text)
+    return int(text)
+
+
 def parse_target(text):
     pid, separator, start = text.partition(":")
-    if not separator or not pid.isdigit() or not start.isdigit() or int(pid) <= 1:
+    if not separator or not start.isdigit():
         raise ValueError(text)
-    return int(pid), start
+    return parse_pid(pid), start
 
 
 def answer(sampler, words):
     if len(words) == 2 and words[0] == "scan" and words[1].isdigit():
         rows = sampler.scan()
         return "begin %s %d\n%s%send %s\n" % (words[1], len(rows), "\n".join(rows), "\n" if rows else "", words[1])
+    if len(words) == 3 and words[0] == "describe" and words[1].isdigit():
+        return "described %s %s\n" % (words[1], sampler.describe(parse_pid(words[2])))
     if len(words) >= 4 and words[0] == "signal" and words[1].isdigit() and words[2] in SIGNALS:
         targets = [parse_target(word) for word in words[3:]]
         results = [sampler.signal_process(pid, start, SIGNALS[words[2]]) for pid, start in targets]
         return "signalled %s %s\n" % (words[1], " ".join(results))
-    if len(words) == 5 and words[0] == "group" and words[1].isdigit() and words[2] in SIGNALS and words[3].isdigit():
+    if len(words) == 5 and words[0] == "group" and words[1].isdigit() and words[2] in SIGNALS:
         pid, start = parse_target(words[4])
-        if int(words[3]) <= 1:
-            raise ValueError(words[3])
-        return "signalled %s %s\n" % (words[1], sampler.signal_group(int(words[3]), pid, start, SIGNALS[words[2]]))
+        return "signalled %s %s\n" % (words[1], sampler.signal_group(parse_pid(words[3]), pid, start, SIGNALS[words[2]]))
     raise ValueError(" ".join(words))
 
 

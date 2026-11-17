@@ -45,7 +45,8 @@ def scripted(scenario):
       "script": {pid: [step, ...]}       the answers for that pid, in the order they are asked for
     }
     A step is ["info", errno, [ppid, pgid, uid, ruid, status]], ["usage", errno,
-    [start, resident, footprint]], ["path", text] or ["record", null or
+    [start, resident, footprint] or [start, resident, footprint, exit time]],
+    ["path", text] or ["record", null or
     [ppid, pgid, uid, ruid, status]]. A read the script did not expect next is
     an error, and so is a step that is never asked for.
     """
@@ -79,9 +80,10 @@ def scripted(scenario):
         answer = step(pid, "usage")
         usage = sampler.usage
         if answer is None or answer[1]:
-            usage.ri_proc_start_abstime = usage.ri_resident_size = usage.ri_phys_footprint = STALE
+            usage.ri_proc_start_abstime = usage.ri_resident_size = usage.ri_phys_footprint = usage.ri_proc_exit_abstime = STALE
             return answer[1] if answer else errno.EIO
-        usage.ri_proc_start_abstime, usage.ri_resident_size, usage.ri_phys_footprint = answer[2]
+        # A successful read fills the whole structure, the exit time included (0 unless the script gives one).
+        usage.ri_proc_start_abstime, usage.ri_resident_size, usage.ri_phys_footprint, usage.ri_proc_exit_abstime = (list(answer[2]) + [0])[:4]
         return 0
 
     def read_path(pid):
