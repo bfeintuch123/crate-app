@@ -128,6 +128,11 @@ contextBridge.exposeInMainWorld('crate', {
     ipcRenderer.on('existing-assets:review', listener);
     return () => ipcRenderer.removeListener('existing-assets:review', listener);
   },
+  onNeedsSaveReview: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('needs-save:review', listener);
+    return () => ipcRenderer.removeListener('needs-save:review', listener);
+  },
   onPackageTrigger: (callback) => {
     ipcRenderer.on('package:trigger', (event, data) => callback(data));
   },

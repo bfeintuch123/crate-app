@@ -4625,6 +4625,7 @@ function renderSettingsControls() {
   $('#input-naming-template').value = state.settings.namingTemplate || DEFAULT_NAMING_TEMPLATE;
   $('#toggle-notifications').checked = state.settings.notifications || false;
   $('#toggle-existing-assets-notifications').checked = state.settings.existingAssetsNotifications !== false;
+  $('#toggle-needs-save-notifications').checked = state.settings.needsSaveNotifications !== false;
   $('#toggle-diagnostic-report').checked = state.settings.includeDiagnosticReport === true;
   $('#toggle-package-details').checked = state.settings.showPackageDetails !== false;
   $('#toggle-package-folders').checked = getPackageOutputLayoutMode() === PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION;
@@ -6836,6 +6837,12 @@ function setupEventListeners() {
     state.settings = settings || { ...state.settings, existingAssetsNotifications: checked };
   });
 
+  $('#toggle-needs-save-notifications').addEventListener('change', async () => {
+    const checked = $('#toggle-needs-save-notifications').checked;
+    const settings = await window.crate.updateSetting('needsSaveNotifications', checked);
+    state.settings = settings || { ...state.settings, needsSaveNotifications: checked };
+  });
+
   $('#toggle-diagnostic-report').addEventListener('change', () => {
     const checked = $('#toggle-diagnostic-report').checked;
     window.crate.updateSetting('includeDiagnosticReport', checked);
@@ -7241,6 +7248,39 @@ function setupMainProcessListeners() {
       setSelectedProject(project.id, { invalidate: true, restoreFocus: false });
       const selectionIntent = projectSelectionIntentEpoch;
       await switchTab('current-project', { isCurrent: () => selectionIntent === projectSelectionIntentEpoch });
+    } catch (_) {
+      // Stale account/project navigation leaves the current interaction intact.
+    }
+  });
+  window.crate.onNeedsSaveReview?.(async (data) => {
+    if (!data || typeof data.projectId !== 'string' || !accountStatus.canUseWorkspace) return;
+    // A notice click opens Review Assets for its project, but never takes over
+    // an add-files operation or an open dialog, and never changes any row.
+    const canNavigate = () => !activeAddFilesOperation && !hasModalInteraction();
+    if (!canNavigate()) return;
+    const read = captureProjectListRead();
+    const intent = ++projectSelectionIntentEpoch;
+    const tabIntent = tabNavigationEpoch;
+    try {
+      const projects = await getAccountCurrentProjects();
+      if (!projectListReadIsCurrent(read) || intent !== projectSelectionIntentEpoch ||
+          tabIntent !== tabNavigationEpoch || !canNavigate()) return;
+      const project = projects.find(item => item.id === data.projectId);
+      if (!project || !getNeedsSaveFiles(getVisiblePendingAssetEntries(project).map(entry => entry.rawFile)).length) return;
+      state.projects = projects;
+      setSelectedProject(project.id, { invalidate: true, restoreFocus: false });
+      const selectionIntent = projectSelectionIntentEpoch;
+      const isCurrent = () => selectionIntent === projectSelectionIntentEpoch;
+      const navigation = switchTab('current-project', { isCurrent });
+      const navigationEpoch = tabNavigationEpoch;
+      await navigation;
+      // Anything may have changed while the project rendered: a newer tab or
+      // project choice, the account, a dialog, or the last Needs Save row saving.
+      const current = state.projects.find(item => item.id === project.id);
+      if (!isCurrent() || navigationEpoch !== tabNavigationEpoch || state.selectedProjectId !== project.id ||
+          !accountStatus.canUseWorkspace || !canNavigate() || !current ||
+          !getNeedsSaveFiles(getVisiblePendingAssetEntries(current).map(entry => entry.rawFile)).length) return;
+      openAssetReviewWorkspace();
     } catch (_) {
       // Stale account/project navigation leaves the current interaction intact.
     }
