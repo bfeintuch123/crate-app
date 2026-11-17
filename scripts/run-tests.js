@@ -89,8 +89,11 @@
 // progress at that moment, plus the delay of the guard's own timers; with the
 // sampler stalled, that scan fails at its request timeout (1000 ms after it was
 // sent), and the stop follows at the top of the next pass, at most 2050 ms plus
-// timer delay in all, unless the sampler has ended, when the blind rule stops
-// the run at once as before. The blind limit cannot come first then: the last
+// timer delay in all (at once, without the pause, when the end of the run or a
+// signal is seen there); and when it is the scan after the end of the run that
+// fails, the sampler standing by takes that scan over at once and the stop
+// comes with it, at most 2000 ms plus that one scan. Unless the sampler has
+// ended, when the blind rule stops the run at once as before. The blind limit cannot come first then: the last
 // good scan is the first exiting one or later. Neither the request timeout,
 // the blind limit nor the pause between scans is changed by this.
 // A process whose usage is denied gets no allowance. All of that also holds
