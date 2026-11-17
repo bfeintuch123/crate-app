@@ -1688,6 +1688,62 @@ test('hand-off: a retry of the cleanup after the first successful scan runs with
   assert.equal(bystanderSurvived(), true);
 });
 
+test('hand-off: a retry after it, still showing the process exiting past its second, does not judge the allowance; gone later, the run keeps its own status', { timeout: 60000 }, async t => {
+  const { environment, bystanderSurvived } = scenario(t);
+  const result = await handOff(environment, 'handoff-retry-still');
+  assert.match(result.stdout, /^# pass 1$/m);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stderr, /run-tests: the sampler failed \(sampler exited \(injected\)\); continuing with the one standing by/);
+  assert.doesNotMatch(result.stderr, /CANNOT READ|INCOMPLETE/);
+  assert.equal(seam(result.stderr).injected, 'the scan after the end of the run at 500 ms, still exiting, '
+    + 'the cleanup\'s first scan failed as a sampler that ends does, a later scan at 1100 ms, still exiting');
+  assert.equal(bystanderSurvived(), true);
+});
+
+test('hand-off: a retry after it, and the process never goes away: 125 through the cleanup, not through the allowance', { timeout: 60000 }, async t => {
+  const { environment, recorded, bystanderSurvived } = scenario(t);
+  const result = await handOff(environment, 'handoff-retry-stays');
+  assert.match(result.stdout, /^# pass 1$/m);
+  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+  assert.doesNotMatch(result.stderr, /CANNOT READ|had been exiting/);
+  assert.match(result.stderr, new RegExp(`run-tests: CLEANUP INCOMPLETE: 1 processes of the run were still there [\\d.]+ s after SIGKILL: ${recorded().get('nested')}\\.\\n`));
+  assert.match(result.stderr, /run-tests: Exit status 125 replaces 0\.\nrun-tests: Not every process of the run is confirmed to have ended\./);
+  assert.equal(bystanderSurvived(), true);
+});
+
+test('hand-off: a retry after it that shows another process whose usage is denied stops the run, as the base does on that retry', { timeout: 60000 }, async t => {
+  const { environment, recorded, bystanderSurvived } = scenario(t);
+  const result = await handOff(environment, 'handoff-retry-eperm');
+  assert.match(result.stdout, /^# pass 1$/m);
+  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+  // The base re-judges the retried scan with readFailure() for its own rules; so does this guard.
+  assert.match(result.stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${recorded().get('nested-child')} OF THE RUN after [\\d.]+ s \\(errno ${EPERM}, 1 samples in a row\\)\\. Its memory is unknown\\.\\n`
+    + 'run-tests: The test run had ended by then, with exit status 0\\. Exit status 125 replaces it\\.\\n'));
+  assert.doesNotMatch(result.stderr, /had been exiting/);
+  assert.equal(bystanderSurvived(), true);
+});
+
+test('after the end of the run, a retry of the cleanup that shows a process whose usage is denied stops the run (the base\'s behaviour on that retry)', { timeout: 60000 }, async t => {
+  const { environment, recorded, bystanderSurvived } = scenario(t);
+  const result = await handOff(environment, 'retry-eperm');
+  assert.match(result.stdout, /^# pass 1$/m);
+  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+  assert.match(result.stderr, /run-tests: the sampler failed \(sampler exited \(injected\)\); continuing with the one standing by/);
+  assert.match(result.stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${recorded().get('nested-child')} OF THE RUN after [\\d.]+ s \\(errno ${EPERM}, 1 samples in a row\\)\\. Its memory is unknown\\.\\n`
+    + 'run-tests: The test run had ended by then, with exit status 0\\. Exit status 125 replaces it\\.\\n'));
+  assert.equal(bystanderSurvived(), true);
+});
+
+test('before the hand-off: a failed scan after the end of the run whose retry still shows the process exiting past its second ends it 125', { timeout: 60000 }, async t => {
+  const { environment, recorded, bystanderSurvived } = scenario(t);
+  const result = await startGuard([descendants], { ...environment('short'), CRATE_GUARD_FAULT: 'exiting-at-exit:nested', CRATE_GUARD_POST: 'retry', CRATE_GUARD_LATE: 'exiting' }, faultyGuard).done;
+  assert.match(result.stdout, /^# pass 1$/m);
+  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+  assert.match(result.stderr, /run-tests: the sampler failed \(sampler exited \(injected\)\); continuing with the one standing by/);
+  endedThen(recorded().get('nested'), result.stderr);
+  assert.equal(bystanderSurvived(), true);
+});
+
 test('hand-off: with no process exiting at the end of the run, the scan after it and then the cleanup, as on the base', { timeout: 60000 }, async t => {
   const { environment, bystanderSurvived } = scenario(t);
   const result = await handOff(environment, 'none');

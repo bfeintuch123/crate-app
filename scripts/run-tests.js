@@ -89,7 +89,11 @@
 // cleanup: SIGTERM, the leftover grace (TIMING.leftoverGraceMs, 2000 ms), then
 // stopRun, and exit 125 unless every process is confirmed to have ended; when
 // it is confirmed gone, the run's own status is kept. A retry of the cleanup by
-// withSight after that scan runs with judging off. In that one case a dying
+// withSight after that scan runs with judging off: its scan is applied as it
+// comes and is not checked against any exiting allowance, while readFailure()
+// still checks it for the base's other rules (a process whose usage is denied,
+// or one answering "no such process" to both reads for too long), as the base
+// does on such a retry. In that one case a dying
 // process can outlast its second, by roughly the leftover grace and the
 // kill-and-confirm window (about eight seconds in all), while the run still
 // reports its own result, and its memory is not judged meanwhile, exactly as
@@ -816,8 +820,11 @@ function createOwnership({ guardPid, guardUid, helperPids = [], runnerPid, now =
     readFailure() {
       if (runnerProblem) return { pid: runnerPid, ...runnerProblem };
       for (const [pid, entry] of unread) {
-        // Exiting for longer than allowed, whatever this scan shows of it.
-        const stop = lapsed(pid, entry, latestTime);
+        // Exiting for longer than allowed, whatever this scan shows of it;
+        // judged only until the hand-off (endJudging()). After it, a process
+        // still exiting is a leftover for the cleanup, and only the rules
+        // below, the base's, are judged here.
+        const stop = judging ? lapsed(pid, entry, latestTime) : null;
         if (stop) return stop;
         if (entry.allowed || entry.exiting) continue;
         if (entry.errno !== ESRCH || entry.ending > UNREADABLE_SAMPLES) return { pid, problem: 'unreadable', errno: entry.errno, samples: entry.samples };

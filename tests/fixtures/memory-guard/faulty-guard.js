@@ -44,7 +44,14 @@
 //                                                  on, still exiting; every later scan 1100 ms on, not listing it),
 //                                                  handoff-stays (the same, but every later scan still lists it as exiting,
 //                                                  whether or not it is there), handoff-retry (as handoff-gone, with the
-//                                                  cleanup's first scan failing as a sampler that ends does), none (no
+//                                                  cleanup's first scan failing as a sampler that ends does),
+//                                                  handoff-retry-still (as handoff-retry, but the retried scan still shows it
+//                                                  exiting; the scans after that do not list it), handoff-retry-stays (the
+//                                                  retried scan and every later one list it as exiting, there or not),
+//                                                  handoff-retry-eperm (the retried scan shows it still exiting and
+//                                                  nested-child with its usage denied), retry-eperm (no process is shown
+//                                                  exiting; the cleanup's first scan fails as a sampler that ends does, and the
+//                                                  retried scan shows nested-child with its usage denied), none (no
 //                                                  process is ever shown exiting). At exit it prints how many scans the
 //                                                  guard took after the end of the run before its first signal, and what
 //                                                  it injected
@@ -107,6 +114,7 @@ const shownAs = (rows, target) => {
   const how = process.env.CRATE_GUARD_LATE;
   if (how === 'gone') return rows.filter(row => row.pid !== target);
   if (how === 'ended') return rows.map(row => (row.pid === target ? { ...row, status: guard.ZOMBIE, megabytes: 0, footprint: 0, exiting: true } : row));
+  if (how === 'exiting') return rows.map(row => (row.pid === target ? exitingRow(row) : row));
   return rows;
 };
 // The row the sampler writes for a set-uid process that is exiting (see the sampler).
@@ -249,7 +257,7 @@ async function atExit(number, rows) {
   const collected = pid => { try { process.kill(pid, 0); return false; } catch { return true; } };
   const runnerRunning = runner !== undefined && !collected(runner.pid);
   if (runnerRunning || afterExit === 0) {
-    if (how === 'none') {
+    if (how === 'none' || how === 'retry-eperm') {
       if (!runnerRunning) afterExit = 1;
       return rows;
     }
@@ -267,9 +275,24 @@ async function atExit(number, rows) {
   afterExit += 1;
   if (!signalled) scansBeforeSignal += 1;
   if (how === 'none') return rows;
-  if (how === 'handoff-gone' || how === 'handoff-stays' || how === 'handoff-retry') {
+  if (how === 'retry-eperm') {
     const first = !postDelivered;
-    if (how === 'handoff-retry' && number === 1 && !first) {
+    if (number === 1 && !first) {
+      deadSamplers.add(number);
+      injected.push('the cleanup\'s first scan failed as a sampler that ends does');
+      throw new Error('sampler exited (injected)');
+    }
+    postDelivered = true;
+    if (!first && !injected.includes('nested-child with its usage denied')) {
+      injected.push('nested-child with its usage denied');
+      const other = recorded().get('nested-child');
+      return rows.map(row => (row.pid === other ? cannotRead(row) : row));
+    }
+    return rows;
+  }
+  if (how.startsWith('handoff-')) {
+    const first = !postDelivered;
+    if (how.startsWith('handoff-retry') && number === 1 && !first) {
       deadSamplers.add(number);
       injected.push('the cleanup\'s first scan failed as a sampler that ends does');
       throw new Error('sampler exited (injected)');
@@ -283,11 +306,20 @@ async function atExit(number, rows) {
       if (shown) lastTargetRow = exitingRow(shown);
       return rows.map(row => (row.pid === target ? exitingRow(row) : row));
     }
-    if (start === fixed && fixed !== null && !injected.some(item => item.startsWith('a later scan'))) {
+    const later = !injected.some(item => item.startsWith('a later scan'));
+    if (start === fixed && fixed !== null && later) {
       fixed += 600;
-      injected.push('a later scan at 1100 ms');
+      injected.push(`a later scan at 1100 ms${how === 'handoff-retry-still' || how === 'handoff-retry-eperm' ? ', still exiting' : ''}`);
     }
-    if (how === 'handoff-stays' && lastTargetRow) {
+    // The retried scan (the first one after the injected failure).
+    if (later && lastTargetRow && (how === 'handoff-retry-still' || how === 'handoff-retry-eperm')) {
+      const shown = [...rows.filter(row => row.pid !== target), lastTargetRow];
+      if (how === 'handoff-retry-still') return shown;
+      const other = recorded().get('nested-child');
+      injected.push('nested-child with its usage denied');
+      return shown.map(row => (row.pid === other ? cannotRead(row) : row));
+    }
+    if ((how === 'handoff-stays' || how === 'handoff-retry-stays') && lastTargetRow) {
       // Listed as exiting for as long as the guard asks, there or not.
       return [...rows.filter(row => row.pid !== target), lastTargetRow];
     }
