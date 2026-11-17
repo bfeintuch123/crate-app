@@ -624,6 +624,16 @@ function resetVirtualAssetList(list) {
   list.scrollTop = 0;
 }
 
+// The dashboard banner names files from the project it was rendered for.
+function resetProjectReviewBanner() {
+  const reviewEyebrow = $('#project-review-eyebrow');
+  if (reviewEyebrow) reviewEyebrow.textContent = 'Project assets';
+  const reviewAlert = $('#project-linking-alert');
+  if (reviewAlert) reviewAlert.textContent = '';
+  const reviewDetail = $('#project-review-detail');
+  if (reviewDetail) reviewDetail.textContent = '';
+}
+
 function setAssetReviewProject(projectId) {
   if (state.assetReviewProjectId === projectId) return;
   state.assetReviewProjectId = projectId;
@@ -631,6 +641,10 @@ function setAssetReviewProject(projectId) {
   reconcileCurrentAssetReviewBatchControls();
   state.assetReviewSelectedKey = null;
   state.assetReviewLogicalItems = { working: [], existing: [], added: [], missing: [] };
+  // Never show the previous project's save instruction or review banner
+  // while the next loads.
+  renderNeedsSaveAlert([]);
+  resetProjectReviewBanner();
   for (const id of ['project-file-list', 'working-assets-list', 'existing-assets-list', 'added-assets-list', 'pending-file-list', 'recent-assets-list']) {
     const list = $(`#${id}`);
     if (!list) continue;
@@ -2108,7 +2122,11 @@ function updateAssetReviewBatchControls(project, existingAssets, includedExistin
       if (pendingCandidates.length > 0 && eligiblePendingCount === 0) {
         message = 'Crate cannot identify which files to update. Include All and Exclude All are unavailable.';
       } else if (eligiblePendingCount > 0 && eligiblePendingCount < visiblePending.length) {
-        message = 'Include All and Exclude All apply only to eligible review items. Other items stay unchanged.';
+        // With Needs Save rows present, the Needs Save alert explains those rows,
+        // so this line names the rows the buttons act on by their visible label.
+        message = getNeedsSaveFiles(visiblePending).length
+          ? 'Include All and Exclude All apply only to rows marked Include or Exclude.'
+          : 'Include All and Exclude All apply only to eligible review items. Other items stay unchanged.';
       }
     } else if (existingAssets.length === 0) message = 'No existing assets.';
     else if (includedExistingCount === existingAssets.length) message = 'All existing assets are already included.';
@@ -3832,6 +3850,15 @@ function applyAssetReviewFilter() {
       pending.classList.toggle('filtered-out', !['all', 'missing'].includes(filter) || visiblePendingCount === 0);
     }
   }
+  // The alert describes the Needs Save rows that the search leaves visible.
+  // Filters other than All and Needs Review hide it with its section, without
+  // changing its text, so switching filters is not announced. It waits for the
+  // selected project's workspace: after an account change the retained rows
+  // belong to the previous account until the workspace reloads.
+  const workspaceCurrent = !!state.selectedProjectId && state.assetWorkspace?.projectId === state.selectedProjectId;
+  renderNeedsSaveAlert(workspaceCurrent ? (Array.isArray(logicalItems.missing) ? logicalItems.missing : []).filter(file => (
+    file.excluded !== true && (!query || getAssetReviewSearchText(file).includes(query))
+  )) : []);
   const visibleHierarchyCount = renderAssetReviewHierarchy(filterItems);
   const emptyAdded = (logicalItems.added || []).length === 0;
   const excludedCount = [...(logicalItems.working || []), ...(logicalItems.existing || []), ...(logicalItems.added || [])]
@@ -3888,12 +3915,20 @@ function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets,
     alert.textContent = first ? `${first.name || 'Untitled file'}${pendingFiles.length > 1 ? ` + ${pendingFiles.length - 1} more` : ''}` : 'Review project assets';
     const detail = $('#project-review-detail');
     const eyebrow = $('#project-review-eyebrow');
-    if (eyebrow) eyebrow.textContent = pendingFiles.length
-      ? `${pendingFiles.length} file${pendingFiles.length === 1 ? ' needs' : 's need'} review`
-      : blocked ? 'Package needs review' : 'Project assets';
-    if (detail) detail.textContent = first
-      ? `${getPendingCaptureState(first) === 'observed' ? 'Opened · Pending' : getPendingFileReason(first).replace(/\.$/, '')} · Not in the package`
-      : '';
+    // When every row needs a save, say so and give the same sentence as the
+    // Review Assets alert. Mixed lists keep the general review wording.
+    const needsSave = getNeedsSaveFiles(pendingFiles);
+    const allNeedSave = pendingFiles.length > 0 && needsSave.length === pendingFiles.length;
+    if (eyebrow) eyebrow.textContent = allNeedSave
+      ? `${pendingFiles.length} asset${pendingFiles.length === 1 ? ' needs' : 's need'} save`
+      : pendingFiles.length
+        ? `${pendingFiles.length} file${pendingFiles.length === 1 ? ' needs' : 's need'} review`
+        : blocked ? 'Package needs review' : 'Project assets';
+    if (detail) detail.textContent = allNeedSave
+      ? getNeedsSaveSentence(needsSave, { pronoun: true })
+      : first
+        ? `${getPendingCaptureState(first) === 'observed' ? 'Opened · Pending' : getPendingFileReason(first).replace(/\.$/, '')} · Not in the package`
+        : '';
     alert.classList.remove('hidden');
     $('.project-review-entry')?.classList.toggle('is-clear', !pendingFiles.length && !blocked);
   }
@@ -4262,6 +4297,82 @@ function getPendingFileReason(file) {
   return appLabel ? `Found in ${appLabel}. Crate isn’t sure it belongs.` : 'Crate isn’t sure it belongs.';
 }
 
+// ===== Needs Save summary =====
+// One sentence shared by the Review Assets alert, the dashboard banner and
+// Package Review. It uses only what each Needs Save row already shows: the
+// sanitized source name and the app label. Rows without a source name count
+// as one more file, so the sentence never names only part of what to save.
+function getNeedsSaveFiles(files) {
+  return (Array.isArray(files) ? files : []).filter(file => getPendingCaptureState(file) === 'needs-save');
+}
+
+// A working file with unsaved changes is listed as its own Needs Save row next
+// to its new linked assets. It is the file to save, not a linked asset.
+function isNeedsSaveWorkingFile(file) {
+  return file?.captureReason === 'unsaved-source-needs-save' ||
+    file?.captureEvidence?.reason === 'unsaved-source-needs-save';
+}
+
+function getNeedsSaveTarget(needsSaveFiles) {
+  const names = [];
+  let unnamed = false;
+  for (const file of needsSaveFiles) {
+    const name = sanitizeRendererSourceName(file?.captureEvidence?.sourceName) ||
+      (isNeedsSaveWorkingFile(file) ? sanitizeRendererSourceName(file?.name) : null);
+    if (!name) unnamed = true;
+    else if (!names.includes(name)) names.push(name);
+  }
+  const apps = [...new Set(needsSaveFiles.map(getPendingAppLabel).filter(Boolean))];
+  const app = apps.length === 1 && !needsSaveFiles.some(file => !getPendingAppLabel(file)) ? apps[0] : null;
+  const others = names.length - 1 + (unnamed ? 1 : 0);
+  if (names.length && others > 0) return `${names[0]} and ${others} other file${others === 1 ? '' : 's'}`;
+  if (names.length) return app ? `${names[0]} in ${app}` : names[0];
+  if (app) return `your file in ${app}`;
+  // Rows from more than one app (known or not) are more than one file.
+  const unknownApp = needsSaveFiles.some(file => !getPendingAppLabel(file));
+  return apps.length > 1 || (apps.length === 1 && unknownApp) ? 'your working files' : 'your working file';
+}
+
+// The banner's pronoun follows its "N assets need save" row count. The alert
+// counts linked assets only; when only working files need saving it says "it"
+// or "them".
+function getNeedsSaveSentence(needsSaveFiles, { pronoun = false } = {}) {
+  const linked = needsSaveFiles.filter(file => !isNeedsSaveWorkingFile(file)).length;
+  const count = pronoun || linked === 0 ? needsSaveFiles.length : linked;
+  const assets = pronoun || linked === 0
+    ? (count === 1 ? 'it' : 'them')
+    : (count === 1 ? 'this linked asset' : `these ${count} linked assets`);
+  return `Save ${getNeedsSaveTarget(needsSaveFiles)} to add ${assets} to the package.`;
+}
+
+function fillNeedsSaveReminder(element, copy) {
+  element.replaceChildren();
+  if (!copy) return;
+  const title = document.createElement('span');
+  title.className = 'modal-reminder-title';
+  title.textContent = 'Needs Save';
+  const body = document.createElement('span');
+  body.className = 'modal-reminder-copy';
+  body.textContent = copy;
+  element.appendChild(title);
+  element.appendChild(body);
+}
+
+// The Review Assets alert is a persistent polite live region. Its content is
+// rewritten only when the sentence changes, so an unchanged re-render is not
+// announced again.
+function renderNeedsSaveAlert(visiblePendingFiles) {
+  const element = $('#needs-save-alert');
+  if (!element) return;
+  const needsSave = getNeedsSaveFiles(visiblePendingFiles);
+  const copy = needsSave.length ? getNeedsSaveSentence(needsSave) : '';
+  if (element.dataset.needsSaveCopy === copy) return;
+  element.dataset.needsSaveCopy = copy;
+  element.classList.toggle('modal-reminder', !!copy);
+  element.classList.toggle('is-thin', !!copy);
+  fillNeedsSaveReminder(element, copy);
+}
+
 function createFileRow(file) {
   const project = state.projects.find(item => item.id === state.selectedProjectId) || {
     id: state.selectedProjectId,
@@ -4455,6 +4566,10 @@ function acceptAccountSnapshot(snapshot) {
     assetWorkspaceRequestGeneration += 1;
     assetWorkspaceRequestId += 1;
     state.assetWorkspace = null;
+    // The previous account's save instruction and banner name its files:
+    // retire them too.
+    renderNeedsSaveAlert([]);
+    resetProjectReviewBanner();
     notificationPackageTriggerId += 1;
     notificationPackageTriggerInFlight = false;
     setSelectedProject(state.selectedProjectId, { invalidate: true, restoreFocus: false });
@@ -5986,6 +6101,27 @@ function renderPackageReview(project, review, message = '', suppliedLease = null
   const presentationReminder = $('#modal-presentation-reminder');
   if (presentationReminder) {
     presentationReminder.classList.toggle('hidden', !isPresentationWorkflow(project));
+  }
+  // Needs Save rows are never part of the package, so Package Review says
+  // which linked assets this package leaves out. Packaging stays allowed.
+  // Reviews that still need a working-file choice can't be packaged and may
+  // be rendered before the project is refreshed, so they don't show it.
+  const needsSaveReminder = $('#modal-needs-save-reminder');
+  const confirmForReminder = $('#btn-confirm-package');
+  if (needsSaveReminder) {
+    // Callers can hold a project captured before the pre-scan and review
+    // preparation; read the current rows so a save in between is reflected.
+    const currentProject = state.projects.find(item => item.id === project.id) || project;
+    const needsSave = canPackage
+      ? getNeedsSaveFiles(getVisiblePendingAssetEntries(currentProject).map(entry => entry.rawFile))
+      : [];
+    const copy = needsSave.length ? getNeedsSaveSentence(needsSave) : '';
+    fillNeedsSaveReminder(needsSaveReminder, copy);
+    needsSaveReminder.classList.toggle('hidden', !copy);
+    if (confirmForReminder) {
+      if (copy) confirmForReminder.setAttribute('aria-describedby', 'modal-needs-save-reminder');
+      else confirmForReminder.removeAttribute('aria-describedby');
+    }
   }
   const reviewMessage = $('#modal-package-review-message');
   if (reviewMessage) {
