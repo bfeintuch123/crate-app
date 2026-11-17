@@ -229,6 +229,9 @@ function initializeAccountSession() {
     const identityChanged = accountWorkspaceId !== snapshot.identity?.id;
     const generationChanged = accountWorkspaceGeneration !== accountSession.generation;
     if (!allowed || identityChanged || generationChanged) invalidateAllPackageReviews();
+    // An identity change while access had already lapsed (a sign-out, then a
+    // sign-in) skips the block below, but still ends every Assets need save episode.
+    if (identityChanged && !accountWorkspaceAllowed) closeNeedsSaveNotifications(null, { forgetSeen: true });
     if (accountWorkspaceAllowed && (!allowed || identityChanged || generationChanged)) {
       // Invalidate the existing project-operation fences before any late scan/package result.
       // Same-account cancellation can retain access while retiring its generation.
@@ -236,6 +239,8 @@ function initializeAccountSession() {
       watchingActivationSequence++;
       closeInactivityPrompts();
       closeExistingAssetsNotifications();
+      // A same-account refresh resumes the same rows: only a different account forgets them.
+      closeNeedsSaveNotifications(null, { forgetSeen: identityChanged });
       for (const project of getProjects()) stopWatching(project.id);
     }
     const resume = allowed && (!accountWorkspaceAllowed || identityChanged || generationChanged);
@@ -300,6 +305,7 @@ function registerStartupDiagnosticIpc() {
       if (phase === 'renderer-startup-data-complete') {
         existingAssetsNotificationReadyContents.add(event.sender);
         deliverExistingAssetsNotificationReview();
+        deliverNeedsSaveNotificationReview();
       }
     });
   }
@@ -8799,6 +8805,7 @@ try {
         namingTemplate: DEFAULT_NAMING_TEMPLATE,
         notifications: true,
         existingAssetsNotifications: true,
+        needsSaveNotifications: true,
         includeDiagnosticReport: false,
         showPackageDetails: true,
         packageOutputLayoutMode: PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
@@ -10505,6 +10512,7 @@ function mutateProject(projectId, fn, { persistIfChanged = false, trustResultCha
   }
   if (shouldPersist) {
     store.set('projects', projects);
+    scheduleNeedsSaveNotificationSync(projectId);
   }
   return result;
 }
@@ -11412,8 +11420,9 @@ function captureProjectOperation(projectId) {
       return baseCurrent(read) && (activationToken === null ||
         illustratorActivationScopes.get(projectId)?.revision === scopeRevision);
     },
-    // Account, status, generation and activation only. Used solely to retire an
-    // owned pending receipt as a non-success; never to publish results.
+    // Account, status, generation and activation only. Used to retire an owned
+    // pending receipt as a non-success, and to keep an "Assets need save" notice
+    // clickable while its scope gains links; never to publish results.
     currentIgnoringScope: baseCurrent,
     adoptScope(scope) {
       if (activationToken === null) return baseCurrent();
@@ -19726,6 +19735,243 @@ function notifyExistingAssetsDecision(projectId) {
   }
 }
 
+// ===== "Assets need save" notification =====
+// One notice per project per episode while linked assets wait for a working
+// file to be saved. It only reads persisted rows: it never changes capture
+// state, rows, decisions or packaging. Bryant (2026-11-16): linked assets only,
+// and only when a new linked asset arrives while Crate is in the background.
+const NEEDS_SAVE_APP_LABELS = Object.freeze({
+  illustrator: 'Illustrator',
+  photoshop: 'Photoshop',
+  indesign: 'InDesign',
+  figma: 'Figma',
+  powerpoint: 'PowerPoint',
+  presentation: 'Presentation',
+  keynote: 'Keynote',
+  sketch: 'Sketch',
+  'adobe-xd': 'Adobe XD',
+  affinity: 'Affinity',
+});
+// Entries survive dismissal so an episode notifies at most once; they are
+// withdrawn when its linked assets clear or its project, account, watching
+// activation or preference ends.
+const needsSaveNotifications = new Map();
+// Linked-asset row keys already seen per project, in the foreground or not, so
+// routine polls, focus changes and preference changes never notify by themselves.
+const needsSaveSeenLinkedKeys = new Map();
+// Projects whose current episode has already shown its one notice, even if that
+// notice was later withdrawn by a stop, refresh or setting change.
+const needsSaveEpisodesNotified = new Set();
+const needsSaveSyncQueue = new Set();
+let needsSaveSyncScheduled = false;
+let pendingNeedsSaveNotificationReview = null;
+
+function needsSaveNotificationsEnabled() {
+  const settings = store.get('settings') || {};
+  return settings.notifications === true && settings.needsSaveNotifications !== false;
+}
+
+// A working file with unsaved changes is its own Needs Save row; it is the
+// file to save, not a linked asset (same rule as the Review Assets alert).
+function isNeedsSaveWorkingFileRow(file) {
+  return file?.captureReason === 'unsaved-source-needs-save' ||
+    file?.captureEvidence?.reason === 'unsaved-source-needs-save';
+}
+
+// The linked-asset Needs Save rows the Review Assets alert counts for this
+// project: the same scoped view the renderer receives, minus remembered
+// exclusion keys. This mirrors the renderer's getVisiblePendingAssetEntries,
+// which keeps a pending row whose content matches an excluded asset, so the
+// notice and the alert always count the same linked assets.
+function getNeedsSaveLinkedRows(project) {
+  const view = project ? getIllustratorScopedProjectView(project) : null;
+  if (!view) return [];
+  const excluded = new Set(Array.isArray(view.excludedAssetKeys) ? view.excludedAssetKeys : []);
+  return (Array.isArray(view.pendingFiles) ? view.pendingFiles : []).filter(file => (
+    file && file.captureState === 'needs-save' && !isNeedsSaveWorkingFileRow(file) &&
+    !excluded.has(getAssetReviewExclusionKey(file))
+  ));
+}
+
+// No file or project names (R3 Q3): only the app and the number of linked assets.
+function getNeedsSaveNotificationBody(linkedRows) {
+  const names = new Set();
+  const apps = new Set();
+  let unnamed = false;
+  let unknownApp = false;
+  for (const file of linkedRows) {
+    const name = sanitizeRendererSourceName(file?.captureEvidence?.sourceName);
+    if (name) names.add(name); else unnamed = true;
+    const app = NEEDS_SAVE_APP_LABELS[file?.captureEvidence?.appFamily];
+    if (app) apps.add(app); else unknownApp = true;
+  }
+  const sources = names.size + (unnamed ? 1 : 0);
+  const target = sources > 1 || apps.size > 1 || (apps.size === 1 && unknownApp)
+    ? 'your working files'
+    : apps.size === 1 ? `your ${[...apps][0]} file` : 'your working file';
+  const count = linkedRows.length;
+  return `Save ${target} to add ${count} linked asset${count === 1 ? '' : 's'} to the package. Click to review in Crate.`;
+}
+
+function closeNeedsSaveNotifications(projectId = null, { forgetSeen = true } = {}) {
+  for (const [id, entry] of needsSaveNotifications) {
+    if (projectId !== null && id !== projectId) continue;
+    needsSaveNotifications.delete(id);
+    activeNativeNotifications.delete(entry.notification);
+    try { entry.notification.close(); } catch (_) {}
+  }
+  if (forgetSeen) {
+    for (const id of [...needsSaveSeenLinkedKeys.keys()]) {
+      if (projectId === null || id === projectId) needsSaveSeenLinkedKeys.delete(id);
+    }
+    for (const id of [...needsSaveEpisodesNotified]) {
+      if (projectId === null || id === projectId) needsSaveEpisodesNotified.delete(id);
+    }
+  }
+  if (projectId === null || pendingNeedsSaveNotificationReview?.entry.projectId === projectId) {
+    pendingNeedsSaveNotificationReview = null;
+  }
+}
+
+function deliverNeedsSaveNotificationReview() {
+  const pending = pendingNeedsSaveNotificationReview;
+  if (!pending) return;
+  if (!pending.entry.isCurrent() || pending.window !== trayWindow || pending.window.isDestroyed()) {
+    pendingNeedsSaveNotificationReview = null;
+    return;
+  }
+  if (!existingAssetsNotificationReadyContents.has(pending.window.webContents)) return;
+  pendingNeedsSaveNotificationReview = null;
+  sendToRenderer('needs-save:review', { projectId: pending.entry.projectId });
+}
+
+// Runs after the write that changed the rows, outside it, once per project per tick.
+function scheduleNeedsSaveNotificationSync(projectId) {
+  if (typeof projectId !== 'string' || !projectId) return;
+  needsSaveSyncQueue.add(projectId);
+  if (needsSaveSyncScheduled) return;
+  needsSaveSyncScheduled = true;
+  setImmediate(() => {
+    needsSaveSyncScheduled = false;
+    const projectIds = [...needsSaveSyncQueue];
+    needsSaveSyncQueue.clear();
+    for (const id of projectIds) syncNeedsSaveNotification(id);
+  });
+}
+
+function syncNeedsSaveNotification(projectId) {
+  try {
+    const project = getProjects().find(item => item.id === projectId);
+    if (!project) {
+      closeNeedsSaveNotifications(projectId);
+      return false;
+    }
+    const tracked = needsSaveNotifications.has(projectId) || needsSaveSeenLinkedKeys.has(projectId) ||
+      needsSaveEpisodesNotified.has(projectId);
+    // Linked-asset Needs Save rows still stored, whether or not they are visible now.
+    const storedKeys = new Set((Array.isArray(project.pendingFiles) ? project.pendingFiles : [])
+      .filter(file => file?.captureState === 'needs-save' && !isNeedsSaveWorkingFileRow(file))
+      .map(getTrackedFileDedupKey).filter(Boolean));
+    const candidate = project.status === 'watching' && storedKeys.size > 0;
+    // Most writes concern projects with no linked asset waiting: skip the scoped view.
+    if (!candidate && !tracked) return false;
+    // A remembered row stays remembered only while it is still stored, so rows
+    // that restage one by one are never announced again, and a row that really
+    // left can be announced if it comes back.
+    const previouslySeen = needsSaveSeenLinkedKeys.get(projectId);
+    if (previouslySeen) {
+      const kept = new Set([...previouslySeen].filter(key => storedKeys.has(key)));
+      if (kept.size) needsSaveSeenLinkedKeys.set(projectId, kept);
+      else {
+        // Every remembered row left storage: that episode is over.
+        needsSaveSeenLinkedKeys.delete(projectId);
+        needsSaveEpisodesNotified.delete(projectId);
+      }
+    }
+    if (project.status !== 'watching') {
+      // Watching stopped: withdraw the notice, but remember the stored rows so a
+      // resumed activation that keeps them does not announce them again.
+      closeNeedsSaveNotifications(projectId, { forgetSeen: false });
+      return false;
+    }
+    const linkedRows = candidate ? getNeedsSaveLinkedRows(project) : [];
+    if (!linkedRows.length) {
+      // Nothing to review: withdraw the notice. The episode ends (and a later one
+      // can notify) only when the stored linked rows have cleared; rows merely
+      // hidden, e.g. while a refreshed activation restages them, stay remembered.
+      closeNeedsSaveNotifications(projectId, { forgetSeen: !candidate });
+      return false;
+    }
+    const keys = linkedRows.map(getTrackedFileDedupKey).filter(Boolean);
+    const seen = needsSaveSeenLinkedKeys.get(projectId);
+    const arrived = keys.some(key => !seen?.has(key));
+    // Episode continuity: a new linked asset continues the current episode only
+    // while some link that episode already saw is visible now. Otherwise those
+    // links were saved in this same write, or are stale rows hidden from an
+    // earlier session: withdraw any old (possibly dismissed) notice and start a
+    // new episode. Links restaging after a refresh stay in the seen set, so they
+    // are never new arrivals by themselves.
+    if (arrived && (needsSaveNotifications.has(projectId) || needsSaveEpisodesNotified.has(projectId)) &&
+        !keys.some(key => seen?.has(key))) {
+      closeNeedsSaveNotifications(projectId, { forgetSeen: false });
+      needsSaveEpisodesNotified.delete(projectId);
+    }
+    needsSaveSeenLinkedKeys.set(projectId, new Set([...(seen || []), ...keys]));
+    if (!arrived || needsSaveNotifications.has(projectId) || needsSaveEpisodesNotified.has(projectId) ||
+        !accountSession?.canUseWorkspace() ||
+        !needsSaveNotificationsEnabled() || isMainWindowForegroundVisible() ||
+        !Notification.isSupported()) return false;
+    const operation = captureProjectOperation(projectId);
+    if (!operation) return false;
+    // The Illustrator scope revision moves whenever a link or document is added;
+    // the notice stays bound to the watch activation, and the scoped-row check
+    // below decides whether there is still something to review.
+    const entry = { projectId, notification: null, clicked: false, isCurrent: () => {
+      const current = getProjects().find(item => item.id === projectId);
+      return needsSaveNotifications.get(projectId) === entry && operation.currentIgnoringScope() &&
+        !!accountSession?.canUseWorkspace() && needsSaveNotificationsEnabled() &&
+        current?.status === 'watching' && getNeedsSaveLinkedRows(current).length > 0;
+    } };
+    const icon = getNotificationIconPath();
+    const notification = new Notification({
+      title: 'Crate — Assets need save',
+      body: getNeedsSaveNotificationBody(linkedRows),
+      silent: false,
+      ...(icon ? { icon } : {}),
+    });
+    entry.notification = notification;
+    needsSaveNotifications.set(projectId, entry);
+    needsSaveEpisodesNotified.add(projectId);
+    activeNativeNotifications.add(notification);
+    const release = () => activeNativeNotifications.delete(notification);
+    // A notice macOS never showed does not use up its episode: a later new
+    // linked asset can try again.
+    const notShown = () => {
+      release();
+      if (needsSaveNotifications.get(projectId) !== entry) return;
+      needsSaveNotifications.delete(projectId);
+      needsSaveEpisodesNotified.delete(projectId);
+    };
+    notification.on('close', release);
+    notification.on('failed', notShown);
+    notification.on('click', () => {
+      try {
+        if (entry.clicked || !entry.isCurrent()) return;
+        entry.clicked = true;
+        showMainWindow({ reason: 'needs-save-notification-click' });
+        pendingNeedsSaveNotificationReview = { entry, window: trayWindow };
+        deliverNeedsSaveNotificationReview();
+      } catch (_) {
+        // A notice click never changes rows, exclusions or decisions.
+      }
+    });
+    try { notification.show(); } catch (_) { notShown(); return false; }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 function showPackageCompleteNotification(projectName, fileCount, options = {}) {
   if (!Notification.isSupported()) return false;
   const { deferShow = false } = options || {};
@@ -20413,6 +20659,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
 
 function stopWatching(projectId, { invalidateActivation = true } = {}) {
   closeExistingAssetsNotifications(projectId);
+  closeNeedsSaveNotifications(projectId, { forgetSeen: false });
   if (invalidateActivation) watchingActivationTokens.delete(projectId);
   cancelWatcherCoordinator(projectId);
   acceptedSourceWatchSubscriptions.delete(projectId);
@@ -20559,6 +20806,7 @@ registerTrustedIpcHandler('projects:get-all', () => {
   if (changed) {
     clearFileVisualProjectCache();
     store.set('projects', projects);
+    for (const project of projects) scheduleNeedsSaveNotificationSync(project.id);
   }
   return projects.map(getIllustratorScopedProjectView);
 });
@@ -26872,6 +27120,7 @@ registerTrustedIpcHandler('projects:delete', (event, id) => {
 
 registerTrustedIpcHandler('projects:delete-all', () => {
   closeExistingAssetsNotifications();
+  closeNeedsSaveNotifications();
   packageReviewSnapshots.clear();
   currentPackageReviewTokenByProject.clear();
   consumedPackageReviewTokens.clear();
@@ -27221,12 +27470,12 @@ registerTrustedIpcHandler('figma:scan-now', async (event) => {
 });
 
 registerTrustedIpcHandler('settings:get', () => {
-  return { existingAssetsNotifications: true, ...store.get('settings') };
+  return { existingAssetsNotifications: true, needsSaveNotifications: true, ...store.get('settings') };
 });
 
 registerTrustedIpcHandler('settings:update', (event, key, value) => {
   // FIX 7 (M1): Whitelist allowed setting keys to prevent arbitrary store writes
-  const ALLOWED_SETTINGS = new Set(["namingTemplate", "notifications", "existingAssetsNotifications", "includeDiagnosticReport", "showPackageDetails", "packageOutputLayoutMode", "packagePortablePictures"]);
+  const ALLOWED_SETTINGS = new Set(["namingTemplate", "notifications", "existingAssetsNotifications", "needsSaveNotifications", "includeDiagnosticReport", "showPackageDetails", "packageOutputLayoutMode", "packagePortablePictures"]);
   if (!ALLOWED_SETTINGS.has(key)) return store.get('settings');
   if (key === 'namingTemplate') {
     store.set(`settings.${key}`, sanitizeNamingTemplate(value));
@@ -27246,10 +27495,14 @@ registerTrustedIpcHandler('settings:update', (event, key, value) => {
     if (previousMode !== nextMode) invalidateAllPackageReviews();
     return store.get('settings');
   }
-  if (key === 'existingAssetsNotifications' && typeof value !== 'boolean') return store.get('settings');
+  if ((key === 'existingAssetsNotifications' || key === 'needsSaveNotifications') && typeof value !== 'boolean') return store.get('settings');
   store.set(`settings.${key}`, value);
   if ((key === 'notifications' || key === 'existingAssetsNotifications') && !existingAssetsNotificationsEnabled()) {
     closeExistingAssetsNotifications();
+  }
+  if ((key === 'notifications' || key === 'needsSaveNotifications') && !needsSaveNotificationsEnabled()) {
+    // Keep the seen rows: turning the switch back on never notifies by itself.
+    closeNeedsSaveNotifications(null, { forgetSeen: false });
   }
   return store.get('settings');
 });
@@ -27401,6 +27654,7 @@ app.on('window-all-closed', (e) => {
 app.on('before-quit', () => {
   closeInactivityPrompts();
   closeExistingAssetsNotifications();
+  closeNeedsSaveNotifications();
   accountSession?.shutdown();
   startupPhaseJournal.mark('before-quit');
   startupPhaseJournal.close();

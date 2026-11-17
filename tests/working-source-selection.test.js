@@ -187,7 +187,9 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
       store.set('projects', projects); realStore = store;
       Object.assign(context, { store, capturePsdReceiptHeldMembers: () => null,
         clearFileVisualProjectCache() {}, normalizeAutoCaptureProjectState() {}, normalizeProjectAssetReviewState() {},
-        safelyEnsureProjectProvenance() {}, retireRemovedPsdReceiptHolds() {} });
+        safelyEnsureProjectProvenance() {}, retireRemovedPsdReceiptHolds() {},
+        // The "Assets need save" notice observes persisted writes (PR 2); not under test here.
+        scheduleNeedsSaveNotificationSync() {} });
       vm.runInContext(between('function mutateProject(', '// FIX 2 (C2):'), context);
     },
     failNextStoreWrite() { failNextStoreWrite = true; },

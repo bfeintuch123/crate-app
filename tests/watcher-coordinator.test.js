@@ -280,6 +280,7 @@ test('actual main mutateProject gate gives unchanged lsof polls zero writes', ()
     .map(name => extractNamedFunction(main, name)).join('\n');
   const projects = [syntheticProject()];
   let storeWrites = 0;
+  let needsSaveSyncs = 0;
   const context = {
     fs, path,
     getProjects: () => projects,
@@ -287,6 +288,8 @@ test('actual main mutateProject gate gives unchanged lsof polls zero writes', ()
     normalizeProjectAssetReviewState: () => {},
     safelyEnsureProjectProvenance: () => {},
     store: { set: () => { storeWrites += 1; } },
+    // The "Assets need save" notice observes each persisted write (PR 2).
+    scheduleNeedsSaveNotificationSync: () => { needsSaveSyncs += 1; },
   };
   const mutateProject = vm.runInNewContext(`${psdHoldSources}\n(${mutateProjectSource})`, context);
   const lsofOutput = syntheticLsofOutput();
@@ -306,12 +309,14 @@ test('actual main mutateProject gate gives unchanged lsof polls zero writes', ()
     });
   }
   assert.equal(storeWrites, 0, '100 unchanged lsof polls must not rewrite the projects store');
+  assert.equal(needsSaveSyncs, 0, 'unchanged polls schedule no notification sync');
 
   mutateProject(projects[0].id, project => {
     project.files.push({ path: '/Users/test/large-project/new-asset.fig', source: 'lsof' });
     return { changed: true, evidenceChanged: false };
   }, { persistIfChanged: true, trustResultChanged: true });
   assert.equal(storeWrites, 1, 'a changed lsof candidate must persist exactly once');
+  assert.equal(needsSaveSyncs, 1, 'each persisted write schedules one notification sync');
 
   mutateProject(projects[0].id, project => {
     project.provenance = { latest: { source: 'lsof', path: '/Users/test/large-project/new-asset.fig' } };
