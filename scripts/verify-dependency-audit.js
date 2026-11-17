@@ -7,9 +7,12 @@
 // the exact set of six dev-only findings caused by GHSA-fc5q-39xc-vjpf
 // (picomatch ReDoS through crafted extglob patterns, no patched release). The
 // exception expires at EXCEPTION_EXPIRES_AT and stops applying as soon as the
-// advisory, the affected lockfile entries, or their runtime reachability
-// change. With no high and no critical findings it passes without using the
-// exception at all.
+// pinned advisory fields, the affected report entries or lockfile entries, or
+// their runtime reachability change. Report and lockfile structures it does
+// not need to model (other report shapes, workspaces, links, bundles, other
+// lockfile versions, non-canonical paths, non-registry sources) are rejected.
+// With no high and no critical finding, entry or advisory, it passes without
+// using the exception at all.
 //
 // No argument, environment variable or file substitutes the report, moves the
 // expiry or disables a check. The environment is passed to npm unchanged so
@@ -88,15 +91,55 @@ const EXCEPTED_FINDINGS = Object.freeze([
   }),
 ]);
 const EXCEPTED_NAMES = Object.freeze(EXCEPTED_FINDINGS.map(item => item.name));
-const RUNTIME_EDGE_FIELDS = Object.freeze(['dependencies', 'optionalDependencies', 'peerDependencies']);
+
+// npm audit JSON (report version 2, npm 10) entry and advisory shapes. Both are
+// checked as total shapes: an unknown or missing field fails.
+const ENTRY_KEYS = Object.freeze(['effects', 'fixAvailable', 'isDirect', 'name', 'nodes', 'range', 'severity', 'via']);
+const ADVISORY_KEYS = Object.freeze(['cvss', 'cwe', 'dependency', 'name', 'range', 'severity', 'source', 'title', 'url']);
+const METADATA_KEYS = Object.freeze(['dependencies', 'vulnerabilities']);
+const DEPENDENCY_COUNT_KEYS = Object.freeze(['dev', 'optional', 'peer', 'peerOptional', 'prod', 'total']);
+
+// Lockfile shape. Anything the verifier would otherwise have to model
+// (workspaces, links, bundles, other lockfile versions, non-canonical paths)
+// is rejected instead.
+const LOCKFILE_KEYS = Object.freeze(['lockfileVersion', 'name', 'packages', 'requires', 'version']);
+const DEPENDENCY_MAP_FIELDS = Object.freeze(['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']);
+const RUNTIME_DECLARATION_FIELDS = Object.freeze(['dependencies', 'optionalDependencies', 'peerDependencies']);
+const STRING_FIELDS = Object.freeze(['integrity', 'name', 'resolved', 'version']);
+const BOOLEAN_FIELDS = Object.freeze(['dev', 'devOptional', 'optional', 'peer']);
+const FORBIDDEN_FIELDS = Object.freeze(['bundleDependencies', 'bundledDependencies', 'inBundle', 'link', 'workspaces']);
+const REGISTRY_HOST = 'registry.npmjs.org';
+// The one lockfile entry not resolved from the registry: the reviewed,
+// vendored http-cache-semantics backport.
+const VENDORED_RESOLVED = Object.freeze({
+  lockPath: 'node_modules/cacheable-request/node_modules/http-cache-semantics',
+  resolved: 'file:vendor/crate-http-cache-semantics-backport-0.1.0.tgz',
+});
+const PACKAGE_NAME = /^(?:@[a-z0-9~-][a-z0-9._~-]*\/)?[a-z0-9~-][a-z0-9._~-]*$/u;
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value) &&
     Object.getPrototypeOf(value) === Object.prototype;
 }
 
+function hasOwn(object, key) {
+  return Object.prototype.hasOwnProperty.call(object, key);
+}
+
+function hasExactKeys(object, keys) {
+  return isDeepStrictEqual(Object.keys(object).sort(), [...keys]);
+}
+
 function isCount(value) {
   return Number.isSafeInteger(value) && value >= 0;
+}
+
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value !== '';
+}
+
+function severityRank(severity) {
+  return SEVERITIES.indexOf(severity);
 }
 
 function failure(rule, message) {
@@ -115,25 +158,46 @@ function parseAuditOutput(text) {
   }
 }
 
-// Rule a: report shape.
-function reportShapeFailures(report) {
+function advisoryShapeIsValid(item, entryName) {
+  if (!isPlainObject(item) || !hasExactKeys(item, ADVISORY_KEYS)) return false;
+  let url;
+  try {
+    url = new URL(item.url);
+  } catch (error) {
+    return false;
+  }
+  return Number.isSafeInteger(item.source) && item.source > 0 &&
+    item.name === entryName && item.dependency === entryName &&
+    isNonEmptyString(item.title) && url.protocol === 'https:' &&
+    SEVERITIES.includes(item.severity) && isNonEmptyString(item.range) &&
+    Array.isArray(item.cwe) && item.cwe.every(isNonEmptyString) &&
+    isPlainObject(item.cvss) && typeof item.cvss.score === 'number' &&
+    (item.cvss.vectorString === null || typeof item.cvss.vectorString === 'string');
+}
+
+// Rule a: total report shape. Every entry and every via member is checked,
+// whatever its severity.
+function reportStructureFailures(report) {
   if (!isPlainObject(report)) return [failure('report-shape', 'Audit report is not a JSON object.')];
-  if (Object.prototype.hasOwnProperty.call(report, 'error')) {
+  if (hasOwn(report, 'error')) {
     return [failure('report-error', 'npm audit reported an error instead of a report.')];
   }
-  const keys = Object.keys(report).sort();
-  if (!isDeepStrictEqual(keys, [...REPORT_KEYS])) {
-    return [failure('report-shape', `Audit report has unexpected top-level fields: ${keys.join(', ')}.`)];
+  if (!hasExactKeys(report, REPORT_KEYS)) {
+    return [failure('report-shape', `Audit report has unexpected top-level fields: ${Object.keys(report).sort().join(', ')}.`)];
   }
   if (report.auditReportVersion !== 2) {
     return [failure('report-version', 'Audit report version is not 2.')];
   }
-  if (!isPlainObject(report.metadata) || !isPlainObject(report.metadata.vulnerabilities)) {
-    return [failure('report-shape', 'Audit report metadata.vulnerabilities is missing or not an object.')];
+  const { metadata } = report;
+  if (!isPlainObject(metadata) || !hasExactKeys(metadata, METADATA_KEYS) ||
+      !isPlainObject(metadata.vulnerabilities) || !hasExactKeys(metadata.vulnerabilities, [...SEVERITIES, 'total'].sort()) ||
+      !isPlainObject(metadata.dependencies) || !hasExactKeys(metadata.dependencies, DEPENDENCY_COUNT_KEYS)) {
+    return [failure('report-shape', 'Audit report metadata is missing or has unexpected fields.')];
   }
-  const counts = report.metadata.vulnerabilities;
-  if (![...SEVERITIES, 'total'].every(key => isCount(counts[key]))) {
-    return [failure('report-shape', 'Audit report severity counts are missing or not non-negative integers.')];
+  const counts = metadata.vulnerabilities;
+  if (![...SEVERITIES, 'total'].every(key => isCount(counts[key])) ||
+      !DEPENDENCY_COUNT_KEYS.every(key => isCount(metadata.dependencies[key]))) {
+    return [failure('report-shape', 'Audit report counts are not non-negative integers.')];
   }
   if (SEVERITIES.reduce((sum, key) => sum + counts[key], 0) !== counts.total) {
     return [failure('report-shape', 'Audit report severity counts do not add up to the total.')];
@@ -143,11 +207,71 @@ function reportShapeFailures(report) {
   }
   const failures = [];
   for (const [name, entry] of Object.entries(report.vulnerabilities)) {
-    if (!isPlainObject(entry) || entry.name !== name || !SEVERITIES.includes(entry.severity) ||
-        !Array.isArray(entry.via) || entry.via.length === 0 ||
-        !entry.via.every(item => typeof item === 'string' || isPlainObject(item)) ||
-        !Array.isArray(entry.nodes) || !entry.nodes.every(item => typeof item === 'string')) {
-      failures.push(failure('report-shape', `Audit report entry ${JSON.stringify(name)} has an unexpected shape.`));
+    const label = JSON.stringify(name);
+    if (!isPlainObject(entry) || !hasExactKeys(entry, ENTRY_KEYS) || entry.name !== name ||
+        !SEVERITIES.includes(entry.severity) || typeof entry.isDirect !== 'boolean' ||
+        typeof entry.range !== 'string' ||
+        !(typeof entry.fixAvailable === 'boolean' || isPlainObject(entry.fixAvailable)) ||
+        !Array.isArray(entry.effects) || !entry.effects.every(isNonEmptyString) ||
+        !Array.isArray(entry.nodes) || entry.nodes.length === 0 || !entry.nodes.every(isNonEmptyString) ||
+        !Array.isArray(entry.via) || entry.via.length === 0) {
+      failures.push(failure('report-shape', `Audit report entry ${label} has an unexpected shape.`));
+      continue;
+    }
+    for (const item of entry.via) {
+      if (typeof item === 'string') {
+        if (item === name || !hasOwn(report.vulnerabilities, item)) {
+          failures.push(failure('report-via', `Audit report entry ${label} names a missing or self via ${JSON.stringify(item)}.`));
+        }
+      } else if (!advisoryShapeIsValid(item, name)) {
+        failures.push(failure('report-advisory', `Audit report entry ${label} has a malformed advisory in via.`));
+      }
+    }
+    for (const effect of entry.effects) {
+      if (!hasOwn(report.vulnerabilities, effect)) {
+        failures.push(failure('report-via', `Audit report entry ${label} names a missing effect ${JSON.stringify(effect)}.`));
+      }
+    }
+  }
+  return failures;
+}
+
+// Severity consistency, as npm derives it (@npmcli/arborist lib/vuln.js and
+// @npmcli/metavuln-calculator lib/advisory.js): an entry's severity is the
+// maximum over its advisories. An advisory object counts with its own
+// severity; a string via is a metavuln that carries the severity of one
+// advisory of the named entry, so it is at most that entry's severity (and may
+// be lower: the real report has moderate dmg-builder via high
+// app-builder-lib). Hence: own advisories <= entry severity <=
+// max(own advisories, named entries). Every entry must also lead, through
+// string vias, to an entry with an advisory object; cycles cannot justify
+// themselves.
+function severityConsistencyFailures(report) {
+  const vulnerabilities = report.vulnerabilities;
+  const failures = [];
+  const rooted = new Set(Object.values(vulnerabilities)
+    .filter(entry => entry.via.some(item => typeof item !== 'string'))
+    .map(entry => entry.name));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const entry of Object.values(vulnerabilities)) {
+      if (!rooted.has(entry.name) && entry.via.some(item => typeof item === 'string' && rooted.has(item))) {
+        rooted.add(entry.name);
+        changed = true;
+      }
+    }
+  }
+  for (const entry of Object.values(vulnerabilities)) {
+    const own = Math.max(-1, ...entry.via.filter(item => typeof item !== 'string').map(item => severityRank(item.severity)));
+    const named = Math.max(-1, ...entry.via.filter(item => typeof item === 'string')
+      .map(item => severityRank(vulnerabilities[item].severity)));
+    const rank = severityRank(entry.severity);
+    if (rank < own || rank > Math.max(own, named)) {
+      failures.push(failure('report-severity', `Audit report entry ${JSON.stringify(entry.name)} has severity ${entry.severity}, inconsistent with its via.`));
+    }
+    if (!rooted.has(entry.name)) {
+      failures.push(failure('report-via', `Audit report entry ${JSON.stringify(entry.name)} does not lead to any advisory.`));
     }
   }
   return failures;
@@ -169,152 +293,15 @@ function countFailures(report) {
   return failures;
 }
 
-function installNameFromLockPath(lockPath) {
-  const index = lockPath.lastIndexOf('node_modules/');
-  return index === -1 ? null : lockPath.slice(index + 'node_modules/'.length);
-}
-
-function parentLockPath(lockPath) {
-  const index = lockPath.lastIndexOf('/node_modules/');
-  return index === -1 ? '' : lockPath.slice(0, index);
-}
-
-// Node's nested resolution: <from>/node_modules/<name>, then each ancestor.
-function resolveLockPath(packages, fromPath, name) {
-  let current = fromPath;
-  while (true) {
-    const candidate = current === '' ? `node_modules/${name}` : `${current}/node_modules/${name}`;
-    if (Object.prototype.hasOwnProperty.call(packages, candidate)) return candidate;
-    if (current === '') return null;
-    current = parentLockPath(current);
-  }
-}
-
-function edgeNames(entry) {
-  const names = [];
-  if (!isPlainObject(entry)) return names;
-  for (const field of RUNTIME_EDGE_FIELDS) {
-    if (entry[field] === undefined) continue;
-    if (!isPlainObject(entry[field])) return null;
-    names.push(...Object.keys(entry[field]).map(name => ({ name, field })));
-  }
-  return names;
-}
-
-// Closure of lockfile paths reachable from the root manifest's runtime
-// dependencies (dependencies, optionalDependencies, peerDependencies), with
-// Node's nested resolution. Links are followed to their targets.
-function runtimeClosure(lockfile, manifest) {
-  const packages = lockfile.packages;
-  const rootEdges = [...(edgeNames(manifest) || []), ...(edgeNames(packages['']) || [])];
-  if (edgeNames(manifest) === null || edgeNames(packages['']) === null) {
-    return { paths: null, unresolved: [] };
-  }
-  const visited = new Set();
-  const unresolved = [];
-  const pending = rootEdges.map(edge => ({ from: '', edge }));
-  while (pending.length > 0) {
-    const { from, edge } = pending.pop();
-    let target = resolveLockPath(packages, from, edge.name);
-    if (target === null) {
-      // Uninstalled optional or peer edges are not part of the runtime tree.
-      if (edge.field === 'dependencies') unresolved.push(`${from || '<root>'} -> ${edge.name}`);
-      continue;
-    }
-    const seenLinks = new Set();
-    while (isPlainObject(packages[target]) && packages[target].link === true) {
-      if (seenLinks.has(target)) return { paths: null, unresolved };
-      seenLinks.add(target);
-      visited.add(target);
-      target = packages[target].resolved;
-      if (typeof target !== 'string' || !Object.prototype.hasOwnProperty.call(packages, target)) {
-        return { paths: null, unresolved };
-      }
-    }
-    if (visited.has(target)) continue;
-    visited.add(target);
-    const edges = edgeNames(packages[target]);
-    if (edges === null) return { paths: null, unresolved };
-    for (const next of edges) pending.push({ from: target, edge: next });
-  }
-  return { paths: visited, unresolved };
-}
-
-// Rules d and e: lockfile identity, single location and runtime reachability.
-function lockfileFailures(lockfile, manifest) {
-  if (!isPlainObject(lockfile) || !isPlainObject(lockfile.packages) ||
-      !isPlainObject(lockfile.packages['']) || !isPlainObject(manifest)) {
-    return [failure('lockfile-shape', 'package-lock.json or package.json could not be inspected.')];
-  }
-  const packages = lockfile.packages;
-  const failures = [];
-  for (const expected of EXCEPTED_FINDINGS) {
-    const entry = packages[expected.lockPath];
-    if (!isPlainObject(entry)) {
-      failures.push(failure('lockfile-entry', `${expected.name}: no lockfile entry at ${expected.lockPath}.`));
-      continue;
-    }
-    if (entry.version !== expected.version) {
-      failures.push(failure('lockfile-version', `${expected.name}: lockfile version is not exactly ${expected.version}.`));
-    }
-    if (entry.integrity !== expected.integrity) {
-      failures.push(failure('lockfile-integrity', `${expected.name}: lockfile integrity is not exactly the approved value.`));
-    }
-    if (entry.resolved !== expected.resolved) {
-      failures.push(failure('lockfile-resolved', `${expected.name}: lockfile resolved is not exactly ${expected.resolved}.`));
-    }
-    if (entry.dev !== true) {
-      failures.push(failure('lockfile-dev', `${expected.name}: lockfile entry is not dev-only.`));
-    }
-    if (entry.link !== undefined || entry.inBundle !== undefined || entry.name !== undefined) {
-      failures.push(failure('lockfile-entry', `${expected.name}: lockfile entry is linked, bundled or aliased.`));
-    }
-  }
-
-  const expectedPaths = new Map(EXCEPTED_FINDINGS.map(item => [item.name, item.lockPath]));
-  for (const [lockPath, entry] of Object.entries(packages)) {
-    if (lockPath === '') continue;
-    const names = new Set([installNameFromLockPath(lockPath)]);
-    if (isPlainObject(entry) && typeof entry.name === 'string') names.add(entry.name);
-    if (isPlainObject(entry) && typeof entry.resolved === 'string') {
-      for (const name of EXCEPTED_NAMES) {
-        const tarball = name.startsWith('@') ? name.split('/')[1] : name;
-        if (entry.resolved.startsWith(`https://registry.npmjs.org/${name}/-/${tarball}-`)) names.add(name);
-      }
-    }
-    for (const name of names) {
-      if (expectedPaths.has(name) && expectedPaths.get(name) !== lockPath) {
-        failures.push(failure('duplicate-path', `${name} also appears in the lockfile at ${lockPath}.`));
-      }
-    }
-  }
-
-  const closure = runtimeClosure(lockfile, manifest);
-  if (closure.paths === null) {
-    failures.push(failure('runtime-reachability', 'Runtime dependency closure could not be computed from the lockfile.'));
-  } else {
-    if (closure.unresolved.length > 0) {
-      failures.push(failure(
-        'runtime-reachability',
-        `Runtime dependencies do not resolve in the lockfile: ${closure.unresolved.sort().join(', ')}.`
-      ));
-    }
-    for (const lockPath of [...closure.paths].sort()) {
-      const entry = packages[lockPath];
-      const name = installNameFromLockPath(lockPath);
-      if (EXCEPTED_NAMES.includes(name) ||
-          (isPlainObject(entry) && EXCEPTED_NAMES.includes(entry.name)) ||
-          EXCEPTED_FINDINGS.some(item => item.lockPath === lockPath)) {
-        failures.push(failure('runtime-reachability', `${lockPath} is reachable from runtime dependencies.`));
-      }
-    }
-  }
-  return failures;
+function advisoryObjects(report) {
+  return Object.values(report.vulnerabilities).flatMap(entry => entry.via
+    .filter(item => typeof item !== 'string')
+    .map(item => ({ entryName: entry.name, item })));
 }
 
 function advisoryMatches(item) {
-  if (!isPlainObject(item)) return false;
-  return item.source === EXCEPTION_ADVISORY.source &&
+  return isPlainObject(item) &&
+    item.source === EXCEPTION_ADVISORY.source &&
     item.name === EXCEPTION_ADVISORY.name &&
     item.dependency === EXCEPTION_ADVISORY.dependency &&
     item.url === EXCEPTION_ADVISORY.url &&
@@ -322,7 +309,9 @@ function advisoryMatches(item) {
     item.range === EXCEPTION_ADVISORY.range;
 }
 
-// Rule d (report side): each excepted entry has exactly its expected via and nodes.
+// Rule d (report side): each excepted entry has exactly its expected via and
+// nodes. For picomatch the pinned advisory fields are source, name,
+// dependency, url, severity and range; title, cwe and cvss are not compared.
 function exceptedEntryFailures(report) {
   const failures = [];
   for (const expected of EXCEPTED_FINDINGS) {
@@ -346,25 +335,283 @@ function exceptedEntryFailures(report) {
   return failures;
 }
 
-function evaluateDependencyAudit({ report, lockfile, manifest, now }) {
-  const shape = reportShapeFailures(report);
-  if (shape.length > 0) return { ok: false, usedException: false, failures: shape, counts: null };
-  const counts = report.metadata.vulnerabilities;
-  const entries = Object.values(report.vulnerabilities);
+// A canonical nested install path: node_modules/<name>(/node_modules/<name>)*.
+function isCanonicalLockPath(lockPath) {
+  if (!lockPath.startsWith('node_modules/')) return false;
+  return lockPath.slice('node_modules/'.length).split('/node_modules/')
+    .every(name => PACKAGE_NAME.test(name) && name !== 'node_modules' && !name.endsWith('/node_modules'));
+}
+
+function installNameFromLockPath(lockPath) {
+  return lockPath.slice(lockPath.lastIndexOf('node_modules/') + 'node_modules/'.length);
+}
+
+function parentLockPath(lockPath) {
+  const index = lockPath.lastIndexOf('/node_modules/');
+  return index === -1 ? '' : lockPath.slice(0, index);
+}
+
+// With only canonical nested install paths (checked first), Node's resolution
+// is exact: <from>/node_modules/<name>, then the same at each ancestor
+// install path, then node_modules/<name>.
+function resolveLockPath(packages, fromPath, name) {
+  let current = fromPath;
+  while (true) {
+    const candidate = current === '' ? `node_modules/${name}` : `${current}/node_modules/${name}`;
+    if (hasOwn(packages, candidate)) return candidate;
+    if (current === '') return null;
+    current = parentLockPath(current);
+  }
+}
+
+function dependencyMapIsValid(value) {
+  return isPlainObject(value) && Object.entries(value).every(([name, spec]) => name !== '' && isNonEmptyString(spec));
+}
+
+function peerMetaIsValid(value) {
+  return isPlainObject(value) && Object.values(value).every(meta => isPlainObject(meta) &&
+    Object.entries(meta).every(([key, flag]) => key === 'optional' && typeof flag === 'boolean'));
+}
+
+function declarationFailures(label, object) {
+  const failures = [];
+  for (const field of FORBIDDEN_FIELDS) {
+    if (hasOwn(object, field)) failures.push(failure('lockfile-shape', `${label}: ${field} is not supported.`));
+  }
+  for (const field of DEPENDENCY_MAP_FIELDS) {
+    if (hasOwn(object, field) && !dependencyMapIsValid(object[field])) {
+      failures.push(failure('lockfile-shape', `${label}: ${field} is not a map of names to non-empty specs.`));
+    }
+  }
+  if (hasOwn(object, 'peerDependenciesMeta') && !peerMetaIsValid(object.peerDependenciesMeta)) {
+    failures.push(failure('lockfile-shape', `${label}: peerDependenciesMeta is malformed.`));
+  }
+  return failures;
+}
+
+// Rule e (structure): everything the verifier does not model is rejected.
+function lockfileStructureFailures(lockfile, manifest) {
+  if (!isPlainObject(lockfile) || !isPlainObject(manifest)) {
+    return [failure('lockfile-shape', 'package-lock.json or package.json could not be inspected.')];
+  }
+  if (lockfile.lockfileVersion !== 3) {
+    return [failure('lockfile-shape', 'package-lock.json lockfileVersion is not 3.')];
+  }
+  const keys = Object.keys(lockfile);
+  if (!keys.every(key => LOCKFILE_KEYS.includes(key)) || !isPlainObject(lockfile.packages) ||
+      !isPlainObject(lockfile.packages[''])) {
+    return [failure('lockfile-shape', 'package-lock.json has unexpected top-level fields or no packages.')];
+  }
+  const failures = [...declarationFailures('package.json', manifest)];
+  for (const [lockPath, entry] of Object.entries(lockfile.packages)) {
+    const label = lockPath === '' ? 'lockfile root' : lockPath;
+    if (lockPath !== '' && !isCanonicalLockPath(lockPath)) {
+      failures.push(failure('lockfile-path', `Lockfile key ${JSON.stringify(lockPath)} is not a canonical nested install path.`));
+      continue;
+    }
+    if (!isPlainObject(entry)) {
+      failures.push(failure('lockfile-shape', `${label}: entry is not an object.`));
+      continue;
+    }
+    failures.push(...declarationFailures(label, entry));
+    for (const field of STRING_FIELDS) {
+      if (hasOwn(entry, field) && typeof entry[field] !== 'string') {
+        failures.push(failure('lockfile-shape', `${label}: ${field} is not a string.`));
+      }
+    }
+    for (const field of BOOLEAN_FIELDS) {
+      if (hasOwn(entry, field) && typeof entry[field] !== 'boolean') {
+        failures.push(failure('lockfile-shape', `${label}: ${field} is not a boolean.`));
+      }
+    }
+  }
+  return failures;
+}
+
+function parseRegistryTarballName(resolved) {
+  let url;
+  try {
+    url = new URL(resolved);
+  } catch (error) {
+    return null;
+  }
+  let pathname;
+  try {
+    pathname = decodeURIComponent(url.pathname).toLowerCase();
+  } catch (error) {
+    pathname = url.pathname.toLowerCase();
+  }
+  for (const name of EXCEPTED_NAMES) {
+    const tarball = name.includes('/') ? name.split('/')[1] : name;
+    if (pathname.startsWith(`/${name}/-/${tarball}-`) && pathname.endsWith('.tgz')) return name;
+  }
+  return null;
+}
+
+// Which of the six packages an entry is, by any of: install path, name field,
+// registry-style tarball path on any host and scheme, or an expected integrity
+// value anywhere in its integrity string.
+function identifiedNames(lockPath, entry) {
+  const names = new Set();
+  const installName = installNameFromLockPath(lockPath);
+  if (EXCEPTED_NAMES.includes(installName)) names.add(installName);
+  if (EXCEPTED_NAMES.includes(entry.name)) names.add(entry.name);
+  if (typeof entry.resolved === 'string') {
+    const fromUrl = parseRegistryTarballName(entry.resolved);
+    if (fromUrl) names.add(fromUrl);
+  }
+  if (typeof entry.integrity === 'string') {
+    for (const expected of EXCEPTED_FINDINGS) {
+      if (entry.integrity.includes(expected.integrity)) names.add(expected.name);
+    }
+  }
+  return names;
+}
+
+function resolvedSourceIsApproved(lockPath, resolved) {
+  if (lockPath === VENDORED_RESOLVED.lockPath && resolved === VENDORED_RESOLVED.resolved) return true;
+  let url;
+  try {
+    url = new URL(resolved);
+  } catch (error) {
+    return false;
+  }
+  return url.protocol === 'https:' && url.hostname === REGISTRY_HOST && url.host === REGISTRY_HOST &&
+    url.username === '' && url.password === '' && url.search === '' && url.hash === '' &&
+    resolved.startsWith(`https://${REGISTRY_HOST}/`);
+}
+
+function runtimeEdges(entry) {
+  const edges = [];
+  const optional = entry.optionalDependencies || {};
+  const peerMeta = entry.peerDependenciesMeta || {};
+  for (const name of Object.keys(entry.dependencies || {})) edges.push({ name, optional: false });
+  for (const name of Object.keys(optional)) {
+    edges.push({ name, optional: !hasOwn(entry.dependencies || {}, name) });
+  }
+  for (const name of Object.keys(entry.peerDependencies || {})) {
+    edges.push({ name, optional: isPlainObject(peerMeta[name]) && peerMeta[name].optional === true });
+  }
+  return edges;
+}
+
+// Closure of lockfile paths reachable from the root manifest's runtime
+// declarations (dependencies, optionalDependencies, peerDependencies). An
+// unresolved required edge is reported; an unresolved edge is tolerated only
+// when declared optional (optionalDependencies, or peerDependenciesMeta
+// optional: true). Call only after lockfileStructureFailures passed.
+function runtimeClosure(lockfile, manifest) {
+  const packages = lockfile.packages;
+  const visited = new Set();
+  const unresolved = [];
+  const pending = runtimeEdges(manifest).map(edge => ({ from: '', edge }));
+  while (pending.length > 0) {
+    const { from, edge } = pending.pop();
+    const target = resolveLockPath(packages, from, edge.name);
+    if (target === null) {
+      if (!edge.optional) unresolved.push(`${from || '<root>'} -> ${edge.name}`);
+      continue;
+    }
+    if (visited.has(target)) continue;
+    visited.add(target);
+    for (const next of runtimeEdges(packages[target])) pending.push({ from: target, edge: next });
+  }
+  return { paths: visited, unresolved: unresolved.sort() };
+}
+
+// Rules d and e: lockfile identity, single location, sources and runtime
+// reachability.
+function lockfileFailures(lockfile, manifest) {
+  const structure = lockfileStructureFailures(lockfile, manifest);
+  if (structure.length > 0) return structure;
+  const packages = lockfile.packages;
   const failures = [];
 
-  // Rule b: no critical findings.
+  for (const field of RUNTIME_DECLARATION_FIELDS) {
+    if (!isDeepStrictEqual(manifest[field] || {}, packages[''][field] || {})) {
+      failures.push(failure('lockfile-root', `package.json and the lockfile root disagree on ${field}.`));
+    }
+  }
+
+  for (const expected of EXCEPTED_FINDINGS) {
+    const entry = packages[expected.lockPath];
+    if (!entry) {
+      failures.push(failure('lockfile-entry', `${expected.name}: no lockfile entry at ${expected.lockPath}.`));
+      continue;
+    }
+    if (entry.version !== expected.version) {
+      failures.push(failure('lockfile-version', `${expected.name}: lockfile version is not exactly ${expected.version}.`));
+    }
+    if (entry.integrity !== expected.integrity) {
+      failures.push(failure('lockfile-integrity', `${expected.name}: lockfile integrity is not exactly the approved value.`));
+    }
+    if (entry.resolved !== expected.resolved) {
+      failures.push(failure('lockfile-resolved', `${expected.name}: lockfile resolved is not exactly ${expected.resolved}.`));
+    }
+    if (entry.dev !== true) {
+      failures.push(failure('lockfile-dev', `${expected.name}: lockfile entry is not dev-only.`));
+    }
+    if (hasOwn(entry, 'name')) {
+      failures.push(failure('lockfile-entry', `${expected.name}: lockfile entry is aliased.`));
+    }
+  }
+
+  const expectedPaths = new Map(EXCEPTED_FINDINGS.map(item => [item.name, item.lockPath]));
+  for (const [lockPath, entry] of Object.entries(packages)) {
+    if (lockPath === '') continue;
+    if (hasOwn(entry, 'resolved') && !resolvedSourceIsApproved(lockPath, entry.resolved)) {
+      failures.push(failure('lockfile-source', `${lockPath} is not resolved from https://${REGISTRY_HOST}/.`));
+    }
+    for (const name of identifiedNames(lockPath, entry)) {
+      if (expectedPaths.get(name) !== lockPath) {
+        failures.push(failure('duplicate-path', `${name} also appears in the lockfile at ${lockPath}.`));
+      }
+    }
+  }
+
+  const closure = runtimeClosure(lockfile, manifest);
+  if (closure.unresolved.length > 0) {
+    failures.push(failure('runtime-unresolved', `Required runtime dependencies do not resolve in the lockfile: ${closure.unresolved.join(', ')}.`));
+  }
+  for (const lockPath of [...closure.paths].sort()) {
+    if (identifiedNames(lockPath, packages[lockPath]).size > 0) {
+      failures.push(failure('runtime-reachability', `${lockPath} is reachable from runtime dependencies.`));
+    }
+  }
+  return failures;
+}
+
+function evaluateDependencyAudit({ report, lockfile, manifest, now }) {
+  const structure = reportStructureFailures(report);
+  if (structure.length > 0) return { ok: false, usedException: false, failures: structure, counts: null };
+  const counts = report.metadata.vulnerabilities;
+  const entries = Object.values(report.vulnerabilities);
+  const advisories = advisoryObjects(report);
+  const failures = [...severityConsistencyFailures(report)];
+
+  // Rule b: no critical finding, as an entry or as an advisory anywhere.
   const criticalEntries = entries.filter(entry => entry.severity === 'critical').map(entry => entry.name).sort();
-  if (counts.critical !== 0 || criticalEntries.length !== 0) {
+  const criticalAdvisories = advisories.filter(({ item }) => item.severity === 'critical').map(({ entryName }) => entryName).sort();
+  if (counts.critical !== 0 || criticalEntries.length !== 0 || criticalAdvisories.length !== 0) {
     failures.push(failure(
       'critical',
-      `Critical findings are never excepted (metadata ${counts.critical}, listed: ${criticalEntries.join(', ') || 'none'}).`
+      `Critical findings are never excepted (metadata ${counts.critical}, entries: ${criticalEntries.join(', ') || 'none'}, advisories under: ${criticalAdvisories.join(', ') || 'none'}).`
     ));
   }
   failures.push(...countFailures(report).filter(item => item.rule !== 'critical'));
 
+  // Any high or critical advisory other than the pinned picomatch advisory
+  // fails, whatever the severity of the entry that lists it.
+  for (const { entryName, item } of advisories) {
+    if (severityRank(item.severity) >= severityRank('high') &&
+        !(entryName === EXCEPTION_ADVISORY.name && advisoryMatches(item))) {
+      failures.push(failure('advisory-severity', `A ${item.severity} advisory (${item.url}) under ${JSON.stringify(entryName)} is not excepted.`));
+    }
+  }
+
   const highNames = entries.filter(entry => entry.severity === 'high').map(entry => entry.name).sort();
-  if (failures.length === 0 && counts.high === 0 && highNames.length === 0) {
+  const highAdvisories = advisories.filter(({ item }) => severityRank(item.severity) >= severityRank('high'));
+  if (failures.length === 0 && counts.high === 0 && highNames.length === 0 && highAdvisories.length === 0) {
     return { ok: true, usedException: false, failures: [], counts };
   }
 
@@ -431,7 +678,10 @@ function runNpmAudit(projectRoot) {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   if (result.error) {
-    return { stdout: null, failure: failure('report-json', `npm audit could not be run (${result.error.code || 'error'}).`) };
+    const reason = result.error.code === 'ENOBUFS'
+      ? `its output exceeded ${AUDIT_MAX_OUTPUT_BYTES} bytes`
+      : `it could not be run (${result.error.code || 'error'})`;
+    return { stdout: null, failure: failure('report-json', `npm audit failed: ${reason}.`) };
   }
   if (result.signal !== null || (result.status !== 0 && result.status !== 1)) {
     return {

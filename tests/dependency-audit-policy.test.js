@@ -21,8 +21,12 @@ const {
 const ROOT = path.resolve(__dirname, '..');
 const SCRIPT = path.join(ROOT, 'scripts', 'verify-dependency-audit.js');
 const WORKFLOW = path.join(ROOT, '.github', 'workflows', 'security-gate.yml');
-// The real `npm audit --json --registry=https://registry.npmjs.org/` output for
-// the committed lockfile on 2026-11-17 (v2.4.x 21f386d).
+// How the fixture was produced, the way CI obtains the report: on 2026-11-17,
+// at v2.4.x 21f386d, with Node 22.23.1 and npm 10.9.8, run
+// `npm ci --ignore-scripts --registry=https://registry.npmjs.org/` and then
+// `npm audit --json --registry=https://registry.npmjs.org/` in the checkout,
+// saving stdout unchanged. On that machine, a lockfile-only run (package.json
+// and package-lock.json alone in an empty directory) printed the same report.
 const REAL_REPORT_TEXT = fs.readFileSync(
   path.join(__dirname, 'fixtures', 'dependency-audit', 'audit-report-2026-11-17.json'),
   'utf8'
@@ -31,8 +35,10 @@ const REAL_REPORT = JSON.parse(REAL_REPORT_TEXT);
 const LIVE_LOCKFILE = JSON.parse(fs.readFileSync(path.join(ROOT, 'package-lock.json'), 'utf8'));
 const LIVE_MANIFEST = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
 const BEFORE_EXPIRY = new Date('2026-11-17T12:00:00Z');
+const EXPIRY_MS = Date.parse('2026-11-20T23:59:59Z');
 const SEVERITIES = ['info', 'low', 'moderate', 'high', 'critical'];
 const EXCEPTED_NAMES = EXCEPTED_FINDINGS.map(item => item.name);
+const PICOMATCH = EXCEPTED_FINDINGS[0];
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -47,10 +53,28 @@ function recount(report) {
   return report;
 }
 
-function zeroHighReport() {
-  const report = clone(REAL_REPORT);
-  for (const name of EXCEPTED_NAMES) delete report.vulnerabilities[name];
+// Removes entries the way a changed tree would: references to them disappear,
+// and entries left with no via disappear too.
+function removeEntries(report, names) {
+  const removed = new Set(names);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const name of removed) delete report.vulnerabilities[name];
+    for (const entry of Object.values(report.vulnerabilities)) {
+      entry.via = entry.via.filter(item => typeof item !== 'string' || !removed.has(item));
+      entry.effects = entry.effects.filter(name => !removed.has(name));
+      if (entry.via.length === 0 && !removed.has(entry.name)) {
+        removed.add(entry.name);
+        changed = true;
+      }
+    }
+  }
   return recount(report);
+}
+
+function zeroHighReport() {
+  return removeEntries(clone(REAL_REPORT), EXCEPTED_NAMES);
 }
 
 function evaluate(overrides = {}) {
@@ -71,8 +95,9 @@ function withReport(mutate) {
 
 function withLockfile(mutate) {
   const lockfile = clone(LIVE_LOCKFILE);
-  mutate(lockfile);
-  return evaluate({ lockfile });
+  const manifest = clone(LIVE_MANIFEST);
+  mutate(lockfile, manifest);
+  return evaluate({ lockfile, manifest });
 }
 
 function assertRejected(result, rule, label = rule) {
@@ -87,20 +112,27 @@ function assertRejected(result, rule, label = rule) {
   assert.equal(formatted.errors.length, result.failures.length + 2);
 }
 
-function highEntry(name) {
+function assertPassed(result, usedException, label = 'pass') {
+  assert.deepEqual(result.failures, [], label);
+  assert.equal(result.ok, true, label);
+  assert.equal(result.usedException, usedException, label);
+}
+
+// A well-formed entry with its own advisory, in npm's exact shape.
+function advisoryEntry(name, severity = 'high', source = 1) {
   return {
     name,
-    severity: 'high',
+    severity,
     isDirect: false,
     via: [{
-      source: 1,
+      source,
       name,
       dependency: name,
       title: 'Synthetic advisory',
-      url: 'https://github.com/advisories/GHSA-0000-0000-0000',
-      severity: 'high',
+      url: `https://github.com/advisories/GHSA-0000-0000-${String(source).padStart(4, '0')}`,
+      severity,
       cwe: [],
-      cvss: { score: 7.5, vectorString: null },
+      cvss: { score: 0, vectorString: null },
       range: '<2.0.0',
     }],
     effects: [],
@@ -110,11 +142,21 @@ function highEntry(name) {
   };
 }
 
+function lockEntry(name, version, extra = {}) {
+  return {
+    version,
+    resolved: `https://registry.npmjs.org/${name}/-/${name.split('/').pop()}-${version}.tgz`,
+    integrity: `sha512-${'C'.repeat(86)}==`,
+    dev: true,
+    ...extra,
+  };
+}
+
+// ---- Pass cases -----------------------------------------------------------
+
 test('the committed real report and lockfile pass under the temporary exception before expiry', () => {
   const result = evaluate();
-  assert.deepEqual(result.failures, []);
-  assert.equal(result.ok, true);
-  assert.equal(result.usedException, true);
+  assertPassed(result, true);
   const formatted = formatResult(result);
   assert.deepEqual(formatted.errors, []);
   const text = formatted.output.join('\n');
@@ -159,13 +201,12 @@ test('the exception constants are the exact approved set', () => {
   assert.equal(EXCEPTED_FINDINGS.every(item => Object.isFrozen(item) && Object.isFrozen(item.via)), true);
 });
 
-test('a report with no high and no critical findings passes without the exception', () => {
+test('a consistent report with no high and no critical findings passes without the exception', () => {
   const report = zeroHighReport();
   assert.equal(report.metadata.vulnerabilities.high, 0);
+  assert.deepEqual(Object.keys(report.vulnerabilities).sort(), ['@electron/asar', 'glob', 'minimatch']);
   const result = evaluate({ report });
-  assert.deepEqual(result.failures, []);
-  assert.equal(result.ok, true);
-  assert.equal(result.usedException, false);
+  assertPassed(result, false);
   const text = formatResult(result).output.join('\n');
   assert.match(text, /^Dependency audit gate passed: no high or critical findings\.$/mu);
   assert.doesNotMatch(text, /GHSA-fc5q-39xc-vjpf|TEMPORARY|expires/u);
@@ -174,28 +215,42 @@ test('a report with no high and no critical findings passes without the exceptio
   // lockfile entries matter once the findings are gone.
   const bumped = clone(LIVE_LOCKFILE);
   bumped.packages['node_modules/tinyglobby/node_modules/picomatch'].version = '4.0.8';
-  const later = evaluate({ report, lockfile: bumped, now: new Date('2027-06-01T00:00:00Z') });
-  assert.equal(later.ok, true);
-  assert.equal(later.usedException, false);
+  assertPassed(evaluate({ report, lockfile: bumped, now: new Date('2027-06-01T00:00:00Z') }), false, 'after expiry');
 
-  const empty = evaluate({
+  assertPassed(evaluate({
     report: {
       auditReportVersion: 2,
       vulnerabilities: {},
-      metadata: { vulnerabilities: { info: 0, low: 0, moderate: 0, high: 0, critical: 0, total: 0 } },
+      metadata: {
+        vulnerabilities: { info: 0, low: 0, moderate: 0, high: 0, critical: 0, total: 0 },
+        dependencies: { prod: 1, dev: 0, optional: 0, peer: 0, peerOptional: 0, total: 1 },
+      },
     },
-  });
-  assert.equal(empty.ok, true);
-  assert.equal(empty.usedException, false);
+  }), false, 'empty report');
 });
 
-test('moderate and lower findings do not fail the gate', () => {
+test('moderate and lower findings with matching advisories do not fail the gate', () => {
   const report = zeroHighReport();
-  report.vulnerabilities.extra = { ...highEntry('extra'), severity: 'low' };
+  report.vulnerabilities.extra = advisoryEntry('extra', 'low');
   const result = evaluate({ report: recount(report) });
-  assert.equal(result.ok, true);
-  assert.match(formatResult(result).output.join('\n'), /moderate 6, low 1, info 0\./u);
+  assertPassed(result, false);
+  assert.match(formatResult(result).output.join('\n'), /moderate 3, low 1, info 0\./u);
 });
+
+test('the declared-optional peer that is not installed is tolerated, as node-fetch encoding is', () => {
+  assert.deepEqual(LIVE_LOCKFILE.packages['node_modules/node-fetch'].peerDependenciesMeta, { encoding: { optional: true } });
+  assert.equal(Object.prototype.hasOwnProperty.call(LIVE_LOCKFILE.packages, 'node_modules/encoding'), false);
+  const closure = runtimeClosure(LIVE_LOCKFILE, LIVE_MANIFEST);
+  assert.deepEqual(closure.unresolved, []);
+  assertPassed(withLockfile(lockfile => {
+    const chokidar = lockfile.packages['node_modules/chokidar'];
+    chokidar.peerDependencies = { 'absent-optional-peer': '^1.0.0' };
+    chokidar.peerDependenciesMeta = { 'absent-optional-peer': { optional: true } };
+    chokidar.optionalDependencies = { 'absent-optional-dependency': '^1.0.0' };
+  }), true, 'declared optional peer and optional dependency');
+});
+
+// ---- Rule a: report shape --------------------------------------------------
 
 test('invalid, empty or truncated audit output is rejected', () => {
   for (const text of ['', '   \n', 'not json', '{"auditReportVersion":', REAL_REPORT_TEXT.slice(0, 2000), undefined, null]) {
@@ -213,27 +268,37 @@ test('a wrong audit report version is rejected', () => {
   assertRejected(withReport(report => { delete report.auditReportVersion; }), 'report-shape');
 });
 
-test('missing or malformed vulnerabilities and metadata are rejected', () => {
+test('missing or malformed vulnerabilities, metadata and entries are rejected', () => {
   const cases = {
-    'no vulnerabilities': report => { delete report.vulnerabilities; report.extraField = {}; },
+    'no vulnerabilities': report => { delete report.vulnerabilities; },
     'vulnerabilities array': report => { report.vulnerabilities = []; },
     'vulnerabilities null': report => { report.vulnerabilities = null; },
-    'no metadata': report => { delete report.metadata; report.extraField = {}; },
+    'no metadata': report => { delete report.metadata; },
     'metadata without vulnerabilities': report => { delete report.metadata.vulnerabilities; },
+    'metadata without dependencies': report => { delete report.metadata.dependencies; },
+    'metadata extra field': report => { report.metadata.extra = {}; },
     'metadata vulnerabilities array': report => { report.metadata.vulnerabilities = []; },
     'string count': report => { report.metadata.vulnerabilities.high = '6'; },
     'negative count': report => { report.metadata.vulnerabilities.low = -1; report.metadata.vulnerabilities.total -= 1; },
     'fractional count': report => { report.metadata.vulnerabilities.info = 0.5; },
     'missing count': report => { delete report.metadata.vulnerabilities.critical; },
+    'extra count': report => { report.metadata.vulnerabilities.severe = 0; },
+    'dependency count string': report => { report.metadata.dependencies.prod = '72'; },
     'total mismatch': report => { report.metadata.vulnerabilities.total = 11; },
     'unexpected top-level field': report => { report.message = 'x'; },
     'entry name mismatch': report => { report.vulnerabilities.fdir.name = 'other'; },
     'entry unknown severity': report => { report.vulnerabilities.fdir.severity = 'severe'; },
+    'entry null severity': report => { report.vulnerabilities.fdir.severity = null; },
+    'entry extra field': report => { report.vulnerabilities.fdir.extra = true; },
+    'entry missing field': report => { delete report.vulnerabilities.fdir.isDirect; },
     'entry via not array': report => { report.vulnerabilities.fdir.via = 'picomatch'; },
     'entry via empty': report => { report.vulnerabilities.fdir.via = []; },
-    'entry via number': report => { report.vulnerabilities.fdir.via = [7]; },
     'entry nodes not array': report => { report.vulnerabilities.fdir.nodes = 'node_modules/x'; },
     'entry nodes number': report => { report.vulnerabilities.fdir.nodes = [1]; },
+    'entry nodes empty string': report => { report.vulnerabilities.fdir.nodes = ['']; },
+    'entry effects not strings': report => { report.vulnerabilities.fdir.effects = [{}]; },
+    'entry isDirect string': report => { report.vulnerabilities.fdir.isDirect = 'false'; },
+    'entry fixAvailable string': report => { report.vulnerabilities.fdir.fixAvailable = 'yes'; },
     'entry is array': report => { report.vulnerabilities.fdir = []; },
   };
   for (const [label, mutate] of Object.entries(cases)) {
@@ -248,6 +313,121 @@ test('missing or malformed vulnerabilities and metadata are rejected', () => {
   );
 });
 
+test('every advisory object in the report must be well formed', () => {
+  const minimatchAdvisory = report => report.vulnerabilities.minimatch.via[0];
+  const cases = {
+    'moderate advisory replaced by {}': report => { report.vulnerabilities.minimatch.via[0] = {}; },
+    'moderate advisory severity "severe"': report => { minimatchAdvisory(report).severity = 'severe'; },
+    'advisory severity missing': report => { delete minimatchAdvisory(report).severity; },
+    'advisory extra field': report => { minimatchAdvisory(report).id = 'x'; },
+    'advisory url missing': report => { delete minimatchAdvisory(report).url; },
+    'advisory url not a URL': report => { minimatchAdvisory(report).url = 'GHSA-g3hv-75wg-m249'; },
+    'advisory url http': report => { minimatchAdvisory(report).url = 'http://github.com/advisories/GHSA-g3hv-75wg-m249'; },
+    'advisory source string': report => { minimatchAdvisory(report).source = '1244623'; },
+    'advisory source zero': report => { minimatchAdvisory(report).source = 0; },
+    'advisory name of another package': report => { minimatchAdvisory(report).name = 'glob'; },
+    'advisory dependency of another package': report => { minimatchAdvisory(report).dependency = 'glob'; },
+    'advisory empty range': report => { minimatchAdvisory(report).range = ''; },
+    'advisory cwe not array': report => { minimatchAdvisory(report).cwe = 'CWE-405'; },
+    'advisory cvss not object': report => { minimatchAdvisory(report).cvss = 7.5; },
+    'advisory as number': report => { report.vulnerabilities.fdir.via = [7]; },
+    'advisory as null': report => { report.vulnerabilities.fdir.via = [null]; },
+    'picomatch advisory copied under fdir': report => {
+      report.vulnerabilities.fdir.via.push(clone(report.vulnerabilities.picomatch.via[0]));
+    },
+  };
+  for (const [label, mutate] of Object.entries(cases)) {
+    assertRejected(withReport(mutate), 'report-advisory', label);
+  }
+});
+
+test('string via members must name another entry present in the report', () => {
+  assertRejected(withReport(report => { report.vulnerabilities.fdir.via = ['not-in-report']; }), 'report-via', 'missing entry');
+  assertRejected(withReport(report => { report.vulnerabilities.fdir.via = ['fdir']; }), 'report-via', 'self');
+  assertRejected(withReport(report => { report.vulnerabilities.fdir.via = ['']; }), 'report-via', 'empty string');
+  assertRejected(withReport(report => { report.vulnerabilities.fdir.effects = ['not-in-report']; }), 'report-via', 'missing effect');
+  // The same with an otherwise clean report: the exception is not needed, the shape still fails.
+  const zero = zeroHighReport();
+  zero.vulnerabilities.glob.via.push('not-in-report');
+  assertRejected(evaluate({ report: zero }), 'report-via', 'missing entry, clean report');
+});
+
+test('a via cycle with no advisory neither hangs nor passes', () => {
+  const report = zeroHighReport();
+  const cycleEntry = (name, other) => ({ ...advisoryEntry(name, 'moderate'), via: [other] });
+  report.vulnerabilities.alpha = cycleEntry('alpha', 'beta');
+  report.vulnerabilities.beta = cycleEntry('beta', 'alpha');
+  const result = evaluate({ report: recount(report) });
+  assertRejected(result, 'report-via');
+  assert.match(result.failures.map(item => item.message).join('\n'), /"alpha" does not lead to any advisory/u);
+
+  const highCycle = clone(REAL_REPORT);
+  highCycle.vulnerabilities.picomatch.via = ['fdir'];
+  assertRejected(evaluate({ report: highCycle }), 'report-via', 'picomatch <-> fdir cycle');
+});
+
+// ---- Severity consistency and hidden advisories ------------------------------
+
+test('a critical advisory under a moderate parent is rejected (review counterexample)', () => {
+  const result = withReport(report => { report.vulnerabilities.minimatch.via[0].severity = 'critical'; });
+  assertRejected(result, 'critical');
+  assertRejected(result, 'advisory-severity');
+  assertRejected(result, 'report-severity');
+});
+
+test('the six removed but a hidden critical advisory kept is rejected after expiry (review counterexample)', () => {
+  const report = zeroHighReport();
+  report.vulnerabilities.minimatch.via[0].severity = 'critical';
+  const result = evaluate({ report: recount(report), now: new Date('2027-01-15T00:00:00Z') });
+  assertRejected(result, 'critical');
+  assertRejected(result, 'advisory-severity');
+});
+
+test('the six parents downgraded to moderate while the picomatch advisory stays high are rejected (review counterexample)', () => {
+  const report = clone(REAL_REPORT);
+  for (const name of EXCEPTED_NAMES) report.vulnerabilities[name].severity = 'moderate';
+  const result = evaluate({ report: recount(report) });
+  assertRejected(result, 'report-severity');
+  assertRejected(result, 'high-set');
+});
+
+test('a low parent with a high advisory is rejected', () => {
+  const report = zeroHighReport();
+  report.vulnerabilities.extra = { ...advisoryEntry('extra', 'high'), severity: 'low' };
+  const result = evaluate({ report: recount(report) });
+  assertRejected(result, 'advisory-severity');
+  assertRejected(result, 'report-severity');
+});
+
+test('a clean report that still contains a high advisory object is rejected', () => {
+  const report = zeroHighReport();
+  report.vulnerabilities.glob.via.push({ ...clone(report.vulnerabilities.glob.via[0]), source: 1300001, severity: 'high' });
+  report.vulnerabilities.glob.severity = 'moderate';
+  const result = evaluate({ report: recount(report) });
+  assertRejected(result, 'advisory-severity');
+  assertRejected(result, 'report-severity');
+});
+
+test('an entry whose severity is lower than its own advisory is rejected', () => {
+  assertRejected(withReport(report => {
+    report.vulnerabilities.glob.severity = 'low';
+    recount(report);
+  }), 'report-severity');
+});
+
+test('an entry whose severity exceeds everything in its via is rejected', () => {
+  assertRejected(withReport(report => {
+    report.vulnerabilities.glob.severity = 'high';
+    recount(report);
+  }), 'report-severity');
+  // npm allows a string via to carry a lower severity than the named entry
+  // (the real report has moderate dmg-builder via high app-builder-lib).
+  assert.equal(REAL_REPORT.vulnerabilities['dmg-builder'].severity, 'moderate');
+  assert.deepEqual(REAL_REPORT.vulnerabilities['dmg-builder'].via, ['app-builder-lib']);
+});
+
+// ---- Rules b and c -----------------------------------------------------------
+
 test('an npm error object is rejected', () => {
   assertRejected(
     evaluate({ report: { error: { code: 'ENOAUDIT', summary: 'Your configured registry does not support audit requests.', detail: '' } } }),
@@ -259,7 +439,7 @@ test('an npm error object is rejected', () => {
 
 test('any critical finding is rejected', () => {
   assertRejected(withReport(report => {
-    report.vulnerabilities.extra = { ...highEntry('extra'), severity: 'critical' };
+    report.vulnerabilities.extra = advisoryEntry('extra', 'critical');
     recount(report);
   }), 'critical', 'listed critical');
   assertRejected(withReport(report => {
@@ -271,22 +451,23 @@ test('any critical finding is rejected', () => {
     report.metadata.vulnerabilities.total += 1;
   }), 'critical', 'metadata-only critical');
   assertRejected(withReport(report => {
-    report.vulnerabilities.extra = { ...highEntry('extra'), severity: 'critical' };
+    report.vulnerabilities.extra = advisoryEntry('extra', 'critical');
   }), 'critical', 'listed-only critical');
   const zero = zeroHighReport();
-  zero.vulnerabilities.extra = { ...highEntry('extra'), severity: 'critical' };
+  zero.vulnerabilities.extra = advisoryEntry('extra', 'critical');
   assertRejected(evaluate({ report: recount(zero) }), 'critical', 'critical without highs');
 });
 
 test('a seventh high finding is rejected', () => {
   const result = withReport(report => {
-    report.vulnerabilities.lodash = highEntry('lodash');
+    report.vulnerabilities.lodash = advisoryEntry('lodash');
     recount(report);
   });
   assertRejected(result, 'high-set');
+  assertRejected(result, 'advisory-severity');
   assert.match(result.failures.find(item => item.rule === 'high-set').message, /lodash/u);
   const zero = zeroHighReport();
-  zero.vulnerabilities.lodash = highEntry('lodash');
+  zero.vulnerabilities.lodash = advisoryEntry('lodash');
   assertRejected(evaluate({ report: recount(zero) }), 'high-set', 'one unrelated high alone');
 });
 
@@ -306,51 +487,53 @@ test('a high count that disagrees with the listed entries is rejected', () => {
 });
 
 test('one to five of the six excepted findings is a changed tree and is rejected', () => {
+  // Keep the lower part of the chain, picomatch first, as a changed tree would.
+  for (let kept = 1; kept <= 5; kept += 1) {
+    const report = removeEntries(clone(REAL_REPORT), EXCEPTED_NAMES.slice(kept));
+    assert.deepEqual(
+      EXCEPTED_NAMES.filter(name => report.vulnerabilities[name]),
+      EXCEPTED_NAMES.slice(0, kept)
+    );
+    assertRejected(evaluate({ report }), 'high-set', `${kept} of six kept`);
+  }
   for (const name of EXCEPTED_NAMES) {
-    assertRejected(withReport(report => {
+    // An entry simply missing leaves dangling references or a short high set.
+    const raw = withReport(report => {
       delete report.vulnerabilities[name];
       recount(report);
-    }), 'high-set', `${name} missing`);
+    });
+    assert.equal(raw.ok, false, `${name} missing`);
+    assert.equal(raw.failures.some(item => item.rule === 'high-set' || item.rule === 'report-via'), true, `${name} missing`);
     assertRejected(withReport(report => {
       report.vulnerabilities[name].severity = 'moderate';
       recount(report);
     }), 'high-set', `${name} downgraded`);
   }
-  for (let kept = 1; kept <= 5; kept += 1) {
-    assertRejected(withReport(report => {
-      for (const name of EXCEPTED_NAMES.slice(kept)) delete report.vulnerabilities[name];
-      recount(report);
-    }), 'high-set', `${kept} of six kept`);
-  }
 });
+
+// ---- Rule d: report side -------------------------------------------------------
 
 test('each excepted entry rejects an extra, different, duplicated or missing via', () => {
   for (const expected of EXCEPTED_FINDINGS) {
     const rule = expected.name === 'picomatch' ? 'advisory' : 'via';
     assertRejected(withReport(report => {
-      report.vulnerabilities[expected.name].via.push('extra-package');
+      report.vulnerabilities[expected.name].via.push('glob');
     }), rule, `${expected.name} extra via`);
     assertRejected(withReport(report => {
-      report.vulnerabilities[expected.name].via = ['different-package'];
+      report.vulnerabilities[expected.name].via = ['minimatch'];
     }), rule, `${expected.name} different via`);
     assertRejected(withReport(report => {
       const via = report.vulnerabilities[expected.name].via;
       via.push(clone(via[0]));
     }), rule, `${expected.name} duplicated via`);
-    if (expected.name !== 'picomatch') {
+    if (expected.via.length > 1) {
       assertRejected(withReport(report => {
-        report.vulnerabilities[expected.name].via = [...expected.via.slice(1), clone(REAL_REPORT.vulnerabilities.picomatch.via[0])];
-      }), rule, `${expected.name} advisory object in via`);
-      if (expected.via.length > 1) {
-        assertRejected(withReport(report => {
-          report.vulnerabilities[expected.name].via = expected.via.slice(1);
-        }), rule, `${expected.name} missing via member`);
-      }
+        report.vulnerabilities[expected.name].via = expected.via.slice(1);
+      }), rule, `${expected.name} missing via member`);
     }
   }
   // Order alone does not matter.
-  const reordered = withReport(report => { report.vulnerabilities['app-builder-lib'].via.reverse(); });
-  assert.equal(reordered.ok, true);
+  assertPassed(withReport(report => { report.vulnerabilities['app-builder-lib'].via.reverse(); }), true, 'reordered');
 });
 
 test('each excepted entry rejects an extra or different node path', () => {
@@ -363,7 +546,7 @@ test('each excepted entry rejects an extra or different node path', () => {
     }), 'nodes', `${expected.name} different node`);
     assertRejected(withReport(report => {
       report.vulnerabilities[expected.name].nodes = [];
-    }), 'nodes', `${expected.name} no nodes`);
+    }), 'report-shape', `${expected.name} no nodes`);
   }
 });
 
@@ -381,25 +564,32 @@ test('picomatch requires exactly the one GHSA-fc5q-39xc-vjpf advisory with range
     'range narrowed': item => { item.range = '<4.0.7'; },
     'range with spaces': item => { item.range = '<= 4.0.7'; },
     'range with trailing text': item => { item.range = '<=4.0.7 || >=5.0.0'; },
-    'range missing': item => { delete item.range; },
     'different source id': item => { item.source = 1247711; },
-    'different package name': item => { item.name = 'micromatch'; },
-    'different dependency': item => { item.dependency = 'micromatch'; },
   };
   for (const [label, mutate] of Object.entries(cases)) {
     assertRejected(advisory(mutate), 'advisory', label);
   }
-  assertRejected(withReport(report => {
+  // Fields that make the object malformed fail as malformed advisories.
+  assertRejected(advisory(item => { delete item.range; }), 'report-advisory', 'range missing');
+  assertRejected(advisory(item => { item.name = 'micromatch'; }), 'report-advisory', 'different package name');
+  assertRejected(advisory(item => { item.dependency = 'micromatch'; }), 'report-advisory', 'different dependency');
+  // title, cwe and cvss are deliberately not pinned.
+  assertPassed(advisory(item => { item.title = 'Retitled'; item.cwe = []; item.cvss = { score: 8, vectorString: null }; }), true, 'unpinned fields');
+  const second = withReport(report => {
     report.vulnerabilities.picomatch.via.push({
       ...clone(report.vulnerabilities.picomatch.via[0]),
       source: 1300000,
       url: 'https://github.com/advisories/GHSA-dddd-eeee-ffff',
     });
-  }), 'advisory', 'second advisory');
+  });
+  assertRejected(second, 'advisory', 'second advisory');
+  assertRejected(second, 'advisory-severity', 'second advisory');
   assertRejected(withReport(report => {
     report.vulnerabilities.picomatch.via = ['fdir'];
   }), 'advisory', 'string via');
 });
+
+// ---- Rule d: lockfile side -----------------------------------------------------
 
 test('each excepted lockfile entry must match version, integrity, resolved and dev exactly', () => {
   for (const expected of EXCEPTED_FINDINGS) {
@@ -412,7 +602,7 @@ test('each excepted lockfile entry must match version, integrity, resolved and d
     assertRejected(withLockfile(lockfile => { at(lockfile).resolved = `${expected.resolved}?x=1`; }), 'lockfile-resolved', `${expected.name} resolved suffix`);
     assertRejected(withLockfile(lockfile => { delete at(lockfile).dev; }), 'lockfile-dev', `${expected.name} dev missing`);
     assertRejected(withLockfile(lockfile => { at(lockfile).dev = false; }), 'lockfile-dev', `${expected.name} dev false`);
-    assertRejected(withLockfile(lockfile => { at(lockfile).dev = 'true'; }), 'lockfile-dev', `${expected.name} dev string`);
+    assertRejected(withLockfile(lockfile => { at(lockfile).dev = 'true'; }), 'lockfile-shape', `${expected.name} dev string`);
     assertRejected(withLockfile(lockfile => { delete at(lockfile).dev; at(lockfile).devOptional = true; }), 'lockfile-dev', `${expected.name} devOptional`);
     assertRejected(withLockfile(lockfile => { delete lockfile.packages[expected.lockPath]; }), 'lockfile-entry', `${expected.name} entry missing`);
     assertRejected(withLockfile(lockfile => { at(lockfile).name = expected.name; }), 'lockfile-entry', `${expected.name} aliased`);
@@ -444,25 +634,173 @@ test('integrity is compared as the complete string, never by prefix, substring o
   }
 });
 
-test('an excepted package reachable from runtime dependencies is rejected', () => {
+// ---- Rule e: lockfile structure --------------------------------------------------
+
+test('only lockfileVersion 3 is accepted', () => {
+  for (const version of [1, 2, 4, 999, '3', null]) {
+    assertRejected(withLockfile(lockfile => { lockfile.lockfileVersion = version; }), 'lockfile-shape', String(version));
+  }
+  assertRejected(withLockfile(lockfile => { delete lockfile.lockfileVersion; }), 'lockfile-shape', 'missing');
+  assertRejected(withLockfile(lockfile => { lockfile.dependencies = {}; }), 'lockfile-shape', 'legacy dependencies section');
+  assertRejected(evaluate({ lockfile: null }), 'lockfile-shape', 'null lockfile');
+  assertRejected(evaluate({ manifest: null }), 'lockfile-shape', 'null manifest');
+  assertRejected(evaluate({ lockfile: { lockfileVersion: 3, packages: [] } }), 'lockfile-shape', 'packages array');
+  assertRejected(evaluate({ lockfile: { lockfileVersion: 3, packages: {} } }), 'lockfile-shape', 'no root entry');
+});
+
+test('links, bundles and workspaces are rejected rather than modelled', () => {
   const cases = {
-    'direct root dependency': (lockfile, manifest) => {
-      manifest.dependencies['node-gyp'] = '^12.4.0';
+    'link entry': lockfile => {
+      lockfile.packages['node_modules/pako'] = { resolved: 'node_modules/tinyglobby', link: true };
     },
-    'direct root optionalDependency': (lockfile, manifest) => {
-      manifest.optionalDependencies = { tinyglobby: '^0.2.17' };
+    'link false is still not supported': lockfile => { lockfile.packages['node_modules/pako'].link = false; },
+    inBundle: lockfile => { lockfile.packages['node_modules/pako'].inBundle = true; },
+    'bundleDependencies in an entry': lockfile => { lockfile.packages['node_modules/canvas'].bundleDependencies = ['nan']; },
+    'bundledDependencies in an entry': lockfile => { lockfile.packages['node_modules/canvas'].bundledDependencies = true; },
+    'workspaces in the lockfile root': lockfile => { lockfile.packages[''].workspaces = ['packages/*']; },
+    'workspaces in package.json': (lockfile, manifest) => { manifest.workspaces = ['packages/*']; },
+    'bundleDependencies in package.json': (lockfile, manifest) => { manifest.bundleDependencies = ['pako']; },
+    'bundledDependencies in package.json': (lockfile, manifest) => { manifest.bundledDependencies = ['pako']; },
+  };
+  for (const [label, mutate] of Object.entries(cases)) {
+    assertRejected(withLockfile(mutate), 'lockfile-shape', label);
+  }
+});
+
+test('the workspace-layout counterexample is rejected (review counterexample)', () => {
+  const result = withLockfile((lockfile, manifest) => {
+    manifest.dependencies['runtime-workspace'] = 'file:packages/group/app';
+    lockfile.packages[''].dependencies['runtime-workspace'] = 'file:packages/group/app';
+    lockfile.packages['node_modules/runtime-workspace'] = { resolved: 'packages/group/app', link: true };
+    lockfile.packages['packages/group/app'] = { version: '1.0.0', optionalDependencies: { bridge: '1.0.0' } };
+    lockfile.packages['packages/group/node_modules/bridge'] = { version: '1.0.0', dependencies: { tinyglobby: '^0.2.17' } };
+  });
+  assertRejected(result, 'lockfile-path');
+  assertRejected(result, 'lockfile-shape');
+});
+
+test('package keys must be canonical nested install paths', () => {
+  const entry = { version: '1.0.0', resolved: 'https://registry.npmjs.org/x/-/x-1.0.0.tgz', integrity: 'sha512-x', dev: true };
+  for (const key of [
+    'packages/group/app',
+    'node_modules/picomatch/',
+    'node_modules\\picomatch',
+    'node_modules/../picomatch',
+    'node_modules/./picomatch',
+    'node_modules//picomatch',
+    '/node_modules/picomatch',
+    'node_modules/',
+    'node_modules/@scope',
+    'node_modules/@scope/',
+    'node_modules/Picomatch',
+    'node_modules/.picomatch',
+    'node_modules/node_modules',
+    'node_modules/a/node_modules',
+    'node_modules/a/b',
+    'vendor/http-cache-semantics',
+  ]) {
+    assertRejected(withLockfile(lockfile => { lockfile.packages[key] = { ...entry }; }), 'lockfile-path', key);
+  }
+});
+
+test('the trailing-slash second copy with an http URL is rejected (review counterexample)', () => {
+  const result = withLockfile(lockfile => {
+    lockfile.packages['node_modules/picomatch/'] = {
+      version: '4.0.5',
+      resolved: 'http://registry.npmjs.org/picomatch/-/picomatch-4.0.5.tgz',
+      integrity: PICOMATCH.integrity,
+      dev: true,
+    };
+  });
+  assertRejected(result, 'lockfile-path');
+});
+
+test('every package entry and declaration map must have the expected types', () => {
+  const cases = {
+    'chokidar entry []': lockfile => { lockfile.packages['node_modules/chokidar'] = []; },
+    'chokidar entry string': lockfile => { lockfile.packages['node_modules/chokidar'] = 'node_modules/readdirp'; },
+    'chokidar entry null': lockfile => { lockfile.packages['node_modules/chokidar'] = null; },
+    'chokidar entry number': lockfile => { lockfile.packages['node_modules/chokidar'] = 4; },
+    'dependencies array': lockfile => { lockfile.packages['node_modules/chokidar'].dependencies = ['readdirp']; },
+    'dependencies string': lockfile => { lockfile.packages['node_modules/chokidar'].dependencies = 'readdirp'; },
+    'dependency value object': lockfile => { lockfile.packages['node_modules/chokidar'].dependencies = { readdirp: {} }; },
+    'dependency value number': lockfile => { lockfile.packages['node_modules/chokidar'].dependencies = { readdirp: 4 }; },
+    'dependency value empty': lockfile => { lockfile.packages['node_modules/chokidar'].dependencies = { readdirp: '' }; },
+    'optionalDependencies array': lockfile => { lockfile.packages['node_modules/canvas'].optionalDependencies = ['x']; },
+    'peerDependencies value null': lockfile => { lockfile.packages['node_modules/canvas'].peerDependencies = { x: null }; },
+    'devDependencies value object': lockfile => { lockfile.packages['node_modules/canvas'].devDependencies = { x: {} }; },
+    'peerDependenciesMeta malformed': lockfile => { lockfile.packages['node_modules/node-fetch'].peerDependenciesMeta = { encoding: true }; },
+    'peerDependenciesMeta optional string': lockfile => { lockfile.packages['node_modules/node-fetch'].peerDependenciesMeta = { encoding: { optional: 'true' } }; },
+    'manifest dependency value {} (review counterexample)': (lockfile, manifest) => { manifest.dependencies.pako = {}; },
+    'manifest dependencies array': (lockfile, manifest) => { manifest.dependencies = ['pako']; },
+    'version number': lockfile => { lockfile.packages['node_modules/pako'].version = 2; },
+    'resolved object': lockfile => { lockfile.packages['node_modules/pako'].resolved = {}; },
+    'integrity array': lockfile => { lockfile.packages['node_modules/pako'].integrity = []; },
+    'name number': lockfile => { lockfile.packages['node_modules/pako'].name = 1; },
+    'optional string': lockfile => { lockfile.packages['node_modules/pako'].optional = 'false'; },
+  };
+  for (const [label, mutate] of Object.entries(cases)) {
+    assertRejected(withLockfile(mutate), 'lockfile-shape', label);
+  }
+});
+
+test('package.json and the lockfile root must declare the same runtime dependencies', () => {
+  const cases = {
+    'spec differs': lockfile => { lockfile.packages[''].dependencies.pako = '^2.0.0'; },
+    'extra in package.json': (lockfile, manifest) => { manifest.dependencies['left-pad'] = '1.3.0'; },
+    'extra in the lockfile root': lockfile => { lockfile.packages[''].dependencies['app-builder-lib'] = '26.15.7'; },
+    'optionalDependencies only in package.json': (lockfile, manifest) => { manifest.optionalDependencies = { pako: '^2.1.0' }; },
+    'peerDependencies only in the lockfile root': lockfile => { lockfile.packages[''].peerDependencies = { pako: '^2.1.0' }; },
+  };
+  for (const [label, mutate] of Object.entries(cases)) {
+    assertRejected(withLockfile(mutate), 'lockfile-root', label);
+  }
+});
+
+test('unresolved required runtime edges are rejected; only declared-optional absences are tolerated', () => {
+  const cases = {
+    'unresolved required dependency': lockfile => {
+      lockfile.packages['node_modules/chokidar'].dependencies['not-in-lockfile'] = '^1.0.0';
     },
-    'direct root peerDependency': (lockfile, manifest) => {
-      manifest.peerDependencies = { '@electron/rebuild': '^4.2.0' };
+    'unresolved required peer (review counterexample)': lockfile => {
+      lockfile.packages['node_modules/chokidar'].peerDependencies = { 'not-in-lockfile': '^1.0.0' };
     },
-    'lockfile root dependency': lockfile => {
-      lockfile.packages[''].dependencies['app-builder-lib'] = '26.15.7';
+    'unresolved optional peer without the optional meta': lockfile => {
+      lockfile.packages['node_modules/chokidar'].peerDependencies = { 'not-in-lockfile': '^1.0.0' };
+      lockfile.packages['node_modules/chokidar'].peerDependenciesMeta = { other: { optional: true } };
     },
+    'unresolved peer with optional: false': lockfile => {
+      lockfile.packages['node_modules/chokidar'].peerDependencies = { 'not-in-lockfile': '^1.0.0' };
+      lockfile.packages['node_modules/chokidar'].peerDependenciesMeta = { 'not-in-lockfile': { optional: false } };
+    },
+    'node-fetch encoding meta removed': lockfile => {
+      delete lockfile.packages['node_modules/node-fetch'].peerDependenciesMeta;
+    },
+    'unresolved root dependency': (lockfile, manifest) => {
+      manifest.dependencies['not-in-lockfile'] = '1.0.0';
+      lockfile.packages[''].dependencies['not-in-lockfile'] = '1.0.0';
+    },
+    'name in dependencies and optionalDependencies counts as required': lockfile => {
+      lockfile.packages['node_modules/chokidar'].dependencies['not-in-lockfile'] = '^1.0.0';
+      lockfile.packages['node_modules/chokidar'].optionalDependencies = { 'not-in-lockfile': '^1.0.0' };
+    },
+  };
+  for (const [label, mutate] of Object.entries(cases)) {
+    assertRejected(withLockfile(mutate), 'runtime-unresolved', label);
+  }
+});
+
+test('an excepted package reachable from runtime dependencies is rejected', () => {
+  const both = (field, name, spec) => (lockfile, manifest) => {
+    manifest[field] = { ...(manifest[field] || {}), [name]: spec };
+    lockfile.packages[''][field] = { ...(lockfile.packages[''][field] || {}), [name]: spec };
+  };
+  const cases = {
+    'direct root dependency': both('dependencies', 'node-gyp', '^12.4.0'),
+    'direct root optionalDependency': both('optionalDependencies', 'tinyglobby', '^0.2.17'),
+    'direct root peerDependency': both('peerDependencies', '@electron/rebuild', '^4.2.0'),
     'transitive dependency': lockfile => {
-      lockfile.packages['node_modules/chokidar'].dependencies = {
-        ...lockfile.packages['node_modules/chokidar'].dependencies,
-        tinyglobby: '^0.2.17',
-      };
+      lockfile.packages['node_modules/chokidar'].dependencies.tinyglobby = '^0.2.17';
     },
     'transitive optionalDependency': lockfile => {
       lockfile.packages['node_modules/canvas'].optionalDependencies = { 'node-gyp': '^12.4.0' };
@@ -470,28 +808,22 @@ test('an excepted package reachable from runtime dependencies is rejected', () =
     'transitive peerDependency': lockfile => {
       lockfile.packages['node_modules/jose'].peerDependencies = { '@electron/rebuild': '*' };
     },
+    'transitive optional peer': lockfile => {
+      lockfile.packages['node_modules/jose'].peerDependencies = { 'app-builder-lib': '*' };
+      lockfile.packages['node_modules/jose'].peerDependenciesMeta = { 'app-builder-lib': { optional: true } };
+    },
   };
   for (const [label, mutate] of Object.entries(cases)) {
-    const lockfile = clone(LIVE_LOCKFILE);
-    const manifest = clone(LIVE_MANIFEST);
-    mutate(lockfile, manifest);
-    const result = evaluate({ lockfile, manifest });
+    const result = withLockfile(mutate);
     assertRejected(result, 'runtime-reachability', label);
-    assert.match(
-      result.failures.filter(item => item.rule === 'runtime-reachability').map(item => item.message).join('\n'),
-      /reachable from runtime dependencies/u,
-      label
-    );
   }
   // Reaching tinyglobby also reaches its nested picomatch and fdir copies.
-  const manifest = clone(LIVE_MANIFEST);
-  manifest.dependencies.tinyglobby = '^0.2.17';
-  const messages = evaluate({ manifest }).failures.map(item => item.message).join('\n');
+  const messages = withLockfile(both('dependencies', 'tinyglobby', '^0.2.17')).failures.map(item => item.message).join('\n');
   assert.match(messages, /node_modules\/tinyglobby\/node_modules\/picomatch is reachable/u);
   assert.match(messages, /node_modules\/tinyglobby\/node_modules\/fdir is reachable/u);
 });
 
-test('the runtime closure follows nested resolution and fails closed on unresolvable edges', () => {
+test('the runtime closure follows nested resolution', () => {
   const closure = runtimeClosure(LIVE_LOCKFILE, LIVE_MANIFEST);
   assert.deepEqual(closure.unresolved, []);
   for (const lockPath of ['node_modules/canvas', 'node_modules/chokidar', 'node_modules/electron-store', 'node_modules/jose']) {
@@ -500,57 +832,57 @@ test('the runtime closure follows nested resolution and fails closed on unresolv
   // decompress-response has its own nested mimic-response.
   assert.equal(closure.paths.has('node_modules/decompress-response/node_modules/mimic-response'), true);
   for (const item of EXCEPTED_FINDINGS) assert.equal(closure.paths.has(item.lockPath), false, item.lockPath);
-
-  const manifest = clone(LIVE_MANIFEST);
-  manifest.dependencies['not-in-lockfile'] = '1.0.0';
-  assertRejected(evaluate({ manifest }), 'runtime-reachability', 'unresolved runtime dependency');
-  const malformed = clone(LIVE_LOCKFILE);
-  malformed.packages['node_modules/chokidar'].dependencies = ['readdirp'];
-  assertRejected(evaluate({ lockfile: malformed }), 'runtime-reachability', 'malformed dependency map');
-  const linked = clone(LIVE_LOCKFILE);
-  linked.packages['node_modules/pako'] = { resolved: 'node_modules/tinyglobby', link: true };
-  assertRejected(evaluate({ lockfile: linked }), 'runtime-reachability', 'runtime link to tinyglobby');
 });
+
+// ---- Rule e: second copies and sources -------------------------------------------
 
 test('a second copy of an excepted package anywhere in the lockfile is rejected', () => {
   const cases = {
     'second picomatch path': lockfile => {
-      lockfile.packages['node_modules/picomatch'] = {
-        version: '4.0.7',
-        resolved: 'https://registry.npmjs.org/picomatch/-/picomatch-4.0.7.tgz',
-        integrity: `sha512-${'C'.repeat(86)}==`,
-        dev: true,
-      };
+      lockfile.packages['node_modules/picomatch'] = lockEntry('picomatch', '4.0.7');
     },
     'nested picomatch under an unrelated package': lockfile => {
-      lockfile.packages['node_modules/glob/node_modules/picomatch'] = {
-        version: '4.0.5',
-        resolved: 'https://registry.npmjs.org/picomatch/-/picomatch-4.0.5.tgz',
-        integrity: EXCEPTED_FINDINGS[0].integrity,
-        dev: true,
-      };
+      lockfile.packages['node_modules/glob/node_modules/picomatch'] = lockEntry('picomatch', '4.0.5', { integrity: PICOMATCH.integrity });
     },
-    'aliased picomatch': lockfile => {
-      lockfile.packages['node_modules/pm'] = {
-        name: 'picomatch',
-        version: '4.0.5',
-        resolved: 'https://registry.npmjs.org/picomatch/-/picomatch-4.0.5.tgz',
-        integrity: EXCEPTED_FINDINGS[0].integrity,
-        dev: true,
-      };
+    'by name field': lockfile => {
+      lockfile.packages['node_modules/pm'] = lockEntry('picomatch', '4.0.5', { name: 'picomatch' });
     },
-    'picomatch tarball under another name': lockfile => {
-      lockfile.packages['node_modules/not-picomatch'] = {
-        version: '4.0.5',
-        resolved: 'https://registry.npmjs.org/picomatch/-/picomatch-4.0.5.tgz',
-        dev: true,
-      };
+    'by registry tarball under another name': lockfile => {
+      lockfile.packages['node_modules/not-picomatch'] = lockEntry('picomatch', '4.0.5');
+    },
+    'by http URL (review counterexample)': lockfile => {
+      lockfile.packages['node_modules/not-picomatch'] = lockEntry('x', '1.0.0', {
+        resolved: 'http://registry.npmjs.org/picomatch/-/picomatch-4.0.5.tgz',
+      });
+    },
+    'by userinfo URL': lockfile => {
+      lockfile.packages['node_modules/not-picomatch'] = lockEntry('x', '1.0.0', {
+        resolved: 'https://user:pass@registry.npmjs.org/picomatch/-/picomatch-4.0.5.tgz',
+      });
+    },
+    'by look-alike host': lockfile => {
+      lockfile.packages['node_modules/not-picomatch'] = lockEntry('x', '1.0.0', {
+        resolved: 'https://registry.npmjs.org.evil.example/picomatch/-/picomatch-4.0.5.tgz',
+      });
+    },
+    'by percent-encoded scoped tarball': lockfile => {
+      lockfile.packages['node_modules/not-rebuild'] = lockEntry('x', '1.0.0', {
+        resolved: 'https://registry.npmjs.org/@electron%2frebuild/-/rebuild-4.2.0.tgz',
+      });
+    },
+    'by integrity at a path with another name': lockfile => {
+      lockfile.packages['node_modules/not-picomatch'] = lockEntry('not-picomatch', '1.0.0', { integrity: PICOMATCH.integrity });
+    },
+    'by integrity among several hashes': lockfile => {
+      lockfile.packages['node_modules/not-fdir'] = lockEntry('not-fdir', '1.0.0', {
+        integrity: `sha512-${'D'.repeat(86)}== ${EXCEPTED_FINDINGS[1].integrity}`,
+      });
     },
     'second scoped @electron/rebuild': lockfile => {
-      lockfile.packages['node_modules/app-builder-lib/node_modules/@electron/rebuild'] = { version: '4.2.1', dev: true };
+      lockfile.packages['node_modules/app-builder-lib/node_modules/@electron/rebuild'] = lockEntry('@electron/rebuild', '4.2.1');
     },
     'second node-gyp': lockfile => {
-      lockfile.packages['node_modules/canvas/node_modules/node-gyp'] = { version: '11.1.0', dev: true };
+      lockfile.packages['node_modules/canvas/node_modules/node-gyp'] = lockEntry('node-gyp', '11.1.0');
     },
   };
   for (const [label, mutate] of Object.entries(cases)) {
@@ -558,10 +890,34 @@ test('a second copy of an excepted package anywhere in the lockfile is rejected'
   }
 });
 
+test('every resolved source must be the npm registry over https, except the pinned vendored backport', () => {
+  const cases = {
+    'non-registry host': lockfile => { lockfile.packages['node_modules/pako'].resolved = 'https://registry.yarnpkg.com/pako/-/pako-2.1.0.tgz'; },
+    'http registry': lockfile => { lockfile.packages['node_modules/pako'].resolved = 'http://registry.npmjs.org/pako/-/pako-2.1.0.tgz'; },
+    'registry with port': lockfile => { lockfile.packages['node_modules/pako'].resolved = 'https://registry.npmjs.org:8443/pako/-/pako-2.1.0.tgz'; },
+    'registry with userinfo': lockfile => { lockfile.packages['node_modules/pako'].resolved = 'https://u@registry.npmjs.org/pako/-/pako-2.1.0.tgz'; },
+    'registry with query': lockfile => { lockfile.packages['node_modules/pako'].resolved = 'https://registry.npmjs.org/pako/-/pako-2.1.0.tgz?x'; },
+    'registry upper case': lockfile => { lockfile.packages['node_modules/pako'].resolved = 'HTTPS://REGISTRY.NPMJS.ORG/pako/-/pako-2.1.0.tgz'; },
+    'git source': lockfile => { lockfile.packages['node_modules/pako'].resolved = 'git+ssh://git@github.com/nodeca/pako.git#abc'; },
+    'file source elsewhere': lockfile => { lockfile.packages['node_modules/pako'].resolved = 'file:vendor/crate-http-cache-semantics-backport-0.1.0.tgz'; },
+    'vendored backport changed': lockfile => {
+      lockfile.packages['node_modules/cacheable-request/node_modules/http-cache-semantics'].resolved = 'file:vendor/other.tgz';
+    },
+    'not a URL': lockfile => { lockfile.packages['node_modules/pako'].resolved = 'pako-2.1.0.tgz'; },
+  };
+  for (const [label, mutate] of Object.entries(cases)) {
+    assertRejected(withLockfile(mutate), 'lockfile-source', label);
+  }
+  assert.equal(
+    LIVE_LOCKFILE.packages['node_modules/cacheable-request/node_modules/http-cache-semantics'].resolved,
+    'file:vendor/crate-http-cache-semantics-backport-0.1.0.tgz'
+  );
+});
+
+// ---- Rule f: expiry ---------------------------------------------------------------
+
 test('the exception expires one millisecond after 2026-11-20T23:59:59Z', () => {
-  const atExpiry = evaluate({ now: new Date('2026-11-20T23:59:59.000Z') });
-  assert.deepEqual(atExpiry.failures, []);
-  assert.equal(atExpiry.ok, true);
+  assertPassed(evaluate({ now: new Date('2026-11-20T23:59:59.000Z') }), true, 'at expiry');
   assertRejected(evaluate({ now: new Date('2026-11-20T23:59:59.001Z') }), 'expiry', 'one millisecond after');
   assertRejected(evaluate({ now: new Date('2026-11-21T00:00:00.000Z') }), 'expiry', 'one second after');
   assertRejected(evaluate({ now: new Date('2027-01-01T00:00:00Z') }), 'expiry', 'long after');
@@ -570,26 +926,22 @@ test('the exception expires one millisecond after 2026-11-20T23:59:59Z', () => {
   }
 });
 
-test('missing lockfile or manifest is rejected when the exception is needed', () => {
-  assertRejected(evaluate({ lockfile: null }), 'lockfile-shape');
-  assertRejected(evaluate({ manifest: null }), 'lockfile-shape');
-  assertRejected(evaluate({ lockfile: { packages: [] } }), 'lockfile-shape');
-});
-
 test('all violations are listed after the first', () => {
   const report = clone(REAL_REPORT);
-  report.vulnerabilities.lodash = highEntry('lodash');
+  report.vulnerabilities.lodash = advisoryEntry('lodash');
   recount(report);
   report.vulnerabilities.picomatch.via[0].range = '<=4.0.8';
   const result = evaluate({ report, now: new Date('2026-12-01T00:00:00Z') });
   const rules = result.failures.map(item => item.rule);
-  for (const rule of ['high-set', 'high-count', 'advisory', 'expiry']) assert.equal(rules.includes(rule), true, rule);
+  for (const rule of ['high-set', 'high-count', 'advisory', 'advisory-severity', 'expiry']) {
+    assert.equal(rules.includes(rule), true, rule);
+  }
   const errors = formatResult(result).errors;
   assert.equal(errors[0], `Dependency audit gate failed: [${result.failures[0].rule}] ${result.failures[0].message}`);
   assert.equal(errors.length, rules.length + 2);
 });
 
-// ---- Command line ---------------------------------------------------------
+// ---- Command line ---------------------------------------------------------------
 
 function withStubNpm(body, callback) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-audit-stub-'));
@@ -638,25 +990,29 @@ test('the command applies the exception to the real report only until expiry', (
     const file = writeReportFile(directory, 'real.json', REAL_REPORT_TEXT);
     // npm audit exits 1 when it lists findings.
     fs.appendFileSync(path.join(directory, 'npm'), `/bin/cat '${file}'\nexit 1\n`);
+    // The command reads the real clock once, somewhere inside this window, so
+    // the expected outcome is decided from the window and cannot race.
+    const before = Date.now();
     const result = runCli({ directory });
-    if (Date.now() <= Date.parse(EXCEPTION_EXPIRES_AT)) {
-      assert.equal(result.status, 0, result.stderr);
-      assert.match(result.stdout, /TEMPORARY exception for GHSA-fc5q-39xc-vjpf/u);
-    } else {
-      assert.equal(result.status, 1);
-      assert.match(result.stderr, /\[expiry\]/u);
-    }
+    const after = Date.now();
+    const passed = result.status === 0 && /TEMPORARY exception for GHSA-fc5q-39xc-vjpf/u.test(result.stdout);
+    const expired = result.status === 1 && /\[expiry\]/u.test(result.stderr) &&
+      !/\[(?!expiry\])[a-z-]+\]/u.test(result.stderr.split('\n').slice(2).join('\n'));
+    if (after <= EXPIRY_MS) assert.equal(passed, true, result.stderr);
+    else if (before > EXPIRY_MS) assert.equal(expired, true, result.stderr);
+    else assert.equal(passed || expired, true, result.stderr);
   });
 });
 
-test('the command fails on garbage, empty, signalled, failed or unexpected npm output', () => {
+test('the command fails on garbage, empty, oversized, signalled, failed or unexpected npm output', () => {
   const seventh = clone(REAL_REPORT);
-  seventh.vulnerabilities.lodash = highEntry('lodash');
+  seventh.vulnerabilities.lodash = advisoryEntry('lodash');
   recount(seventh);
   const cases = [
     { label: 'garbage', body: "printf 'npm WARN something\\nnot json\\n'\nexit 1", pattern: /\[report-json\] npm audit output is not valid JSON/u },
     { label: 'nothing', body: 'exit 1', pattern: /\[report-json\] npm audit printed no report/u },
     { label: 'signal', body: 'kill -TERM $$', pattern: /\[report-json\] npm audit ended unexpectedly \(signal SIGTERM\)/u },
+    { label: 'over the output limit', body: '/usr/bin/head -c 70000000 /dev/zero\nexit 1', pattern: /\[report-json\] npm audit failed: its output exceeded 67108864 bytes/u },
     { label: 'other status with a valid report', report: zeroHighReport(), status: 2, pattern: /\[report-json\] npm audit ended unexpectedly \(status 2\)/u },
     { label: 'error object', report: { error: { code: 'ENOTFOUND', summary: 'request failed' } }, status: 1, pattern: /\[report-error\]/u },
     { label: 'seventh high', report: seventh, status: 1, pattern: /\[high-set\] High findings outside the GHSA-fc5q-39xc-vjpf exception: lodash/u },
@@ -679,7 +1035,7 @@ test('the command fails on garbage, empty, signalled, failed or unexpected npm o
   try {
     const result = runCli({ directory: empty });
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /\[report-json\] npm audit could not be run \(ENOENT\)/u);
+    assert.match(result.stderr, /\[report-json\] npm audit failed: it could not be run \(ENOENT\)/u);
   } finally {
     fs.rmSync(empty, { recursive: true, force: true });
   }
@@ -687,7 +1043,7 @@ test('the command fails on garbage, empty, signalled, failed or unexpected npm o
 
 test('no argument or environment variable substitutes the report, moves the expiry or skips a check', () => {
   const seventh = clone(REAL_REPORT);
-  seventh.vulnerabilities.lodash = highEntry('lodash');
+  seventh.vulnerabilities.lodash = advisoryEntry('lodash');
   recount(seventh);
   withStubNpm('', ({ directory, marker }) => {
     const bad = writeReportFile(directory, 'seventh.json', seventh);
