@@ -229,6 +229,9 @@ function initializeAccountSession() {
     const identityChanged = accountWorkspaceId !== snapshot.identity?.id;
     const generationChanged = accountWorkspaceGeneration !== accountSession.generation;
     if (!allowed || identityChanged || generationChanged) invalidateAllPackageReviews();
+    // An identity change while access had already lapsed (a sign-out, then a
+    // sign-in) skips the block below, but still ends every Assets need save episode.
+    if (identityChanged && !accountWorkspaceAllowed) closeNeedsSaveNotifications(null, { forgetSeen: true });
     if (accountWorkspaceAllowed && (!allowed || identityChanged || generationChanged)) {
       // Invalidate the existing project-operation fences before any late scan/package result.
       // Same-account cancellation can retain access while retiring its generation.

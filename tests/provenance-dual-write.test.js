@@ -25551,6 +25551,7 @@ test('Assets need save notice click opens Review Assets for its project once, af
   const rows = JSON.stringify((await getProject(project.id)).pendingFiles);
   notice.handlers.get('click')();
   assert.equal(testMainWindowShowCount, shows + 1);
+  assert.equal(messages().length, before, 'nothing is sent before the renderer is ready');
   rendererReady();
   assert.equal(messages().length, before + 1);
   assert.deepEqual(messages().at(-1).data, { projectId: project.id });
@@ -25775,6 +25776,76 @@ test('Assets need save notice: links first seen with Crate in front are not anno
   await pollUntilNeedsSave(project.id, item => linkedNeedsSaveRows(item).length === 2, 'second link restaged');
   await settleNeedsSave();
   assert.equal(needsSaveNotices().length, 0, 'restaged links are not new arrivals');
+});
+
+// Access lapses with the same identity (the notice is withdrawn but its rows stay
+// remembered), then a sign-out and a sign-in happen while access is not allowed.
+async function lapseThenSignOutAndSignIn(identity) {
+  const originalNow = testAccountSession.now;
+  try {
+    testAccountSession.now = () => testAccountSession.accessExpiresAt;
+    testAccountSession.publish('offline', 'Your session needs to be checked.');
+    assert.equal(testAccountSession.canUseWorkspace(), false);
+    testAccountSession.publish('signed_out', '', null);
+  } finally {
+    testAccountSession.now = originalNow;
+  }
+  testAccountSession.publish('signed_in', '', identity);
+  assert.equal(testAccountSession.canUseWorkspace(), true);
+  await new Promise(resolve => originalSetTimeout(resolve, 100));
+}
+
+for (const [label, identity] of [['another account', { id: 'test-account-b' }], ['the same account', { id: 'test-account' }]]) {
+  test(`Assets need save notice: after access lapses, a sign-out and a sign-in as ${label} start a new episode`, async () => {
+    resetTestHomeWorkspace();
+    backgroundNeedsSave();
+    needsSaveSession();
+    try {
+      const project = await createProject(`Lapse then ${label}`);
+      await waitForNeedsSave(() => needsSaveNotices().length === 1, 'first notice');
+      await lapseThenSignOutAndSignIn(identity);
+      assert.equal(needsSaveNotices()[0].closed, true, 'the lapse withdrew the first notice');
+      await settleNeedsSave();
+      assert.ok(linkedNeedsSaveRows(await getProject(project.id)).length > 0, 'the link is still stored and unsaved');
+      assert.equal(needsSaveNotices().length, 2, 'the new sign-in announces the waiting link once');
+      await settleNeedsSave();
+      assert.equal(needsSaveNotices().length, 2, 'and only once');
+    } finally {
+      await testAccountSession.restore();
+    }
+  });
+}
+
+test('Assets need save notice stays open across a silent token refresh that keeps the account and its generation', async () => {
+  const originalProvider = testAccountSession.provider, originalCredentials = testAccountSession.credentials;
+  resetTestHomeWorkspace();
+  backgroundNeedsSave();
+  needsSaveSession();
+  try {
+    const identity = { id: '22222222-2222-4222-8222-222222222222', email: 'synthetic@example.test', verified: true };
+    testAccountSession.record = { identity, refreshToken: 'synthetic-refresh' };
+    testAccountSession.publish('signed_in', '', identity);
+    await createProject('Silent token refresh');
+    await waitForNeedsSave(() => needsSaveNotices().length === 1, 'notice');
+    const generation = testAccountSession.generation;
+    testAccountSession.provider = {
+      refresh: async () => ({ access_token: 'synthetic-refreshed-access', refresh_token: 'synthetic-refreshed' }),
+      validate: async () => ({ subject: identity.id, expiresAt: Date.now() + 7200000 }),
+      me: async () => identity,
+    };
+    testAccountSession.credentials = { write() {} };
+    await testAccountSession.refresh();
+    assert.equal(testAccountSession.accessToken, 'synthetic-refreshed-access');
+    assert.equal(testAccountSession.generation, generation, 'the same generation');
+    assert.equal(testAccountSession.canUseWorkspace(), true, 'access never lapsed');
+    await settleNeedsSave();
+    assert.equal(needsSaveNotices().length, 1, 'no second notice');
+    assert.notEqual(needsSaveNotices()[0].closed, true, 'the open notice stays in place');
+  } finally {
+    testAccountSession.provider = originalProvider;
+    testAccountSession.credentials = originalCredentials;
+    await testAccountSession.restore();
+  }
 });
 
 test('Assets need save episode ends when its announced links clear, even with an older hidden row still stored', async () => {
