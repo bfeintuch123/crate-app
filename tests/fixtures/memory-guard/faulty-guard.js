@@ -39,7 +39,15 @@
 //                                                  first scan instead fails at the request timeout, with the clock 1100 ms on),
 //                                                  retry (the next scan fails as a sampler that ends does, and the one taken
 //                                                  with the sampler standing by arrives 1100 ms on). What those scans show of
-//                                                  the process: CRATE_GUARD_LATE, gone, ended or readable, as above
+//                                                  the process: CRATE_GUARD_LATE, gone, ended or readable, as above.
+//                                                  The hand-off: handoff-gone (the scan after the end of the run arrives 500 ms
+//                                                  on, still exiting; every later scan 1100 ms on, not listing it),
+//                                                  handoff-stays (the same, but every later scan still lists it as exiting,
+//                                                  whether or not it is there), handoff-retry (as handoff-gone, with the
+//                                                  cleanup's first scan failing as a sampler that ends does), none (no
+//                                                  process is ever shown exiting). At exit it prints how many scans the
+//                                                  guard took after the end of the run before its first signal, and what
+//                                                  it injected
 //   CRATE_GUARD_FAULT=tool-exiting:<role>          once the tree is up, two scans read that process as the system's ps; after
 //                                                  that it reads as that ps does once killed and before it has ended (no
 //                                                  process info, usage denied)
@@ -84,6 +92,15 @@ let lateScans = 0;
 let toolScans = 0;
 let afterExit = 0;
 let postDelivered = false;
+let signalled = false;
+let scansBeforeSignal = 0;
+let lastTargetRow = null;
+const injected = [];
+if (kind === 'exiting-at-exit') {
+  process.on('exit', () => {
+    process.stderr.write(`faulty-guard: after the end of the run, ${scansBeforeSignal} scans before the first signal; injected: ${injected.join(', ') || 'nothing'}\n`);
+  });
+}
 const deadSamplers = new Set();
 // What a scan shows of `target` after the end of the run, by CRATE_GUARD_LATE.
 const shownAs = (rows, target) => {
@@ -232,6 +249,10 @@ async function atExit(number, rows) {
   const collected = pid => { try { process.kill(pid, 0); return false; } catch { return true; } };
   const runnerRunning = runner !== undefined && !collected(runner.pid);
   if (runnerRunning || afterExit === 0) {
+    if (how === 'none') {
+      if (!runnerRunning) afterExit = 1;
+      return rows;
+    }
     if (!rows.some(row => row.pid === target)) return rows;
     if (fixed === null) fixed = performance.now();
     if (!runnerRunning) {
@@ -244,13 +265,44 @@ async function atExit(number, rows) {
     return rows.map(row => (row.pid === target ? exitingRow(row) : row));
   }
   afterExit += 1;
+  if (!signalled) scansBeforeSignal += 1;
+  if (how === 'none') return rows;
+  if (how === 'handoff-gone' || how === 'handoff-stays' || how === 'handoff-retry') {
+    const first = !postDelivered;
+    if (how === 'handoff-retry' && number === 1 && !first) {
+      deadSamplers.add(number);
+      injected.push('the cleanup\'s first scan failed as a sampler that ends does');
+      throw new Error('sampler exited (injected)');
+    }
+    postDelivered = true;
+    const start = fixed;
+    if (first) {
+      fixed += 500;
+      injected.push('the scan after the end of the run at 500 ms, still exiting');
+      const shown = rows.find(row => row.pid === target);
+      if (shown) lastTargetRow = exitingRow(shown);
+      return rows.map(row => (row.pid === target ? exitingRow(row) : row));
+    }
+    if (start === fixed && fixed !== null && !injected.some(item => item.startsWith('a later scan'))) {
+      fixed += 600;
+      injected.push('a later scan at 1100 ms');
+    }
+    if (how === 'handoff-stays' && lastTargetRow) {
+      // Listed as exiting for as long as the guard asks, there or not.
+      return [...rows.filter(row => row.pid !== target), lastTargetRow];
+    }
+    return rows.filter(row => row.pid !== target);
+  }
   if (how === 'retry' && number === 1) {
     deadSamplers.add(number);
     throw new Error('sampler exited (injected)');
   }
   if (!postDelivered) {
     postDelivered = true;
-    if (how !== 'timeout') fixed += how === 'inside' ? 900 : 1100;
+    if (how !== 'timeout') {
+      fixed += how === 'inside' ? 900 : 1100;
+      injected.push(`the scan after the end of the run at ${how === 'inside' ? 900 : 1100} ms`);
+    }
   }
   return shownAs(rows, target);
 }
@@ -291,8 +343,8 @@ async function startFaultySampler() {
     }),
     // The real sampler signals the group through a readable member; the faults
     // above do not change what it reads.
-    signalGroup: (...args) => use(() => real.signalGroup(...args)),
-    signalProcesses: (name, rows) => use(() => signalProcesses(name, rows)),
+    signalGroup: (...args) => use(() => { if (afterExit > 0) signalled = true; return real.signalGroup(...args); }),
+    signalProcesses: (name, rows) => use(() => { if (afterExit > 0) signalled = true; return signalProcesses(name, rows); }),
     describe: (...args) => {
       const how = process.env.CRATE_GUARD_DESCRIBE;
       if (how === 'stall') return new Promise(() => {});

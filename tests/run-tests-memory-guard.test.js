@@ -1637,6 +1637,65 @@ test('the scan after the end of the run, arriving inside the exiting second and 
   assert.match(result.stdout, /^# pass 1$/m);
   assert.equal(result.code, 0, result.stderr);
   assert.doesNotMatch(result.stderr, /CANNOT READ|LOST SIGHT|INCOMPLETE/);
+  // The fault fired: the scan after the end of the run came with the clock exactly 900 ms on.
+  assert.match(result.stderr, /faulty-guard: after the end of the run, \d+ scans before the first signal; injected: the scan after the end of the run at 900 ms\n/);
+  assert.equal(bystanderSurvived(), true);
+});
+
+// The hand-off. The guard stops judging exiting allowances at the first
+// successful scan after the end of the run; a process still inside its second
+// then is an ordinary leftover for the existing cleanup.
+const handOff = (environment, how) => startGuard([descendants],
+  { ...environment('short'), CRATE_GUARD_FAULT: 'exiting-at-exit:nested', CRATE_GUARD_POST: how }, faultyGuard).done;
+const seam = stderr => {
+  const line = /faulty-guard: after the end of the run, (\d+) scans before the first signal; injected: (.*)\n/.exec(stderr);
+  assert.ok(line, stderr);
+  return { beforeSignal: Number(line[1]), injected: line[2] };
+};
+
+test('hand-off: a process still exiting at the first scan after the end of the run is a leftover; gone during cleanup, the run keeps its own status', { timeout: 60000 }, async t => {
+  const { environment, bystanderSurvived } = scenario(t);
+  const result = await handOff(environment, 'handoff-gone');
+  assert.match(result.stdout, /^# pass 1$/m);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stderr, /run-tests: The test run ended and left \d+ of its processes running; ending them\./);
+  assert.doesNotMatch(result.stderr, /CANNOT READ|INCOMPLETE|LOST SIGHT/);
+  // Not vacuous: the cleanup's scan arrived after the one-second mark, and showed the process gone.
+  assert.equal(seam(result.stderr).injected, 'the scan after the end of the run at 500 ms, still exiting, a later scan at 1100 ms');
+  assert.equal(bystanderSurvived(), true);
+});
+
+test('hand-off: a leftover that is still there when the cleanup\'s confirmation ends makes it 125, as on the base', { timeout: 60000 }, async t => {
+  const { environment, recorded, bystanderSurvived } = scenario(t);
+  const result = await handOff(environment, 'handoff-stays');
+  assert.match(result.stdout, /^# pass 1$/m);
+  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+  assert.doesNotMatch(result.stderr, /CANNOT READ/);
+  assert.match(result.stderr, new RegExp(`run-tests: CLEANUP INCOMPLETE: 1 processes of the run were still there [\\d.]+ s after SIGKILL: ${recorded().get('nested')}\\.\\n`));
+  assert.match(result.stderr, /run-tests: Exit status 125 replaces 0\.\nrun-tests: Not every process of the run is confirmed to have ended\./);
+  assert.equal(bystanderSurvived(), true);
+});
+
+test('hand-off: a retry of the cleanup after the first successful scan runs with judging off; gone after the mark, the run keeps its own status', { timeout: 60000 }, async t => {
+  const { environment, bystanderSurvived } = scenario(t);
+  const result = await handOff(environment, 'handoff-retry');
+  assert.match(result.stdout, /^# pass 1$/m);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stderr, /run-tests: the sampler failed \(sampler exited \(injected\)\); continuing with the one standing by/);
+  assert.doesNotMatch(result.stderr, /CANNOT READ|INCOMPLETE/);
+  assert.equal(seam(result.stderr).injected,
+    'the scan after the end of the run at 500 ms, still exiting, the cleanup\'s first scan failed as a sampler that ends does, a later scan at 1100 ms');
+  assert.equal(bystanderSurvived(), true);
+});
+
+test('hand-off: with no process exiting at the end of the run, the scan after it and then the cleanup, as on the base', { timeout: 60000 }, async t => {
+  const { environment, bystanderSurvived } = scenario(t);
+  const result = await handOff(environment, 'none');
+  assert.match(result.stdout, /^# pass 1$/m);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stderr, /run-tests: The test run ended and left \d+ of its processes running; ending them\./);
+  // The scan after the end of the run, and the cleanup's first scan, then its signal.
+  assert.deepEqual(seam(result.stderr), { beforeSignal: 2, injected: 'nothing' });
   assert.equal(bystanderSurvived(), true);
 });
 
