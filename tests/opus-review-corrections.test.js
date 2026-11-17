@@ -29,8 +29,10 @@ test('pending count and capture consequences share one atomic status region',()=
   assert.equal(one.elements['project-review-eyebrow'].textContent,'1 file needs review');
   assert.equal(two.elements['project-review-eyebrow'].textContent,'2 files need review');
   assert.match(two.elements['project-linking-alert'].textContent,/Opened.pptx.*1 more/);
+  // Every row needs a save: the banner says so and uses the Needs Save sentence.
   const saved=fixture({pending:[{...raw,captureState:'needs-save',captureEvidence:{appFamily:'powerpoint'}}]});
-  assert.match(saved.elements['project-review-detail'].textContent,/Save to make package-ready.*Not in the package/);
+  assert.equal(saved.elements['project-review-eyebrow'].textContent,'1 asset needs save');
+  assert.equal(saved.elements['project-review-detail'].textContent,'Save your file in PowerPoint to add it to the package.');
   assert.doesNotMatch(saved.elements['project-review-detail'].textContent,/\. ·/);
   const html=fs.readFileSync(path.join(__dirname,'../renderer/index.html'),'utf8');
   assert.match(html,/id="project-review-status"[^>]*role="status"[^>]*aria-live="polite"[^>]*aria-atomic="true"/);

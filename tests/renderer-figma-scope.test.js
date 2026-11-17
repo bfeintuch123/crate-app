@@ -8377,7 +8377,8 @@ test('Olivia UI: busy mixed batch explains both controls and preserves unresolve
   const before = cloneTestValue(project);
   const f = await loadPendingBatchFixture({ project, beforeAccept: () => held.promise });
   attachOliviaReviewDescriptions(f);
-  assertOliviaBulkReason(f, /only to eligible review items.*Other items stay unchanged/, [false, false]);
+  // The mixed list includes a Needs Save row, so the line names the rows the buttons act on.
+  assertOliviaBulkReason(f, /^Include All and Exclude All apply only to rows marked Include or Exclude\.$/, [false, false]);
   const action = f.renderer.submitAssetReviewBatchDecision('include');
   assertOliviaBulkReason(f, /Updating assets.*Wait/);
   assert.equal(await f.renderer.submitAssetReviewBatchDecision('skip'), undefined);
@@ -8690,7 +8691,7 @@ for (const decision of ['include', 'skip']) for (const outcome of ['success', 'e
       assertNoPendingBatchControls(f);
       assert.deepEqual(f.getPersisted().pendingFiles, before.pendingFiles.slice(1));
     } else {
-      assertOliviaBulkReason(f, /only to eligible review items/, [false, false]);
+      assertOliviaBulkReason(f, /^Include All and Exclude All apply only to rows marked Include or Exclude\.$/, [false, false]);
       assert.deepEqual(f.getPersisted(), before);
     }
   });
@@ -9379,10 +9380,16 @@ test('every changed message is exact: Existing batch toasts, batch reasons, and 
   // Batch reasons, full text.
   {
     const mixed = createPendingBatchProject('reason-mixed');
-    mixed.pendingFiles[3].captureState = 'needs-save';
+    mixed.pendingFiles[3].captureState = 'observed';
     const f = await loadPendingBatchFixture({ project: mixed });
     assert.equal(f.elements['asset-review-batch-reason'].textContent,
       'Include All and Exclude All apply only to eligible review items. Other items stay unchanged.');
+    // With a Needs Save row, the Needs Save alert explains it, so the line names the rows the buttons act on.
+    const mixedSave = createPendingBatchProject('reason-mixed-save');
+    mixedSave.pendingFiles[3].captureState = 'needs-save';
+    const s = await loadPendingBatchFixture({ project: mixedSave });
+    assert.equal(s.elements['asset-review-batch-reason'].textContent,
+      'Include All and Exclude All apply only to rows marked Include or Exclude.');
     const unidentified = createPendingBatchProject('reason-unidentified');
     unidentified.pendingFiles = [{ name: 'Unidentified.png', captureState: 'pending' }];
     const g = await loadPendingBatchFixture({ project: unidentified });

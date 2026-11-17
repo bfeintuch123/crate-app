@@ -2183,6 +2183,33 @@ body {
   color: #9a3412;
 }
 
+/* Thin one-line variant for the Needs Save alert: title and copy inline. */
+.modal-reminder.is-thin {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 12px;
+  border-color: #fcd34d;
+}
+
+.modal-reminder.is-thin .modal-reminder-title {
+  margin-bottom: 0;
+  white-space: nowrap;
+}
+
+.modal-reminder.is-thin .modal-reminder-copy {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.needs-save-alert.modal-reminder {
+  margin: 0 0 8px;
+}
+
+#modal-needs-save-reminder.modal-reminder {
+  margin-bottom: 8px;
+}
+
 .modal-naming-box {
   background: #f8f8f8;
   border: 1px solid var(--gray-200);

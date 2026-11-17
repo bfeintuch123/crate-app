@@ -157,6 +157,8 @@ Module._load = function patchedLoad(request, parent, ...rest) {
 };
 
 const ipcHandlers = new Map();
+// Renderer-to-main events (ipcMain.on), e.g. the renderer-ready startup signal.
+const ipcEventHandlers = new Map();
 let nextOpenDialogResult = { canceled: true };
 let testNotificationSupported = false;
 let testAppActive = true;
@@ -721,6 +723,7 @@ setStub('electron', () => ({
   },
   ipcMain: {
     handle(channel, fn) { ipcHandlers.set(channel, fn); },
+    on(channel, fn) { ipcEventHandlers.set(channel, fn); },
   },
   dialog: {
     showOpenDialog: async () => {
@@ -774,6 +777,7 @@ class FakeStore {
     fs.mkdirSync(path.dirname(this.path), { recursive: true });
     fs.writeFileSync(this.path, '{}', { mode: 0o600 });
     this.data = JSON.parse(JSON.stringify(opts.defaults || {}));
+    this.options = opts;
     this.projectSetCount = 0;
     this.measureProjectSerialization = false;
     this.projectSerializedBytes = 0;
@@ -1060,6 +1064,8 @@ Module._extensions['.js'] = function loadMainWithMetadataTestHooks(module, filen
     workspaceEvidenceGateAnchor);
   return module._compile(`${source}
 module.exports.__crateMetadataTestHooks = {
+  // The "Assets need save" notice body, for wording cases no live observer produces.
+  needsSaveNotificationBody(rows) { return getNeedsSaveNotificationBody(rows); },
   normalizeFailedRequiredAssetBaselineSources(project, baseline) {
     return normalizeFailedRequiredAssetBaselineSources(project, baseline);
   },
@@ -25398,7 +25404,661 @@ test('Opus correction: actual pending projections preserve capture copy across r
       const workspace=await callIpcRaw('projects:get-asset-workspace',project.id),current=await getProject(project.id);
       assert.equal(Object.hasOwn(workspace.pendingFiles[0],'captureState'),false);
       const f=require('./opus-renderer-helpers').loadProjectedWorkspace(current,workspace);
-      assert.match(f.elements['project-review-detail'].textContent,captureState==='observed'?/Opened.*Pending/:/Save to make package-ready/,ext);
+      // A single Needs Save row with no source or app uses the shared Needs Save sentence.
+      assert.match(f.elements['project-review-detail'].textContent,captureState==='observed'?/Opened.*Pending/:/^Save your working file to add it to the package\.$/,ext);
     }
   } finally {fs.rmSync(root,{recursive:true,force:true});}
+});
+
+// ===== "Assets need save" notification (PR 2) =====
+// Real Needs Save rows come from the InDesign and Illustrator live polls.
+// Bryant (2026-11-16): linked assets only; a new linked asset must arrive while
+// Crate is in the background; no file or project names.
+const needsSaveRendererFixture = (() => {
+  const vm = require('vm');
+  const { createRequire } = require('module');
+  const sharedPath = path.join(__dirname, 'renderer-figma-scope.test.js');
+  const shared = fs.readFileSync(sharedPath, 'utf8');
+  const scope = { require: createRequire(sharedPath), __dirname, console, setTimeout: originalSetTimeout, clearTimeout: originalClearTimeout };
+  vm.createContext(scope);
+  vm.runInContext(shared.slice(0, shared.indexOf('\ntest(')), scope);
+  return { vm, scope };
+})();
+
+function needsSaveSession({ docs = [{ name: 'Client Secret Board.indd', links: ['private-logo.png'] }], modified = true } = {}) {
+  const session = { docs, modified };
+  const desktop = path.join(TEST_HOME, 'Desktop');
+  const ensure = name => { const filePath = path.join(desktop, name); if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, `synthetic ${name}`); return filePath; };
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (kind === 'exec' && command.includes("grep -i 'Adobe InDesign'")) {
+      return { stdout: '456 /Applications/Adobe InDesign.app/Contents/MacOS/Adobe InDesign\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-poll.applescript')) {
+      const lines = [];
+      for (const doc of session.docs) {
+        const docPath = ensure(doc.name);
+        const modified = doc.modified ?? session.modified;
+        lines.push(`DOC\t${docPath}\t${doc.name}\t${modified}\ttrue`);
+        for (const link of doc.links) lines.push(`LINK\t${docPath}\t${doc.name}\t${ensure(link)}\t${modified}\ttrue`);
+      }
+      return { stdout: `${lines.join('\n')}\n` };
+    }
+    return { stdout: '' };
+  });
+  return session;
+}
+
+async function waitForNeedsSave(predicate, label, timeoutMs = 5000) {
+  const startedAt = Date.now();
+  while (!predicate()) {
+    if (Date.now() - startedAt > timeoutMs) assert.fail(`timed out waiting for ${label}`);
+    await new Promise(resolve => originalSetTimeout(resolve, 25));
+  }
+}
+
+// Runs a live-app poll now (instead of waiting for its 10-second interval) and
+// lets the deferred notification sync run.
+async function pollNeedsSave(times = 1) {
+  for (let i = 0; i < times; i++) {
+    await runTrackedIntervalCallbacksForDelay(10000);
+    await new Promise(resolve => originalSetTimeout(resolve, 60));
+  }
+}
+
+async function settleNeedsSave() {
+  await pollNeedsSave(2);
+}
+
+async function pollUntilNeedsSave(projectId, predicate, label) {
+  for (let i = 0; i < 40; i++) {
+    if (predicate(await getProject(projectId))) return;
+    await pollNeedsSave();
+  }
+  assert.fail(`timed out waiting for ${label}`);
+}
+
+const needsSaveNotices = () => testNotifications.filter(item => item.options?.title === 'Crate — Assets need save');
+const linkedNeedsSaveRows = project => (project.pendingFiles || []).filter(file => (
+  file.captureState === 'needs-save' && file.captureReason !== 'unsaved-source-needs-save'
+));
+
+function backgroundNeedsSave() {
+  testNotificationSupported = true;
+  testMainWindowVisible = false;
+  storeInstance.set('settings.notifications', true);
+  storeInstance.set('settings.needsSaveNotifications', true);
+}
+
+function rendererReady() {
+  ipcEventHandlers.get('startup:renderer-startup-data-complete')({ sender: trustedRendererWindow.webContents, senderFrame: trustedRendererMainFrame });
+}
+
+test('Assets need save notice: once per episode, background only, private, withdrawn when the save clears it', async () => {
+  resetTestHomeWorkspace();
+  backgroundNeedsSave();
+  const session = needsSaveSession();
+  const shows = testMainWindowShowCount;
+  const project = await createProject('Private project label');
+  await waitForProject(project.id, item => linkedNeedsSaveRows(item).length === 1, 5000);
+  await waitForNeedsSave(() => needsSaveNotices().length === 1, 'first notice');
+  const notice = needsSaveNotices()[0];
+  assert.equal(notice.shown, true);
+  assert.equal(notice.options.title, 'Crate — Assets need save');
+  assert.equal(notice.options.body, 'Save your InDesign file to add 1 linked asset to the package. Click to review in Crate.');
+  // The icon is Crate's own asset; the text names no project, file or path.
+  assert.doesNotMatch(`${notice.options.title} ${notice.options.body}`, /Private project|Client Secret|private-logo|Desktop|\/Users\//);
+  assert.equal(testMainWindowShowCount, shows, 'arrival cannot bring Crate to the front');
+
+  // More linked assets in the same episode: no second notice.
+  session.docs[0].links.push('private-photo.png');
+  await pollUntilNeedsSave(project.id, item => linkedNeedsSaveRows(item).length === 2, 'second linked asset');
+  await settleNeedsSave();
+  assert.equal(needsSaveNotices().length, 1, 'one notice per episode');
+
+  // The save clears the linked assets: the notice is withdrawn.
+  session.modified = false;
+  await pollUntilNeedsSave(project.id, item => linkedNeedsSaveRows(item).length === 0, 'save clears linked assets');
+  await waitForNeedsSave(() => notice.closed === true, 'withdrawn notice');
+
+  // A new episode can notify again.
+  session.modified = true;
+  session.docs[0].links.push('private-pattern.png');
+  await pollUntilNeedsSave(project.id, item => linkedNeedsSaveRows(item).length > 0, 'new episode rows');
+  await waitForNeedsSave(() => needsSaveNotices().length === 2, 'second episode notice');
+  assert.match(needsSaveNotices()[1].options.body, /^Save your InDesign file to add \d+ linked assets? to the package\. Click to review in Crate\.$/);
+});
+
+test('Assets need save notice: a working file alone never notifies, and foreground arrivals are not repeated by routine polls', async () => {
+  resetTestHomeWorkspace();
+  backgroundNeedsSave();
+  const session = needsSaveSession({ docs: [{ name: 'Only Board.indd', links: [] }] });
+  const project = await createProject('Working file only');
+  await waitForProject(project.id, item => (item.pendingFiles || []).some(file => file.captureReason === 'unsaved-source-needs-save'), 5000);
+  await settleNeedsSave();
+  assert.equal(needsSaveNotices().length, 0, 'linked assets only');
+
+  // A linked asset arrives while Crate is in front: no notice, then or later.
+  testMainWindowVisible = true;
+  session.docs[0].links.push('seen-in-front.png');
+  await pollUntilNeedsSave(project.id, item => linkedNeedsSaveRows(item).length === 1, 'foreground arrival');
+  await settleNeedsSave();
+  testMainWindowVisible = false;
+  await settleNeedsSave();
+  assert.equal(needsSaveNotices().length, 0, 'focus loss and routine polls never notify by themselves');
+
+  // A new linked asset arrives in the background: one notice, counting both linked assets.
+  session.docs[0].links.push('arrived-in-background.png');
+  await pollUntilNeedsSave(project.id, item => linkedNeedsSaveRows(item).length === 2, 'background arrival');
+  await waitForNeedsSave(() => needsSaveNotices().length === 1, 'background arrival notice');
+  assert.equal(needsSaveNotices()[0].options.body, 'Save your InDesign file to add 2 linked assets to the package. Click to review in Crate.');
+});
+
+test('Assets need save notice: settings default on, persist off, ignore invalid values and obey every gate', async () => {
+  assert.equal(storeInstance.options.defaults.settings.needsSaveNotifications, true);
+  const withoutKey = { ...storeInstance.get('settings') };
+  delete withoutKey.needsSaveNotifications;
+  storeInstance.set('settings', withoutKey);
+  assert.equal((await callIpc('settings:get')).needsSaveNotifications, true);
+  await callIpc('settings:update', 'needsSaveNotifications', false);
+  assert.equal((await callIpc('settings:get')).needsSaveNotifications, false);
+  await callIpc('settings:update', 'needsSaveNotifications', 'invalid');
+  assert.equal((await callIpc('settings:get')).needsSaveNotifications, false);
+  for (const gate of ['type-off', 'global-off', 'unsupported', 'foreground']) {
+    resetTestHomeWorkspace();
+    backgroundNeedsSave();
+    storeInstance.set('settings.needsSaveNotifications', gate !== 'type-off');
+    storeInstance.set('settings.notifications', gate !== 'global-off');
+    testNotificationSupported = gate !== 'unsupported';
+    testMainWindowVisible = gate === 'foreground';
+    needsSaveSession();
+    const project = await createProject(`Gate ${gate}`);
+    await waitForProject(project.id, item => linkedNeedsSaveRows(item).length === 1, 5000);
+    await settleNeedsSave();
+    assert.equal(needsSaveNotices().length, 0, gate);
+    await callIpc('projects:delete-all');
+  }
+});
+
+test('Assets need save notice: turning the switch off withdraws it, and turning it back on never notifies by itself', async () => {
+  resetTestHomeWorkspace();
+  backgroundNeedsSave();
+  needsSaveSession();
+  const project = await createProject('Switch withdraw');
+  await waitForNeedsSave(() => needsSaveNotices().length === 1, 'notice');
+  await callIpc('settings:update', 'needsSaveNotifications', false);
+  assert.equal(needsSaveNotices()[0].closed, true);
+  await callIpc('settings:update', 'needsSaveNotifications', true);
+  await settleNeedsSave();
+  assert.equal(needsSaveNotices().length, 1);
+  assert.ok((await getProject(project.id)).pendingFiles.length > 0);
+});
+
+test('Assets need save notice click opens Review Assets for its project once, after the renderer is ready', async () => {
+  resetTestHomeWorkspace();
+  backgroundNeedsSave();
+  needsSaveSession();
+  const project = await createProject('Click target');
+  await waitForNeedsSave(() => needsSaveNotices().length === 1, 'notice');
+  const notice = needsSaveNotices()[0];
+  const shows = testMainWindowShowCount;
+  const messages = () => testRendererEvents.filter(event => event.channel === 'needs-save:review');
+  const before = messages().length;
+  const rows = JSON.stringify((await getProject(project.id)).pendingFiles);
+  notice.handlers.get('click')();
+  assert.equal(testMainWindowShowCount, shows + 1);
+  assert.equal(messages().length, before, 'nothing is sent before the renderer is ready');
+  rendererReady();
+  assert.equal(messages().length, before + 1);
+  assert.deepEqual(messages().at(-1).data, { projectId: project.id });
+  notice.handlers.get('click')();
+  assert.equal(messages().length, before + 1, 'a second click does nothing');
+  assert.equal(JSON.stringify((await getProject(project.id)).pendingFiles), rows, 'a click never changes rows');
+});
+
+test('Assets need save notice: stale clicks after a save, delete, pause, switch off, Package alerts off or sign-out do nothing', async () => {
+  for (const boundary of ['saved', 'deleted', 'paused', 'type-off', 'global-off', 'account']) {
+    resetTestHomeWorkspace();
+    backgroundNeedsSave();
+    const session = needsSaveSession();
+    const project = await createProject(`Stale ${boundary}`);
+    await waitForNeedsSave(() => needsSaveNotices().length === 1, `${boundary} notice`);
+    const notice = needsSaveNotices()[0];
+    if (boundary === 'saved') {
+      session.modified = false;
+      await pollUntilNeedsSave(project.id, item => linkedNeedsSaveRows(item).length === 0, 'stale save');
+    }
+    if (boundary === 'deleted') await callIpc('projects:delete', project.id);
+    if (boundary === 'paused') await callIpc('projects:pause', project.id);
+    if (boundary === 'type-off') await callIpc('settings:update', 'needsSaveNotifications', false);
+    if (boundary === 'global-off') await callIpc('settings:update', 'notifications', false);
+    if (boundary === 'account') testAccountSession.publish('signed_out', '', null);
+    const events = testRendererEvents.length;
+    const shows = testMainWindowShowCount;
+    notice.handlers.get('click')();
+    rendererReady();
+    assert.equal(testRendererEvents.filter(event => event.channel === 'needs-save:review').length,
+      testRendererEvents.slice(0, events).filter(event => event.channel === 'needs-save:review').length, boundary);
+    assert.equal(testMainWindowShowCount, shows, boundary);
+    if (boundary === 'account') await testAccountSession.restore();
+    await callIpc('projects:delete-all');
+    testNotifications.length = 0;
+  }
+});
+
+test('Assets need save notice wording: Illustrator, and several working files without names', async () => {
+  resetTestHomeWorkspace();
+  backgroundNeedsSave();
+  needsSaveSession({ docs: [
+    { name: 'First Board.indd', links: ['first-link.png'] },
+    { name: 'Second Board.indd', links: ['second-link.png', 'third-link.png'] },
+  ] });
+  const project = await createProject('Two working files');
+  await waitForProject(project.id, item => linkedNeedsSaveRows(item).length === 3, 5000);
+  await waitForNeedsSave(() => needsSaveNotices().length === 1, 'two sources notice');
+  assert.equal(needsSaveNotices()[0].options.body, 'Save your working files to add 3 linked assets to the package. Click to review in Crate.');
+  assert.doesNotMatch(`${needsSaveNotices()[0].options.title} ${needsSaveNotices()[0].options.body}`, /First Board|Second Board|link\.png/);
+  await callIpc('projects:delete-all');
+  testNotifications.length = 0;
+
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'notice-illustrator.ai');
+  const linkedPath = path.join(TEST_HOME, 'Desktop', 'notice-linked.png');
+  fs.writeFileSync(sourcePath, 'ai bytes');
+  fs.writeFileSync(linkedPath, 'png bytes');
+  setIllustratorOpenedAfterActivationHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '123\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      return { stdout: [
+        `DOC\t${sourcePath}\tnotice-illustrator.ai\ttrue\ttrue`,
+        `LINK\t${sourcePath}\tnotice-illustrator.ai\t${linkedPath}\ttrue\ttrue`,
+        'COMPLETE\t1\t1',
+      ].join('\n') + '\n' };
+    }
+    return { stdout: '' };
+  });
+  const illustrator = await createProject('Illustrator notice');
+  await waitForProject(illustrator.id, item => linkedNeedsSaveRows(item).length === 1, 5000);
+  await waitForNeedsSave(() => needsSaveNotices().length === 1, 'Illustrator notice');
+  assert.equal(needsSaveNotices()[0].options.body, 'Save your Illustrator file to add 1 linked asset to the package. Click to review in Crate.');
+});
+
+test('Assets need save notice counts the same linked assets as the Review Assets alert (parity), with excluded and earlier-session rows', async () => {
+  resetTestHomeWorkspace();
+  backgroundNeedsSave();
+  testMainWindowVisible = true;
+  const session = needsSaveSession({ docs: [{ name: 'Parity Board.indd', links: ['parity-excluded.png', 'parity-kept.png'] }] });
+  const project = await createProject('Parity');
+  await waitForProject(project.id, item => linkedNeedsSaveRows(item).length === 2, 5000);
+  await settleNeedsSave();
+  assert.equal(needsSaveNotices().length, 0, 'arrived while Crate was in front');
+  // A remembered exclusion and a Needs Save row from an earlier watch session:
+  // Review Assets shows neither, so the notice must not count them either.
+  const projects = storeInstance.get('projects');
+  const stored = projects.find(item => item.id === project.id);
+  const excluded = stored.pendingFiles.find(file => file.name === 'parity-excluded.png');
+  stored.excludedAssetKeys = [...(stored.excludedAssetKeys || []), excluded.path];
+  const earlierPath = path.join(TEST_HOME, 'Desktop', 'parity-earlier.png');
+  fs.writeFileSync(earlierPath, 'synthetic earlier');
+  stored.pendingFiles.push({ ...structuredClone(stored.pendingFiles.find(file => file.name === 'parity-kept.png')),
+    path: earlierPath, name: 'parity-earlier.png', captureSessionId: 'earlier-session', addedAt: 1 });
+  storeInstance.set('projects', projects);
+  testMainWindowVisible = false;
+  session.docs[0].links.push('parity-new.png');
+  await pollUntilNeedsSave(project.id, item => item.pendingFiles.some(file => file.name === 'parity-new.png'), 'new linked asset');
+  await waitForNeedsSave(() => needsSaveNotices().length === 1, 'parity notice');
+  const projected = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(projected.pendingFiles.some(file => file.name === 'parity-earlier.png'), false, 'earlier-session row hidden');
+  assert.ok((projected.excludedAssetKeys || []).includes(excluded.path), 'exclusion remembered');
+  // Render the real Review Assets alert from the same main-process results the
+  // app reads: projects:get-all and projects:get-asset-workspace.
+  const { vm, scope } = needsSaveRendererFixture;
+  const { document, elements } = scope.createInteractiveRendererDom();
+  const renderer = scope.loadRendererHelpers(document, { crate: {
+    getProjects: async () => structuredClone(await callIpc('projects:get-all')),
+    getAssetWorkspace: async projectId => structuredClone(await callIpc('projects:get-asset-workspace', projectId)),
+    getFileVisual: async () => null,
+  } });
+  renderer.parityProjects = structuredClone(await callIpc('projects:get-all'));
+  renderer.parityProjectId = project.id;
+  vm.runInContext('state.projects = parityProjects; state.selectedProjectId = parityProjectId; state.assetReviewOpen = true;', renderer);
+  await renderer.renderFiles();
+  const alertText = scope.getElementTreeText(elements['needs-save-alert']).replace(/\s+/g, ' ').trim();
+  const alertCount = /this linked asset/.test(alertText) ? 1 : Number(/these (\d+) linked assets/.exec(alertText)?.[1]);
+  const noticeCount = Number(/add (\d+) linked asset/.exec(needsSaveNotices()[0].options.body)?.[1]);
+  assert.equal(alertCount, 2, alertText);
+  assert.equal(noticeCount, alertCount);
+});
+
+test('Assets need save notice wording for unknown and mixed apps (no live observer produces these rows)', () => {
+  const row = (appFamily, sourceName) => ({ captureState: 'needs-save', captureReason: 'linked-asset-observed',
+    captureEvidence: { ...(appFamily ? { appFamily } : {}), ...(sourceName ? { sourceName } : {}), reason: 'linked-asset-observed' } });
+  const body = rows => metadataTestHooks.needsSaveNotificationBody(rows);
+  const tail = ' Click to review in Crate.';
+  assert.equal(body([row(null, null), row(null, null)]), `Save your working file to add 2 linked assets to the package.${tail}`);
+  assert.equal(body([row('illustrator', 'Board.ai'), row('indesign', 'Board.ai')]), `Save your working files to add 2 linked assets to the package.${tail}`);
+  assert.equal(body([row('illustrator', null), row(null, null)]), `Save your working files to add 2 linked assets to the package.${tail}`);
+  assert.equal(body([row('photoshop', 'Poster.psd')]), `Save your Photoshop file to add 1 linked asset to the package.${tail}`);
+  assert.equal(body([row('illustrator', 'Private Client.ai'), row('illustrator', '/Users/private/x.ai')]), `Save your working files to add 2 linked assets to the package.${tail}`);
+  assert.doesNotMatch(body([row('illustrator', 'Private Client.ai')]), /Private Client/);
+});
+
+test('Assets need save notice on Illustrator stays clickable after more links widen its scope', async () => {
+  resetTestHomeWorkspace();
+  backgroundNeedsSave();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'scope-board.ai');
+  fs.writeFileSync(sourcePath, 'ai bytes');
+  const links = ['scope-first.png'];
+  setIllustratorOpenedAfterActivationHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '123\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      const lines = [`DOC\t${sourcePath}\tscope-board.ai\ttrue\ttrue`];
+      for (const name of links) {
+        const linkedPath = path.join(TEST_HOME, 'Desktop', name);
+        if (!fs.existsSync(linkedPath)) fs.writeFileSync(linkedPath, 'png bytes');
+        lines.push(`LINK\t${sourcePath}\tscope-board.ai\t${linkedPath}\ttrue\ttrue`);
+      }
+      return { stdout: `${lines.join('\n')}\nCOMPLETE\t1\t${links.length}\n` };
+    }
+    return { stdout: '' };
+  });
+  const project = await createProject('Illustrator scope click');
+  await waitForProject(project.id, item => linkedNeedsSaveRows(item).length === 1, 5000);
+  await waitForNeedsSave(() => needsSaveNotices().length === 1, 'Illustrator notice');
+  links.push('scope-second.png');
+  await pollUntilNeedsSave(project.id, item => linkedNeedsSaveRows(item).length === 2, 'second Illustrator link');
+  assert.equal(needsSaveNotices().length, 1, 'still one notice in the episode');
+  const shows = testMainWindowShowCount;
+  const before = testRendererEvents.filter(event => event.channel === 'needs-save:review').length;
+  needsSaveNotices()[0].handlers.get('click')();
+  rendererReady();
+  assert.equal(testMainWindowShowCount, shows + 1, 'the click brings Crate forward');
+  assert.equal(testRendererEvents.filter(event => event.channel === 'needs-save:review').length, before + 1);
+});
+
+test('Assets need save notice is not repeated when a same-account refresh resumes the same rows', async () => {
+  resetTestHomeWorkspace();
+  backgroundNeedsSave();
+  needsSaveSession();
+  const project = await createProject('Same account refresh');
+  await waitForNeedsSave(() => needsSaveNotices().length === 1, 'notice');
+  testAccountSession.invalidate();
+  testAccountSession.publish('signed_in', '', { id: 'test-account' });
+  await new Promise(resolve => originalSetTimeout(resolve, 100));
+  await settleNeedsSave();
+  assert.equal(needsSaveNotices()[0].closed, true, 'the old activation\'s notice is withdrawn');
+  assert.ok(linkedNeedsSaveRows(await getProject(project.id)).length > 0, 'the rows are still there');
+  assert.equal(needsSaveNotices().length, 1, 'the same rows are not announced again');
+});
+
+test('Assets need save notice is not repeated when stored links restage one at a time after a same-account refresh', async () => {
+  resetTestHomeWorkspace();
+  backgroundNeedsSave();
+  const session = needsSaveSession({ docs: [{ name: 'Restage Board.indd', links: ['restage-a.png', 'restage-b.png'] }] });
+  const project = await createProject('Partial restage');
+  await waitForProject(project.id, item => linkedNeedsSaveRows(item).length === 2, 5000);
+  await waitForNeedsSave(() => needsSaveNotices().length === 1, 'initial notice');
+  session.docs[0].links = ['restage-a.png'];
+  testAccountSession.invalidate();
+  testAccountSession.publish('signed_in', '', { id: 'test-account' });
+  await new Promise(resolve => originalSetTimeout(resolve, 100));
+  await settleNeedsSave();
+  session.docs[0].links.push('restage-b.png');
+  await pollUntilNeedsSave(project.id, item => linkedNeedsSaveRows(item).length === 2, 'second stored link restaged');
+  await settleNeedsSave();
+  assert.equal(needsSaveNotices().length, 1, 'links that stayed stored are not new arrivals');
+  // A genuinely new link in the same episode never repeats the notice, even
+  // though the refresh withdrew the first one.
+  session.docs[0].links.push('restage-c.png');
+  await pollUntilNeedsSave(project.id, item => linkedNeedsSaveRows(item).length === 3, 'new link');
+  await settleNeedsSave();
+  assert.equal(needsSaveNotices().length, 1, 'one notice per episode');
+});
+
+test('Assets need save notice: links first seen with Crate in front are not announced when they restage after a refresh', async () => {
+  resetTestHomeWorkspace();
+  backgroundNeedsSave();
+  testMainWindowVisible = true;
+  const session = needsSaveSession({ docs: [{ name: 'Front Board.indd', links: ['front-a.png', 'front-b.png'] }] });
+  const project = await createProject('Seen in front');
+  await waitForProject(project.id, item => linkedNeedsSaveRows(item).length === 2, 5000);
+  await settleNeedsSave();
+  testMainWindowVisible = false;
+  session.docs[0].links = ['front-a.png'];
+  testAccountSession.invalidate();
+  testAccountSession.publish('signed_in', '', { id: 'test-account' });
+  await new Promise(resolve => originalSetTimeout(resolve, 100));
+  await settleNeedsSave();
+  session.docs[0].links.push('front-b.png');
+  await pollUntilNeedsSave(project.id, item => linkedNeedsSaveRows(item).length === 2, 'second link restaged');
+  await settleNeedsSave();
+  assert.equal(needsSaveNotices().length, 0, 'restaged links are not new arrivals');
+});
+
+// Access lapses with the same identity (the notice is withdrawn but its rows stay
+// remembered), then a sign-out and a sign-in happen while access is not allowed.
+async function lapseThenSignOutAndSignIn(identity) {
+  const originalNow = testAccountSession.now;
+  try {
+    testAccountSession.now = () => testAccountSession.accessExpiresAt;
+    testAccountSession.publish('offline', 'Your session needs to be checked.');
+    assert.equal(testAccountSession.canUseWorkspace(), false);
+    testAccountSession.publish('signed_out', '', null);
+  } finally {
+    testAccountSession.now = originalNow;
+  }
+  testAccountSession.publish('signed_in', '', identity);
+  assert.equal(testAccountSession.canUseWorkspace(), true);
+  await new Promise(resolve => originalSetTimeout(resolve, 100));
+}
+
+for (const [label, identity] of [['another account', { id: 'test-account-b' }], ['the same account', { id: 'test-account' }]]) {
+  test(`Assets need save notice: after access lapses, a sign-out and a sign-in as ${label} start a new episode`, async () => {
+    resetTestHomeWorkspace();
+    backgroundNeedsSave();
+    needsSaveSession();
+    try {
+      const project = await createProject(`Lapse then ${label}`);
+      await waitForNeedsSave(() => needsSaveNotices().length === 1, 'first notice');
+      await lapseThenSignOutAndSignIn(identity);
+      assert.equal(needsSaveNotices()[0].closed, true, 'the lapse withdrew the first notice');
+      await settleNeedsSave();
+      assert.ok(linkedNeedsSaveRows(await getProject(project.id)).length > 0, 'the link is still stored and unsaved');
+      assert.equal(needsSaveNotices().length, 2, 'the new sign-in announces the waiting link once');
+      await settleNeedsSave();
+      assert.equal(needsSaveNotices().length, 2, 'and only once');
+    } finally {
+      await testAccountSession.restore();
+    }
+  });
+}
+
+test('Assets need save notice stays open across a silent token refresh that keeps the account and its generation', async () => {
+  const originalProvider = testAccountSession.provider, originalCredentials = testAccountSession.credentials;
+  resetTestHomeWorkspace();
+  backgroundNeedsSave();
+  needsSaveSession();
+  try {
+    const identity = { id: '22222222-2222-4222-8222-222222222222', email: 'synthetic@example.test', verified: true };
+    testAccountSession.record = { identity, refreshToken: 'synthetic-refresh' };
+    testAccountSession.publish('signed_in', '', identity);
+    await createProject('Silent token refresh');
+    await waitForNeedsSave(() => needsSaveNotices().length === 1, 'notice');
+    const generation = testAccountSession.generation;
+    testAccountSession.provider = {
+      refresh: async () => ({ access_token: 'synthetic-refreshed-access', refresh_token: 'synthetic-refreshed' }),
+      validate: async () => ({ subject: identity.id, expiresAt: Date.now() + 7200000 }),
+      me: async () => identity,
+    };
+    testAccountSession.credentials = { write() {} };
+    await testAccountSession.refresh();
+    assert.equal(testAccountSession.accessToken, 'synthetic-refreshed-access');
+    assert.equal(testAccountSession.generation, generation, 'the same generation');
+    assert.equal(testAccountSession.canUseWorkspace(), true, 'access never lapsed');
+    await settleNeedsSave();
+    assert.equal(needsSaveNotices().length, 1, 'no second notice');
+    assert.notEqual(needsSaveNotices()[0].closed, true, 'the open notice stays in place');
+  } finally {
+    testAccountSession.provider = originalProvider;
+    testAccountSession.credentials = originalCredentials;
+    await testAccountSession.restore();
+  }
+});
+
+test('Assets need save episode ends when its announced links clear, even with an older hidden row still stored', async () => {
+  resetTestHomeWorkspace();
+  backgroundNeedsSave();
+  const session = needsSaveSession({ docs: [{ name: 'Episode Board.indd', links: ['episode-a.png'] }] });
+  const project = await createProject('Episode end');
+  await waitForProject(project.id, item => linkedNeedsSaveRows(item).length === 1, 5000);
+  await waitForNeedsSave(() => needsSaveNotices().length === 1, 'first notice');
+  // A Needs Save row from an earlier watch session stays stored but hidden.
+  const projects = storeInstance.get('projects');
+  const stored = projects.find(item => item.id === project.id);
+  const earlierPath = path.join(TEST_HOME, 'Desktop', 'episode-earlier.png');
+  fs.writeFileSync(earlierPath, 'synthetic earlier');
+  stored.pendingFiles.push({ ...structuredClone(stored.pendingFiles.find(file => file.name === 'episode-a.png')),
+    path: earlierPath, name: 'episode-earlier.png', captureSessionId: 'earlier-session', addedAt: 1 });
+  storeInstance.set('projects', projects);
+  session.modified = false;
+  await pollUntilNeedsSave(project.id, item => linkedNeedsSaveRows(item).length === 0, 'save clears the announced link');
+  await waitForNeedsSave(() => needsSaveNotices()[0].closed === true, 'withdrawn notice');
+  session.modified = true;
+  session.docs[0].links.push('episode-b.png');
+  await pollUntilNeedsSave(project.id, item => linkedNeedsSaveRows(item).length > 0, 'next episode link');
+  await waitForNeedsSave(() => needsSaveNotices().length === 2, 'next episode notice');
+});
+
+test('Assets need save notice and Review Assets alert agree when a linked asset matches an excluded asset by content', async () => {
+  resetTestHomeWorkspace();
+  backgroundNeedsSave();
+  testMainWindowVisible = true;
+  const session = needsSaveSession({ docs: [{ name: 'Content Board.indd', links: ['content-copy.png'] }] });
+  const project = await createProject('Content exclusion parity');
+  await waitForProject(project.id, item => linkedNeedsSaveRows(item).length === 1, 5000);
+  await settleNeedsSave();
+  // An excluded project asset with the same bytes as the pending linked copy.
+  const originalPath = path.join(TEST_HOME, 'Desktop', 'content-original.png');
+  fs.copyFileSync(path.join(TEST_HOME, 'Desktop', 'content-copy.png'), originalPath);
+  const projects = storeInstance.get('projects');
+  const stored = projects.find(item => item.id === project.id);
+  stored.files.push({ path: originalPath, name: 'content-original.png', ext: '.png', projectRole: 'asset', assetOrigin: 'added', addedAt: Date.now(), source: 'manual' });
+  stored.excludedAssetKeys = [...(stored.excludedAssetKeys || []), originalPath];
+  storeInstance.set('projects', projects);
+  testMainWindowVisible = false;
+  session.docs[0].links.push('content-new.png');
+  await pollUntilNeedsSave(project.id, item => item.pendingFiles.some(file => file.name === 'content-new.png'), 'new linked asset');
+  await waitForNeedsSave(() => needsSaveNotices().length === 1, 'content parity notice');
+  const { vm, scope } = needsSaveRendererFixture;
+  const { document, elements } = scope.createInteractiveRendererDom();
+  const renderer = scope.loadRendererHelpers(document, { crate: {
+    getProjects: async () => structuredClone(await callIpc('projects:get-all')),
+    getAssetWorkspace: async projectId => structuredClone(await callIpc('projects:get-asset-workspace', projectId)),
+    getFileVisual: async () => null,
+  } });
+  renderer.parityProjects = structuredClone(await callIpc('projects:get-all'));
+  renderer.parityProjectId = project.id;
+  vm.runInContext('state.projects = parityProjects; state.selectedProjectId = parityProjectId; state.assetReviewOpen = true;', renderer);
+  await renderer.renderFiles();
+  const alertText = scope.getElementTreeText(elements['needs-save-alert']).replace(/\s+/g, ' ').trim();
+  const alertCount = /this linked asset/.test(alertText) ? 1 : Number(/these (\d+) linked assets/.exec(alertText)?.[1]);
+  const noticeCount = Number(/add (\d+) linked asset/.exec(needsSaveNotices()[0].options.body)?.[1]);
+  assert.equal(alertCount, 2, alertText);
+  assert.equal(noticeCount, alertCount);
+});
+
+test('Assets need save notice that macOS fails to show does not use up its episode', async () => {
+  resetTestHomeWorkspace();
+  backgroundNeedsSave();
+  const originalShow = TestNotification.prototype.show;
+  TestNotification.prototype.show = function failingShow() { throw new Error('synthetic show failure'); };
+  let session;
+  try {
+    session = needsSaveSession({ docs: [{ name: 'Failing Board.indd', links: ['failing-a.png'] }] });
+    const project = await createProject('Failed show');
+    await waitForProject(project.id, item => linkedNeedsSaveRows(item).length === 1, 5000);
+    await waitForNeedsSave(() => needsSaveNotices().length === 1, 'attempted notice');
+    assert.equal(needsSaveNotices()[0].shown, false);
+    TestNotification.prototype.show = originalShow;
+    session.docs[0].links.push('failing-b.png');
+    await pollUntilNeedsSave(project.id, item => linkedNeedsSaveRows(item).length === 2, 'next linked asset');
+    await waitForNeedsSave(() => needsSaveNotices().length === 2, 'retried notice');
+    assert.equal(needsSaveNotices()[1].shown, true);
+  } finally {
+    TestNotification.prototype.show = originalShow;
+  }
+});
+
+test('Assets need save: a save and a new linked asset in the same poll start a new episode, even after the old notice was dismissed', async () => {
+  resetTestHomeWorkspace();
+  backgroundNeedsSave();
+  // Two open documents: the first has an unsaved link, the second none yet.
+  const session = needsSaveSession({ docs: [
+    { name: 'Saved Board.indd', links: ['saved-a.png'] },
+    { name: 'Other Board.indd', links: [] },
+  ] });
+  const project = await createProject('Save plus new link');
+  await waitForProject(project.id, item => linkedNeedsSaveRows(item).length === 1, 5000);
+  await waitForNeedsSave(() => needsSaveNotices().length === 1, 'first notice');
+  // The user dismisses the first notice; its entry stays for the episode.
+  needsSaveNotices()[0].handlers.get('close')?.();
+  // One poll: the first document is saved while another document gains a link.
+  session.docs[0].modified = false;
+  session.docs[1].links.push('other-new.png');
+  await pollUntilNeedsSave(project.id, item => {
+    const names = linkedNeedsSaveRows(item).map(file => file.name);
+    return !names.includes('saved-a.png') && names.includes('other-new.png');
+  }, 'save and new link in one poll');
+  await waitForNeedsSave(() => needsSaveNotices().length === 2, 'new episode notice');
+  assert.equal(needsSaveNotices()[1].shown, true);
+  assert.equal(needsSaveNotices()[1].options.body, 'Save your InDesign file to add 1 linked asset to the package. Click to review in Crate.');
+});
+
+test('Assets need save: stale hidden rows from an earlier session do not silence a later new linked asset', async () => {
+  resetTestHomeWorkspace();
+  backgroundNeedsSave();
+  const session = needsSaveSession({ docs: [{ name: 'Stale Board.indd', links: ['stale-a.png', 'stale-b.png'] }] });
+  const project = await createProject('Stale hidden rows');
+  await waitForProject(project.id, item => linkedNeedsSaveRows(item).length === 2, 5000);
+  await waitForNeedsSave(() => needsSaveNotices().length === 1, 'first notice');
+  // Pause, discard link B from the document, resume, then save: link A leaves
+  // storage, B stays stored from the earlier session but is never shown again.
+  await callIpc('projects:pause', project.id);
+  session.docs[0].links = ['stale-a.png'];
+  await callIpc('projects:start-watching', project.id);
+  await settleNeedsSave();
+  session.modified = false;
+  await pollUntilNeedsSave(project.id, item => linkedNeedsSaveRows(item).length === 0, 'save clears the visible link');
+  const stored = storeInstance.get('projects').find(item => item.id === project.id);
+  assert.ok(stored.pendingFiles.some(file => file.name === 'stale-b.png' && file.captureState === 'needs-save'),
+    'the discarded link is still stored');
+  // A genuinely new linked asset in the background: a new episode, so a notice.
+  session.modified = true;
+  session.docs[0].links.push('stale-new.png');
+  await pollUntilNeedsSave(project.id, item => linkedNeedsSaveRows(item).some(file => file.name === 'stale-new.png'), 'new link');
+  await waitForNeedsSave(() => needsSaveNotices().length === 2, 'notice after stale rows');
+  assert.equal(needsSaveNotices()[1].shown, true);
+});
+
+test('Assets need save notice leaves stored rows unchanged and is independent of the Existing Assets switch', async () => {
+  const snapshot = async enabled => {
+    resetTestHomeWorkspace();
+    backgroundNeedsSave();
+    storeInstance.set('settings.needsSaveNotifications', enabled);
+    storeInstance.set('settings.existingAssetsNotifications', false);
+    needsSaveSession({ docs: [{ name: 'Same Board.indd', links: ['same-a.png'] }] });
+    const project = await createProject('Same rows');
+    const fresh = await waitForProject(project.id, item => linkedNeedsSaveRows(item).length === 1, 5000);
+    await settleNeedsSave();
+    const notices = needsSaveNotices().length;
+    const rows = fresh.pendingFiles.map(file => [file.name, file.captureState, file.captureReason, file.source,
+      file.captureEvidence?.appFamily, file.captureEvidence?.sourceName, file.captureEvidence?.relationship]);
+    await callIpc('projects:delete-all');
+    testNotifications.length = 0;
+    storeInstance.set('settings.existingAssetsNotifications', true);
+    return { notices, rows };
+  };
+  const on = await snapshot(true);
+  const off = await snapshot(false);
+  assert.equal(on.notices, 1, 'Existing Assets switch off does not block this notice');
+  assert.equal(off.notices, 0);
+  assert.deepEqual(on.rows, off.rows);
 });
