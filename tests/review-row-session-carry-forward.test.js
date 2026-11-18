@@ -447,6 +447,28 @@ function cases() {
     assert.equal(writes.some(write => OWNERS_KEY in write || ACCOUNT_KEY in write), false);
   });
 
+  lifecycleTest('a settings file from before these markers carries nothing at first, then starts carrying', async () => {
+    const { file } = setup('carry-older-settings');
+    const project = await createProject('Carry older settings');
+    const firstRow = await addReviewRow(project.id, file('BeforeMarkers.psd'));
+    await callIpcRaw('projects:pause', project.id);
+    delete storeInstance.data[OWNERS_KEY];
+    delete storeInstance.data[ACCOUNT_KEY];
+    roundTripFakeStore();
+    testAccountSession.invalidate();
+    useAccount('test-account');
+    await callIpcRaw('projects:start-watching', project.id);
+    await idle(project.id);
+    await assertLeftHidden(project.id, firstRow);
+    assert.ok(storeInstance.data[OWNERS_KEY] && typeof storeInstance.data[OWNERS_KEY] === 'object');
+    assert.match(String(ownerOf(project.id)), /^[0-9a-f]{64}$/);
+    assert.match(String(storeInstance.data[ACCOUNT_KEY]), /^[0-9a-f]{64}$/);
+    const nextRow = await addReviewRow(project.id, file('AfterMarkers.psd'));
+    await pauseThenWatch(project.id);
+    await assertCarried(project.id, nextRow);
+    await assertLeftHidden(project.id, firstRow);
+  });
+
   lifecycleTest('a malformed marker for another project does not stop this project, and is repaired', async () => {
     const { file } = setup('carry-mixed-owners');
     const other = await createProject('Carry mixed other');
