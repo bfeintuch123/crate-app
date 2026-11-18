@@ -376,6 +376,14 @@ function cases() {
     assert.ok(findRow(f, 'seed-row')); assert.deepEqual(retiredEntries(f), []);
     assert.ok(memberRows(f).some(item => item.psdExtractionReceipt?.outputDigest === sha(other)), 'the other object is handled as before');
   });
+  routeTest('an excluded row that could be either of two objects does not decide for them', { timeout: 60000 }, async () => {
+    const f = await seededProject(), other = plainDocument('same-name-excluded'), otherId = psdFixtures.guid('other');
+    fs.writeFileSync(f.psd, parentPsd([{ ...embedded('Smart.psb', other), id: otherId }, { ...embedded('Smart.psb', f.smart), id: f.smartId }], 'reordered-excluded'));
+    const row = seedRow(f); f.project().files.push(row); f.project().excludedAssetKeys = [row.fileId]; await settled(f);
+    await scanOn('pre-package scan', f);
+    assert.ok(findRow(f, 'seed-row'));
+    assert.ok(memberRows(f).some(item => item.psdExtractionReceipt?.outputDigest === sha(other)), 'both objects keep their handling');
+  });
   routeTest('a choice on the other kind of row made during the scan keeps the object', { timeout: 60000 }, async () => {
     const f = await seededProject(), row = seedRow(f), logical = logicalRow(f); f.project().files.push(row, logical); await settled(f);
     const hold = holdRead(f.psd, 1); metadataTestHooks.clearPsdParseDebounce();

@@ -135,6 +135,21 @@ for (const [format, options] of [['PSD', { psb: false }], ['PSB', { psb: true }]
   });
 }
 
+test('any media carrier in the raw walk refuses the document, even a well-formed one', () => {
+  const movie = withLayerBlock(plainDocument('valid-media', { psb: false }), 'PxSc', pixelSourcePayload({ pixelType: 1986285651, fullPath: '/Users/synthetic/outside/clip.mov' }));
+  assert.equal(inspectPsdLinkFraming(movie).mediaCarriers.length, 1);
+  assert.equal(workerParsing({}).isProvenEmbeddedDocumentBytes(movie), false);
+});
+
+test('a large link block without the large signature is still walked', () => {
+  const bytes = Buffer.from(documentHolding([embedded('inner.png', png(11), { type: 'png ' })]));
+  const at = bytes.indexOf('8B64lnk2', 0, 'latin1');
+  assert.ok(at > 0);
+  bytes.write('8BIM', at, 'latin1');
+  assert.equal(read(bytes).linkedFiles.length, 1);
+  assert.equal(isProven(bytes), true);
+});
+
 test('raw link records must agree with the parsed ones', () => {
   const inner = documentHolding([embedded('inner.png', png(9), { type: 'png ' })]);
   assert.equal(isProven(inner), true);
