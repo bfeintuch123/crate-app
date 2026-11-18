@@ -116,7 +116,7 @@ function cases() {
     assert.ok(added, 'Add Files finished');
   }
   const pollFinished = id => waitForCondition(() => !metadataTestHooks.isLivePollInProgress(id), 'live poll finished', 5000);
-  async function offerOlderPsd(f, name = 'OlderMockup.psd') {
+  async function offerOlderPsd(f, name = 'LayeredOlder.psd') {
     const psd = path.join(f.dir, name);
     fs.writeFileSync(psd, '8BPS synthetic ' + name);
     const watchStartedAt = stored(f.id).watchStartedAt;
@@ -226,7 +226,7 @@ function cases() {
     const f = await watchedDocument('Link row 4 unconfirmable');
     const tempDir = unconfirmableDir();
     try {
-      const keep = png(tempDir, 'Screenshot Keep.png'), drop = png(tempDir, 'Screenshot Drop.png');
+      const keep = png(tempDir, 'Kept Image.png'), drop = png(tempDir, 'Dropped Image.png');
       await placeUnsaved(f, keep);
       await placeUnsaved(f, drop);
       // Saved with both links. Saving itself triggers a reading here, so the
@@ -234,15 +234,15 @@ function cases() {
       writeSyntheticAiFile(f.ai, `linked\n${keep}\n${drop}\n`);
       setDoc(f, { modified: false, links: [keep, drop] });
       await poll(f.id);
-      for (const name of ['Screenshot Keep.png', 'Screenshot Drop.png']) {
+      for (const name of ['Kept Image.png', 'Dropped Image.png']) {
         assert.equal(storedRow(f.id, name).captureState, 'needs-save', 'first clean reading: still Needs Save');
       }
       await poll(f.id);
       await emitWatcher('change', f.ai);
       await metadataTestHooks.waitForWatcherIdle(f.id);
       await poll(f.id);
-      for (const name of ['Screenshot Keep.png', 'Screenshot Drop.png']) assert.equal(isProjectFile(f.id, name), false, 'the scan cannot confirm ' + name);
-      for (const name of ['Screenshot Keep.png', 'Screenshot Drop.png']) {
+      for (const name of ['Kept Image.png', 'Dropped Image.png']) assert.equal(isProjectFile(f.id, name), false, 'the scan cannot confirm ' + name);
+      for (const name of ['Kept Image.png', 'Dropped Image.png']) {
         const row = storedRow(f.id, name);
         assert.equal(row.captureState, 'pending', 'second clean reading: Include or Exclude');
         assert.equal(row.captureEvidence.needsSave, false);
@@ -254,19 +254,19 @@ function cases() {
       setDoc(f, { modified: true });
       await poll(f.id);
       await poll(f.id);
-      assert.equal(storedRow(f.id, 'Screenshot Keep.png').captureState, 'pending', 'stays decidable after an unsaved edit');
+      assert.equal(storedRow(f.id, 'Kept Image.png').captureState, 'pending', 'stays decidable after an unsaved edit');
       // Include makes it a project file; Exclude records it as excluded.
-      const keepRow = storedRow(f.id, 'Screenshot Keep.png');
+      const keepRow = storedRow(f.id, 'Kept Image.png');
       assert.ok(await callIpcRaw('projects:accept-pending', f.id, keepRow.path));
-      assert.equal(isProjectFile(f.id, 'Screenshot Keep.png'), true);
-      assert.equal(storedRow(f.id, 'Screenshot Keep.png'), undefined);
-      const keptFile = stored(f.id).files.find(file => file.name === 'Screenshot Keep.png');
+      assert.equal(isProjectFile(f.id, 'Kept Image.png'), true);
+      assert.equal(storedRow(f.id, 'Kept Image.png'), undefined);
+      const keptFile = stored(f.id).files.find(file => file.name === 'Kept Image.png');
       assert.equal(keptFile.illustratorLinkReview, undefined, 'review state never reaches a project file');
       const keysBefore = (stored(f.id).excludedAssetKeys || []).length;
-      await callIpcRaw('projects:reject-pending', f.id, storedRow(f.id, 'Screenshot Drop.png').path);
-      assert.equal(storedRow(f.id, 'Screenshot Drop.png'), undefined);
+      await callIpcRaw('projects:reject-pending', f.id, storedRow(f.id, 'Dropped Image.png').path);
+      assert.equal(storedRow(f.id, 'Dropped Image.png'), undefined);
       assert.equal((stored(f.id).excludedAssetKeys || []).length, keysBefore + 1);
-      const record = (stored(f.id).excludedPendingFiles || []).find(item => item.name === 'Screenshot Drop.png');
+      const record = (stored(f.id).excludedPendingFiles || []).find(item => item.name === 'Dropped Image.png');
       assert.ok(record, 'Excluded record written');
       assert.equal(record.illustratorLinkReview, undefined, 'review state never reaches an Excluded record');
     } finally { fs.rmSync(tempDir, { recursive: true, force: true }); }
@@ -276,25 +276,25 @@ function cases() {
   adapterTest('link-row-6: a decidable row stays as it is while linked and after the link goes; placed and saved it is Included', async () => {
     const f = await watchedDocument('Link row 6 PSD');
     const psd = await offerOlderPsd(f);
-    const before = clone(storedRow(f.id, 'OlderMockup.psd'));
-    const beforeView = clone(await viewRow(f.id, 'OlderMockup.psd'));
+    const before = clone(storedRow(f.id, 'LayeredOlder.psd'));
+    const beforeView = clone(await viewRow(f.id, 'LayeredOlder.psd'));
     assert.ok(beforeView, 'decidable row visible');
     await linkInUnsavedDocument(f, psd);
     // The claim only re-observes the row, which updates its session stamp.
-    assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'OlderMockup.psd')), withoutSessionStamp(before), 'an unsaved link does not replace the row');
-    assert.deepEqual(withoutSessionStamp(await viewRow(f.id, 'OlderMockup.psd')), withoutSessionStamp(beforeView), 'still offered as before');
+    assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'LayeredOlder.psd')), withoutSessionStamp(before), 'an unsaved link does not replace the row');
+    assert.deepEqual(withoutSessionStamp(await viewRow(f.id, 'LayeredOlder.psd')), withoutSessionStamp(beforeView), 'still offered as before');
     setDoc(f, { modified: true, links: [] });
     await poll(f.id);
-    assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'OlderMockup.psd')), withoutSessionStamp(before), 'the link going changes nothing');
-    assert.deepEqual(withoutSessionStamp(await viewRow(f.id, 'OlderMockup.psd')), withoutSessionStamp(beforeView));
+    assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'LayeredOlder.psd')), withoutSessionStamp(before), 'the link going changes nothing');
+    assert.deepEqual(withoutSessionStamp(await viewRow(f.id, 'LayeredOlder.psd')), withoutSessionStamp(beforeView));
     // Placed again and saved with a confirmable path: Included.
     await linkInUnsavedDocument(f, psd);
     setDoc(f, { modified: false, links: [psd] });
     await save(f, `linked\n${psd}\n`);
-    await waitForCondition(() => isProjectFile(f.id, 'OlderMockup.psd'), 'saved link promoted', 5000);
+    await waitForCondition(() => isProjectFile(f.id, 'LayeredOlder.psd'), 'saved link promoted', 5000);
     await poll(f.id);
-    assert.equal(isProjectFile(f.id, 'OlderMockup.psd'), true, 'still a project file after the next reading');
-    assert.equal(storedRow(f.id, 'OlderMockup.psd'), undefined);
+    assert.equal(isProjectFile(f.id, 'LayeredOlder.psd'), true, 'still a project file after the next reading');
+    assert.equal(storedRow(f.id, 'LayeredOlder.psd'), undefined);
   });
 
   // 7. Two documents link the same file.
@@ -839,28 +839,28 @@ function cases() {
     adapterTest(`link-row-decision-1: a decidable row linked across a session change (${change}) is still offered when the link goes`, async () => {
       const f = await watchedDocument('Link row decision 1');
       const psd = await offerOlderPsd(f);
-      const original = clone(storedRow(f.id, 'OlderMockup.psd'));
+      const original = clone(storedRow(f.id, 'LayeredOlder.psd'));
       const stillOriginal = label => {
-        assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'OlderMockup.psd')), withoutSessionStamp(original), label);
+        assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'LayeredOlder.psd')), withoutSessionStamp(original), label);
       };
       await linkInUnsavedDocument(f, psd);
       stillOriginal('never a Needs Save row while linked');
       await changeWatchSession(f, change);
       stillOriginal('after the session change');
-      assert.equal(storedRow(f.id, 'OlderMockup.psd').captureSessionId, stored(f.id).watchSessionId, 'the link still present re-observes it in this session');
+      assert.equal(storedRow(f.id, 'LayeredOlder.psd').captureSessionId, stored(f.id).watchSessionId, 'the link still present re-observes it in this session');
       setDoc(f, { links: [] });
       await poll(f.id);
       stillOriginal('after the link goes');
-      assert.equal((await viewRow(f.id, 'OlderMockup.psd'))?.captureState, 'pending', 'shown for a decision');
+      assert.equal((await viewRow(f.id, 'LayeredOlder.psd'))?.captureState, 'pending', 'shown for a decision');
     });
 
     adapterTest(`link-row-decision-2: a link removed during a session change (${change}) leaves only the original row stored`, async () => {
       const f = await watchedDocument('Link row decision 2');
       const psd = await offerOlderPsd(f);
-      const original = clone(storedRow(f.id, 'OlderMockup.psd'));
+      const original = clone(storedRow(f.id, 'LayeredOlder.psd'));
       await linkInUnsavedDocument(f, psd);
       await changeWatchSession(f, change, () => setDoc(f, { links: [] }));
-      const row = storedRow(f.id, 'OlderMockup.psd');
+      const row = storedRow(f.id, 'LayeredOlder.psd');
       assert.deepEqual(withoutSessionStamp(row), withoutSessionStamp(original), 'the original decidable row');
       assert.equal(Object.hasOwn(row, 'illustratorLinkReview'), false, 'nothing is kept inside it');
       assert.equal((stored(f.id).pendingFiles || []).some(item => item.captureState === 'needs-save'), false, 'no Needs Save row');
@@ -871,14 +871,14 @@ function cases() {
     const other = photoshopChecks();
     const f = await watchedDocument('Link row decision 3', { extra: other.extra });
     const psd = await offerOlderPsd(f);
-    const original = clone(storedRow(f.id, 'OlderMockup.psd'));
+    const original = clone(storedRow(f.id, 'LayeredOlder.psd'));
     other.output = psd + '\n';
     await poll(f.id);
-    assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'OlderMockup.psd')), withoutSessionStamp(original), 'not replaced by the claim');
+    assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'LayeredOlder.psd')), withoutSessionStamp(original), 'not replaced by the claim');
     other.running = false;
     await poll(f.id);
-    assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'OlderMockup.psd')), withoutSessionStamp(original), 'unchanged after Photoshop quits');
-    assert.equal((await viewRow(f.id, 'OlderMockup.psd'))?.captureState, 'pending');
+    assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'LayeredOlder.psd')), withoutSessionStamp(original), 'unchanged after Photoshop quits');
+    assert.equal((await viewRow(f.id, 'LayeredOlder.psd'))?.captureState, 'pending');
   });
 
   for (const observer of ['Illustrator', 'Photoshop']) {
@@ -893,8 +893,8 @@ function cases() {
       const psd = await offerOlderPsd(f);
       await claim(f, other, psd);
       assert.ok(await callIpcRaw('projects:accept-pending', f.id, psd));
-      assert.equal(isProjectFile(f.id, 'OlderMockup.psd'), true);
-      assert.equal(storedRow(f.id, 'OlderMockup.psd'), undefined);
+      assert.equal(isProjectFile(f.id, 'LayeredOlder.psd'), true);
+      assert.equal(storedRow(f.id, 'LayeredOlder.psd'), undefined);
     });
     adapterTest(`link-row-decision-4: Exclude on a decidable row under a ${observer} claim survives a save with the link still there`, async () => {
       const other = photoshopChecks();
@@ -902,26 +902,26 @@ function cases() {
       const psd = await offerOlderPsd(f);
       await claim(f, other, psd);
       await callIpcRaw('projects:reject-pending', f.id, psd);
-      assert.ok((stored(f.id).excludedPendingFiles || []).some(item => item.name === 'OlderMockup.psd'));
+      assert.ok((stored(f.id).excludedPendingFiles || []).some(item => item.name === 'LayeredOlder.psd'));
       setDoc(f, { modified: false, links: [psd] });
       await save(f, `linked\n${psd}\n`);
       await pause(700);
       await metadataTestHooks.waitForWatcherIdle(f.id);
       await poll(f.id);
-      assert.equal(isProjectFile(f.id, 'OlderMockup.psd'), false, 'not included');
-      assert.equal(storedRow(f.id, 'OlderMockup.psd'), undefined, 'no row comes back');
-      assert.ok((stored(f.id).excludedPendingFiles || []).some(item => item.name === 'OlderMockup.psd'), 'still excluded');
+      assert.equal(isProjectFile(f.id, 'LayeredOlder.psd'), false, 'not included');
+      assert.equal(storedRow(f.id, 'LayeredOlder.psd'), undefined, 'no row comes back');
+      assert.ok((stored(f.id).excludedPendingFiles || []).some(item => item.name === 'LayeredOlder.psd'), 'still excluded');
     });
     adapterTest(`link-row-decision-5: a package scan with only an unsaved ${observer} claim adds nothing and leaves the row decidable`, async () => {
       const other = photoshopChecks();
       const f = await watchedDocument('Link row decision scan', { extra: other.extra });
       const psd = await offerOlderPsd(f);
-      const original = clone(storedRow(f.id, 'OlderMockup.psd'));
+      const original = clone(storedRow(f.id, 'LayeredOlder.psd'));
       await claim(f, other, psd);
       const files = stored(f.id).files.map(file => file.name).sort();
       await callIpcRaw('projects:pre-package-scan', f.id);
       assert.deepEqual(stored(f.id).files.map(file => file.name).sort(), files, 'no project file added');
-      assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'OlderMockup.psd')), withoutSessionStamp(original), 'still the decidable row');
+      assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'LayeredOlder.psd')), withoutSessionStamp(original), 'still the decidable row');
     });
     adapterTest(`link-row-decision-6 (control): a file with no row claimed through ${observer} shows Needs Save and raises the notice`, async () => {
       backgroundNeedsSave();
@@ -951,8 +951,8 @@ function cases() {
     await linkInUnsavedDocument(f, psd);
     setDoc(f, { modified: false, links: [psd] });
     await save(f, `linked\n${psd}\n`);
-    await waitForCondition(() => isProjectFile(f.id, 'OlderMockup.psd'), 'saved link Included', 5000);
-    assert.equal(storedRow(f.id, 'OlderMockup.psd'), undefined);
+    await waitForCondition(() => isProjectFile(f.id, 'LayeredOlder.psd'), 'saved link Included', 5000);
+    assert.equal(storedRow(f.id, 'LayeredOlder.psd'), undefined);
   });
 
   adapterTest('link-row-decision-9: a link row made decidable by clean readings stays so without a mark and is still withdrawn', async () => {
@@ -978,7 +978,7 @@ function cases() {
   });
 
   // One chronological workflow through a document with existing links. It pins
-  // what reconciliation must remove (the new screenshot's row) and what it must
+  // what reconciliation must remove (the latest capture's row) and what it must
   // not disturb. Whether undecided rows stay visible after pause then Watch is
   // deliberately not asserted here.
   function workflowFixture() {
@@ -988,13 +988,13 @@ function cases() {
     const file = name => path.join(dir, name);
     // Crate excludes by content, so every fixture has its own bytes.
     const write = (filePath, label = path.basename(filePath)) => { fs.writeFileSync(filePath, Buffer.concat([createSyntheticPngBytes(), Buffer.from('workflow:' + label)])); return filePath; };
-    const mockup = name => { const filePath = file(name); fs.writeFileSync(filePath, '8BPS synthetic ' + name); return filePath; };
+    const layered = name => { const filePath = file(name); fs.writeFileSync(filePath, '8BPS synthetic ' + name); return filePath; };
     return {
       dir, write, doc: file('Board.ai'),
       existing: Array.from({ length: 12 }, (_, i) => write(file(`Existing${i + 1}.png`))),
-      firstMockup: mockup('FirstMockup.psd'), secondMockup: mockup('SecondMockup.psd'),
+      firstLayered: layered('LayeredOne.psd'), secondLayered: layered('LayeredTwo.psd'),
       photos: [1, 2, 3].map(i => write(file(`Photo${i}.jpg`))),
-      olderShots: [1, 2, 3].map(i => write(file(`OlderScreenshot${i}.png`))),
+      earlierCaptures: [1, 2, 3].map(i => write(file(`EarlierCapture${i}.png`))),
     };
   }
   async function workflowState(id) {
@@ -1012,8 +1012,8 @@ function cases() {
       excludedRecords: (workspace.excludedPendingFiles || []).map(file => file.name).sort(),
     };
   }
-  for (const session of ['no session change', 'pause then Watch']) for (const shot of ['removed before any save', 'unconfirmable path saved then removed']) {
-    adapterTest(`link-row workflow (${session}; new screenshot ${shot}): only the removed link's row leaves`, { timeout: 120000 }, async () => {
+  for (const session of ['no session change', 'pause then Watch']) for (const captureCase of ['removed before any save', 'unconfirmable path saved then removed']) {
+    adapterTest(`link-row workflow (${session}; latest capture ${captureCase}): only the removed link's row leaves`, { timeout: 120000 }, async () => {
       const f = workflowFixture(), ill = illustrator();
       const names = paths => paths.map(item => path.basename(item));
       let tempDir = null;
@@ -1036,15 +1036,15 @@ function cases() {
         const state = await workflowState(id);
         for (const name of expected) assert.ok(state.added.includes(name), name + ' Included: ' + JSON.stringify(state.added));
       };
-      const secondMockupDecidable = async label => {
+      const secondLayeredDecidable = async label => {
         if (session !== 'no session change') return;
-        const name = path.basename(f.secondMockup);
+        const name = path.basename(f.secondLayered);
         assert.equal(storedRow(id, name)?.captureState, 'pending', label + ': stored row decidable');
         assert.equal((await viewRow(id, name))?.captureState, 'pending', label + ': visible row decidable');
       };
       const checkpoint = async (label, { added, excluded }) => {
-        assert.equal(storedRow(id, 'NewScreenshot.png'), undefined, label + ': no stored row for the removed link');
-        assert.equal(await viewRow(id, 'NewScreenshot.png'), undefined, label + ': no visible row for the removed link');
+        assert.equal(storedRow(id, 'LatestCapture.png'), undefined, label + ': no stored row for the removed link');
+        assert.equal(await viewRow(id, 'LatestCapture.png'), undefined, label + ': no visible row for the removed link');
         const state = await workflowState(id);
         assert.deepEqual(state.workingFiles, ['Board.ai'], label + ': one working file');
         assert.deepEqual(state.existing, names(f.existing).sort(), label + ': existing assets still included');
@@ -1066,11 +1066,11 @@ function cases() {
         assert.equal(decision.success, true, JSON.stringify(decision));
         await poll(id);
         const watchStart = stored(id).watchStartedAt;
-        for (const mockup of [f.secondMockup, f.firstMockup]) {
-          await emitWatcherWithStats('add', mockup, { mtimeMs: watchStart - 86_400_000, birthtimeMs: watchStart - 86_400_000 });
+        for (const layered of [f.secondLayered, f.firstLayered]) {
+          await emitWatcherWithStats('add', layered, { mtimeMs: watchStart - 86_400_000, birthtimeMs: watchStart - 86_400_000 });
         }
         await metadataTestHooks.waitForWatcherIdle(id);
-        await secondMockupDecidable('offered for review');
+        await secondLayeredDecidable('offered for review');
         if (session === 'pause then Watch') {
           await callIpcRaw('projects:pause', id);
           await callIpcRaw('projects:start-watching', id);
@@ -1083,41 +1083,41 @@ function cases() {
         await place(f.photos);
         await saveDoc();
         await includedAfterSave(f.photos);
-        await secondMockupDecidable('after the photos');
+        await secondLayeredDecidable('after the photos');
 
-        await place([...f.olderShots, f.firstMockup]);
+        await place([...f.earlierCaptures, f.firstLayered]);
         await saveDoc();
-        await includedAfterSave([...f.olderShots, f.firstMockup]);
-        await secondMockupDecidable('after the first mockup');
+        await includedAfterSave([...f.earlierCaptures, f.firstLayered]);
+        await secondLayeredDecidable('after the first layered file');
 
-        let newShot = f.write(path.join(f.dir, 'NewScreenshot.png'));
-        if (shot !== 'removed before any save') {
+        let latestCapture = f.write(path.join(f.dir, 'LatestCapture.png'));
+        if (captureCase !== 'removed before any save') {
           tempDir = unconfirmableDir();
-          newShot = f.write(path.join(tempDir, 'NewScreenshot.png'), 'NewScreenshot-unconfirmable');
+          latestCapture = f.write(path.join(tempDir, 'LatestCapture.png'), 'LatestCapture-unconfirmable');
         }
-        await place([newShot]);
-        assert.ok(storedRow(id, 'NewScreenshot.png'), 'the new screenshot is under Needs Review while linked');
-        if (shot !== 'removed before any save') await saveDoc();
-        await unlink([newShot]);
+        await place([latestCapture]);
+        assert.ok(storedRow(id, 'LatestCapture.png'), 'the latest capture is under Needs Review while linked');
+        if (captureCase !== 'removed before any save') await saveDoc();
+        await unlink([latestCapture]);
         await saveDoc();
         await saveDoc();
-        const beforeExclusions = [...f.photos, ...f.olderShots, f.firstMockup];
+        const beforeExclusions = [...f.photos, ...f.earlierCaptures, f.firstLayered];
         await checkpoint('after the removed link and two saves', { added: beforeExclusions, excluded: [] });
-        await secondMockupDecidable('after the removed link');
+        await secondLayeredDecidable('after the removed link');
 
-        await unlink(f.olderShots);
+        await unlink(f.earlierCaptures);
         await saveDoc();
-        for (const shotPath of f.olderShots) await callIpcRaw('projects:remove-file', id, shotPath);
-        await secondMockupDecidable('after the exclusions');
-        await place([f.secondMockup]);
+        for (const capturePath of f.earlierCaptures) await callIpcRaw('projects:remove-file', id, capturePath);
+        await secondLayeredDecidable('after the exclusions');
+        await place([f.secondLayered]);
         await saveDoc();
-        await includedAfterSave([f.secondMockup]);
-        const afterExclusions = [...f.photos, f.firstMockup, f.secondMockup];
-        await checkpoint('after the exclusions and second mockup', { added: afterExclusions, excluded: f.olderShots });
+        await includedAfterSave([f.secondLayered]);
+        const afterExclusions = [...f.photos, f.firstLayered, f.secondLayered];
+        await checkpoint('after the exclusions and second layered file', { added: afterExclusions, excluded: f.earlierCaptures });
 
         await unlink(f.photos);
         await saveDoc();
-        await checkpoint('at the end', { added: afterExclusions, excluded: f.olderShots });
+        await checkpoint('at the end', { added: afterExclusions, excluded: f.earlierCaptures });
       } finally {
         if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
       }
