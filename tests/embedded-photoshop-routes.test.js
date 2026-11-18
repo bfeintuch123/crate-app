@@ -30,7 +30,7 @@ function cases() {
   // What the sequence shows besides the 12 linked PNGs: every step equals the same
   // sequence on the previous code with the proven documents' rows removed.
   const row = (source, name, state = 'included') => `files | ${source} | ${name} | ${state}`;
-  const SOURCES = [row('app-opened', 'Logo Board.ai'), row('scan-on-open', 'Pin Mockup.psd'), row('scan-on-open', 'Tote Mockup.psd')];
+  const SOURCES = [row('app-opened', 'Board.ai'), row('scan-on-open', 'Mockup A.psd'), row('scan-on-open', 'Mockup B.psd')];
   const withSources = rows => [...SOURCES, ...rows].sort();
   const FIRST_SCAN = withSources([row('psd-embedded', 'Linked Smart.psb'), row('psd-embedded', 'Placed Texture.png')]);
   const EXCLUDED = withSources([row('psd-embedded', 'Linked Smart.psb', 'excluded'), row('psd-embedded', 'Placed Texture.png')]);
@@ -42,7 +42,7 @@ function cases() {
   const FIRST_CACHE = ['Linked Smart.psb', 'Placed Texture.png', 'Retired Sentinel.psb'], LAST_CACHE = ['Linked Smart.psb', 'Linked Smart_1.psb', 'Placed Texture.png', 'Placed Texture_1.png', 'Retired Sentinel.psb'];
   const EXPECTED_CACHE = { 'links read': [], 'package 1': FIRST_CACHE, 'package 2': FIRST_CACHE, 'package 3': FIRST_CACHE, 'after exclude': FIRST_CACHE,
     'photoshop open': FIRST_CACHE, saved: FIRST_CACHE, 'photoshop closed': LAST_CACHE, 'final package click': LAST_CACHE };
-  const EXPECTED_PACKAGE = ["AI/Logo Board.ai", "Crate Diagnostics/crate-provenance.json", "PNG/Pin_Option1.png", "PNG/Pin_Option2.png", "PNG/Pin_Option3.png", "PNG/Pin_Option4.png", "PNG/Pin_Option5.png", "PNG/Pin_Option6.png", "PNG/Placed Texture_1_1.png", "PNG/Placed Texture_1.png", "PNG/Placed Texture.png", "PNG/Tote_Option1.png", "PNG/Tote_Option2.png", "PNG/Tote_Option3.png", "PNG/Tote_Option4.png", "PNG/Tote_Option5.png", "PNG/Tote_Option6.png", "PSB/Linked Smart_1.psb", "PSB/Linked Smart.psb", "PSD/Pin Mockup.psd", "PSD/Tote Mockup.psd"];
+  const EXPECTED_PACKAGE = ["AI/Board.ai", "Crate Diagnostics/crate-provenance.json", "PNG/Art A1.png", "PNG/Art A2.png", "PNG/Art A3.png", "PNG/Art A4.png", "PNG/Art A5.png", "PNG/Art A6.png", "PNG/Placed Texture_1_1.png", "PNG/Placed Texture_1.png", "PNG/Placed Texture.png", "PNG/Swatch B1.png", "PNG/Swatch B2.png", "PNG/Swatch B3.png", "PNG/Swatch B4.png", "PNG/Swatch B5.png", "PNG/Swatch B6.png", "PSB/Linked Smart_1.psb", "PSB/Linked Smart.psb", "PSD/Mockup A.psd", "PSD/Mockup B.psd"];
   const stored = id => storeInstance.data.projects.find(item => item.id === id);
   const extractDir = id => path.join(os.tmpdir(), 'crate-psd-extract-' + id);
   const cacheNames = id => { try { return fs.readdirSync(extractDir(id)).filter(name => !name.startsWith('.')).sort(); } catch (_) { return []; } };
@@ -54,34 +54,34 @@ function cases() {
     return [...project.files.map(row => describe(row, 'files')), ...(project.pendingFiles || []).map(row => describe(row, 'pending'))].sort();
   }
 
-  // Two mockups. Tote holds every kind of object; Pin only proven ones.
+  // Two mockups. B holds every kind of object; A only proven ones.
   function createMockups(root) {
     const links = path.join(root, 'Links'); fs.mkdirSync(links, { recursive: true });
-    const tote = path.join(links, 'Tote Mockup.psd'), pin = path.join(links, 'Pin Mockup.psd');
+    const mockupB = path.join(links, 'Mockup B.psd'), mockupA = path.join(links, 'Mockup A.psd');
     const fabric = path.join(links, 'Shared Fabric.psb'), inner = path.join(links, 'Inner External.png');
     fs.writeFileSync(fabric, plainDocument('fabric')); fs.writeFileSync(inner, createSyntheticPngBytes(8, 8, 0x21));
     const ids = {}, documents = {};
     const stable = (key, record) => { record.id = ids[key] ||= record.id; return record; };
     const once = (key, make) => (documents[key] ||= make());
-    const state = { revision: { tote: 0, pin: 0 } };
+    const state = { revision: { mockupB: 0, mockupA: 0 } };
     const write = {
-      tote() {
-        const r = state.revision.tote;
-        fs.writeFileSync(tote, parentPsd([
-          stable('t0', embedded(SMART, plainDocument(`tote-0-${r}`))), stable('t1', embedded(SMART, once('t1', () => plainDocument('tote-1')))), stable('t2', embedded(SMART, once('t2', () => plainDocument('tote-2')))),
+      mockupB() {
+        const r = state.revision.mockupB;
+        fs.writeFileSync(mockupB, parentPsd([
+          stable('t0', embedded(SMART, plainDocument(`b-0-${r}`))), stable('t1', embedded(SMART, once('t1', () => plainDocument('b-1')))), stable('t2', embedded(SMART, once('t2', () => plainDocument('b-2')))),
           stable('png', embedded('Placed Texture.png', png('texture'), { type: 'png ' })),
           stable('open', embedded('Linked Smart.psb', once('open', () => documentHolding([external('Inner External.png', inner)])))),
-          stable('nest', embedded('Nested Smart.psb', once('nest', () => documentHolding([embedded('Inner.psb', plainDocument('tote-inner'))])))),
+          stable('nest', embedded('Nested Smart.psb', once('nest', () => documentHolding([embedded('Inner.psb', plainDocument('b-inner'))])))),
           stable('ext', external('Shared Fabric.psb', fabric)),
-        ], `tote-doc-${r}`));
+        ], `b-doc-${r}`));
       },
-      pin() {
-        const r = state.revision.pin;
-        fs.writeFileSync(pin, parentPsd([stable('p0', embedded(SMART, plainDocument(`pin-0-${r}`))), stable('p1', embedded(SMART, once('p1', () => plainDocument('pin-1'))))], `pin-doc-${r}`));
+      mockupA() {
+        const r = state.revision.mockupA;
+        fs.writeFileSync(mockupA, parentPsd([stable('p0', embedded(SMART, plainDocument(`a-0-${r}`))), stable('p1', embedded(SMART, once('p1', () => plainDocument('a-1'))))], `a-doc-${r}`));
       },
     };
-    write.tote(); write.pin();
-    return { links, tote, pin, fabric, inner, state, write, documents };
+    write.mockupB(); write.mockupA();
+    return { links, mockupB, mockupA, fabric, inner, state, write, documents };
   }
 
   function modelApps(apps, ai, linkPaths) {
@@ -112,8 +112,8 @@ function cases() {
     const root = path.join(TEST_HOME, 'Desktop', 'Synthetic Mockup Project'), outDir = path.join(TEST_HOME, 'Desktop', 'Synthetic Packages');
     fs.mkdirSync(root, { recursive: true }); fs.mkdirSync(outDir, { recursive: true });
     const mockups = createMockups(root), pngs = [];
-    for (const kind of ['Tote', 'Pin']) for (let i = 1; i <= 6; i++) { const file = path.join(mockups.links, `${kind}_Option${i}.png`); fs.writeFileSync(file, createSyntheticPngBytes(16, 12, 0x40 + pngs.length)); pngs.push(file); }
-    const ai = path.join(root, 'Logo Board.ai'), linkPaths = [mockups.tote, mockups.pin, ...pngs];
+    for (const stem of ['Swatch B', 'Art A']) for (let i = 1; i <= 6; i++) { const file = path.join(mockups.links, `${stem}${i}.png`); fs.writeFileSync(file, createSyntheticPngBytes(16, 12, 0x40 + pngs.length)); pngs.push(file); }
+    const ai = path.join(root, 'Board.ai'), linkPaths = [mockups.mockupB, mockups.mockupA, ...pngs];
     writeSyntheticAiFile(ai, linkPaths.join('\n'));
     const apps = { aiOpen: false, psOpen: new Set() };
     modelApps(apps, ai, linkPaths);
@@ -154,8 +154,9 @@ function cases() {
     const data = plainDocument('retired-sentinel'), file = path.join(extractDir(f.id), SENTINEL_NAME);
     fs.mkdirSync(extractDir(f.id), { recursive: true }); fs.writeFileSync(file, data);
     stored(f.id).files.push({ path: file, name: SENTINEL_NAME, ext: '.psb', source: 'psd-embedded', addedAt: Date.now(), fileId: SENTINEL_ID,
-      psdExtractionReceipt: { version: 1, parentPath: f.tote, sourceDigest: sha(fs.readFileSync(f.tote)), layerPath: null, linkedIndex: 40, originalName: SENTINEL_NAME, outputDigest: sha(data) } });
+      psdExtractionReceipt: { version: 1, parentPath: f.mockupB, sourceDigest: sha(fs.readFileSync(f.mockupB)), layerPath: null, linkedIndex: 40, originalName: SENTINEL_NAME, outputDigest: sha(data) } });
   }
+  const isLinkedArt = row => /\| (Art A|Swatch B)\d\.png \|/.test(row);
   const LEAK_MARKERS = ['retiredEmbeddedDocuments', SENTINEL_ID, SENTINEL_NAME];
   const leakIn = text => LEAK_MARKERS.find(marker => text.includes(marker)) || null;
   const serialize = value => { try { return JSON.stringify(value) || ''; } catch (_) { return String(value); } };
@@ -186,8 +187,8 @@ function cases() {
     const check = async name => {
       await rendererReads();
       seen[name] = rowsOf(f.id);
-      assert.deepEqual(seen[name].filter(row => !row.includes('_Option')), EXPECTED_ROWS[name], name);
-      assert.equal(seen[name].filter(row => row.includes('_Option')).length, 12, name);
+      assert.deepEqual(seen[name].filter(row => !isLinkedArt(row)), EXPECTED_ROWS[name], name);
+      assert.equal(seen[name].filter(isLinkedArt).length, 12, name);
       assert.deepEqual(cacheNames(f.id), EXPECTED_CACHE[name], `${name}: cache`);
       assert.equal(stored(f.id).workingSourceRelationshipHolds ?? null, null, `${name}: holds`);
     };
@@ -199,20 +200,20 @@ function cases() {
       assert.deepEqual(stored(f.id).retiredEmbeddedDocuments.entries.map(entry => entry.row.fileId), [SENTINEL_ID]);
       for (const row of stored(f.id).files.filter(item => item.ext === '.psb' && item.source === 'psd-embedded')) await callIpcRaw('projects:remove-file', f.id, row.fileId || row.path);
       await packageClick(f); await check('after exclude');
-      f.apps.psOpen = new Set([f.tote, f.pin]); await pollFiles(f); await pollApps(f); await check('photoshop open');
-      await save(f, 'tote'); await save(f, 'pin'); await check('saved');
+      f.apps.psOpen = new Set([f.mockupB, f.mockupA]); await pollFiles(f); await pollApps(f); await check('photoshop open');
+      await save(f, 'mockupB'); await save(f, 'mockupA'); await check('saved');
       f.apps.psOpen = new Set(); await pollFiles(f); await check('photoshop closed');
       await packageClick(f); await check('final package click');
-      const toteBytes = fs.readFileSync(f.tote), pinBytes = fs.readFileSync(f.pin);
+      const mockupBBytes = fs.readFileSync(f.mockupB), mockupABytes = fs.readFileSync(f.mockupA);
       let result = await callIpcRaw('projects:package', f.id, f.outDir, f.review.token);
       if (result?.error === 'package_review_changed' && result.review?.token) result = await callIpcRaw('projects:package', f.id, f.outDir, result.review.token);
       assert.equal(result?.success, true, serialize(result).slice(0, 300));
       const listing = listPackage(result.folderPath), bySuffix = name => listing.filter(item => path.basename(item.rel) === name).map(item => item.sha);
       {
         assert.deepEqual(listing.map(item => item.rel), EXPECTED_PACKAGE);
-        assert.deepEqual(bySuffix('Tote Mockup.psd'), [sha(toteBytes)]);
-        assert.deepEqual(bySuffix('Pin Mockup.psd'), [sha(pinBytes)]);
-        assert.deepEqual(bySuffix('Logo Board.ai'), [sha(fs.readFileSync(f.ai))]);
+        assert.deepEqual(bySuffix('Mockup B.psd'), [sha(mockupBBytes)]);
+        assert.deepEqual(bySuffix('Mockup A.psd'), [sha(mockupABytes)]);
+        assert.deepEqual(bySuffix('Board.ai'), [sha(fs.readFileSync(f.ai))]);
         for (const file of f.pngs) assert.deepEqual(bySuffix(path.basename(file)), [sha(fs.readFileSync(file))]);
         for (const name of ['Placed Texture.png', 'Placed Texture_1.png', 'Placed Texture_1_1.png']) assert.deepEqual(bySuffix(name), [sha(png('texture'))], name);
         for (const name of ['Linked Smart.psb', 'Linked Smart_1.psb']) assert.deepEqual(bySuffix(name), [sha(f.documents.open)], name);
