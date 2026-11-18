@@ -59,11 +59,13 @@ function cases() {
     const project = await createProject(`Linked scan ${ext}`);
     await callIpcRaw('projects:pause', project.id); clearTrackedTimers();
     const sourcePath = path.join(TEST_HOME, 'Desktop', `Synthetic Layout${ext}`);
-    const [first, second, third] = createLinks(['Alpha.png', 'Bêta 😀.jpg', 'Gamma.woff2']);
+    // Retouch.png does not exist, so only a greedy search reaches this file: the
+    // lazy matcher stops at the first extension. The two greedy sites own this row.
+    const [first, second, third, greedyOnly] = createLinks(['Alpha.png', 'Bêta 😀.jpg', 'Gamma.woff2', 'Retouch.png-retouched.jpg']);
     const missing = path.join(path.dirname(first), 'Missing.png');
-    writeBinary(sourcePath, [first, missing, second, third], seed);
+    writeBinary(sourcePath, [first, missing, greedyOnly, second, third], seed);
     await setProjectFiles(project.id, { files: [{ path: sourcePath, ext, name: path.basename(sourcePath), source: 'manual-browse', addedAt: Date.now() }], preserveAwaitingAssetBaseline: firstScan });
-    return { id: project.id, sourcePath, links: [first, second, third].sort(), missing };
+    return { id: project.id, sourcePath, lazyLinks: [first, second, third].sort(), links: [first, second, third, greedyOnly].sort(), missing };
   }
 
   const storedProject = id => storeInstance.data.projects.find(item => item.id === id);
@@ -115,7 +117,7 @@ function cases() {
     const f = await fixture('.ai', { firstScan: true });
     const { result, large } = await watchLargeDecodes(() => metadataTestHooks.runScanOnOpen(f.id, f.sourcePath, null, null, { allowPausedBaseline: true }));
     assert.deepEqual(result, { success: true });
-    assert.deepEqual(linkedRows(f), f.links);
+    assert.deepEqual(linkedRows(f), f.lazyLinks);
     assert.deepEqual(large, []);
   });
 
@@ -140,22 +142,27 @@ function cases() {
     const project = storedProject(f.id);
     return [...project.files, ...(project.pendingFiles || [])].map(file => file.path).filter(file => !f.isSource(file)).sort();
   };
-  function oversizedBuffer() {
+  // A Buffer in type only, over the string limit, whose old decode is observable.
+  function oversizedBuffer(decode) {
     const fake = Object.setPrototypeOf(new Uint8Array(0), Buffer.prototype);
     Object.defineProperty(fake, 'length', { value: require('node:buffer').constants.MAX_STRING_LENGTH + 1 });
-    fake.toString = () => { throw Object.assign(new Error('synthetic string limit'), { code: 'ERR_STRING_TOO_LONG' }); };
+    fake.toString = decode;
     return fake;
   }
 
-  for (const [label, failRead] of [
-    ['a read error', () => { throw Object.assign(new Error('synthetic read failure'), { code: 'EIO' }); }],
-    ['an over-limit decode error', () => oversizedBuffer()],
+  for (const [label, failRead, expectDecode] of [
+    ['a read error', () => { throw Object.assign(new Error('synthetic read failure'), { code: 'EIO' }); }, false],
+    ['an over-limit decode error', state => oversizedBuffer(() => {
+      state.decodes++;
+      throw Object.assign(new Error('synthetic string limit'), { code: 'ERR_STRING_TOO_LONG' });
+    }), true],
   ]) {
     routeTest(`pre-package scan: ${label} on one file leaves the other file's links intact`, { timeout: 120000 }, async () => {
       const f = await twoSourceFixture();
       let attempts = 0;
+      const state = { decodes: 0 };
       fs.promises.readFile = async function (file, ...args) {
-        if (file === f.brokenPath) { attempts++; return failRead(); }
+        if (file === f.brokenPath) { attempts++; return failRead(state); }
         return realReadFile.call(this, file, ...args);
       };
       try {
@@ -163,6 +170,7 @@ function cases() {
         assert.equal(result?.error, undefined);
       } finally { fs.promises.readFile = realReadFile; }
       assert.ok(attempts > 0);
+      assert.equal(state.decodes > 0, expectDecode);
       assert.deepEqual(rowsBesideSources(f), f.links);
     });
 
@@ -174,13 +182,40 @@ function cases() {
         return { stdout: '' };
       });
       let attempts = 0;
+      const state = { decodes: 0 };
       fs.readFileSync = function (file, ...args) {
-        if (file === f.brokenPath) { attempts++; return failRead(); }
+        if (file === f.brokenPath) { attempts++; return failRead(state); }
         return realReadFileSync.call(this, file, ...args);
       };
       try { await startWatchingAndStop(f.id); } finally { fs.readFileSync = realReadFileSync; }
       assert.ok(attempts > 0);
+      assert.equal(state.decodes > 0, expectDecode);
       assert.deepEqual(rowsBesideSources(f), f.links);
+    });
+  }
+
+  // The old decode's text is what these sites search when a buffer is over the limit.
+  for (const [label, run, installRead] of [
+    ['pre-package scan', f => callIpcRaw('projects:pre-package-scan', f.id), (f, read) => {
+      fs.promises.readFile = async function (file, ...args) { return file === f.brokenPath ? read() : realReadFile.call(this, file, ...args); };
+    }],
+    ['Watch start', f => {
+      setChildProcessHandler(({ kind, command }) => {
+        if (kind === 'execFile' && command === '/bin/ps') return { stdout: '444 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
+        if (kind === 'execFile' && command === '/usr/sbin/lsof') return { stdout: `p444\nf14\ntREG\nn${f.brokenPath}\n` };
+        return { stdout: '' };
+      });
+      return startWatchingAndStop(f.id);
+    }, (f, read) => {
+      fs.readFileSync = function (file, ...args) { return file === f.brokenPath ? read() : realReadFileSync.call(this, file, ...args); };
+    }],
+  ]) {
+    routeTest(`${label}: links in an over-limit file's successful decode are still found`, { timeout: 120000 }, async () => {
+      const f = await twoSourceFixture();
+      const [decodedLink] = createLinks(['Only In Oversized Decode.png']);
+      installRead(f, () => oversizedBuffer(() => `\0${decodedLink}\0`));
+      try { await run(f); } finally { fs.promises.readFile = realReadFile; fs.readFileSync = realReadFileSync; }
+      assert.ok(rowsBesideSources(f).includes(decodedLink));
     });
   }
 }

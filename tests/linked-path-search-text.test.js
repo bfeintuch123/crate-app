@@ -43,9 +43,9 @@ const describe = buffer => `${buffer.length} bytes: ${buffer.subarray(0, 120).to
 
 // Returns how many matches the whole-buffer decode produced, so each case can
 // prove that it exercised something.
-function checkSame(buffer, label) {
+function checkSame(buffer, label, options) {
   const whole = buffer.toString('utf8');
-  const reduced = searchText(buffer);
+  const reduced = searchText(buffer, options);
   if (reduced.length > buffer.length) assert.fail(`${label}: text is longer than the buffer (${describe(buffer)})`);
   let matches = 0;
   for (const [name, run] of GRAMMARS) {
@@ -227,20 +227,29 @@ test('empty and prefix-only inputs', () => {
   assert.equal(searchText(Buffer.alloc(0)), '');
 });
 
-test('a seeded generator over those atoms produces identical results', () => {
+test('a seeded generator over those atoms produces identical results on both paths', () => {
   const atoms = [
     '/', '/Users/', '/users/', '/USERS/', '/Volumes/', '/vOLUMES/', 'Users', 'a', 'B', '.', '.png', '.JPG', '.psd', '.woff', '.woff2',
     '.ai', '.tif', '.tiff', '.psb', 'f', ' ', '%20', '?', '#', '\\', 'ſ', 'K', 'ı', 'İ', '﻿', 'é', '€', '😀',
     [0x00], [0x0a], [0x0d], [0x1f], [0x22], [0x27], [0x7f], [0xc3], [0xe2, 0x82], [0xf0, 0x9f], [0x80], [0xff], [0xc0, 0xaf],
   ].map(bytes);
   const random = createRandom(0x1234abcd);
-  let matches = 0;
+  // Every other round gets one tiny budget, so runs of both paths are compared.
+  const tinyBudget = round => [
+    { maxSlashMisses: random(3) }, { maxRuns: random(3) }, { maxRunBytes: random(24) },
+  ][round % 3];
+  let matches = 0, fellBack = 0, reducedRounds = 0;
   for (let round = 0; round < 60000; round++) {
     const parts = [];
     for (let count = random(16); count > 0; count--) parts.push(atoms[random(atoms.length)]);
-    matches += checkSame(Buffer.concat(parts), `round ${round}`);
+    const buffer = Buffer.concat(parts), options = round % 2 ? tinyBudget(round) : undefined;
+    matches += checkSame(buffer, `round ${round}`, options);
+    const whole = buffer.toString('utf8');
+    if (whole !== searchText(buffer)) (searchText(buffer, options) === whole ? fellBack++ : reducedRounds++);
   }
   assert.ok(matches > 20000, `only ${matches} matches`);
+  assert.ok(fellBack > 1000, `only ${fellBack} rounds used the whole-buffer path`);
+  assert.ok(reducedRounds > 1000, `only ${reducedRounds} rounds used reduced text`);
 });
 
 test('only candidate runs are decoded, and they are joined by a delimiter', t => {
@@ -280,10 +289,10 @@ test('a buffer over the string limit takes the old whole-buffer decode', t => {
     calls.push({ same: this === buffer, args });
     return realToString.apply(this, args);
   });
-  assert.equal(searchText(buffer, buffer.length - 1), 'noise /Users/a.png noise');
+  assert.equal(searchText(buffer, { maxStringLength: buffer.length - 1 }), 'noise /Users/a.png noise');
   assert.deepEqual(calls, [{ same: true, args: ['utf8'] }]);
   calls.length = 0;
-  assert.equal(searchText(buffer, buffer.length), '/Users/a.png noise', 'exactly at the limit is still reduced');
+  assert.equal(searchText(buffer, { maxStringLength: buffer.length }), '/Users/a.png noise', 'exactly at the limit is still reduced');
   assert.equal(calls.some(call => call.same), false);
 });
 
@@ -302,6 +311,87 @@ test('the default limit is the runtime string limit, and the old decode error pa
   assert.throws(() => searchText(over), error => error === failure);
   const atLimit = bufferReporting(constants.MAX_STRING_LENGTH, () => { throw failure; });
   assert.equal(searchText(atLimit), '');
+});
+
+test('each budget, once exceeded, gives exactly the whole-buffer text', () => {
+  const cases = [
+    ['slash misses', join('head /a /b /Users/x.png', [0x00], 'tail'), { maxSlashMisses: 2 }, { maxSlashMisses: 1 }],
+    ['runs', join('head', [0x00], '/Users/a.png', [0x00], '/Users/b.png', [0x00]), { maxRuns: 2 }, { maxRuns: 1 }],
+    ['run bytes', join('head', [0x00], '/Users/a.png', [0x00], '/Users/b.png', [0x00]), { maxRunBytes: 24 }, { maxRunBytes: 23 }],
+  ];
+  for (const [name, buffer, atLimit, overLimit] of cases) {
+    const whole = buffer.toString('utf8');
+    assert.notEqual(searchText(buffer, atLimit), whole, `${name}: exactly at the budget stays reduced`);
+    assert.equal(searchText(buffer, overLimit), whole, `${name}: over the budget`);
+    checkSame(buffer, name, atLimit);
+    checkSame(buffer, name, overLimit);
+  }
+});
+
+function repeated(unit, byteLength) {
+  const pattern = Buffer.from(unit, 'latin1'), out = Buffer.alloc(byteLength);
+  for (let offset = 0; offset < byteLength; offset += pattern.length) pattern.copy(out, offset, 0, Math.min(pattern.length, byteLength - offset));
+  return out;
+}
+
+function seededBytes(byteLength, seed) {
+  const random = createRandom(seed), out = Buffer.alloc(byteLength);
+  for (let offset = 0; offset < byteLength; offset += 4) out.writeUInt32LE(random(0xffffffff), Math.min(offset, byteLength - 4));
+  return out;
+}
+
+const DENSE_BYTES = 3 * 1024 * 1024;
+function slashEvery(step) {
+  const out = seededBytes(DENSE_BYTES, 0x7a1c55e3);
+  for (let offset = 0; offset < out.length; offset += step) out[offset] = 0x2f;
+  return out;
+}
+const DENSE_INPUTS = {
+  'all slashes': () => Buffer.alloc(DENSE_BYTES, 0x2f),
+  'a slash every 24 bytes': () => slashEvery(24),
+  'prefixes with delimiters': () => repeated('/Users/\0', DENSE_BYTES),
+  'one prefix per line': () => repeated('/Users/synthetic/Links/linked-file.png\n', DENSE_BYTES),
+  'prefixes without delimiters': () => repeated('/Volumes/', DENSE_BYTES),
+};
+
+test('dense input with the default budgets gives exactly the whole-buffer text', () => {
+  for (const [name, build] of Object.entries(DENSE_INPUTS)) {
+    const buffer = build();
+    assert.ok(searchText(buffer) === buffer.toString('utf8'), name);
+  }
+});
+
+function countDecodes(t, buffer, run) {
+  const realToString = Buffer.prototype.toString, counts = { total: 0, whole: 0 };
+  t.mock.method(Buffer.prototype, 'toString', function (...args) {
+    counts.total++;
+    if (this === buffer) counts.whole++;
+    return realToString.apply(this, args);
+  });
+  try { run(); } finally { t.mock.restoreAll(); }
+  return counts;
+}
+
+test('dense input costs at most the run limit plus one decode', t => {
+  const RUN_LIMIT = 4096;
+  for (const [name, build] of Object.entries(DENSE_INPUTS)) {
+    const buffer = build(), counts = countDecodes(t, buffer, () => searchText(buffer));
+    assert.ok(counts.total <= RUN_LIMIT + 1, `${name}: ${counts.total} decodes`);
+    assert.equal(counts.whole, 1, name);
+  }
+  const prefixes = DENSE_INPUTS['prefixes with delimiters']();
+  assert.equal(countDecodes(t, prefixes, () => searchText(prefixes)).total, RUN_LIMIT + 1);
+});
+
+test('sparse binary data stays on the reduced path', t => {
+  const buffer = seededBytes(DENSE_BYTES, 0x31d0a9c7);
+  for (let i = 0; i < 2000; i++) Buffer.from(`\0/Users/s/Links/f${i}.png\0`).copy(buffer, 1000 + i * 1400);
+  let text;
+  const counts = countDecodes(t, buffer, () => { text = searchText(buffer); });
+  assert.equal(counts.whole, 0);
+  assert.ok(counts.total >= 2000 && counts.total <= 4096, `${counts.total} decodes`);
+  assert.deepEqual(extractLinkedAssetPaths(text, '/x'), extractLinkedAssetPaths(buffer.toString('utf8'), '/x'));
+  assert.ok(extractLinkedAssetPaths(text, '/x').length >= 2000);
 });
 
 test('a value that is not a Buffer keeps the old toString behavior', () => {

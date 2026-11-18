@@ -40,6 +40,17 @@ const NEARBY_BYTES = 32;
 const USERS_PREFIX = Buffer.from('/users/', 'latin1');
 const VOLUMES_PREFIX = Buffer.from('/volumes/', 'latin1');
 
+// Budgets for building the reduced text. Past any of them the input is dense
+// enough that the whole-file decode is the cheaper route, so it is used instead.
+// Random binary data has one slash per 256 bytes; twice that density is where
+// examining slashes stops paying for itself.
+const MIN_SLASH_MISSES = 4096;
+const BYTES_PER_SLASH_MISS = 128;
+// Each kept run is its own string, which is what costs memory on dense input.
+const MAX_KEPT_RUNS = 4096;
+const MIN_RUN_BYTES = 64 * 1024;
+const BYTES_PER_RUN_BYTE = 8;
+
 // `prefix` is lowercase ASCII and `at` already holds its leading slash.
 function hasPrefixAt(buffer, at, prefix) {
   if (at + prefix.length > buffer.length) return false;
@@ -50,18 +61,10 @@ function hasPrefixAt(buffer, at, prefix) {
   return true;
 }
 
-// Finds the next prefix. Design data can be dense with slash bytes, so a miss
-// looks a short way ahead itself instead of paying for a native search per byte.
-function nextPrefixAt(buffer, from) {
-  let at = buffer.indexOf(SLASH, from);
-  while (at !== -1) {
-    if (hasPrefixAt(buffer, at, USERS_PREFIX) || hasPrefixAt(buffer, at, VOLUMES_PREFIX)) return at;
-    const nearbyEnd = Math.min(at + NEARBY_BYTES, buffer.length);
-    let next = at + 1;
-    while (next < nearbyEnd && buffer[next] !== SLASH) next++;
-    at = next < nearbyEnd ? next : buffer.indexOf(SLASH, next);
-  }
-  return -1;
+function isPathPrefixAt(buffer, at) {
+  const next = buffer[at + 1] | 0x20;
+  return (next === 0x75 && hasPrefixAt(buffer, at, USERS_PREFIX)) ||
+    (next === 0x76 && hasPrefixAt(buffer, at, VOLUMES_PREFIX));
 }
 
 function isPathDelimiterByte(byte) {
@@ -74,15 +77,37 @@ function isPathDelimiterByte(byte) {
 // ASCII or lets a broken sequence absorb one. Each run from a prefix to its
 // delimiter therefore decodes to the same characters as in the whole-file text,
 // and `\n`, itself a delimiter, keeps runs from joining into one match.
-function linkedPathSearchText(buffer, maxStringLength = MAX_STRING_LENGTH) {
+// The options exist for tests; callers use the defaults.
+function linkedPathSearchText(buffer, {
+  maxStringLength = MAX_STRING_LENGTH,
+  maxSlashMisses = Math.max(MIN_SLASH_MISSES, Math.floor(buffer?.length / BYTES_PER_SLASH_MISS)),
+  maxRuns = MAX_KEPT_RUNS,
+  maxRunBytes = Math.max(MIN_RUN_BYTES, Math.floor(buffer?.length / BYTES_PER_RUN_BYTE)),
+} = {}) {
   // Past the string limit the whole-file decode decides the outcome, as before.
   if (!Buffer.isBuffer(buffer) || buffer.length > maxStringLength) return buffer.toString('utf8');
   const runs = [];
-  for (let at = nextPrefixAt(buffer, 0); at !== -1;) {
-    let end = at + 1;
-    while (end < buffer.length && !isPathDelimiterByte(buffer[end])) end++;
-    runs.push(buffer.subarray(at, end).toString('utf8'));
-    at = nextPrefixAt(buffer, end + 1);
+  let slashMisses = 0, runBytes = 0;
+  let at = buffer.indexOf(SLASH, 0);
+  while (at !== -1) {
+    if (isPathPrefixAt(buffer, at)) {
+      if (runs.length >= maxRuns) return buffer.toString('utf8');
+      // Stops one byte past the budget, so an endless run is not walked to its end.
+      const scanEnd = Math.min(buffer.length, at + (maxRunBytes - runBytes) + 1);
+      let end = at + 1;
+      while (end < scanEnd && !isPathDelimiterByte(buffer[end])) end++;
+      runBytes += end - at;
+      if (runBytes > maxRunBytes) return buffer.toString('utf8');
+      runs.push(buffer.subarray(at, end).toString('utf8'));
+      at = buffer.indexOf(SLASH, end + 1);
+    } else {
+      if (++slashMisses > maxSlashMisses) return buffer.toString('utf8');
+      // Slashes cluster in design data: look a short way ahead before another native search.
+      const nearbyEnd = Math.min(at + NEARBY_BYTES, buffer.length);
+      let next = at + 1;
+      while (next < nearbyEnd && buffer[next] !== SLASH) next++;
+      at = next < nearbyEnd ? next : buffer.indexOf(SLASH, next);
+    }
   }
   return runs.join('\n');
 }
