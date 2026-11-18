@@ -585,7 +585,20 @@ function baselineCases() {
       let restore;
       try {
         await metadataTestHooks.waitForWatcherIdle(f.project.id); clearTrackedTimers();
-        if (reconciled) { f.state.opened = true; await f.live(); clearTrackedTimers(); }
+        if (reconciled) {
+          // The fixture's Add Files starts a live poll without awaiting it, and
+          // the watcher coordinator does not track that poll. While it runs,
+          // f.live() returns without polling, so it can see the open document
+          // late and change the B card's revision after the test reads it.
+          // Let it finish, poll, then wait for the open document's evidence.
+          const pollIdle = () => !metadataTestHooks.getIllustratorPollState(f.project.id).inProgress;
+          const openKey = liveEvidenceKeyForTest(f.sources[0]);
+          f.state.opened = true;
+          await waitForCondition(pollIdle, 'earlier live poll did not finish');
+          await f.live(); clearTrackedTimers();
+          await waitForCondition(() => pollIdle() && (f.current().liveEvidenceLedger?.candidates?.[openKey]?.observations || [])
+            .some(observation => observation.observerMethod === 'illustrator-active-session'), 'no completed live poll saw the open document');
+        }
         const b = path.join(f.outside, 'B.ai'); fs.writeFileSync(b, `%PDF-1.7\n${f.paths[0].link}\n%%EOF\n`);
         const before = metadataTestHooks.getAcceptedSourceWatchSnapshot(f.project.id); assert.equal(before.paths.length, 256);
         restore = metadataTestHooks.traceWatchCoverageOperations(f.project.id, trace);
