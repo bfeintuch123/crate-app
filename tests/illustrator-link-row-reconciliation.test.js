@@ -126,6 +126,47 @@ function cases() {
     return psd;
   }
 
+  // A row the designer cannot decide, written by another app's live claim.
+  async function photoshopClaimRow(f, other, name) {
+    const file = png(f.dir, name);
+    other.output = file + '\n';
+    await poll(f.id);
+    other.output = '';
+    const row = clone(storedRow(f.id, name));
+    assert.equal(row?.source, 'ps-poll');
+    assert.equal(row.captureState, 'needs-save');
+    return { file, row };
+  }
+  const withoutSessionStamp = row => {
+    if (!row) return row;
+    const { captureSessionId, captureSessionObserved, ...rest } = row;
+    return rest;
+  };
+  async function linkInUnsavedDocument(f, link) {
+    setDoc(f, { modified: true, links: [...f.ill.docs[0].links, link] });
+    await poll(f.id);
+  }
+  async function changeWatchSession(f, kind, during = null) {
+    const before = stored(f.id).watchSessionId;
+    if (kind === 'pause then Watch') {
+      await callIpcRaw('projects:pause', f.id);
+      if (during) during();
+      await callIpcRaw('projects:start-watching', f.id);
+    } else {
+      const account = testAccountSession, realNow = account.now;
+      account.now = () => account.accessExpiresAt;
+      account.publish('offline', 'Your session needs to be checked. Connect to the internet to continue.');
+      if (during) during();
+      account.now = realNow;
+      account.accessExpiresAt = Date.now() + 3_600_000;
+      account.publish('signed_in', '', account.status.identity);
+    }
+    await waitForCondition(() => stored(f.id).watchSessionId !== before, 'watch session changed', 5000);
+    await metadataTestHooks.waitForWatcherIdle(f.id);
+    await pause(200);
+    await poll(f.id);
+  }
+
   function png(dir, name) { const filePath = path.join(dir, name); fs.writeFileSync(filePath, createSyntheticPngBytes()); return filePath; }
 
   async function placeUnsaved(f, link, docIndex = 0) {
@@ -232,24 +273,22 @@ function cases() {
   });
 
   // 6. A decidable PSD row overwritten by a live link is restored exactly.
-  adapterTest('link-row-6: a decidable PSD row placed and deleted is restored deep-equal; placed and saved it is Included', async () => {
+  adapterTest('link-row-6: a decidable row stays as it is while linked and after the link goes; placed and saved it is Included', async () => {
     const f = await watchedDocument('Link row 6 PSD');
-    const psd = path.join(f.dir, 'OlderMockup.psd');
-    fs.writeFileSync(psd, '8BPS synthetic');
-    const watchStartedAt = stored(f.id).watchStartedAt;
-    await emitWatcherWithStats('add', psd, { mtimeMs: watchStartedAt - 86_400_000, birthtimeMs: watchStartedAt - 172_800_000 });
-    await metadataTestHooks.waitForWatcherIdle(f.id);
+    const psd = await offerOlderPsd(f);
     const before = clone(storedRow(f.id, 'OlderMockup.psd'));
     const beforeView = clone(await viewRow(f.id, 'OlderMockup.psd'));
-    assert.equal(before.captureState, 'pending');
-    assert.ok(beforeView, 'decidable PSD row visible');
-    await placeUnsaved(f, psd);
+    assert.ok(beforeView, 'decidable row visible');
+    await linkInUnsavedDocument(f, psd);
+    // The claim only re-observes the row, which updates its session stamp.
+    assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'OlderMockup.psd')), withoutSessionStamp(before), 'an unsaved link does not replace the row');
+    assert.deepEqual(withoutSessionStamp(await viewRow(f.id, 'OlderMockup.psd')), withoutSessionStamp(beforeView), 'still offered as before');
     setDoc(f, { modified: true, links: [] });
     await poll(f.id);
-    assert.deepEqual(storedRow(f.id, 'OlderMockup.psd'), before, 'stored row restored exactly');
-    assert.deepEqual(await viewRow(f.id, 'OlderMockup.psd'), beforeView, 'visible exactly as before');
+    assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'OlderMockup.psd')), withoutSessionStamp(before), 'the link going changes nothing');
+    assert.deepEqual(withoutSessionStamp(await viewRow(f.id, 'OlderMockup.psd')), withoutSessionStamp(beforeView));
     // Placed again and saved with a confirmable path: Included.
-    await placeUnsaved(f, psd);
+    await linkInUnsavedDocument(f, psd);
     setDoc(f, { modified: false, links: [psd] });
     await save(f, `linked\n${psd}\n`);
     await waitForCondition(() => isProjectFile(f.id, 'OlderMockup.psd'), 'saved link promoted', 5000);
@@ -397,27 +436,27 @@ function cases() {
     assert.equal(await viewRow(f.id, 'Restaged.png'), undefined, 'not visible');
   });
 
-  adapterTest('link-row-9c: the remembered review row survives a session change and returns exactly', async () => {
-    const f = await watchedDocument('Link row 9c remembered row');
-    const psd = await offerOlderPsd(f);
-    const original = clone(storedRow(f.id, 'OlderMockup.psd'));
-    const first = await placeUnsaved(f, psd);
+  adapterTest('link-row-9c: a remembered row the designer could not decide survives a session change and returns exactly', async () => {
+    const other = photoshopChecks();
+    const f = await watchedDocument('Link row 9c remembered row', { extra: other.extra });
+    const { file, row: original } = await photoshopClaimRow(f, other, 'ClaimedElsewhere.png');
+    const first = await placeUnsaved(f, file);
     assert.deepEqual(first.illustratorLinkReview.prior, original);
-    setDoc(f, { modified: false, links: [psd] });
+    setDoc(f, { modified: false, links: [file] });
     await poll(f.id);
-    assert.equal(storedRow(f.id, 'OlderMockup.psd').illustratorLinkReview.cleanSeen, true);
-    setDoc(f, { modified: true, links: [psd] });
+    assert.equal(storedRow(f.id, 'ClaimedElsewhere.png').illustratorLinkReview.cleanSeen, true);
+    setDoc(f, { modified: true, links: [file] });
     await callIpcRaw('projects:pause', f.id);
     await callIpcRaw('projects:start-watching', f.id);
     await metadataTestHooks.waitForWatcherIdle(f.id);
     await poll(f.id);
-    const restaged = storedRow(f.id, 'OlderMockup.psd');
+    const restaged = storedRow(f.id, 'ClaimedElsewhere.png');
     assert.equal(restaged.captureSessionId, stored(f.id).watchSessionId);
     assert.deepEqual(restaged.illustratorLinkReview, { version: 1, prior: original }, 'only the remembered row is inherited');
     assert.equal(Object.hasOwn(restaged.illustratorLinkReview.prior, 'illustratorLinkReview'), false);
     setDoc(f, { links: [] });
     await poll(f.id);
-    assert.deepEqual(storedRow(f.id, 'OlderMockup.psd'), original, 'the original decidable row returns exactly');
+    assert.deepEqual(storedRow(f.id, 'ClaimedElsewhere.png'), original, 'the remembered row returns exactly');
   });
 
   // 10. A link reported only by an excluded working file.
@@ -560,19 +599,19 @@ function cases() {
   });
 
   adapterTest('link-row-race-b: an older snapshot finishing last does not stage a row a newer reading withdrew', async () => {
-    const f = await watchedDocument('Link row race b');
-    const psd = await offerOlderPsd(f);
-    const original = clone(storedRow(f.id, 'OlderMockup.psd'));
-    await placeUnsaved(f, psd);
+    const other = photoshopChecks();
+    const f = await watchedDocument('Link row race b', { extra: other.extra });
+    const { file, row: original } = await photoshopClaimRow(f, other, 'ClaimedElsewhere.png');
+    await placeUnsaved(f, file);
     const older = f.ill.hold = gate();
     await startAddFilesPoll(f, 'AddedB.png');
     await waitForCondition(() => older.reached, 'older poll took its snapshot');
     setDoc(f, { links: [] });
     await callIpcRaw('projects:pre-package-scan', f.id);
-    assert.deepEqual(storedRow(f.id, 'OlderMockup.psd'), original, 'the newer reading restored the row');
+    assert.deepEqual(storedRow(f.id, 'ClaimedElsewhere.png'), original, 'the newer reading restored the row');
     older.open();
     await pollFinished(f.id);
-    assert.deepEqual(storedRow(f.id, 'OlderMockup.psd'), original, 'the older snapshot does not overwrite it again');
+    assert.deepEqual(storedRow(f.id, 'ClaimedElsewhere.png'), original, 'the older snapshot does not overwrite it again');
   });
 
   adapterTest('link-row-race-c: an older pre-package reading is discarded and the rest of the scan continues', async () => {
@@ -617,9 +656,9 @@ function cases() {
   // A poll that read Illustrator and then waits on Photoshop while a newer
   // reading is applied.
   function photoshopChecks() {
-    const other = { hold: null, output: '' };
+    const other = { running: true, hold: null, output: '' };
     other.extra = request => {
-      if (request.kind === 'exec' && request.command.includes("grep -i 'Adobe Photoshop'")) return { stdout: '777 /Applications/Adobe Photoshop 2026/Adobe Photoshop 2026.app/Contents/MacOS/Adobe Photoshop 2026\n' };
+      if (request.kind === 'exec' && request.command.includes("grep -i 'Adobe Photoshop'")) return { stdout: other.running ? '777 /Applications/Adobe Photoshop 2026/Adobe Photoshop 2026.app/Contents/MacOS/Adobe Photoshop 2026\n' : '' };
       if (isOsascriptInvocation(request, 'crate-ps-poll.applescript')) {
         const result = { stdout: other.output }, hold = other.hold;
         other.hold = null;
@@ -629,14 +668,14 @@ function cases() {
     };
     return other;
   }
-  for (const decidable of [false, true]) {
-    adapterTest(`link-row-race-d: a poll held at the Photoshop check cannot restore a withdrawn link (${decidable ? 'decidable row underneath' : 'no earlier row'})`, async () => {
+  for (const remembered of [false, true]) {
+    adapterTest(`link-row-race-d: a poll held at the Photoshop check cannot restore a withdrawn link (${remembered ? 'remembered row underneath' : 'no earlier row'})`, async () => {
       backgroundNeedsSave();
       const other = photoshopChecks();
       const f = await watchedDocument('Link row race d', { extra: other.extra });
-      const link = decidable ? await offerOlderPsd(f) : png(f.dir, 'Withdrawn.png');
+      const earlier = remembered ? await photoshopClaimRow(f, other, 'ClaimedElsewhere.png') : null;
+      const link = earlier ? earlier.file : png(f.dir, 'Withdrawn.png');
       const name = path.basename(link);
-      const original = clone(storedRow(f.id, name));
       await placeUnsaved(f, link);
       await waitForNeedsSave(() => needsSaveNotices().length === 1, 'first notice');
       const held = other.hold = gate();
@@ -644,8 +683,8 @@ function cases() {
       await waitForCondition(() => held.reached, 'poll waits at the Photoshop check');
       setDoc(f, { links: [] });
       await callIpcRaw('projects:pre-package-scan', f.id);
-      assert.deepEqual(storedRow(f.id, name), original, 'withdrawn by the newer reading');
-      await waitForNeedsSave(() => needsSaveNotices()[0].closed === true, 'notice withdrawn');
+      assert.deepEqual(storedRow(f.id, name), earlier ? earlier.row : undefined, 'withdrawn by the newer reading');
+      if (!earlier) await waitForNeedsSave(() => needsSaveNotices()[0].closed === true, 'notice withdrawn');
       const rows = clone(stored(f.id).pendingFiles), events = testRendererEvents.length;
       held.open();
       await pollFinished(f.id);
@@ -748,25 +787,29 @@ function cases() {
     assert.equal(storedRow(f.id, 'WithdrawnNotSaved.png'), undefined);
   });
 
-  adapterTest('link-row-13c: at pre-package a restored review row keeps its path out of the saved-file pass', async () => {
-    const f = await watchedDocument('Link row 13c');
-    const psd = await offerOlderPsd(f);
-    const original = clone(storedRow(f.id, 'OlderMockup.psd'));
-    await placeUnsaved(f, psd);
+  adapterTest('link-row-13c: at pre-package a restored row keeps its path out of the saved-file pass', async () => {
+    const other = photoshopChecks();
+    const f = await watchedDocument('Link row 13c', { extra: other.extra });
+    const { file, row: original } = await photoshopClaimRow(f, other, 'ClaimedElsewhere.png');
+    await placeUnsaved(f, file);
     setDoc(f, { links: [] });
-    writeSyntheticAiFile(f.ai, `linked\n${psd}\n`);
+    writeSyntheticAiFile(f.ai, `linked\n${file}\n`);
     await callIpcRaw('projects:pre-package-scan', f.id);
-    assert.equal(isProjectFile(f.id, 'OlderMockup.psd'), false);
-    assert.deepEqual(storedRow(f.id, 'OlderMockup.psd'), original);
+    assert.equal(isProjectFile(f.id, 'ClaimedElsewhere.png'), false);
+    // The saved-file pass records the referencing document on a row it skips.
+    const { dependencyOwners, ...restored } = storedRow(f.id, 'ClaimedElsewhere.png');
+    assert.deepEqual(restored, original);
+    assert.deepEqual(dependencyOwners, [f.ai]);
   });
 
   // Review state stays in the main process, also when nothing is hidden.
   adapterTest('link-row-view: review state reaches no renderer route when nothing is hidden', async () => {
-    const f = await watchedDocument('Link row view');
-    const psd = await offerOlderPsd(f);
+    const other = photoshopChecks();
+    const f = await watchedDocument('Link row view', { extra: other.extra });
+    const { file: claimed } = await photoshopClaimRow(f, other, 'ClaimedElsewhere.png');
     const plain = png(f.dir, 'PlainLink.png'), rejected = png(f.dir, 'RejectedLater.png');
     testRendererEvents.length = 0;
-    const row = await placeUnsaved(f, psd);
+    const row = await placeUnsaved(f, claimed);
     assert.ok(row.illustratorLinkReview?.prior, 'the stored row carries review state');
     await placeUnsaved(f, plain);
     const scope = metadataTestHooks.getIllustratorActivationScopeSnapshot(f.id);
@@ -787,8 +830,151 @@ function cases() {
     assert.ok(testRendererEvents.some(event => event.channel === 'files:pending'), 'file state was sent');
     leaks('projects:pause', await callIpcRaw('projects:pause', f.id));
     leaks('projects:start-watching', await callIpcRaw('projects:start-watching', f.id));
-    const noReview = { id: 'no-review', files: [], pendingFiles: [{ path: psd, name: 'OlderMockup.psd' }] };
+    const noReview = { id: 'no-review', files: [], pendingFiles: [{ path: claimed, name: 'ClaimedElsewhere.png' }] };
     assert.equal(metadataTestHooks.scopedProjectView(noReview), noReview, 'a project with no review state is returned as is');
+  });
+
+  // A live claim never takes a decision away.
+  for (const change of ['pause then Watch', 'account-access lapse']) {
+    adapterTest(`link-row-decision-1: a decidable row linked across a session change (${change}) is still offered when the link goes`, async () => {
+      const f = await watchedDocument('Link row decision 1');
+      const psd = await offerOlderPsd(f);
+      const original = clone(storedRow(f.id, 'OlderMockup.psd'));
+      const stillOriginal = label => {
+        assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'OlderMockup.psd')), withoutSessionStamp(original), label);
+      };
+      await linkInUnsavedDocument(f, psd);
+      stillOriginal('never a Needs Save row while linked');
+      await changeWatchSession(f, change);
+      stillOriginal('after the session change');
+      assert.equal(storedRow(f.id, 'OlderMockup.psd').captureSessionId, stored(f.id).watchSessionId, 'the link still present re-observes it in this session');
+      setDoc(f, { links: [] });
+      await poll(f.id);
+      stillOriginal('after the link goes');
+      assert.equal((await viewRow(f.id, 'OlderMockup.psd'))?.captureState, 'pending', 'shown for a decision');
+    });
+
+    adapterTest(`link-row-decision-2: a link removed during a session change (${change}) leaves only the original row stored`, async () => {
+      const f = await watchedDocument('Link row decision 2');
+      const psd = await offerOlderPsd(f);
+      const original = clone(storedRow(f.id, 'OlderMockup.psd'));
+      await linkInUnsavedDocument(f, psd);
+      await changeWatchSession(f, change, () => setDoc(f, { links: [] }));
+      const row = storedRow(f.id, 'OlderMockup.psd');
+      assert.deepEqual(withoutSessionStamp(row), withoutSessionStamp(original), 'the original decidable row');
+      assert.equal(Object.hasOwn(row, 'illustratorLinkReview'), false, 'nothing is kept inside it');
+      assert.equal((stored(f.id).pendingFiles || []).some(item => item.captureState === 'needs-save'), false, 'no Needs Save row');
+    });
+  }
+
+  adapterTest('link-row-decision-3: a Photoshop smart-object claim leaves a decidable row decidable, also after Photoshop quits', async () => {
+    const other = photoshopChecks();
+    const f = await watchedDocument('Link row decision 3', { extra: other.extra });
+    const psd = await offerOlderPsd(f);
+    const original = clone(storedRow(f.id, 'OlderMockup.psd'));
+    other.output = psd + '\n';
+    await poll(f.id);
+    assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'OlderMockup.psd')), withoutSessionStamp(original), 'not replaced by the claim');
+    other.running = false;
+    await poll(f.id);
+    assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'OlderMockup.psd')), withoutSessionStamp(original), 'unchanged after Photoshop quits');
+    assert.equal((await viewRow(f.id, 'OlderMockup.psd'))?.captureState, 'pending');
+  });
+
+  for (const observer of ['Illustrator', 'Photoshop']) {
+    const claim = async (f, other, file) => {
+      if (observer === 'Illustrator') await linkInUnsavedDocument(f, file);
+      else { other.output = file + '\n'; await poll(f.id); }
+      assert.equal(storedRow(f.id, path.basename(file))?.captureState, 'pending', 'still decidable under the claim');
+    };
+    adapterTest(`link-row-decision-4: Include on a decidable row under a ${observer} claim makes it a project file`, async () => {
+      const other = photoshopChecks();
+      const f = await watchedDocument('Link row decision include', { extra: other.extra });
+      const psd = await offerOlderPsd(f);
+      await claim(f, other, psd);
+      assert.ok(await callIpcRaw('projects:accept-pending', f.id, psd));
+      assert.equal(isProjectFile(f.id, 'OlderMockup.psd'), true);
+      assert.equal(storedRow(f.id, 'OlderMockup.psd'), undefined);
+    });
+    adapterTest(`link-row-decision-4: Exclude on a decidable row under a ${observer} claim survives a save with the link still there`, async () => {
+      const other = photoshopChecks();
+      const f = await watchedDocument('Link row decision exclude', { extra: other.extra });
+      const psd = await offerOlderPsd(f);
+      await claim(f, other, psd);
+      await callIpcRaw('projects:reject-pending', f.id, psd);
+      assert.ok((stored(f.id).excludedPendingFiles || []).some(item => item.name === 'OlderMockup.psd'));
+      setDoc(f, { modified: false, links: [psd] });
+      await save(f, `linked\n${psd}\n`);
+      await pause(700);
+      await metadataTestHooks.waitForWatcherIdle(f.id);
+      await poll(f.id);
+      assert.equal(isProjectFile(f.id, 'OlderMockup.psd'), false, 'not included');
+      assert.equal(storedRow(f.id, 'OlderMockup.psd'), undefined, 'no row comes back');
+      assert.ok((stored(f.id).excludedPendingFiles || []).some(item => item.name === 'OlderMockup.psd'), 'still excluded');
+    });
+    adapterTest(`link-row-decision-5: a package scan with only an unsaved ${observer} claim adds nothing and leaves the row decidable`, async () => {
+      const other = photoshopChecks();
+      const f = await watchedDocument('Link row decision scan', { extra: other.extra });
+      const psd = await offerOlderPsd(f);
+      const original = clone(storedRow(f.id, 'OlderMockup.psd'));
+      await claim(f, other, psd);
+      const files = stored(f.id).files.map(file => file.name).sort();
+      await callIpcRaw('projects:pre-package-scan', f.id);
+      assert.deepEqual(stored(f.id).files.map(file => file.name).sort(), files, 'no project file added');
+      assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'OlderMockup.psd')), withoutSessionStamp(original), 'still the decidable row');
+    });
+    adapterTest(`link-row-decision-6 (control): a file with no row claimed through ${observer} shows Needs Save and raises the notice`, async () => {
+      backgroundNeedsSave();
+      const other = photoshopChecks();
+      const f = await watchedDocument('Link row decision control', { extra: other.extra });
+      const file = png(f.dir, 'NoEarlierRow.png');
+      if (observer === 'Illustrator') await linkInUnsavedDocument(f, file);
+      else { other.output = file + '\n'; await poll(f.id); }
+      assert.equal(storedRow(f.id, 'NoEarlierRow.png')?.captureState, 'needs-save');
+      await waitForNeedsSave(() => needsSaveNotices().length === 1, 'notice');
+    });
+    adapterTest(`link-row-decision-8: no notice is raised for a decidable row under a ${observer} claim`, async () => {
+      backgroundNeedsSave();
+      const other = photoshopChecks();
+      const f = await watchedDocument('Link row decision notice', { extra: other.extra });
+      const psd = await offerOlderPsd(f);
+      await claim(f, other, psd);
+      await poll(f.id);
+      await pause(150);
+      assert.equal(needsSaveNotices().length, 0);
+    });
+  }
+
+  adapterTest('link-row-decision-7 (control): a decidable row linked and saved with a confirmable path is Included', async () => {
+    const f = await watchedDocument('Link row decision saved');
+    const psd = await offerOlderPsd(f);
+    await linkInUnsavedDocument(f, psd);
+    setDoc(f, { modified: false, links: [psd] });
+    await save(f, `linked\n${psd}\n`);
+    await waitForCondition(() => isProjectFile(f.id, 'OlderMockup.psd'), 'saved link Included', 5000);
+    assert.equal(storedRow(f.id, 'OlderMockup.psd'), undefined);
+  });
+
+  adapterTest('link-row-decision-9: a link row made decidable by clean readings stays so without a mark and is still withdrawn', async () => {
+    const f = await watchedDocument('Link row decision 9');
+    const tempDir = unconfirmableDir();
+    try {
+      const link = png(tempDir, 'CleanLink.png');
+      await placeUnsaved(f, link);
+      setDoc(f, { modified: false, links: [link] });
+      await poll(f.id);
+      await poll(f.id);
+      const row = storedRow(f.id, 'CleanLink.png');
+      assert.equal(row.captureState, 'pending');
+      assert.equal(row.source, 'ai-linked');
+      assert.equal(Object.hasOwn(row, 'illustratorLinkReview'), false, 'no mark is stored');
+      setDoc(f, { modified: true });
+      await poll(f.id);
+      assert.equal(storedRow(f.id, 'CleanLink.png').captureState, 'pending', 'stays decidable on unsaved edits');
+      setDoc(f, { links: [] });
+      await poll(f.id);
+      assert.equal(storedRow(f.id, 'CleanLink.png'), undefined, 'withdrawn when unlinked');
+    } finally { fs.rmSync(tempDir, { recursive: true, force: true }); }
   });
 
   // One chronological workflow through a document with existing links. It pins

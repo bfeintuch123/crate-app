@@ -2598,6 +2598,11 @@ function shouldUpdatePendingCandidate(existingFile, classification) {
   if (!existingFile || !classification) return false;
   const existingState = normalizeLiveCaptureState(existingFile.captureState, LIVE_CAPTURE_STATES.PENDING);
   const nextState = normalizeLiveCaptureState(classification.captureState, LIVE_CAPTURE_STATES.PENDING);
+  // A row the designer can decide is never replaced by a live claim that would
+  // take the decision away, from any observer. The claim only re-observes it;
+  // saved evidence and the designer's own Include or Exclude still decide it.
+  if (existingState === LIVE_CAPTURE_STATES.PENDING &&
+      (nextState === LIVE_CAPTURE_STATES.OBSERVED || nextState === LIVE_CAPTURE_STATES.NEEDS_SAVE)) return false;
   if (getLiveCaptureStateRank(nextState) > getLiveCaptureStateRank(existingState)) return true;
   const existingMethod = existingFile.captureEvidence && existingFile.captureEvidence.observerMethod;
   const nextMethod = classification.evidenceSummary && classification.evidenceSummary.observerMethod;
@@ -2909,13 +2914,8 @@ function classifyLiveObservedFile(project, fileEntry, observation = {}, stageInd
       };
     }
     const pendingFile = (project.pendingFiles || []).find(file => getTrackedFileDedupKey(file) === candidateKey);
-    // A link row that became decidable in a clean document stays decidable on
-    // later unsaved edits; only saved evidence (above) or withdrawal moves it.
-    const settledLinkRow = fileEntry.source === 'ai-linked' &&
-      evidence.observerMethod === LIVE_APP_OBSERVER_METHODS.ILLUSTRATOR_ACTIVE_SESSION &&
-      getIllustratorLinkReview(project, pendingFile)?.settled === true;
     return {
-      decision: !settledLinkRow && shouldUpdatePendingCandidate(pendingFile, { captureState, evidenceSummary })
+      decision: shouldUpdatePendingCandidate(pendingFile, { captureState, evidenceSummary })
         ? LIVE_CAPTURE_DECISIONS.UPDATE_PENDING
         : LIVE_CAPTURE_DECISIONS.KEEP_EXISTING,
       reason: 'already-pending',
@@ -3031,7 +3031,9 @@ function stageLiveObservedFile(project, fileEntry, observation = {}, stageIndex 
 // exclusion key, Excluded record or decision provenance. Saved-file evidence
 // stays the only route to an automatic Include.
 // Row state, stripped with the capture metadata so it never reaches a project
-// file or an Excluded record: { version: 1, prior?, cleanSeen?, settled? }.
+// file or an Excluded record: { version: 1, prior?, cleanSeen? }. A decidable
+// row is never overwritten by a claim, so `prior` only ever holds a row the
+// designer could not decide.
 const ILLUSTRATOR_LINK_REVIEW_VERSION = 1;
 
 function isIllustratorLiveLinkRow(row) {
@@ -3064,6 +3066,11 @@ function getRememberedIllustratorLinkRow(row) {
   const prior = review?.version === ILLUSTRATOR_LINK_REVIEW_VERSION ? review.prior : null;
   return prior && typeof prior === 'object' && !Array.isArray(prior) && !isIllustratorLiveLinkRow(prior) &&
     normalizeTrackedFilePath(prior.path) === normalizeTrackedFilePath(row.path) ? prior : null;
+}
+
+function withIllustratorLinkReview(row, review) {
+  const { illustratorLinkReview, ...plainRow } = row;
+  return review.prior || review.cleanSeen ? { ...plainRow, illustratorLinkReview: review } : plainRow;
 }
 
 // Keeps the review state of a row this session's readings own. A link claim
@@ -3146,7 +3153,7 @@ function reconcileIllustratorLinkRows(project, reading, liveMembership) {
     const { cleanSeen, ...reviewWithoutClean } = review || { version: ILLUSTRATOR_LINK_REVIEW_VERSION };
     if (link.modified) {
       // Clean readings must be consecutive.
-      if (cleanSeen) { nextRows.push({ ...row, illustratorLinkReview: reviewWithoutClean }); outcome.changed++; }
+      if (cleanSeen) { nextRows.push(withIllustratorLinkReview(row, reviewWithoutClean)); outcome.changed++; }
       else nextRows.push(row);
       continue;
     }
@@ -3163,7 +3170,7 @@ function reconcileIllustratorLinkRows(project, reading, liveMembership) {
     }
     // Second consecutive clean reading: Include or Exclude. No saved evidence.
     const captureEvidence = row.captureEvidence || {};
-    nextRows.push({
+    nextRows.push(withIllustratorLinkReview({
       ...row,
       captureState: LIVE_CAPTURE_STATES.PENDING,
       captureEvidence: {
@@ -3178,8 +3185,7 @@ function reconcileIllustratorLinkRows(project, reading, liveMembership) {
         }),
         documentModified: false,
       },
-      illustratorLinkReview: { ...reviewWithoutClean, settled: true },
-    });
+    }, reviewWithoutClean));
   }
   if (outcome.changed) project.pendingFiles = nextRows;
   return outcome;
