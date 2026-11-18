@@ -168,6 +168,16 @@
 // does not reach the guard, even one it would have stopped the run for. The
 // test runner is not read again; its first reading always reaches the guard.
 //
+// The same holds for a `ps` that is dying: the kernel has marked it dead, so
+// libproc no longer describes it, its usage is still denied, and it is not yet
+// a zombie. The sampler reads it again on those same pauses, by its pid and the
+// start time in the process table, and reports it as ended or gone if it has
+// become so by then. The guard allows nothing for this state and has no rule
+// for it: a `ps` still dying when the pauses run out reaches the guard as a
+// process it cannot read, and stops the run. The pauses add at most 4 ms to a
+// scan (plus the reads and what the system adds under load), and every other
+// process of that scan is read as it would be without them (see the sampler).
+//
 // It also exits 125, whatever the tests' own result, when it cannot confirm
 // that every process of the run has ended.
 //
@@ -196,11 +206,10 @@
 //   when one is started by a process that has left the run's group and lost
 //   its parent, and when one stays between two states (starting or ending)
 //   for longer than the few milliseconds the sampler waits for it to settle,
-//   which can happen when the machine is too busy to let it finish starting.
-//   One more, a matter of microseconds: a `ps` that has ended is collected by
-//   its parent after the sampler was denied its usage and before it asks the
-//   process table. The row then says "not there" and "denied" and nothing
-//   says "ended", and the guard stops the run.
+//   which can happen when the machine is too busy to let it finish starting
+//   or to finish dying. A `ps` collected by its parent after the sampler was
+//   denied its usage and before it asks the process table is read once more,
+//   and reaches the guard as "no such process" when the kernel says so.
 // - Not able to end the whole run when no sampler works any more (the one in
 //   use, the one standing by, and a newly started one all fail). It then kills
 //   the runner's process group, leaves whatever the run started outside that

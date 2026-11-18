@@ -58,6 +58,13 @@
 //   CRATE_GUARD_FAULT=tool-exiting:<role>          once the tree is up, two scans read that process as the system's ps; after
 //                                                  that it reads as that ps does once killed and before it has ended (no
 //                                                  process info, usage denied)
+//   CRATE_GUARD_FAULT=sampler-script:<role>        once the tree is up, that process's row comes from the sampler's own code
+//                                                  (sampler-harness.py, "scripted") with the kernel's answers scripted: two scans
+//                                                  as the system's ps, then what CRATE_GUARD_SHAPE says, with the guard's clock
+//                                                  standing still: dying-then-ended, dying-twice-then-gone or collected, after
+//                                                  which no scan lists it (it is still running); or other-start, wrong-parent,
+//                                                  other-owner or still-dying, after which every scan shows the row it got. At
+//                                                  exit it prints each row it got that way
 //   CRATE_GUARD_FAULT=exiting-over-limit:<role>    once the tree is up, one scan reads that process in full at 1300 MB; after that
 //                                                  it reads as exiting with no memory, and `nested-child` reads 1100 MB more than it holds
 //   CRATE_GUARD_FAULT=system-tool:<role>           that process reads exactly as the system's set-uid ps does, for as long as it lives
@@ -70,6 +77,8 @@
 //
 // Everything else goes to the real sampler untouched.
 const fs = require('node:fs');
+const path = require('node:path');
+const { execFile } = require('node:child_process');
 const guard = require('../../../scripts/run-tests');
 
 const [kind, role] = String(process.env.CRATE_GUARD_FAULT).split(':');
@@ -109,6 +118,65 @@ if (kind === 'exiting-at-exit') {
   });
 }
 const deadSamplers = new Set();
+// CRATE_GUARD_FAULT=sampler-script (see the top): the row of `role` as the
+// sampler's own code makes it from scripted answers of the kernel.
+const scriptedRows = [];
+let scriptedRemembered = {};
+let scriptedLast = null;
+if (kind === 'sampler-script') {
+  process.on('exit', () => {
+    process.stderr.write(`faulty-guard: scripted rows: ${scriptedRows.join(' | ') || 'none'}\n`);
+  });
+}
+function askSampler(scenario) {
+  const harness = path.join(__dirname, 'sampler-harness.py');
+  const samplerFile = path.join(__dirname, '../../../scripts/run-tests-sampler.py');
+  return new Promise((resolve, reject) => {
+    execFile('/usr/bin/python3', ['-I', '-B', harness, samplerFile, 'scripted', JSON.stringify(scenario)], { encoding: 'utf8' },
+      (error, stdout) => { if (error) reject(error); else resolve(JSON.parse(stdout)); });
+  });
+}
+function shapeReads(shown) {
+  const owner = process.getuid();
+  const WEXIT = 0x2000;
+  const STARTED = [1763440000, 123456];
+  const denied = ['usage', EPERM];
+  const noInfo = ['info', ESRCH];
+  const table = (status, start = STARTED, ppid = shown.ppid, ruid = owner) => ['record', [ppid, shown.pgid, 0, ruid, status, start, WEXIT]];
+  const dying = [noInfo, denied, table(2)];
+  const ended = start => [noInfo, denied, table(guard.ZOMBIE, start)];
+  const gone = [noInfo, ['usage', ESRCH]];
+  return {
+    'dying-then-ended': [...dying, ...ended(STARTED)],
+    'dying-twice-then-gone': [...dying, ...dying, ...gone],
+    collected: [noInfo, denied, ['record', 'absent'], ['usage', ESRCH]],
+    'other-start': [...dying, ...ended([STARTED[0], STARTED[1] + 1])],
+    'wrong-parent': [noInfo, denied, table(2, STARTED, process.pid)],
+    'other-owner': [noInfo, denied, table(2, STARTED, shown.ppid, owner + 1)],
+    'still-dying': [...dying, ...dying, ...dying, ...dying],
+  }[process.env.CRATE_GUARD_SHAPE];
+}
+async function samplerScript(rows) {
+  if (!recorded().has('ready')) return rows;
+  const target = recorded().get(role);
+  const shown = rows.find(row => row.pid === target);
+  if (!shown) return rows;
+  if (scriptedRows.length >= 3) {
+    return scriptedLast ? rows.map(row => (row.pid === target ? { ...scriptedLast } : row)) : rows.filter(row => row.pid !== target);
+  }
+  if (fixed === null) fixed = performance.now();
+  const tool = [['info', 0, [shown.ppid, shown.pgid, 0, process.getuid(), 2]], ['usage', EPERM], ['path', '/bin/ps']];
+  const number = scriptedRows.length + 1;
+  const reads = number === 1 ? [...tool, ...tool] : number === 2 ? tool : shapeReads(shown);
+  const answer = await askSampler({ uid: process.getuid(), guard: process.pid, scans: [[target]], known: scriptedRemembered, script: { [target]: reads } });
+  const text = answer.scans[0].rows[0];
+  scriptedRemembered = answer.scans[0].remembered;
+  scriptedRows.push(text);
+  const row = guard.parseRow(text);
+  const passes = ['dying-then-ended', 'dying-twice-then-gone', 'collected'].includes(process.env.CRATE_GUARD_SHAPE);
+  if (number === 3 && !passes) scriptedLast = row;
+  return rows.map(item => (item.pid === target ? row : item));
+}
 // What a scan shows of `target` after the end of the run, by CRATE_GUARD_LATE.
 const shownAs = (rows, target) => {
   const how = process.env.CRATE_GUARD_LATE;
@@ -370,6 +438,7 @@ async function startFaultySampler() {
     scan: (...args) => use(async () => {
       if (stalling && number === 1) return unanswered();
       if (kind === 'exiting-at-exit') return atExit(number, await real.scan(...args));
+      if (kind === 'sampler-script') return samplerScript(await real.scan(...args));
       const rows = misread(await real.scan(...args));
       return HELD.includes(kind) && number === 1 ? holdBack(rows, real) : rows;
     }),

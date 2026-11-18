@@ -29,7 +29,10 @@ usage read still answers for an ordinary ended process (with the resident size
 it had at the end and a footprint of zero) and is denied for a set-uid one. In
 those two cases the sampler asks the system's process table
 
-  sysctl kern.proc.pid.<pid>              state, parent, group and owners
+  sysctl kern.proc.pid.<pid>              state, parent, group and owners, and
+                                          for a process this user may not read,
+                                          its start time and whether it is
+                                          exiting
 
 and reports the process as ended only when the table says so in so many words
 (state 5, awaiting collection by its parent). A record that shows the pid as
@@ -90,6 +93,33 @@ Protocol, one request per line on stdin, one answer on stdout.
     process. All such processes of one scan share those waits. The row is
     always the last reading, complete and fresh, whether or not it agreed with
     the one before; nothing in it comes from an earlier reading or scan.
+
+    A set-uid tool this user started is also in transition while it is dying:
+    the kernel has marked it dead (P_REF_DEAD) and it is not yet a zombie.
+    Then proc_pidinfo says there is no such process, the usage read is still
+    denied, and the process table still has its whole record, with P_WEXIT set
+    and a state other than ended. Such a reading names its process by pid and
+    by the start time in that record (seconds and microseconds). It is read
+    again on the same pauses for as long as it reads the same way, and only
+    these readings replace it: ended, with that same start time; or no such
+    process to both reads, which the guard treats as it treats any such row.
+    Anything else leaves the first reading as the row, and the first reading is
+    one the guard stops the run for. So is a process still dying when the
+    pauses run out. Nothing here lets a process through: the row is either the
+    first reading or one a scan a few milliseconds later would have given.
+
+    When the usage read is denied and the process table then has no record of
+    the pid, the parent collected the process between the two reads. The usage
+    is read once more: a real "no such process" goes into the row, and anything
+    else leaves the row as it was.
+
+    The cost is confined to the pauses. Every row of a scan is read before any
+    pause, so these readings neither delay nor replace the first reading of any
+    other process, and every other process in transition is read again exactly
+    as often, after the same pauses, as without them. A scan with a dying
+    process takes up to the 4 ms the pauses add up to (nothing more when another
+    process in transition has already used them all), plus the reads themselves
+    and whatever the system adds to a pause under load.
 
     This means the guard does not get to see a state that lasted less than
     those waits, even one it would have stopped the run for. The exception is
@@ -153,12 +183,18 @@ ENDED = 5  # SZOMB: awaiting collection by parent
 # sampler checks them before it answers anything; see check_records.
 SYSCTL_PROCESS = (1, 14, 1)  # CTL_KERN, KERN_PROC, KERN_PROC_PID
 KINFO_PROC_SIZE = 648
+KINFO_START_SECONDS = 0  # kp_proc.p_starttime.tv_sec
+KINFO_START_MICROSECONDS = 8  # kp_proc.p_starttime.tv_usec
+KINFO_FLAGS = 32  # kp_proc.p_flag
 KINFO_STATUS = 36  # kp_proc.p_stat, one byte
 KINFO_PID = 40  # kp_proc.p_pid
 KINFO_REAL_UID = 392  # kp_eproc.e_pcred.p_ruid
 KINFO_UID = 420  # kp_eproc.e_ucred.cr_uid
 KINFO_PPID = 560  # kp_eproc.e_ppid
 KINFO_PGID = 564  # kp_eproc.e_pgid
+P_WEXIT = 0x2000  # in p_flag: working on exiting, <sys/proc.h>
+# What read_table gives when the table answers and has no record of the pid.
+NO_RECORD = "no record"
 # How long to wait before reading a process in transition again, in seconds.
 SETTLE_PAUSES = (0.001, 0.001, 0.002)
 SIGNALS = {
@@ -274,17 +310,23 @@ class Sampler:
             return "-"
         return urllib.parse.quote(buffer.raw[:length], safe="/") or "-"
 
-    def read_record(self, pid):
-        """(ppid, pgid, uid, ruid, status) of <pid> from the system's process table, or None.
+    def read_table(self, pid):
+        """(ppid, pgid, uid, ruid, status, (seconds, microseconds), flags) of <pid>
+        from the system's process table; NO_RECORD when the call succeeds and
+        reports no record; None for anything else.
 
-        None unless the call succeeds, fills exactly one record, and the record
-        is that of <pid>. The buffer is new for every call, so a call that
-        fails or comes back short cannot leave an earlier record to be read.
+        A record counts only when the call fills exactly one and it is that of
+        <pid>. The buffer is new for every call, so a call that fails or comes
+        back short cannot leave an earlier record to be read.
         """
         name = (ctypes.c_int * 4)(*SYSCTL_PROCESS, pid)
         record = ctypes.create_string_buffer(KINFO_PROC_SIZE)
         size = ctypes.c_size_t(KINFO_PROC_SIZE)
-        if self.libc.sysctl(name, 4, record, ctypes.byref(size), None, 0) != 0 or size.value != KINFO_PROC_SIZE:
+        if self.libc.sysctl(name, 4, record, ctypes.byref(size), None, 0) != 0:
+            return None
+        if size.value == 0:
+            return NO_RECORD
+        if size.value != KINFO_PROC_SIZE:
             return None
         raw = record.raw
         if struct.unpack_from("i", raw, KINFO_PID)[0] != pid:
@@ -295,7 +337,14 @@ class Sampler:
             struct.unpack_from("I", raw, KINFO_UID)[0],
             struct.unpack_from("I", raw, KINFO_REAL_UID)[0],
             raw[KINFO_STATUS],
+            (struct.unpack_from("q", raw, KINFO_START_SECONDS)[0], struct.unpack_from("i", raw, KINFO_START_MICROSECONDS)[0]),
+            struct.unpack_from("i", raw, KINFO_FLAGS)[0],
         )
+
+    def read_record(self, pid):
+        """(ppid, pgid, uid, ruid, status) of <pid> from the process table, or None."""
+        record = self.read_table(pid)
+        return None if record is None or record == NO_RECORD else record[:5]
 
     def check_records(self):
         """True when read_record reads two processes whose facts are known.
@@ -311,10 +360,14 @@ class Sampler:
         return self.read_record(os.getpid()) == own and self.read_record(1) == (0, 1, 0, 0, RUNNING)
 
     def read_row(self, pid):
-        """One reading of <pid>: its row, and whether it may be in transition.
+        """One reading of <pid>: its row, whether it may be in transition, and
+        what the reading shows of a process on its way out.
 
         In transition can only be a process this user started and may not
-        read, other than a child of the guard.
+        read, other than a child of the guard. The last value is ("dying",
+        start) for such a process that is dying, ("ended", start) for one the
+        process table shows as ended, ("gone", None) when both reads say there
+        is no such process, and None otherwise; start is the table's.
         """
         info_errno = self.read_info(pid)
         # Each value is taken from the structures only when this pid's own
@@ -333,25 +386,40 @@ class Sampler:
         # something else. The process table is asked last, so that "ended" is
         # the latest thing this row knows about the pid, and it is believed
         # only when it says ended.
+        leaving = None
+        dying = False
         if info_errno == errno.ESRCH and usage_errno in (0, errno.EPERM):
-            record = self.read_record(pid)
-            if record and record[4] == ENDED:
+            record = self.read_table(pid)
+            if record == NO_RECORD:
+                # Collected since the usage read was denied, if the kernel now says so.
+                if usage_errno == errno.EPERM and self.read_usage(pid) == errno.ESRCH:
+                    usage_errno = errno.ESRCH
+            elif record and record[4] == ENDED:
                 info_errno = 0
-                ppid, pgid, effective_uid, real_uid, status = record
+                ppid, pgid, effective_uid, real_uid, status = record[:5]
+                leaving = ("ended", record[5])
+            elif record and usage_errno == errno.EPERM and record[6] & P_WEXIT and record[3] == self.uid and record[2] != self.uid and record[0] != self.guard:
+                dying = True
+                leaving = ("dying", record[5])
+        if info_errno == errno.ESRCH and usage_errno == errno.ESRCH:
+            leaving = ("gone", None)
         denied = usage_errno == errno.EPERM and not info_errno and status != ENDED and real_uid == self.uid
         path = self.read_path(pid) if denied and effective_uid != self.uid else "-"
         row = "%d %d %d %d %d %d %d %d %d %d %d %d %s" % (
             pid, ppid, pgid, effective_uid, status, start, resident, footprint, info_errno, usage_errno, real_uid, exiting, path)
-        return row, denied and ppid != self.guard
+        return row, dying or (denied and ppid != self.guard), leaving
 
     def settle(self, readings):
         """Reads again what may have been read in the middle of a change.
 
-        <readings> is a list of [pid, row, in transition]. Each one that may be
-        in transition, and that the last scan did not report in exactly the
-        same way, is read again after a pause, until two readings in a row
-        agree, it can no longer be in transition, or the pauses run out. The
-        list ends up holding the last reading of every pid.
+        <readings> is a list of [pid, row, in transition, leaving], as read_row
+        gives them. Each one that may be in transition, and that the last scan
+        did not report in exactly the same way, is read again after a pause,
+        until two readings in a row agree, it can no longer be in transition,
+        or the pauses run out. The list ends up holding the last reading of
+        every pid, with one exception. A dying process is read again for as
+        long as it is dying with the same start time, and its first reading
+        stays unless it has ended with that start time or is gone.
         """
         pending = [reading for reading in readings if reading[2] and self.denied.get(reading[0]) != reading[1]]
         for seconds in SETTLE_PAUSES:
@@ -360,12 +428,19 @@ class Sampler:
             self.pause(seconds)
             changed = []
             for reading in pending:
-                row, transition = self.read_row(reading[0])
+                row, transition, leaving = self.read_row(reading[0])
+                was = reading[3]
+                if was and was[0] == "dying":
+                    if leaving == was:
+                        changed.append(reading)
+                    elif leaving == ("ended", was[1]) or leaving == ("gone", None):
+                        reading[1:] = row, transition, leaving
+                    continue
                 if transition and row != reading[1]:
                     changed.append(reading)
-                reading[1], reading[2] = row, transition
+                reading[1:] = row, transition, leaving
             pending = changed
-        self.denied = {pid: row for pid, row, transition in readings if transition}
+        self.denied = {pid: row for pid, row, transition, _ in readings if transition}
 
     def list_pids(self):
         # The pid list can grow between sizing and reading it, so leave headroom.
@@ -381,7 +456,7 @@ class Sampler:
     def scan(self):
         readings = [[pid, *self.read_row(pid)] for pid in self.list_pids()]
         self.settle(readings)
-        return [row for _, row, _ in readings]
+        return [row for _, row, _, _ in readings]
 
     def describe(self, pid):
         """One line of facts about <pid> for a report; see the protocol above."""
