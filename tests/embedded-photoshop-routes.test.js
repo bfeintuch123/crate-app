@@ -400,13 +400,16 @@ function cases() {
       assert.ok(memberRows(f).some(row => row.embeddedOriginalName === 'Renamed.png'));
     });
   }
-  routeTest('a proven object with its own Include is never put on hold by a sibling', { timeout: 60000 }, async () => {
-    const f = await seededProject(), fingerprint = `${f.smart.length}:${sha(f.smart)}`;
-    f.project().files.push(logicalRow(f, { individualContentInclude: fingerprint }), logicalRow(f, { fileId: 'sibling', name: 'Texture.png', ext: '.png', embeddedOriginalName: 'Texture.png', embeddedIndex: 1,
-      embeddedContentFingerprint: `${f.texture.length}:${sha(f.texture)}`, individualContentInclude: `${f.texture.length}:${sha(f.texture)}` })); await settled(f);
+  routeTest('a proven object kept by its own Include is never put on hold by a sibling', { timeout: 60000 }, async () => {
+    const f = await seededProject(), row = seedRow(f), textureFingerprint = `${f.texture.length}:${sha(f.texture)}`;
+    row.keptAfterSourceExclusion = true;
+    f.project().files.push(row, logicalRow(f, { fileId: 'sibling', name: 'Texture.png', ext: '.png', embeddedOriginalName: 'Texture.png', embeddedIndex: 1,
+      embeddedContentFingerprint: textureFingerprint, individualContentInclude: textureFingerprint })); await settled(f);
     fs.writeFileSync(f.psd, parentPsd([{ ...embedded('Smart.psb', f.smart), id: f.smartId }, { ...embedded('Renamed.png', png('changed-sibling'), { type: 'png ' }), id: f.textureId }], 'held-sibling'));
     await scanOn('save scan', f);
-    assert.equal(memberRows(f).filter(row => row.embeddedOriginalName === 'Smart.psb').some(row => row.individualChoiceReview !== undefined), false);
+    const smartRows = memberRows(f).filter(item => item.embeddedOriginalName === 'Smart.psb');
+    assert.equal(smartRows.length, 1, 'the kept object goes through staging as before');
+    assert.equal(smartRows[0].individualChoiceReview, undefined);
   });
 
   const KEPT_ROWS = {
