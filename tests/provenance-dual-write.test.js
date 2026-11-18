@@ -16174,7 +16174,7 @@ test('pre-existing chokidar candidates remain pending across pause and resume wi
 
   const fresh = await getProject(project.id);
   assert.equal(fresh.files.some(file => file.path === filePath), false);
-  assert.equal(fresh.pendingFiles.some(file => file.path === filePath), false);
+  assert.equal(fresh.pendingFiles.some(file => file.path === filePath), true);
   assert.equal(storeInstance.data.projects
     .find(item => item.id === project.id)
     .pendingFiles.filter(file => file.path === filePath).length, 1);

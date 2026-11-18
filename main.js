@@ -1416,6 +1416,73 @@ function startWatchSession(project) {
   return project.watchSessionId;
 }
 
+// One-way marker of the account that owns a project's watch session, so a
+// session change can tell "same account" from "another account" after a restart.
+// The markers live beside the projects in the store, never on a project, so no
+// project object sent to the renderer can contain one.
+function getWatchSessionOwnerDigest(projectId) {
+  if (typeof projectId !== 'string' || !projectId || !accountSession?.canUseWorkspace()) return null;
+  const identityId = accountSession.snapshot().identity?.id;
+  if (typeof identityId !== 'string' || !identityId) return null;
+  return crypto.createHash('sha256')
+    .update(JSON.stringify(['crate.watch-session-owner.v1', projectId, identityId]))
+    .digest('hex');
+}
+
+function readWatchSessionOwners() {
+  const owners = store.get('watchSessionOwners', null);
+  return owners && typeof owners === 'object' && !Array.isArray(owners) ? owners : {};
+}
+
+// The markers to keep: only string markers of projects that still exist. An
+// activation with no known owner records none, so it can never match later.
+function getNextWatchSessionOwners(owners, projects, projectId, ownerDigest) {
+  const next = {};
+  for (const { id } of projects) {
+    const digest = id === projectId ? ownerDigest : owners[id];
+    if (typeof digest === 'string' && digest) next[id] = digest;
+  }
+  return next;
+}
+
+function isReadableRegularFile(filePath) {
+  if (typeof filePath !== 'string' || !path.isAbsolute(filePath)) return false;
+  try {
+    if (!fs.lstatSync(filePath).isFile()) return false;
+    fs.accessSync(filePath, fs.constants.R_OK);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// A new watch session keeps the questions the designer had not answered yet.
+// A row moves into the new session only when the same account owned the session
+// that ended, the row was visible in it, and it is still an undecided, eligible
+// row for a file that is still there. Only the row's session stamp changes: it
+// stays a question, and every other row is left as it is.
+function carryUndecidedReviewRows(project, endedSessionId, endedOwnerDigest, ownerDigest) {
+  const endedSession = typeof endedSessionId === 'string' ? endedSessionId.trim() : '';
+  if (!endedSession || !ownerDigest || endedOwnerDigest !== ownerDigest || !Array.isArray(project.pendingFiles)) return;
+  const excludedRecords = readExcludedPendingRecords(project);
+  if (!excludedRecords.valid) return;
+  const excludedKeys = new Set(Array.isArray(project.excludedAssetKeys) ? project.excludedAssetKeys : []);
+  const decidedKeys = getTrackedFileKeySet([...(project.files || []), ...excludedRecords.records]);
+  const decidedPaths = getNormalizedPathSet([...(project.files || []), ...excludedRecords.records]);
+  let stageContext = null;
+  for (const file of project.pendingFiles) {
+    if (!file || typeof file.path !== 'string' || file.captureState !== LIVE_CAPTURE_STATES.PENDING) continue;
+    if (typeof file.captureSessionId !== 'string' || file.captureSessionId.trim() !== endedSession) continue;
+    if (getScopedFileAppFamily(project, file) === 'illustrator') continue;
+    if (decidedKeys.has(getTrackedFileDedupKey(file)) || decidedPaths.has(normalizeTrackedFilePath(file.path))) continue;
+    if (excludedKeys.has(file.path) || excludedKeys.has(getAssetReviewExclusionKey(file))) continue;
+    if (!isReadableRegularFile(file.path)) continue;
+    stageContext ||= createLiveObservedFileStageContext(project);
+    if (!shouldKeepPendingFileForSession(project, file, stageContext)) continue;
+    file.captureSessionId = project.watchSessionId;
+  }
+}
+
 function isCurrentWatchSessionPendingFile(project, file) {
   if (!project || !file || (project.status !== 'watching' && project.status !== 'paused')) return true;
   if (isExplicitUserCapturedFile(file) || isAcceptedPendingCapturedFile(project, file)) return true;
@@ -10499,7 +10566,7 @@ function isDiagnosticManifestDestinationSafe(destFolder, relativePath = path.joi
 }
 
 // FIX 1 (C1): Atomic store helper — prevents read-mutate-write race conditions
-function mutateProject(projectId, fn, { persistIfChanged = false, trustResultChanged = false, packageStageContext = false } = {}) {
+function mutateProject(projectId, fn, { persistIfChanged = false, trustResultChanged = false, packageStageContext = false, alsoStore = null } = {}) {
   const projects = getProjects();
   const project = projects.find(p => p.id === projectId);
   if (!project) return null;
@@ -10530,7 +10597,8 @@ function mutateProject(projectId, fn, { persistIfChanged = false, trustResultCha
     try { shouldPersist = before === null || JSON.stringify(project) !== before; } catch (_) { shouldPersist = true; }
   }
   if (shouldPersist) {
-    store.set('projects', projects);
+    if (alsoStore) store.set({ projects, ...alsoStore(projects) });
+    else store.set('projects', projects);
     scheduleNeedsSaveNotificationSync(projectId);
   }
   return result;
@@ -11469,12 +11537,21 @@ function activateSingleWatchingProject(projectId, settings, { preserveWatchStart
   if (!preserveWatchStartedAt || !project.watchStartedAt) {
     project.watchStartedAt = Date.now();
   }
+  const endedSessionId = project.watchSessionId;
+  const watchSessionOwners = readWatchSessionOwners();
+  const endedOwnerDigest = watchSessionOwners[project.id];
   startWatchSession(project);
+  const ownerDigest = getWatchSessionOwnerDigest(project.id);
   project.figmaSession = buildFigmaSessionSnapshot(project, settings);
   normalizeAutoCaptureProjectState(project);
+  carryUndecidedReviewRows(project, endedSessionId, endedOwnerDigest, ownerDigest);
   safelyEnsureProjectProvenance(project);
   clearFileVisualProjectCache();
-  store.set('projects', projects);
+  // One write: a session's rows and its owner can never disagree after a crash.
+  store.set({
+    projects,
+    watchSessionOwners: getNextWatchSessionOwners(watchSessionOwners, projects, project.id, ownerDigest),
+  });
 
   for (const pausedProjectId of pausedProjectIds) {
     stopWatching(pausedProjectId);
@@ -27126,6 +27203,9 @@ registerTrustedIpcHandler('projects:delete', (event, id) => {
       removed = true;
     }
     return projects;
+  }, {
+    // A project's session owner marker goes in the same write as the project.
+    alsoStore: remaining => ({ watchSessionOwners: getNextWatchSessionOwners(readWatchSessionOwners(), remaining, null, null) }),
   });
   if (removed) {
     scheduleProjectCacheCleanup({
@@ -27194,7 +27274,7 @@ registerTrustedIpcHandler('projects:delete-all', () => {
   assetBaselineScans.clear();
 
   clearFileVisualProjectCache();
-  store.set('projects', []);
+  store.set({ projects: [], watchSessionOwners: {} });
   if (projectCacheIds !== null) {
     scheduleProjectCacheCleanup({
       projectIds: projectCacheIds,
