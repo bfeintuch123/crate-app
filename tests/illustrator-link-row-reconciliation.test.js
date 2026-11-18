@@ -116,7 +116,7 @@ function cases() {
     assert.ok(added, 'Add Files finished');
   }
   const pollFinished = id => waitForCondition(() => !metadataTestHooks.isLivePollInProgress(id), 'live poll finished', 5000);
-  async function offerOlderPsd(f, name = 'PinMockup.psd') {
+  async function offerOlderPsd(f, name = 'OlderMockup.psd') {
     const psd = path.join(f.dir, name);
     fs.writeFileSync(psd, '8BPS synthetic ' + name);
     const watchStartedAt = stored(f.id).watchStartedAt;
@@ -234,28 +234,28 @@ function cases() {
   // 6. A decidable PSD row overwritten by a live link is restored exactly.
   adapterTest('link-row-6: a decidable PSD row placed and deleted is restored deep-equal; placed and saved it is Included', async () => {
     const f = await watchedDocument('Link row 6 PSD');
-    const psd = path.join(f.dir, 'PinMockup.psd');
+    const psd = path.join(f.dir, 'OlderMockup.psd');
     fs.writeFileSync(psd, '8BPS synthetic');
     const watchStartedAt = stored(f.id).watchStartedAt;
     await emitWatcherWithStats('add', psd, { mtimeMs: watchStartedAt - 86_400_000, birthtimeMs: watchStartedAt - 172_800_000 });
     await metadataTestHooks.waitForWatcherIdle(f.id);
-    const before = clone(storedRow(f.id, 'PinMockup.psd'));
-    const beforeView = clone(await viewRow(f.id, 'PinMockup.psd'));
+    const before = clone(storedRow(f.id, 'OlderMockup.psd'));
+    const beforeView = clone(await viewRow(f.id, 'OlderMockup.psd'));
     assert.equal(before.captureState, 'pending');
     assert.ok(beforeView, 'decidable PSD row visible');
     await placeUnsaved(f, psd);
     setDoc(f, { modified: true, links: [] });
     await poll(f.id);
-    assert.deepEqual(storedRow(f.id, 'PinMockup.psd'), before, 'stored row restored exactly');
-    assert.deepEqual(await viewRow(f.id, 'PinMockup.psd'), beforeView, 'visible exactly as before');
+    assert.deepEqual(storedRow(f.id, 'OlderMockup.psd'), before, 'stored row restored exactly');
+    assert.deepEqual(await viewRow(f.id, 'OlderMockup.psd'), beforeView, 'visible exactly as before');
     // Placed again and saved with a confirmable path: Included.
     await placeUnsaved(f, psd);
     setDoc(f, { modified: false, links: [psd] });
     await save(f, `linked\n${psd}\n`);
-    await waitForCondition(() => isProjectFile(f.id, 'PinMockup.psd'), 'saved link promoted', 5000);
+    await waitForCondition(() => isProjectFile(f.id, 'OlderMockup.psd'), 'saved link promoted', 5000);
     await poll(f.id);
-    assert.equal(isProjectFile(f.id, 'PinMockup.psd'), true, 'still a project file after the next reading');
-    assert.equal(storedRow(f.id, 'PinMockup.psd'), undefined);
+    assert.equal(isProjectFile(f.id, 'OlderMockup.psd'), true, 'still a project file after the next reading');
+    assert.equal(storedRow(f.id, 'OlderMockup.psd'), undefined);
   });
 
   // 7. Two documents link the same file.
@@ -400,24 +400,24 @@ function cases() {
   adapterTest('link-row-9c: the remembered review row survives a session change and returns exactly', async () => {
     const f = await watchedDocument('Link row 9c remembered row');
     const psd = await offerOlderPsd(f);
-    const original = clone(storedRow(f.id, 'PinMockup.psd'));
+    const original = clone(storedRow(f.id, 'OlderMockup.psd'));
     const first = await placeUnsaved(f, psd);
     assert.deepEqual(first.illustratorLinkReview.prior, original);
     setDoc(f, { modified: false, links: [psd] });
     await poll(f.id);
-    assert.equal(storedRow(f.id, 'PinMockup.psd').illustratorLinkReview.cleanSeen, true);
+    assert.equal(storedRow(f.id, 'OlderMockup.psd').illustratorLinkReview.cleanSeen, true);
     setDoc(f, { modified: true, links: [psd] });
     await callIpcRaw('projects:pause', f.id);
     await callIpcRaw('projects:start-watching', f.id);
     await metadataTestHooks.waitForWatcherIdle(f.id);
     await poll(f.id);
-    const restaged = storedRow(f.id, 'PinMockup.psd');
+    const restaged = storedRow(f.id, 'OlderMockup.psd');
     assert.equal(restaged.captureSessionId, stored(f.id).watchSessionId);
     assert.deepEqual(restaged.illustratorLinkReview, { version: 1, prior: original }, 'only the remembered row is inherited');
     assert.equal(Object.hasOwn(restaged.illustratorLinkReview.prior, 'illustratorLinkReview'), false);
     setDoc(f, { links: [] });
     await poll(f.id);
-    assert.deepEqual(storedRow(f.id, 'PinMockup.psd'), original, 'the original decidable row returns exactly');
+    assert.deepEqual(storedRow(f.id, 'OlderMockup.psd'), original, 'the original decidable row returns exactly');
   });
 
   // 10. A link reported only by an excluded working file.
@@ -562,17 +562,17 @@ function cases() {
   adapterTest('link-row-race-b: an older snapshot finishing last does not stage a row a newer reading withdrew', async () => {
     const f = await watchedDocument('Link row race b');
     const psd = await offerOlderPsd(f);
-    const original = clone(storedRow(f.id, 'PinMockup.psd'));
+    const original = clone(storedRow(f.id, 'OlderMockup.psd'));
     await placeUnsaved(f, psd);
     const older = f.ill.hold = gate();
     await startAddFilesPoll(f, 'AddedB.png');
     await waitForCondition(() => older.reached, 'older poll took its snapshot');
     setDoc(f, { links: [] });
     await callIpcRaw('projects:pre-package-scan', f.id);
-    assert.deepEqual(storedRow(f.id, 'PinMockup.psd'), original, 'the newer reading restored the row');
+    assert.deepEqual(storedRow(f.id, 'OlderMockup.psd'), original, 'the newer reading restored the row');
     older.open();
     await pollFinished(f.id);
-    assert.deepEqual(storedRow(f.id, 'PinMockup.psd'), original, 'the older snapshot does not overwrite it again');
+    assert.deepEqual(storedRow(f.id, 'OlderMockup.psd'), original, 'the older snapshot does not overwrite it again');
   });
 
   adapterTest('link-row-race-c: an older pre-package reading is discarded and the rest of the scan continues', async () => {
@@ -751,13 +751,13 @@ function cases() {
   adapterTest('link-row-13c: at pre-package a restored review row keeps its path out of the saved-file pass', async () => {
     const f = await watchedDocument('Link row 13c');
     const psd = await offerOlderPsd(f);
-    const original = clone(storedRow(f.id, 'PinMockup.psd'));
+    const original = clone(storedRow(f.id, 'OlderMockup.psd'));
     await placeUnsaved(f, psd);
     setDoc(f, { links: [] });
     writeSyntheticAiFile(f.ai, `linked\n${psd}\n`);
     await callIpcRaw('projects:pre-package-scan', f.id);
-    assert.equal(isProjectFile(f.id, 'PinMockup.psd'), false);
-    assert.deepEqual(storedRow(f.id, 'PinMockup.psd'), original);
+    assert.equal(isProjectFile(f.id, 'OlderMockup.psd'), false);
+    assert.deepEqual(storedRow(f.id, 'OlderMockup.psd'), original);
   });
 
   // Review state stays in the main process, also when nothing is hidden.
@@ -787,7 +787,7 @@ function cases() {
     assert.ok(testRendererEvents.some(event => event.channel === 'files:pending'), 'file state was sent');
     leaks('projects:pause', await callIpcRaw('projects:pause', f.id));
     leaks('projects:start-watching', await callIpcRaw('projects:start-watching', f.id));
-    const noReview = { id: 'no-review', files: [], pendingFiles: [{ path: psd, name: 'PinMockup.psd' }] };
+    const noReview = { id: 'no-review', files: [], pendingFiles: [{ path: psd, name: 'OlderMockup.psd' }] };
     assert.equal(metadataTestHooks.scopedProjectView(noReview), noReview, 'a project with no review state is returned as is');
   });
 
