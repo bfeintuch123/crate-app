@@ -22,6 +22,28 @@ harness = harness.replace('  captureProjectOperation,\n  runScanOnOpen', `
   },
   captureProjectOperation,
   runScanOnOpen`);
+// Equivalence check for the per-call caches in getWorkingFileChoicePresentation:
+// compile beside it a twin with both cache lookups disabled, so every file is
+// presented and checked afresh for each card. Each anchor must occur once.
+const presentationLoaderAnchor = "  let source = fs.readFileSync(filename, 'utf8');";
+require('./bounded-assert').equal(harness.split(presentationLoaderAnchor).length - 1, 1, 'harness main.js loader anchor');
+harness = harness.replace(presentationLoaderAnchor, "  let source = global.__crateUncachedPresentationTwin(fs.readFileSync(filename, 'utf8'));");
+global.__crateUncachedPresentationTwin = source => {
+  const assert = require('./bounded-assert');
+  const occurrences = (text, needle) => text.split(needle).length - 1;
+  const header = 'function getWorkingFileChoicePresentation(project) {\n';
+  const ending = '  return { ...summary, choices };\n}\n';
+  assert.equal(occurrences(source, header), 1, 'presentation function anchor');
+  const begin = source.indexOf(header), end = source.indexOf(ending, begin) + ending.length;
+  assert.ok(end > begin + header.length, 'presentation function end anchor');
+  let twin = source.slice(begin, end).replace(header, 'function getWorkingFileChoicePresentationUncached(project) {\n');
+  for (const lookup of ['    if (!presentations.has(file)) {\n', '    if (!predecessorChecks.has(file)) {\n']) {
+    assert.equal(occurrences(twin, lookup), 1, `cache lookup anchor ${lookup.trim()}`);
+    twin = twin.replace(lookup, '    if (true) {\n');
+  }
+  return source.slice(0, end) + twin +
+    'global.__crateUncachedWorkingFileChoicePresentation = getWorkingFileChoicePresentationUncached;\n' + source.slice(end);
+};
 const compiled = new Module(harnessPath, module);
 compiled.filename = harnessPath; compiled.paths = Module._nodeModulePaths(__dirname);
 compiled._compile(harness + '\n(' + cases.toString() + ')();', harnessPath);
@@ -826,6 +848,89 @@ function cases() {
     assert.equal(ws.workingFileChoices.choices[0].predecessors.length,131);
     assert.equal((await f.resolve(ws.workingFileChoices.choices[0])).success,true);
     roundTripFakeStore();assert.equal((await f.workspace()).workingFileChoices.blocked,false);
+  });
+  choiceTest('presentation resolves a shared predecessor a fixed number of times, however many cards list it', async () => {
+    // Every card lists each earlier selected source, so one presentation call
+    // used to repeat the same file's work once per card. Counts path
+    // resolutions of the shared predecessor A; makes no timing claim.
+    const f = await setup();
+    const resolvedA = () => {
+      const original = fs.realpathSync.native; let calls = 0;
+      fs.realpathSync.native = function countedRealpath(target, ...rest) {
+        if (path.resolve(String(target)) === path.resolve(f.a)) calls += 1;
+        return original.call(this, target, ...rest);
+      };
+      try {
+        const presentation = metadataTestHooks.getWorkingFileChoicePresentation(f.stored());
+        return { calls, presentation };
+      } finally { fs.realpathSync.native = original; }
+    };
+    const admit = names => {
+      const paths = names.map(name => path.join(TEST_HOME,'Desktop',name));
+      for (const target of paths) writeSyntheticAiFile(target, 'saved source');
+      manualDialogFor(paths);
+      return callIpcRaw('projects:add-files',f.id);
+    };
+    await admit(['Shared-0.ai','Shared-1.ai','Shared-2.ai']);
+    const few = resolvedA();
+    await admit(['Shared-3.ai','Shared-4.ai','Shared-5.ai','Shared-6.ai','Shared-7.ai','Shared-8.ai']);
+    const many = resolvedA();
+    const listsA = presentation => presentation.choices.every(card => card.predecessors.some(item => item.name === 'A.ai'));
+    assert.equal(few.presentation.choices.length, 3); assert.equal(many.presentation.choices.length, 9);
+    assert.ok(listsA(few.presentation) && listsA(many.presentation), 'A is a predecessor on every card');
+    assert.ok(few.calls > 0, 'the count observes path resolution');
+    assert.equal(many.calls, few.calls, `A resolved ${few.calls} times with 3 cards and ${many.calls} with 9`);
+  });
+  choiceTest('presentation with its per-call caches equals the same code without them, revisions included', async () => {
+    // Compares against an uncached twin of the current function, compiled by
+    // the loader replacement at the top of this file: the caches must change
+    // nothing for files that do not change during a call. This is not a
+    // comparison with the code before the caches were added.
+    const f = await setup();
+    const uncached = global.__crateUncachedWorkingFileChoicePresentation;
+    assert.equal(typeof uncached, 'function', 'uncached twin compiled');
+    const compare = (label, expectedCards) => {
+      const cached = metadataTestHooks.getWorkingFileChoicePresentation(f.stored()), fresh = uncached(f.stored());
+      assert.equal(cached.choices.length, expectedCards, label);
+      assert.ok(cached.choices.every(card => /^[a-f0-9]{64}$/.test(card.revision)), label);
+      assert.equal(JSON.stringify(cached), JSON.stringify(fresh), label);
+      return cached;
+    };
+    const admit = names => {
+      const paths = names.map(name => path.join(TEST_HOME,'Desktop',...name.split('/')));
+      for (const target of paths) { fs.mkdirSync(path.dirname(target), { recursive: true }); writeSyntheticAiFile(target, 'saved source'); }
+      manualDialogFor(paths);
+      return callIpcRaw('projects:add-files',f.id);
+    };
+    await admit(['Equal-0.ai','Equal-1.ai','Equal-2.ai']);
+    compare('3 cards', 3);
+    await admit(['Equal-3.ai','Equal-4.ai','Equal-5.ai','Equal-6.ai','Equal-7.ai','Equal-8.ai']);
+    const nine = compare('9 cards', 9);
+    assert.ok(nine.choices.every(card => card.predecessors.length >= 2), 'cards list predecessors');
+    // Same file name in different folders: folder labels must disambiguate alike.
+    await admit(['One/Same.ai','Two/Same.ai','Two/Deeper/Same.ai']);
+    const duplicates = compare('duplicate names', 12);
+    assert.equal(duplicates.choices.filter(card => card.source.name === 'Same.ai').length, 3, 'three same-named sources');
+    const oneLabel = presentation => presentation.choices.find(card => card.source.name === 'Same.ai' &&
+      /(^| › )One$/.test(card.source.folder) && !card.source.folder.includes('Elsewhere')).source.folder;
+    assert.equal(oneLabel(duplicates), 'One');
+    // A second "One" folder lengthens the first file's label, so a presentation
+    // kept from an earlier call would now be stale.
+    await admit(['Elsewhere/One/Same.ai']);
+    const later = compare('duplicate names as predecessors', 13);
+    assert.equal(oneLabel(later), 'Desktop › One');
+    assert.equal(later.choices.find(card => card.source.folder.includes('Elsewhere')).predecessors.filter(item => item.name === 'Same.ai').length, 3);
+    // An excluded predecessor drops out of every card, in both versions.
+    const rowA = (await f.workspace()).files.find(row => row.name === 'A.ai');
+    assert.equal((await callIpcRaw('projects:set-working-source-selection',f.id,rowA.visualIdentity,{action:'exclude',expectedRevision:rowA.selectionRevision})).success,true);
+    const excluded = compare('excluded predecessor', 13);
+    assert.ok(excluded.choices.every(card => !card.predecessors.some(item => item.name === 'A.ai')), 'A is excluded everywhere');
+    // A short drain: compare after each Keep both.
+    for (let remaining = 13; remaining > 9; remaining--) {
+      const card = (await f.workspace()).workingFileChoices.choices[0]; assert.ok(card?.ready, JSON.stringify(card));
+      assert.equal((await f.resolve(card)).success, true);
+      compare(`drain to ${remaining - 1}`, remaining - 1);
+    }
   });
   for (const corruption of ['legacy-overflow','null','array','bad-version','bad-record','duplicate-event']) {
     choiceTest(`canonical malformed or ${corruption} state blocks tokens and explicitly recovers`, async () => {
