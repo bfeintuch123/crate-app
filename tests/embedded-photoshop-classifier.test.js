@@ -96,6 +96,13 @@ test('an external link at document or layer level is not self-contained', () => 
   assert.equal(isProven(holder), false, 'an external link below an embedded document');
 });
 
+test('external and alias type codes anywhere in the bytes leave a document not proven', () => {
+  // A record of those forms can parse like an embedded one, so its bytes decide.
+  for (const code of ['liFE', 'liFA']) {
+    assert.equal(isProven(documentHolding([embedded('note.png', Buffer.concat([png(8), Buffer.from(code)]), { type: 'png ' })])), false, code);
+  }
+});
+
 test('parsed link fields refuse the document even when the bytes look clean', () => {
   const bytes = plainDocument('parsed');
   const id = guid('parsed');

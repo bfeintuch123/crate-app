@@ -179,7 +179,12 @@ function cases() {
     }
     testRendererEvents.length = 0;
     const seen = {};
-    const check = name => {
+    // What the renderer asks for after each step.
+    const rendererReads = async () => {
+      await callIpcRaw('projects:get-all'); await callIpcRaw('projects:get-files', f.id); await callIpcRaw('projects:get-asset-workspace', f.id);
+    };
+    const check = async name => {
+      await rendererReads();
       seen[name] = rowsOf(f.id);
       assert.deepEqual(seen[name].filter(row => !row.includes('_Option')), EXPECTED_ROWS[name], name);
       assert.equal(seen[name].filter(row => row.includes('_Option')).length, 12, name);
@@ -187,17 +192,17 @@ function cases() {
       assert.equal(stored(f.id).workingSourceRelationshipHolds ?? null, null, `${name}: holds`);
     };
     try {
-      await pollApps(f); f.apps.aiOpen = true; await pollApps(f); await pollFiles(f); await pollApps(f); check('links read');
+      await pollApps(f); f.apps.aiOpen = true; await pollApps(f); await pollFiles(f); await pollApps(f); await check('links read');
       if (stored(f.id).assetBaseline?.status === 'decision-required') await callIpcRaw('projects:set-existing-assets-decision', f.id, 'include');
       addRetiringRow(f);
-      for (const n of [1, 2, 3]) { await packageClick(f); check(`package ${n}`); }
+      for (const n of [1, 2, 3]) { await packageClick(f); await check(`package ${n}`); }
       assert.deepEqual(stored(f.id).retiredEmbeddedDocuments.entries.map(entry => entry.row.fileId), [SENTINEL_ID]);
       for (const row of stored(f.id).files.filter(item => item.ext === '.psb' && item.source === 'psd-embedded')) await callIpcRaw('projects:remove-file', f.id, row.fileId || row.path);
-      await packageClick(f); check('after exclude');
-      f.apps.psOpen = new Set([f.tote, f.pin]); await pollFiles(f); await pollApps(f); check('photoshop open');
-      await save(f, 'tote'); await save(f, 'pin'); check('saved');
-      f.apps.psOpen = new Set(); await pollFiles(f); check('photoshop closed');
-      await packageClick(f); check('final package click');
+      await packageClick(f); await check('after exclude');
+      f.apps.psOpen = new Set([f.tote, f.pin]); await pollFiles(f); await pollApps(f); await check('photoshop open');
+      await save(f, 'tote'); await save(f, 'pin'); await check('saved');
+      f.apps.psOpen = new Set(); await pollFiles(f); await check('photoshop closed');
+      await packageClick(f); await check('final package click');
       const toteBytes = fs.readFileSync(f.tote), pinBytes = fs.readFileSync(f.pin);
       let result = await callIpcRaw('projects:package', f.id, f.outDir, f.review.token);
       if (result?.error === 'package_review_changed' && result.review?.token) result = await callIpcRaw('projects:package', f.id, f.outDir, result.review.token);
@@ -292,6 +297,24 @@ function cases() {
       });
     }
   }
+
+  for (const route of Object.keys(ROUTES)) {
+    routeTest(`${route}: retires a row when the PSD holds nothing but proven objects`, { timeout: 60000 }, async () => {
+      const f = await seededProject(), row = seedRow(f); f.project().files.push(row);
+      fs.writeFileSync(f.psd, parentPsd([{ ...embedded('Smart.psb', f.smart), id: f.smartId }], 'only-proven'));
+      await scanOn(route, f);
+      assert.equal(findRow(f, 'seed-row'), undefined); assert.equal(retiredEntries(f).length, 1); assert.deepEqual(cacheNames(f.id), ['Smart.psb']);
+    });
+  }
+
+  routeTest('save scan: an excluded logical row of a proven object stays when its index changes', { timeout: 60000 }, async () => {
+    const f = await seededProject();
+    f.project().files.push(logicalRow(f, { fileId: 'moved', embeddedIndex: 5, individualContentExclusion: `${f.smart.length}:${sha(f.smart)}` })); await settled(f);
+    const before = plain(findRow(f, 'moved'));
+    await scanOn('save scan', f);
+    assert.deepEqual(plain(findRow(f, 'moved')), before);
+    assert.equal(memberRows(f).filter(row => row.embeddedOriginalName === 'Smart.psb').length, 1); assert.deepEqual(retiredEntries(f), []);
+  });
 
   routeTest('save scan: a logical row is retired only when this scan finds and proves its object', { timeout: 60000 }, async () => {
     const f = await seededProject();
@@ -394,6 +417,28 @@ function cases() {
     assert.ok(findRow(f, 'seed-row')); assert.deepEqual(plain(f.project().retiredEmbeddedDocuments), { version: 2 });
   });
 
+  routeTest('a choice made while the scan runs keeps the row', { timeout: 60000 }, async () => {
+    // A choice that does not touch the row itself: only the final check can see it.
+    const f = await seededProject(), row = seedRow(f, { name: 'Old Smart.psb', data: plainDocument('old-during-scan'), linkedIndex: 9 }); f.project().files.push(row); await settled(f);
+    const hold = holdRead(row.path); metadataTestHooks.clearPsdParseDebounce();
+    try {
+      const scan = ROUTES['pre-package scan'](f); await hold.started;
+      f.project().excludedAssetKeys = [row.fileId]; hold.release(); await scan;
+      assert.ok(findRow(f, 'seed-row')); assert.deepEqual(retiredEntries(f), []);
+    } finally { hold.restore(); }
+  });
+
+  routeTest('a cached file that changes after it was checked keeps the row', { timeout: 60000 }, async () => {
+    const f = await seededProject(), row = seedRow(f); f.project().files.push(row); await settled(f);
+    // The pre-package pass reads the PSD again after the PSD block has planned.
+    const hold = holdRead(f.psd, 1); metadataTestHooks.clearPsdParseDebounce();
+    try {
+      const scan = ROUTES['pre-package scan'](f); await hold.started;
+      fs.writeFileSync(row.path, plainDocument('changed-after-check')); hold.release(); await scan;
+      assert.ok(findRow(f, 'seed-row')); assert.deepEqual(retiredEntries(f), []);
+    } finally { hold.restore(); }
+  });
+
   routeTest('a simple receipt hold on a retired row is released with its last member', { timeout: 60000 }, async () => {
     const f = await seededProject(), row = seedRow(f); f.project().files.push(row);
     f.project().workingSourceRelationshipHolds = [{ reason: 'psd-extraction-receipt-unverified', sourcePath: row.path }];
@@ -477,6 +522,22 @@ function cases() {
     assert.equal(f.project().workingSourceRelationshipHolds?.length || 0, 0);
     assert.equal((await callIpcRaw('projects:prepare-package-review', f.id))?.error, undefined);
   });
+  routeTest('a scan that publishes no record still stops it naming a retired row', { timeout: 60000 }, async () => {
+    const f = await engagedProject(); await f.scan();
+    const row = seedRow(f, { field: 'psdResource' }); f.project().files.push(row);
+    const record = f.record();
+    record.requiredEmbeddedOutputs.push({ path: row.path, sourceDigest: record.sourceFingerprint, outputDigest: sha(f.smart) });
+    await scanOn('pre-package scan', f);
+    assert.equal(findRow(f, 'seed-row'), undefined);
+    assert.deepEqual(f.record().requiredEmbeddedOutputs.map(output => path.basename(output.path)), ['Texture.png']);
+  });
+  routeTest('engaged route: with a malformed record the object keeps its complete handling', { timeout: 60000 }, async () => {
+    const f = await engagedProject(); await f.scan();
+    const row = seedRow(f, { field: 'psdResource' }); f.project().files.push(row); f.project().retiredEmbeddedDocuments = { version: 2 };
+    await f.scan();
+    assert.ok(findRow(f, 'seed-row'));
+    assert.ok(f.record().requiredEmbeddedOutputs.some(output => path.basename(output.path) === 'Smart.psb'));
+  });
   routeTest('engaged route: an excluded resource row stays and raises no hold after its bytes change', { timeout: 60000 }, async () => {
     const f = await engagedProject(); await f.scan();
     const row = seedRow(f, { field: 'psdResource' }); f.project().files.push(row); f.project().excludedAssetKeys = [row.fileId]; await settled(f);
@@ -495,10 +556,13 @@ function cases() {
   });
 
   // --- Scans that stop being current ----------------------------------------
-  function holdRead(file) {
+  function holdRead(file, skip = 0) {
     const real = fs.promises.readFile; let reached, release;
     const started = new Promise(resolve => { reached = resolve; }), gate = new Promise(resolve => { release = resolve; });
-    fs.promises.readFile = async function (target, ...args) { if (target === file) { reached(); fs.promises.readFile = real; await gate; } return real.call(this, target, ...args); };
+    fs.promises.readFile = async function (target, ...args) {
+      if (target === file && skip-- <= 0) { reached(); fs.promises.readFile = real; await gate; }
+      return real.call(this, target, ...args);
+    };
     return { started, release, restore() { fs.promises.readFile = real; release(); } };
   }
   async function watchingSeed() {
