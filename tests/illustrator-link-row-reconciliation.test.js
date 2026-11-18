@@ -14,7 +14,7 @@ replaceOnce("const test = require('node:test');", "const adapterTest = require('
 // synthetic home lives beside the checkout (as in cross-app-live-pipeline).
 replaceOnce("fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual-write-home-'))", "fs.mkdtempSync(path.join(path.dirname(MAIN_UNDER_TEST_ROOT), 'illustrator-link-reconciliation-home-'))");
 // Read-only views of main-process state these tests need.
-replaceOnce("  isLsofPollInProgress(projectId) {", "  isLivePollInProgress(projectId) { return psInProgress.has(projectId); },\n  scopedProjectView(project) { return getIllustratorScopedProjectView(project); },\n  isLsofPollInProgress(projectId) {");
+replaceOnce("  isLsofPollInProgress(projectId) {", "  isLivePollInProgress(projectId) { return psInProgress.has(projectId); },\n  scopedProjectView(project) { return getIllustratorScopedProjectView(project); },\n  illustratorQueryOrder(projectId) { return illustratorActivationScopes.get(projectId)?.queryOrder ?? null; },\n  overlappingWorkInFlight() { return scanInFlight.size + psInProgress.size; },\n  isLsofPollInProgress(projectId) {");
 const compiled = new Module(harnessPath, module); compiled.filename = harnessPath; compiled.paths = Module._nodeModulePaths(path.dirname(harnessPath));
 compiled._compile(harness + '\n(' + cases.toString() + ')();', harnessPath);
 
@@ -102,18 +102,38 @@ function cases() {
     return { project, id: project.id, dir, ai: paths[0], paths, ill };
   }
 
+  const openGates = new Set();
   function gate() {
-    let open;
-    const opened = new Promise(resolve => { open = resolve; });
-    const held = { reached: false, open, reach(result) { held.reached = true; return opened.then(() => result); } };
+    let release;
+    const opened = new Promise(resolve => { release = resolve; });
+    const held = { reached: false, open() { openGates.delete(held); release(); }, reach(result) { held.reached = true; return opened.then(() => result); } };
+    openGates.add(held);
     return held;
   }
+  // Overlap tests never leave held work behind, even when an assertion fails.
+  const overlapTest = (name, body) => adapterTest(name, async () => {
+    try { await body(); } finally {
+      for (const held of [...openGates]) held.open();
+      await waitForCondition(() => metadataTestHooks.overlappingWorkInFlight() === 0, 'overlapping work finished', 5000);
+    }
+  });
   // Starts a live poll the way Add Files does: outside the watcher coordinator,
   // so it can overlap a pre-package scan.
   async function startAddFilesPoll(f, name) {
     manualDialogFor([png(f.dir, name)]);
     const added = await callIpcRaw('projects:add-files', f.id);
     assert.ok(added, 'Add Files finished');
+  }
+  // The packaged app's store returns a new copy on every read; the harness store
+  // returns live objects. Runs `work` with the packaged behavior.
+  async function withCopiedStore(enabled, work) {
+    if (!enabled) return work();
+    const liveGet = storeInstance.get;
+    storeInstance.get = function copiedGet(key, fallback) {
+      const value = liveGet.call(this, key, fallback);
+      return key === 'projects' ? structuredClone(value) : value;
+    };
+    try { return await work(); } finally { delete storeInstance.get; }
   }
   const pollFinished = id => waitForCondition(() => !metadataTestHooks.isLivePollInProgress(id), 'live poll finished', 5000);
   async function offerOlderPsd(f, name = 'LayeredOlder.psd') {
@@ -337,7 +357,8 @@ function cases() {
     });
   }
 
-  adapterTest('link-row-8: a stale reading (activation ended during the query) changes no row', async () => {
+  // Control: the base never withdraws a row, so this also passes there.
+  adapterTest('link-row-8 (control): a stale reading (activation ended during the query) changes no row', async () => {
     const f = await watchedDocument('Link row 8 stale');
     await placeUnsaved(f, png(f.dir, 'Stale.png'));
     const before = clone(storedRow(f.id, 'Stale.png'));
@@ -581,7 +602,8 @@ function cases() {
   });
 
   // Overlapping readings: order is fixed when each query starts.
-  adapterTest('link-row-race-a: an older empty snapshot finishing last does not withdraw a row a newer reading kept', async () => {
+  // Control: the base never withdraws a row, so this also passes there.
+  overlapTest('link-row-race-a (control): an older empty snapshot finishing last does not withdraw a row a newer reading kept', async () => {
     const f = await watchedDocument('Link row race a');
     const link = png(f.dir, 'Relinked.png');
     await placeUnsaved(f, link);
@@ -598,7 +620,7 @@ function cases() {
     assert.deepEqual(storedRow(f.id, 'Relinked.png'), kept, 'the older snapshot changes nothing');
   });
 
-  adapterTest('link-row-race-b: an older snapshot finishing last does not stage a row a newer reading withdrew', async () => {
+  overlapTest('link-row-race-b: an older snapshot finishing last does not stage a row a newer reading withdrew', async () => {
     const other = photoshopChecks();
     const f = await watchedDocument('Link row race b', { extra: other.extra });
     const { file, row: original } = await photoshopClaimRow(f, other, 'ClaimedElsewhere.png');
@@ -614,7 +636,7 @@ function cases() {
     assert.deepEqual(storedRow(f.id, 'ClaimedElsewhere.png'), original, 'the older snapshot does not overwrite it again');
   });
 
-  adapterTest('link-row-race-c: an older pre-package reading is discarded and the rest of the scan continues', async () => {
+  overlapTest('link-row-race-c: an older pre-package reading is discarded and the rest of the scan continues', async () => {
     const f = await watchedDocument('Link row race c');
     const link = png(f.dir, 'KeptByPoll.png');
     await placeUnsaved(f, link);
@@ -633,7 +655,7 @@ function cases() {
     assert.deepEqual(storedRow(f.id, 'KeptByPoll.png'), kept);
   });
 
-  adapterTest('link-row-race-control: readings that finish in start order apply in order', async () => {
+  overlapTest('link-row-race-control: readings that finish in start order apply in order', async () => {
     const f = await watchedDocument('Link row race control');
     const link = png(f.dir, 'InOrder.png');
     await placeUnsaved(f, link);
@@ -651,6 +673,10 @@ function cases() {
     second.open();
     await scan;
     assert.equal(storedRow(f.id, 'InOrder.png')?.captureState, 'needs-save', 'the second reading brought it back');
+    assert.ok(metadataTestHooks.illustratorQueryOrder(f.id), 'order is tracked while watching');
+    await callIpcRaw('projects:pause', f.id);
+    assert.equal(metadataTestHooks.illustratorQueryOrder(f.id), null, 'Pause retires the reading order');
+    assert.ok(metadataTestHooks.getIllustratorActivationScopeSnapshot(f.id), 'the paused view keeps its scope');
   });
 
   // A poll that read Illustrator and then waits on Photoshop while a newer
@@ -669,7 +695,7 @@ function cases() {
     return other;
   }
   for (const remembered of [false, true]) {
-    adapterTest(`link-row-race-d: a poll held at the Photoshop check cannot restore a withdrawn link (${remembered ? 'remembered row underneath' : 'no earlier row'})`, async () => {
+    overlapTest(`link-row-race-d: a poll held at the Photoshop check cannot restore a withdrawn link (${remembered ? 'remembered row underneath' : 'no earlier row'})`, async () => {
       backgroundNeedsSave();
       const other = photoshopChecks();
       const f = await watchedDocument('Link row race d', { extra: other.extra });
@@ -695,7 +721,7 @@ function cases() {
     });
   }
 
-  adapterTest('link-row-race-e: Photoshop records in the held poll still stage when its Illustrator reading is dropped', async () => {
+  overlapTest('link-row-race-e: Photoshop records in the held poll still stage when its Illustrator reading is dropped', async () => {
     const other = photoshopChecks();
     const f = await watchedDocument('Link row race e', { extra: other.extra });
     const link = png(f.dir, 'IllustratorLink.png');
@@ -714,7 +740,7 @@ function cases() {
     assert.equal(storedRow(f.id, 'PhotoshopLink.png')?.source, 'ps-poll', 'the Photoshop record stages');
   });
 
-  adapterTest('link-row-race-f: a poll whose activation scope was replaced while it waited stages no Illustrator record', async () => {
+  overlapTest('link-row-race-f: a poll whose activation scope was replaced while it waited stages no Illustrator record', async () => {
     const other = photoshopChecks();
     const f = await watchedDocument('Link row race f', { extra: other.extra });
     const link = png(f.dir, 'SeenBeforeScopeChange.png');
@@ -732,7 +758,8 @@ function cases() {
     assert.equal(storedRow(f.id, 'SeenBeforeScopeChange.png')?.captureState, 'needs-save', 'the next reading does');
   });
 
-  adapterTest('link-row-race-activation: the activation reading sets the baseline even when a later reading finishes first', async () => {
+  // Control: the base always applies the activation reading, so this also passes there.
+  overlapTest('link-row-race-activation (control): the activation reading sets the baseline even when a later reading finishes first', async () => {
     resetTestHomeWorkspace();
     fs.mkdirSync(path.join(TEST_HOME, 'Desktop'), { recursive: true });
     const dir = fs.mkdtempSync(path.join(TEST_HOME, 'Desktop', 'link-row-'));
@@ -751,6 +778,196 @@ function cases() {
     assert.equal(metadataTestHooks.getIllustratorActivationScopeSnapshot(id).baselineDocumentPaths.length, 1, 'the open document is baseline');
     await poll(id);
     assert.equal(isProjectFile(id, 'OpenAtWatch.ai'), false, 'a document open at Watch is not admitted');
+  });
+
+  overlapTest('link-row-race-e2: a Photoshop claim for the same path still stages when the Illustrator reading is dropped', async () => {
+    const other = photoshopChecks();
+    const f = await watchedDocument('Link row race e2', { extra: other.extra });
+    const link = png(f.dir, 'ClaimedByBoth.png');
+    await placeUnsaved(f, link);
+    other.output = link + '\n';
+    const held = other.hold = gate();
+    await startAddFilesPoll(f, 'AddedE2.png');
+    await waitForCondition(() => held.reached, 'poll waits at the Photoshop check');
+    other.output = '';
+    setDoc(f, { links: [] });
+    await callIpcRaw('projects:pre-package-scan', f.id);
+    assert.equal(storedRow(f.id, 'ClaimedByBoth.png'), undefined, 'withdrawn by the newer reading');
+    held.open();
+    await pollFinished(f.id);
+    const row = storedRow(f.id, 'ClaimedByBoth.png');
+    assert.equal(row?.source, 'ps-poll', 'the Photoshop claim stages as if the Illustrator record were absent');
+    assert.equal(row.captureState, 'needs-save');
+  });
+
+  // The saved-file pass must see the project as it is now.
+  const includedShape = file => { const { path: filePath, name, addedAt, dependencyOwners, ...rest } = file; return { ...rest, owners: dependencyOwners }; };
+  for (const copied of [false, true]) {
+    const storeLabel = copied ? 'copying store' : 'live store';
+    overlapTest(`link-row-membership-a: a discarded scan reading does not keep a row a newer reading withdrew pending (${storeLabel})`, async () => {
+      const f = await watchedDocument('Link row membership a');
+      const link = png(f.dir, 'WithdrawnMeanwhile.png'), neverSeen = png(f.dir, 'BesideItA.png');
+      await placeUnsaved(f, link);
+      writeSyntheticAiFile(f.ai, `linked\n${link}\n${neverSeen}\n`);
+      await withCopiedStore(copied, async () => {
+        const older = f.ill.hold = gate();
+        const scan = callIpcRaw('projects:pre-package-scan', f.id);
+        await waitForCondition(() => older.reached, 'scan took its snapshot');
+        setDoc(f, { links: [] });
+        await startAddFilesPoll(f, 'AddedMembershipA.png');
+        await pollFinished(f.id);
+        assert.equal(storedRow(f.id, 'WithdrawnMeanwhile.png'), undefined, 'the newer reading withdrew the row');
+        older.open();
+        assert.ok(await scan, 'the scan finished');
+      });
+      const file = name => stored(f.id).files.find(item => item.name === name);
+      assert.ok(file('BesideItA.png'), 'control: the never-seen path is included');
+      assert.ok(file('WithdrawnMeanwhile.png'), 'the withdrawn path follows the same rule');
+      assert.deepEqual(includedShape(file('WithdrawnMeanwhile.png')), includedShape(file('BesideItA.png')));
+      assert.equal(storedRow(f.id, 'WithdrawnMeanwhile.png'), undefined);
+    });
+
+    overlapTest(`link-row-membership-b: a discarded scan reading treats a row a newer reading created as pending (${storeLabel})`, async () => {
+      const f = await watchedDocument('Link row membership b');
+      const link = png(f.dir, 'CreatedMeanwhile.png'), neverSeen = png(f.dir, 'BesideItB.png');
+      writeSyntheticAiFile(f.ai, `linked\n${link}\n${neverSeen}\n`);
+      await withCopiedStore(copied, async () => {
+        const older = f.ill.hold = gate();
+        const scan = callIpcRaw('projects:pre-package-scan', f.id);
+        await waitForCondition(() => older.reached, 'scan took its snapshot');
+        setDoc(f, { modified: true, links: [link] });
+        await startAddFilesPoll(f, 'AddedMembershipB.png');
+        await pollFinished(f.id);
+        assert.equal(storedRow(f.id, 'CreatedMeanwhile.png')?.captureState, 'needs-save', 'the newer reading created the row');
+        older.open();
+        assert.ok(await scan, 'the scan finished');
+      });
+      assert.equal(isProjectFile(f.id, 'BesideItB.png'), true, 'control: the never-seen path is included');
+      assert.equal(isProjectFile(f.id, 'CreatedMeanwhile.png'), false, 'a path pending now is not included');
+      assert.equal(storedRow(f.id, 'CreatedMeanwhile.png')?.captureState, 'needs-save');
+    });
+
+    overlapTest(`link-row-membership-c: an in-order scan sees another reading's withdrawal and keeps what it staged (${storeLabel})`, async () => {
+      const f = await watchedDocument('Link row membership c');
+      const link = png(f.dir, 'WithdrawnEarlier.png'), neverSeen = png(f.dir, 'BesideItC.png');
+      fs.writeFileSync(path.join(f.dir, 'FoundDuringScan.fig'), 'synthetic design file');
+      await placeUnsaved(f, link);
+      writeSyntheticAiFile(f.ai, `linked\n${link}\n${neverSeen}\n`);
+      setDoc(f, { links: [] });
+      await withCopiedStore(copied, async () => {
+        const first = f.ill.hold = gate();
+        await startAddFilesPoll(f, 'AddedMembershipC.png');
+        await waitForCondition(() => first.reached, 'first reading took its snapshot');
+        const second = f.ill.hold = gate();
+        const scan = callIpcRaw('projects:pre-package-scan', f.id);
+        await waitForCondition(() => second.reached, 'scan took its snapshot');
+        first.open();
+        await pollFinished(f.id);
+        assert.equal(storedRow(f.id, 'WithdrawnEarlier.png'), undefined, 'withdrawn by the other reading');
+        second.open();
+        assert.ok(await scan, 'the scan finished');
+      });
+      const file = name => stored(f.id).files.find(item => item.name === name);
+      assert.ok(file('WithdrawnEarlier.png'), 'no longer pending, so the saved-file pass includes it');
+      assert.deepEqual(includedShape(file('WithdrawnEarlier.png')), includedShape(file('BesideItC.png')));
+      assert.ok(storedRow(f.id, 'FoundDuringScan.fig') || file('FoundDuringScan.fig'), 'what the scan found earlier is kept');
+    });
+  }
+
+  overlapTest('link-row-race-g: a discarded poll does not move a working file; an in-order reading does', async () => {
+    const f = await watchedDocument('Link row race g');
+    await poll(f.id);
+    assert.ok(Object.keys(stored(f.id).workingSourceLocators?.records || {}).length, 'the working file has a locator');
+    const renamed = path.join(f.dir, 'BoardRenamed.ai');
+    const scopeBefore = clone(metadataTestHooks.getIllustratorActivationScopeSnapshot(f.id).admittedDocumentPaths);
+    fs.renameSync(f.ai, renamed);
+    f.ill.docs = [{ path: renamed, modified: false, links: [] }];
+    const older = f.ill.hold = gate();
+    await startAddFilesPoll(f, 'AddedG.png');
+    await waitForCondition(() => older.reached, 'older poll took its snapshot');
+    f.ill.docs = [];
+    const queries = f.ill.queries;
+    await callIpcRaw('projects:pre-package-scan', f.id);
+    assert.ok(f.ill.queries > queries, 'a newer reading was applied');
+    older.open();
+    await pollFinished(f.id);
+    assert.equal(isProjectFile(f.id, 'BoardRenamed.ai'), false, 'the older reading moved nothing');
+    assert.equal(isProjectFile(f.id, 'Board.ai'), true);
+    const admitted = metadataTestHooks.getIllustratorActivationScopeSnapshot(f.id).admittedDocumentPaths;
+    for (const documentPath of scopeBefore) assert.ok(admitted.includes(documentPath), 'admitted paths are not rewritten');
+    f.ill.docs = [{ path: renamed, modified: false, links: [] }];
+    await poll(f.id);
+    assert.equal(isProjectFile(f.id, 'BoardRenamed.ai'), true, 'an in-order reading follows the rename');
+  });
+
+  overlapTest('link-row-race-h: a failed activation reading does not close a scope a newer reading left ready', async () => {
+    resetTestHomeWorkspace();
+    fs.mkdirSync(path.join(TEST_HOME, 'Desktop'), { recursive: true });
+    const dir = fs.mkdtempSync(path.join(TEST_HOME, 'Desktop', 'link-row-'));
+    const doc = path.join(dir, 'BoardAfterFailure.ai');
+    writeSyntheticAiFile(doc, 'no links');
+    const ill = illustrator();
+    ill.raw = 'ERROR\tillustrator-query-failed\nCOMPLETE\t0\t0\n';
+    const activation = ill.hold = gate();
+    const creating = createProject('Link row race h');
+    await waitForCondition(() => activation.reached, 'activation took its failing snapshot');
+    ill.raw = null;
+    const id = storeInstance.data.projects.find(project => project.status === 'watching').id;
+    await callIpcRaw('projects:pre-package-scan', id);
+    assert.equal(metadataTestHooks.getIllustratorActivationScopeSnapshot(id).status, 'ready', 'the newer reading left the scope ready');
+    activation.open();
+    await creating;
+    await metadataTestHooks.waitForWatcherIdle(id);
+    assert.equal(metadataTestHooks.getIllustratorActivationScopeSnapshot(id).status, 'ready', 'the older failure does not close it');
+    const f = { id, dir, ai: doc, ill };
+    ill.docs = [{ path: doc, modified: false, links: [] }];
+    await poll(id);
+    await waitForProject(id, item => item.files.some(file => file.path === doc));
+    await placeUnsaved(f, png(dir, 'AfterFailure.png'));
+    setDoc(f, { links: [] });
+    await poll(id);
+    assert.equal(storedRow(id, 'AfterFailure.png'), undefined, 'later readings stage and reconcile');
+  });
+
+  adapterTest('link-row-remembered: another app\'s same-rank claim does not displace a link row holding a remembered row', async () => {
+    const other = photoshopChecks(), layout = { running: false, doc: null, link: null };
+    const extra = request => {
+      if (request.kind === 'exec' && request.command.includes("grep -i 'Adobe InDesign'")) return { stdout: layout.running ? '456 /Applications/Adobe InDesign.app/Contents/MacOS/Adobe InDesign\n' : '' };
+      if (layout.running && isOsascriptInvocation(request, 'crate-indd-poll.applescript')) {
+        const name = path.basename(layout.doc);
+        return { stdout: `DOC\t${layout.doc}\t${name}\ttrue\ttrue\nLINK\t${layout.doc}\t${name}\t${layout.link}\ttrue\ttrue\n` };
+      }
+      return other.extra(request);
+    };
+    const f = await watchedDocument('Link row remembered', { extra });
+    layout.doc = path.join(f.dir, 'Layout.indd');
+    fs.writeFileSync(layout.doc, 'synthetic layout');
+    const sessionStart = stored(f.id).watchStartedAt;
+    await emitWatcherWithStats('add', layout.doc, { mtimeMs: sessionStart + 1, birthtimeMs: sessionStart + 1 });
+    await waitForCondition(() => isProjectFile(f.id, 'Layout.indd'), 'layout admitted', 5000);
+    await metadataTestHooks.waitForWatcherIdle(f.id);
+    layout.link = png(f.dir, 'ClaimedThreeWays.png');
+    layout.running = true;
+    await poll(f.id);
+    layout.running = false;
+    const original = clone(storedRow(f.id, 'ClaimedThreeWays.png'));
+    assert.equal(original?.captureState, 'needs-save');
+    assert.notEqual(original.source, 'ai-linked');
+    const linkRow = clone(await placeUnsaved(f, layout.link));
+    assert.deepEqual(linkRow.illustratorLinkReview.prior, original);
+    // Illustrator's reading fails here, so Photoshop's report is the only claim.
+    other.output = layout.link + '\n';
+    f.ill.raw = 'ERROR\tillustrator-query-failed\nCOMPLETE\t0\t0\n';
+    await poll(f.id);
+    f.ill.raw = null;
+    other.output = '';
+    assert.deepEqual(storedRow(f.id, 'ClaimedThreeWays.png'), linkRow, 'the link row and its remembered row survive');
+    f.ill.running = false;
+    await poll(f.id);
+    assert.deepEqual(storedRow(f.id, 'ClaimedThreeWays.png'), original, 'the remembered row returns');
+    other.output = layout.link + '\n';
+    await poll(f.id);
+    assert.equal(storedRow(f.id, 'ClaimedThreeWays.png')?.source, 'ps-poll', 'the other app can stage on its next report');
   });
 
   // An inconclusive process check is not "Illustrator is not running".
@@ -923,6 +1140,7 @@ function cases() {
       assert.deepEqual(stored(f.id).files.map(file => file.name).sort(), files, 'no project file added');
       assert.deepEqual(withoutSessionStamp(storedRow(f.id, 'LayeredOlder.psd')), withoutSessionStamp(original), 'still the decidable row');
     });
+    // Control: a file with no row behaves as it does on the base.
     adapterTest(`link-row-decision-6 (control): a file with no row claimed through ${observer} shows Needs Save and raises the notice`, async () => {
       backgroundNeedsSave();
       const other = photoshopChecks();
@@ -945,6 +1163,7 @@ function cases() {
     });
   }
 
+  // Control: saved-file inclusion is the same on the base.
   adapterTest('link-row-decision-7 (control): a decidable row linked and saved with a confirmable path is Included', async () => {
     const f = await watchedDocument('Link row decision saved');
     const psd = await offerOlderPsd(f);
@@ -1124,7 +1343,7 @@ function cases() {
     });
   }
 
-  // 14. Unchanged: a confirmable saved link is promoted as before.
+  // 14. Control: a confirmable saved link is promoted as on the base.
   for (const cleanReadings of [0, 1, 2]) {
     adapterTest(`link-row-14 (unchanged): a confirmable saved link is promoted after ${cleanReadings} clean reading(s) first`, async () => {
       const f = await watchedDocument('Link row 14 promoted ' + cleanReadings);

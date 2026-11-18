@@ -2914,8 +2914,14 @@ function classifyLiveObservedFile(project, fileEntry, observation = {}, stageInd
       };
     }
     const pendingFile = (project.pendingFiles || []).find(file => getTrackedFileDedupKey(file) === candidateKey);
+    // A link row holding a remembered row stays until a trusted reading withdraws
+    // it; another app's same-rank claim would lose the remembered row.
+    const keepsRememberedRow = evidence.observerMethod !== LIVE_APP_OBSERVER_METHODS.ILLUSTRATOR_ACTIVE_SESSION &&
+      isCurrentIllustratorLiveLinkRow(project, pendingFile) && !!getRememberedIllustratorLinkRow(pendingFile) &&
+      getLiveCaptureStateRank(normalizeLiveCaptureState(captureState, LIVE_CAPTURE_STATES.PENDING)) ===
+        getLiveCaptureStateRank(normalizeLiveCaptureState(pendingFile.captureState, LIVE_CAPTURE_STATES.PENDING));
     return {
-      decision: shouldUpdatePendingCandidate(pendingFile, { captureState, evidenceSummary })
+      decision: !keepsRememberedRow && shouldUpdatePendingCandidate(pendingFile, { captureState, evidenceSummary })
         ? LIVE_CAPTURE_DECISIONS.UPDATE_PENDING
         : LIVE_CAPTURE_DECISIONS.KEEP_EXISTING,
       reason: 'already-pending',
@@ -3134,7 +3140,7 @@ function createIllustratorLinkReading(projectId, activationToken, queryResult, s
 // Runs inside the project mutation that staged the same reading, and only for
 // a reading applyLiveAppEvidenceRefresh found current before staging anything.
 function reconcileIllustratorLinkRows(project, reading, liveMembership) {
-  const outcome = { changed: 0, withdrawnPaths: [] };
+  const outcome = { changed: 0 };
   if (!reading || !project || project.id !== reading.projectId || !Array.isArray(project.pendingFiles)) return outcome;
   const acceptedKeys = getTrackedFileKeySet(project.files);
   const nextRows = [];
@@ -3147,7 +3153,6 @@ function reconcileIllustratorLinkRows(project, reading, liveMembership) {
       outcome.changed++;
       const remembered = getRememberedIllustratorLinkRow(row);
       if (remembered) nextRows.push(structuredClone(remembered));
-      else outcome.withdrawnPaths.push(normalizeTrackedFilePath(row.path));
       continue;
     }
     const { cleanSeen, ...reviewWithoutClean } = review || { version: ILLUSTRATOR_LINK_REVIEW_VERSION };
@@ -6077,13 +6082,16 @@ async function readWorkingSourceDocumentIdentity(project, file, operation, timeo
   return documentIdentity;
 }
 
-async function refreshWorkingSourceLocators(projectId, observedPaths = null, parentCurrent = null) {
+// `beforePublish` is an extra condition that must hold until the locator state
+// is published; work that follows a published move is not bound by it.
+async function refreshWorkingSourceLocators(projectId, observedPaths = null, parentCurrent = null, beforePublish = null) {
   if (Array.isArray(observedPaths) && !observedPaths.some(locator => typeof locator === 'string' && LOCAL_ADOBE_CONTINUATION_EXTENSIONS.has(path.extname(locator).toLowerCase()))) return;
   const captured = captureProjectOperation(projectId);
   const operation = captured && { ...captured, current: () => captured.current() && (!parentCurrent || parentCurrent()) };
+  const publishable = () => operation.current() && (!beforePublish || beforePublish());
   try {
     const project = getProjects().find(item => item.id === projectId);
-    if (!project || !operation?.current()) return;
+    if (!project || !operation || !publishable()) return;
     const beforeSignature = getPackageSelectionInputSignature(project);
     const state = project.workingSourceLocators;
     if (getWorkingFileChoiceObligations(project).invalid) { project.workingFileChoiceLimit = true; return; }
@@ -6108,7 +6116,7 @@ async function refreshWorkingSourceLocators(projectId, observedPaths = null, par
       const remainingMs = identityDeadline - Date.now();
       if (remainingMs <= 0) continue;
       const documentIdentity = await readWorkingSourceDocumentIdentity(project, file, operation, remainingMs);
-      if (!operation.current()) return;
+      if (!publishable()) return;
       documentRecords.set(key, { version: 1, path: file.path, physicalIdentity: identity, documentIdentity });
     }
     const relocated = [], changedBytes = [], aliases = [...(state?.aliases || [])];
@@ -6188,7 +6196,7 @@ async function refreshWorkingSourceLocators(projectId, observedPaths = null, par
     const nextState = { version: 1, records, aliases: aliases.slice(-128) };
     if (JSON.stringify(state) === JSON.stringify(nextState) && !relocated.length && !changedBytes.length) return;
     const result = mutateProject(projectId, latest => {
-      if (!operation.current() || beforeSignature !== getPackageSelectionInputSignature(latest) ||
+      if (!publishable() || beforeSignature !== getPackageSelectionInputSignature(latest) ||
           [...documentRecords.values()].some(record => getWorkingSourceContinuationPhysicalIdentity(latest, { path: record.path, projectRole: 'source' }) !== record.physicalIdentity) ||
           relocated.some(item => fs.existsSync(project.files.find(file => getAssetBaselineSourceRecoveryRouteKey(project, file) === item.oldKey)?.path || '') ||
             getWorkingSourceContinuationPhysicalIdentity(latest, item.file) !== records[item.key].physicalIdentity)) return { changed: false };
@@ -11619,10 +11627,12 @@ function captureProjectOperation(projectId) {
     // pending receipt as a non-success, and to keep an "Assets need save" notice
     // clickable while its scope gains links; never to publish results.
     currentIgnoringScope: baseCurrent,
-    adoptScope(scope) {
+    // `allowAdvance` is for a caller that has just discarded its own older
+    // reading and rebuilds its state from the current project.
+    adoptScope(scope, { allowAdvance = false } = {}) {
       if (activationToken === null) return baseCurrent();
       if (!baseCurrent() || illustratorActivationScopes.get(projectId) !== scope ||
-          ![scopeRevision, scopeRevision + 1].includes(scope?.revision)) return false;
+          !(allowAdvance ? scope?.revision >= scopeRevision : [scopeRevision, scopeRevision + 1].includes(scope?.revision))) return false;
       scopeRevision = scope.revision;
       return true;
     },
@@ -14706,7 +14716,10 @@ async function initializeIllustratorActivationScope(projectId, activationToken) 
   const queryResult = await queryIllustratorActiveState(projectId, activationToken); if (queryResult.stale || !getFreshActiveWatchingProject(projectId, activationToken)) return null;
   // The activation reading always defines the session's baseline, even if a
   // later-started reading finished first; only its records can be superseded.
+  // A failed reading has no baseline to give, and a newer reading already
+  // decided the scope, so it does not close that scope.
   const superseded = isIllustratorQuerySuperseded(projectId, activationToken, queryResult);
+  if (superseded && getIllustratorSnapshotFailureReason(queryResult)) return null;
   if (!superseded) claimIllustratorQueryResult(projectId, activationToken, queryResult);
   const updated = updateIllustratorActivationScope(projectId, activationToken, queryResult, true); if (!updated || !updated.ready) return updated;
   const refreshed = await applyLiveAppEvidenceRefresh(projectId, createIllustratorLiveEvidenceRecords(projectId, queryResult.activeState, updated.project), activationToken, null, { illustratorQuery: queryResult, illustratorScope: updated.scope });
@@ -14813,12 +14826,21 @@ async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], 
     return { changed: false, stagedCount: 0, skipped: {} };
   }
   const { candidates, skipped } = collectLiveAppEvidenceCandidates(liveEvidenceRecords);
+  const isIllustratorEvidence = evidence => evidence?.observerMethod === LIVE_APP_OBSERVER_METHODS.ILLUSTRATOR_ACTIVE_SESSION;
+  // A later-started reading was applied, or the activation scope was replaced,
+  // while this batch waited (other apps' checks, locator refresh).
+  const isIllustratorReadingStale = () => isIllustratorQuerySuperseded(projectId, activationToken, illustratorQuery) ||
+    (!!illustratorScope && getIllustratorActivationScope(projectId, activationToken) !== illustratorScope);
   // A trusted Illustrator reading reconciles this session's link rows even when
   // it stages nothing; skip the mutation when there is no such row at all.
   const reconcileReading = illustratorReading && (candidates.length > 0 || hasIllustratorLiveLinkRows(projectId, activationToken))
     ? illustratorReading : null;
   if (candidates.length) {
-    await refreshWorkingSourceLocators(projectId, candidates.map(item => item.evidence.filePath), parentOperation?.current);
+    // A stale reading's paths never reach the locator refresh.
+    const readingStale = isIllustratorReadingStale();
+    const locatorCandidates = readingStale ? candidates.filter(item => !isIllustratorEvidence(item.evidence)) : candidates;
+    await refreshWorkingSourceLocators(projectId, locatorCandidates.map(item => item.evidence.filePath), parentOperation?.current,
+      locatorCandidates.some(item => isIllustratorEvidence(item.evidence)) ? () => !isIllustratorReadingStale() : null);
     if (!isBoundWatchingActivationCurrent(projectId, activationToken) || (parentOperation && !parentOperation.current())) return { cancelled: true, changed: false, stagedCount: 0, skipped };
   }
   const skipSummary = formatLiveAppSkipCounts(skipped);
@@ -14830,12 +14852,13 @@ async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], 
   let illustratorSuperseded = false;
   const result = mutateProject(projectId, (proj) => {
     if (proj.status !== 'watching' || !isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
-    // Decided here, before staging: while this batch waited (other apps' checks,
-    // locator refresh) a later-started reading may have been applied, or the
-    // activation scope replaced. Then this snapshot's Illustrator records and
-    // reconciliation are dropped; other apps' records still stage.
-    illustratorSuperseded = isIllustratorQuerySuperseded(projectId, activationToken, illustratorQuery) ||
-      (!!illustratorScope && getIllustratorActivationScope(projectId, activationToken) !== illustratorScope);
+    // Decided here, before staging. A stale reading's Illustrator records and
+    // reconciliation are dropped, and candidates are chosen as if those records
+    // were never in the batch, so another app's claim for the same path stages.
+    illustratorSuperseded = isIllustratorReadingStale();
+    const stagingCandidates = illustratorSuperseded
+      ? collectLiveAppEvidenceCandidates(liveEvidenceRecords.filter(evidence => !isIllustratorEvidence(evidence))).candidates
+      : candidates;
     let changed = false;
     let evidenceChanged = false;
     let stagedCount = 0;
@@ -14845,11 +14868,10 @@ async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], 
     const newSavedSourcePaths = [];
     const previouslyAccepted = getNormalizedPathSet(proj.files);
     const liveMembership = hasWorkingSourceSelectionState(proj) &&
-      (candidates.some(({ evidence }) => evidence.relationshipSourcePath) || (reconcileReading && reconcileReading.links.size > 0))
+      (stagingCandidates.some(({ evidence }) => evidence.relationshipSourcePath) || (reconcileReading && reconcileReading.links.size > 0))
       ? getWorkingSourceMembership(proj) : null;
 
-    for (const { evidence, ext, owners: batchOwners = [] } of candidates) {
-      if (illustratorSuperseded && evidence.observerMethod === LIVE_APP_OBSERVER_METHODS.ILLUSTRATOR_ACTIVE_SESSION) continue;
+    for (const { evidence, ext, owners: batchOwners = [] } of stagingCandidates) {
       const fileEntry = buildAutoCaptureFileEntry(evidence.filePath, evidence.source, { ext });
       // A link reported for a document the owner excluded (and that no
       // included file retains) is never admitted directly; record which
@@ -14921,7 +14943,6 @@ async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], 
       stagedCount,
       illustratorSuperseded,
       reconciledCount: reconciled.changed,
-      withdrawnPaths: reconciled.withdrawnPaths,
       stagedStates: Array.from(stagedStates.entries()),
       stagedByApp: Array.from(stagedByApp.entries()),
       baselineSourcePaths,
@@ -15366,9 +15387,11 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
     // --- Illustrator ---
     const illustratorQuery = await queryIllustratorActiveState(projectId, activationToken);
     if (illustratorQuery.stale || !getFreshActiveWatchingProject(projectId, activationToken)) return;
-    if (!getIllustratorSnapshotFailureReason(illustratorQuery)) {
+    // A reading older than one already applied never moves working-file locators.
+    const illustratorInOrder = () => !isIllustratorQuerySuperseded(projectId, activationToken, illustratorQuery);
+    if (!getIllustratorSnapshotFailureReason(illustratorQuery) && illustratorInOrder()) {
       await refreshWorkingSourceLocators(projectId, (illustratorQuery.activeState?.documents || []).map(doc => doc.documentPath),
-        () => watcherGeneration === null || getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration));
+        () => watcherGeneration === null || getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration), illustratorInOrder);
       if (!getFreshActiveWatchingProject(projectId, activationToken)) return;
     }
     // A reading older than one already applied adds nothing for Illustrator;
@@ -20922,7 +20945,12 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
 function stopWatching(projectId, { invalidateActivation = true } = {}) {
   closeExistingAssetsNotifications(projectId);
   closeNeedsSaveNotifications(projectId, { forgetSeen: false });
-  if (invalidateActivation) watchingActivationTokens.delete(projectId);
+  if (invalidateActivation) {
+    watchingActivationTokens.delete(projectId);
+    // The paused view still reads the scope; its reading order has ended.
+    const scope = illustratorActivationScopes.get(projectId);
+    if (scope) scope.queryOrder = null;
+  }
   cancelWatcherCoordinator(projectId);
   acceptedSourceWatchSubscriptions.delete(projectId);
   const watcher = watchers.get(projectId);
@@ -21755,6 +21783,28 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   const preScanExistingKeys = getTrackedFileKeySet(project.files);
   const existingPaths = getNormalizedPathSet(project.files);
   const pendingPaths = getNormalizedPathSet(project.pendingFiles);
+  const pendingAtScanStart = new Set(pendingPaths);
+  // Other readings can change the project while this scan runs. Continue from
+  // the current project, keeping what this scan has staged on its working copy.
+  const adoptCurrentProjectForScan = current => {
+    if (current !== project) {
+      const currentFileKeys = getTrackedFileKeySet(current.files), currentPendingKeys = getTrackedFileKeySet(current.pendingFiles);
+      for (const file of project.files || []) {
+        const key = getTrackedFileDedupKey(file);
+        if (!preScanExistingKeys.has(key) && !currentFileKeys.has(key)) { current.files.push(file); currentFileKeys.add(key); }
+      }
+      for (const file of project.pendingFiles || []) {
+        const key = getTrackedFileDedupKey(file);
+        if (pendingAtScanStart.has(normalizeTrackedFilePath(file.path)) || currentPendingKeys.has(key) || currentFileKeys.has(key)) continue;
+        (current.pendingFiles ||= []).push(file);
+        currentPendingKeys.add(key);
+      }
+      project = current;
+    }
+    for (const file of project.files || []) existingPaths.add(normalizeTrackedFilePath(file.path));
+    pendingPaths.clear();
+    for (const pendingPath of getNormalizedPathSet(project.pendingFiles)) pendingPaths.add(pendingPath);
+  };
   const scanMetrics = {
     candidateCount: 0,
     xattrResolvedCount: 0,
@@ -22074,7 +22124,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     if (illustratorSuperseded) {
       // Discard this older reading and go on under the scope the newer one left.
       const currentScope = getIllustratorActivationScope(projectId, illustratorActivationToken);
-      if (!currentScope || !operation.adoptScope(currentScope)) return;
+      if (!currentScope || !operation.adoptScope(currentScope, { allowAdvance: true })) return;
     }
     if (!operationCurrent()) return;
     if (!illustratorSuperseded && !illustratorQuery.stale && getFreshActiveWatchingProject(projectId, illustratorActivationToken)) {
@@ -22084,13 +22134,10 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
       const illustratorReading = createIllustratorLinkReading(projectId, illustratorActivationToken, illustratorQuery, scopeResult, records);
       if (scopeResult.ready || illustratorReading) {
         const refreshed = await applyLiveAppEvidenceRefresh(projectId, records, illustratorActivationToken, operation, { illustratorQuery, illustratorReading }); newCount += refreshed.stagedCount || 0;
-        project = getFreshActiveWatchingProject(projectId, illustratorActivationToken) || project;
-        for (const file of project.files || []) existingPaths.add(normalizeTrackedFilePath(file.path));
-        for (const file of project.pendingFiles || []) pendingPaths.add(normalizeTrackedFilePath(file.path));
-        // A withdrawn link row is no longer pending for later discovery here.
-        for (const withdrawnPath of refreshed.withdrawnPaths || []) pendingPaths.delete(withdrawnPath);
       }
     }
+    const currentProject = getFreshActiveWatchingProject(projectId, illustratorActivationToken);
+    if (currentProject) adoptCurrentProjectForScan(currentProject);
   }
 
   // v2.3.4: do javascript query to Photoshop for smart object / placed item paths.
