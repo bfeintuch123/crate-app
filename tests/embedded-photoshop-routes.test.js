@@ -15,7 +15,7 @@ replaceOnce('                  psd: fixture,',
   "                  psd: originalLoad.call(Module, 'ag-psd/dist/index.js', module).readPsd(fs.readFileSync(filePath), { skipLayerImageData: true, skipCompositeImageData: true, totalMemoryLimit: -Infinity }),\n" +
   "                  framing: require('../parsers/add-files-psd-worker').inspectPsdLinkFraming(fs.readFileSync(filePath)),");
 replaceOnce('      return nextOpenDialogResult;', '      if (globalThis.__embeddedDialog) return globalThis.__embeddedDialog();\n      return nextOpenDialogResult;');
-replaceOnce('  captureProjectOperation,\n  runScanOnOpen', '  clearPsdParseDebounce() { psdParseDebounce.clear(); },\n  isRowExcludedForReview(project, row) { return isAssetReviewFileExcluded(project, row); },\n  fileNodeId(filePath) { return createNodeId(NODE_TYPES.FILE, { normalizedPath: normalizeTrackedFilePath(filePath) }); },\n  sourceRouteKey(project, row) { return getAssetBaselineSourceRecoveryRouteKey(project, row); },\n  captureProjectOperation,\n  runScanOnOpen');
+replaceOnce('  captureProjectOperation,\n  runScanOnOpen', '  clearPsdParseDebounce() { psdParseDebounce.clear(); },\n  isRowExcludedForReview(project, row) { return isAssetReviewFileExcluded(project, row); },\n  fileNodeId(filePath) { return createNodeId(NODE_TYPES.FILE, { normalizedPath: normalizeTrackedFilePath(filePath) }); },\n  sourceRouteKey(project, row) { return getAssetBaselineSourceRecoveryRouteKey(project, row); },\n  watchStagedFiles(observe) { const stage = stageLiveObservedFile; stageLiveObservedFile = (project, file, ...rest) => { observe(file); return stage(project, file, ...rest); }; return () => { stageLiveObservedFile = stage; }; },\n  captureProjectOperation,\n  runScanOnOpen');
 source += '\n(' + cases.toString() + ')();\n';
 const compiled = new Module(entry, module); compiled.filename = entry; compiled.paths = Module._nodeModulePaths(path.dirname(entry)); compiled._compile(source, entry);
 
@@ -267,6 +267,11 @@ function cases() {
     'save scan': async f => { await metadataTestHooks.runScanOnSave(f.id, f.psd, null); },
   };
   const scanOn = async (route, f) => { metadataTestHooks.clearPsdParseDebounce(); await ROUTES[route](f); };
+  // The save scan offers each object to staging; this records the names offered.
+  function stagedSaveEntries() {
+    const seen = new Set(), restore = metadataTestHooks.watchStagedFiles(file => seen.add(file.embeddedOriginalName));
+    return { names: () => [...seen], restore };
+  }
   const memberRows = f => [...f.project().files, ...(f.project().pendingFiles || [])];
   const findRow = (f, fileId) => memberRows(f).find(row => row.fileId === fileId);
   const retiredEntries = f => f.project().retiredEmbeddedDocuments?.entries || [];
@@ -317,15 +322,91 @@ function cases() {
     assert.equal(memberRows(f).filter(row => row.embeddedOriginalName === 'Smart.psb').length, 1); assert.deepEqual(retiredEntries(f), []);
   });
 
-  routeTest('save scan: a logical row is retired only when this scan finds and proves its object', { timeout: 60000 }, async () => {
-    const f = await seededProject();
-    f.project().files.push(logicalRow(f), logicalRow(f, { fileId: 'no-print', embeddedIndex: 0, embeddedOriginalName: 'Smart.psb', name: 'Smart_copy.psb', embeddedContentFingerprint: undefined }));
-    f.project().files.push(logicalRow(f, { fileId: 'other-bytes', name: 'Other.psb', embeddedContentFingerprint: `9:${'0'.repeat(64)}` }));
+  routeTest('save scan: a logical row is retired when its recorded bytes are the proven object', { timeout: 60000 }, async () => {
+    const f = await seededProject(); f.project().files.push(logicalRow(f));
     await scanOn('save scan', f);
-    assert.equal(findRow(f, 'logical-row'), undefined); assert.equal(findRow(f, 'no-print'), undefined);
-    assert.ok(findRow(f, 'other-bytes'), 'recorded bytes differ');
-    assert.deepEqual(retiredEntries(f).map(entry => entry.row.fileId).sort(), ['logical-row', 'no-print']);
-    assert.equal(memberRows(f).some(row => row.source === 'scan-on-save-embedded' && row.embeddedOriginalName === 'Smart.psb' && row.fileId !== 'other-bytes'), false);
+    assert.equal(findRow(f, 'logical-row'), undefined);
+    assert.deepEqual(retiredEntries(f).map(entry => entry.row.fileId), ['logical-row']);
+    assert.equal(memberRows(f).some(row => row.embeddedOriginalName === 'Smart.psb'), false);
+  });
+
+  for (const [label, overrides] of [
+    ['no recorded content fingerprint', { embeddedContentFingerprint: undefined }],
+    ['other recorded bytes', { embeddedContentFingerprint: `9:${'0'.repeat(64)}` }],
+  ]) {
+    routeTest(`a logical row with ${label} stays, and its object keeps its handling`, { timeout: 60000 }, async () => {
+      const f = await seededProject(); f.project().files.push(logicalRow(f, overrides)); await settled(f);
+      await scanOn('pre-package scan', f);
+      assert.ok(findRow(f, 'logical-row')); assert.deepEqual(retiredEntries(f), []);
+      assert.ok(memberRows(f).some(row => row.psdExtractionReceipt?.outputDigest === sha(f.smart)), 'the object is exported as before');
+    });
+  }
+
+  // --- One decision per embedded object, across both kinds of row -------------
+  routeTest('an Include on the logical row keeps the object cache row', { timeout: 60000 }, async () => {
+    const f = await seededProject(), row = seedRow(f); f.project().files.push(row, logicalRow(f, { individualContentInclude: `${f.smart.length}:${sha(f.smart)}` })); await settled(f);
+    const before = plain(findRow(f, 'seed-row'));
+    await scanOn('pre-package scan', f);
+    assert.deepEqual(plain(findRow(f, 'seed-row')), before); assert.ok(findRow(f, 'logical-row')); assert.deepEqual(retiredEntries(f), []);
+  });
+  routeTest('an Include on the logical row gives an excluded cache row replacement output when bytes change', { timeout: 60000 }, async () => {
+    const f = await seededProject(), row = seedRow(f);
+    f.project().files.push(row, logicalRow(f, { individualContentInclude: `${f.smart.length}:${sha(f.smart)}` })); f.project().excludedAssetKeys = [row.fileId]; await settled(f);
+    const edited = plainDocument('edited-with-logical-include'); f.rewrite(edited, 'edited-parent');
+    await scanOn('pre-package scan', f);
+    assert.ok(findRow(f, 'seed-row'));
+    assert.ok(memberRows(f).some(item => item.psdExtractionReceipt?.outputDigest === sha(edited)), 'a replacement output exists');
+    assert.ok(cacheNames(f.id).length >= 3, cacheNames(f.id).join());
+  });
+  routeTest('an Include on the cache row keeps save-scan handling for an excluded logical row', { timeout: 60000 }, async () => {
+    const f = await seededProject(), row = seedRow(f); row.keptAfterSourceExclusion = true;
+    const excludedPrint = `${f.smart.length}:${sha(f.smart)}`;
+    f.project().files.push(row, logicalRow(f, { individualContentExclusion: excludedPrint })); await settled(f);
+    const edited = plainDocument('edited-with-cache-include'); f.rewrite(edited, 'edited-parent');
+    const staged = stagedSaveEntries(); try { await scanOn('save scan', f); } finally { staged.restore(); }
+    assert.ok(findRow(f, 'seed-row')); assert.ok(findRow(f, 'logical-row')); assert.deepEqual(retiredEntries(f), []);
+    assert.ok(staged.names().includes('Smart.psb'), 'the object still goes through save-scan staging');
+  });
+  routeTest('a row that could be either of two same-named objects keeps both objects as they are', { timeout: 60000 }, async () => {
+    const f = await seededProject(), other = plainDocument('same-name-other'), otherId = psdFixtures.guid('other');
+    fs.writeFileSync(f.psd, parentPsd([{ ...embedded('Smart.psb', other), id: otherId }, { ...embedded('Smart.psb', f.smart), id: f.smartId }], 'reordered'));
+    // Recorded at index 0 with the bytes now at index 1.
+    const row = seedRow(f); f.project().files.push(row); await settled(f);
+    await scanOn('pre-package scan', f);
+    assert.ok(findRow(f, 'seed-row')); assert.deepEqual(retiredEntries(f), []);
+    assert.ok(memberRows(f).some(item => item.psdExtractionReceipt?.outputDigest === sha(other)), 'the other object is handled as before');
+  });
+  routeTest('a choice on the other kind of row made during the scan keeps the object', { timeout: 60000 }, async () => {
+    const f = await seededProject(), row = seedRow(f), logical = logicalRow(f); f.project().files.push(row, logical); await settled(f);
+    const hold = holdRead(f.psd, 1); metadataTestHooks.clearPsdParseDebounce();
+    try {
+      const scan = ROUTES['pre-package scan'](f); await hold.started;
+      findRow(f, 'logical-row').individualContentInclude = `${f.smart.length}:${sha(f.smart)}`; hold.release(); await scan;
+      assert.ok(findRow(f, 'seed-row')); assert.deepEqual(retiredEntries(f).map(entry => entry.row.fileId), []);
+    } finally { hold.restore(); }
+  });
+
+  // --- A sibling cannot bring a proven object in -------------------------------
+  for (const [label, siblingBytes] of [['keeping its bytes', f => f.texture], ['with new bytes', () => png('sibling-edited')]]) {
+    routeTest(`save scan: renaming another embedded file ${label} admits no proven object`, { timeout: 60000 }, async () => {
+      const f = await seededProject(), textureFingerprint = `${f.texture.length}:${sha(f.texture)}`;
+      await scanOn('save scan', f);
+      assert.deepEqual(memberRows(f).filter(row => row.source === 'scan-on-save-embedded').map(row => row.embeddedOriginalName), ['Texture.png']);
+      memberRows(f).find(row => row.embeddedOriginalName === 'Texture.png').individualContentInclude = textureFingerprint; await settled(f);
+      fs.writeFileSync(f.psd, parentPsd([{ ...embedded('Smart.psb', f.smart), id: f.smartId }, { ...embedded('Renamed.png', siblingBytes(f), { type: 'png ' }), id: f.textureId }], 'renamed-sibling'));
+      await scanOn('save scan', f);
+      const smartRows = memberRows(f).filter(row => row.embeddedOriginalName === 'Smart.psb');
+      assert.deepEqual(smartRows, []);
+      assert.ok(memberRows(f).some(row => row.embeddedOriginalName === 'Renamed.png'));
+    });
+  }
+  routeTest('a proven object with its own Include is never put on hold by a sibling', { timeout: 60000 }, async () => {
+    const f = await seededProject(), fingerprint = `${f.smart.length}:${sha(f.smart)}`;
+    f.project().files.push(logicalRow(f, { individualContentInclude: fingerprint }), logicalRow(f, { fileId: 'sibling', name: 'Texture.png', ext: '.png', embeddedOriginalName: 'Texture.png', embeddedIndex: 1,
+      embeddedContentFingerprint: `${f.texture.length}:${sha(f.texture)}`, individualContentInclude: `${f.texture.length}:${sha(f.texture)}` })); await settled(f);
+    fs.writeFileSync(f.psd, parentPsd([{ ...embedded('Smart.psb', f.smart), id: f.smartId }, { ...embedded('Renamed.png', png('changed-sibling'), { type: 'png ' }), id: f.textureId }], 'held-sibling'));
+    await scanOn('save scan', f);
+    assert.equal(memberRows(f).filter(row => row.embeddedOriginalName === 'Smart.psb').some(row => row.individualChoiceReview !== undefined), false);
   });
 
   const KEPT_ROWS = {

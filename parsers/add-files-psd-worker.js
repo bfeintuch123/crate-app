@@ -7,6 +7,8 @@ const { createReader } = require('ag-psd/dist/psdReader');
 const { readVersionAndDescriptor } = require('ag-psd/dist/descriptor');
 
 const MAX_PARSE_FILE_SIZE = 300 * 1024 * 1024;
+// Additional-info keys with 8-byte lengths in large documents, as ag-psd reads them.
+const LARGE_ADDITIONAL_INFO_KEYS = new Set(['LMsk', 'Lr16', 'Lr32', 'Layr', 'Mt16', 'Mt32', 'Mtrn', 'Alph', 'FMsk', 'lnk2', 'FEid', 'FXid', 'PxSD', 'cinf']);
 
 function getParentPort() {
   if (process.parentPort) return process.parentPort;
@@ -58,7 +60,10 @@ function parsePsd(filePath) {
 // A bounded section walk, not a second PSD/descriptor parser. This supplies
 // wire facts absent from ag-psd's parsed objects. It cannot establish that this
 // named smart-object domain contains every reference required by a PSD.
-function inspectPsdLinkFraming(buffer) {
+// `allowLarge` also walks large-format documents; only the embedded-document
+// proof asks for it, so every other caller's facts stay as they are.
+function inspectPsdLinkFraming(buffer, { allowLarge = false } = {}) {
+  let large = false;
   const facts = { domain: 'psd-v1-link-and-media-descriptors', version: 3,
     status: 'incomplete', records: [], mediaCarriers: [], keys: [], resourceIds: [], issues: [], notes: [] };
   let offset = 0;
@@ -85,6 +90,8 @@ function inspectPsdLinkFraming(buffer) {
     if (u32(end) !== 0) throw new Error('unsupported-large-length');
     return u32(end);
   }
+  function section64(end) { const size = length64(end); need(size, end); return offset + size; }
+  const documentSection = end => (large ? section64(end) : section(end));
   function unicode(end) {
     const units = u32(end);
     if (units > 16384) throw new Error('coverage-limit');
@@ -212,7 +219,7 @@ function inspectPsdLinkFraming(buffer) {
       if (!['8BIM', '8B64'].includes(sig)) throw new Error('unsupported-additional-signature');
       const key = signature(end);
       if (facts.keys.length < 128 && !facts.keys.includes(key)) facts.keys.push(key);
-      const blockSize = sig === '8B64' ? length64(end) : u32(end);
+      const blockSize = sig === '8B64' || (large && LARGE_ADDITIONAL_INFO_KEYS.has(key)) ? length64(end) : u32(end);
       need(blockSize, end);
       const blockEnd = offset + blockSize;
       const size = blockEnd - offset;
@@ -250,7 +257,7 @@ function inspectPsdLinkFraming(buffer) {
       skip(16, layerEnd);
       const channelCount = u16(layerEnd);
       if (channelCount > 56) throw new Error('unsupported-layer-channels');
-      for (let c = 0; c < channelCount; c++) { skip(2, layerEnd); channelBytes += u32(layerEnd); }
+      for (let c = 0; c < channelCount; c++) { skip(2, layerEnd); channelBytes += large ? length64(layerEnd) : u32(layerEnd); }
       if (signature(layerEnd) !== '8BIM') throw new Error('invalid-layer-signature');
       skip(8, layerEnd); // blend mode, opacity, clipping, flags, filler
       const extraEnd = section(layerEnd);
@@ -272,7 +279,9 @@ function inspectPsdLinkFraming(buffer) {
   }
   try {
     const end = buffer.length;
-    if (signature(end) !== '8BPS' || u16(end) !== 1) throw new Error('unsupported-psd-version');
+    const isPhotoshop = signature(end) === '8BPS', version = u16(end);
+    if (!isPhotoshop || !(version === 1 || (allowLarge && version === 2))) throw new Error('unsupported-psd-version');
+    large = version === 2;
     skip(6, end);
     const channels = u16(end);
     skip(8, end); // dimensions; semantic decoding belongs to ag-psd
@@ -294,9 +303,9 @@ function inspectPsdLinkFraming(buffer) {
       offset = resourceEnd;
       skip(size % 2, resourcesEnd);
     }
-    const maskEnd = section(end);
+    const maskEnd = documentSection(end);
     if (offset < maskEnd) {
-      const layerEnd = section(maskEnd);
+      const layerEnd = documentSection(maskEnd);
       const layerStart = offset;
       if (offset < layerEnd) {
         layerInfo(layerEnd);
@@ -357,7 +366,7 @@ function hasCompletePhotoshopSections(bytes) {
   offset += 2;
   const remaining = bytes.length - offset;
   if (compression === 0) return remaining === channels * height * Math.ceil(width * depth / 8);
-  if (compression === 2 || compression === 3) return remaining > 0;
+  // A compressed composite cannot be shown complete without inflating it.
   if (compression !== 1) return false;
   const rows = channels * height, entryBytes = version === 2 ? 4 : 2;
   if (rows * entryBytes > remaining) return false;
@@ -417,6 +426,13 @@ function isProvenEmbeddedDocument(data, budget, limits, depth = 1) {
   if (!psd || typeof psd !== 'object') return false;
   const links = collectDocumentLinkRecords(psd, budget, limits);
   if (!links) return false;
+  // What ag-psd leaves out of its parsed result still shows in the raw walk: any
+  // doubt there, or any media carrier at all, leaves the document not proven.
+  const framing = inspectPsdLinkFraming(bytes, { allowLarge: true });
+  if (framing.status !== 'framed' || framing.issues.length || framing.notes.length || framing.mediaCarriers.length) return false;
+  const wireIds = framing.records.map(item => item.id).sort();
+  if (framing.records.some(item => item.type !== 'liFD' || item.carrier === 'lnkE' || item.tailBytes !== 0) ||
+      JSON.stringify(wireIds) !== JSON.stringify(links.records.map(record => record?.id).sort())) return false;
   const ids = new Set();
   for (const record of links.records) {
     if (!record || typeof record !== 'object' || ++budget.records > limits.records) return false;

@@ -9,6 +9,67 @@ function guid(label) {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
+// Offsets of a written document's sections, for edits ag-psd's writer cannot make.
+function documentLayout(bytes) {
+  const large = bytes.readUInt16BE(4) === 2, sizeBytes = large ? 8 : 4;
+  const readSize = at => (large ? bytes.readUInt32BE(at + 4) : bytes.readUInt32BE(at));
+  const colorEnd = 30 + bytes.readUInt32BE(26);
+  const mask = colorEnd + 4 + bytes.readUInt32BE(colorEnd);
+  const layers = mask + sizeBytes, maskEnd = layers + readSize(mask);
+  return { large, sizeBytes, readSize, mask, layers, maskEnd, firstLayer: layers + sizeBytes + 2 };
+}
+function withSizes(bytes, layout, grown, positions) {
+  for (const { at, wide } of positions) {
+    const offset = wide ? at + 4 : at;
+    bytes.writeUInt32BE(bytes.readUInt32BE(offset) + grown, offset);
+  }
+  return bytes;
+}
+// One additional-info block appended to the first layer.
+function withLayerBlock(original, key, payload) {
+  const layout = documentLayout(original);
+  let offset = layout.firstLayer + 16;
+  const channels = original.readUInt16BE(offset);
+  offset += 2 + channels * (2 + layout.sizeBytes) + 12;
+  const extraEnd = offset + 4 + original.readUInt32BE(offset);
+  const block = Buffer.alloc(12 + payload.length + payload.length % 2);
+  block.write('8BIM'); block.write(key, 4); block.writeUInt32BE(payload.length, 8); payload.copy(block, 12);
+  return withSizes(Buffer.concat([original.subarray(0, extraEnd), block, original.subarray(extraEnd)]), layout, block.length,
+    [{ at: offset, wide: false }, { at: layout.layers, wide: layout.large }, { at: layout.mask, wide: layout.large }]);
+}
+// One additional-info block at the end of the layer and mask section.
+function withDocumentBlock(original, key, payload, { wideLength = false } = {}) {
+  const layout = documentLayout(original), lengthBytes = wideLength ? 8 : 4;
+  const block = Buffer.alloc(8 + lengthBytes + payload.length + payload.length % 2);
+  block.write('8BIM'); block.write(key, 4); block.writeUInt32BE(payload.length, 8 + lengthBytes - 4); payload.copy(block, 8 + lengthBytes);
+  return withSizes(Buffer.concat([original.subarray(0, layout.maskEnd), block, original.subarray(layout.maskEnd)]), layout, block.length,
+    [{ at: layout.mask, wide: layout.large }]);
+}
+// The composite image replaced by a compression code and these bytes.
+function withComposite(original, compression, payload) {
+  const code = Buffer.alloc(2); code.writeUInt16BE(compression);
+  return Buffer.concat([original.subarray(0, documentLayout(original).maskEnd), code, payload]);
+}
+// A video source descriptor in the layout Photoshop stores, linking a movie.
+function pixelSourcePayload({ pixelType, fullPath }) {
+  const w = require('ag-psd/dist/psdWriter'), writer = w.createWriter();
+  const id = value => { w.writeUint32(writer, value.length === 4 ? 0 : value.length); w.writeAsciiString(writer, value); };
+  function descriptor(classId, fields) {
+    w.writeUnicodeStringWithPadding(writer, ''); id(classId); w.writeUint32(writer, fields.length);
+    for (const [key, type, value] of fields) {
+      id(key); w.writeSignature(writer, type);
+      if (type === 'Objc') descriptor(value[0], value[1]);
+      else if (type === 'long') w.writeInt32(writer, value);
+      else if (type === 'TEXT') w.writeUnicodeString(writer, value);
+    }
+  }
+  w.writeUint32(writer, 16);
+  descriptor('PixelSource', [['pixelSourceType', 'long', pixelType], ['descVersion', 'long', 1],
+    ['frameReader', 'Objc', ['FrameReader', [['frameReaderType', 'long', 1364477522], ['descVersion', 'long', 1],
+      ['Lnk ', 'Objc', ['ExternalFileLink', [['descVersion', 'long', 2], ['Nm  ', 'TEXT', 'clip.mov'], ['fullPath', 'TEXT', fullPath]]]]]]]]);
+  return Buffer.from(w.getWriterBuffer(writer));
+}
+
 function createFixtures(agPsd) {
   function pixels(size, seed) {
     const data = new Uint8ClampedArray(size * size * 4);
@@ -38,4 +99,4 @@ function createFixtures(agPsd) {
   return { guid, pixels, layer, write, embedded, external, plainDocument, documentHolding, png, parentPsd };
 }
 
-module.exports = { createFixtures };
+module.exports = { createFixtures, withLayerBlock, withDocumentBlock, withComposite, pixelSourcePayload };

@@ -5,9 +5,10 @@
 const test = require('node:test');
 const assert = require('./bounded-assert');
 const Module = require('node:module');
+const zlib = require('node:zlib');
 const agPsd = require('ag-psd');
 const worker = require('../parsers/add-files-psd-worker');
-const { createFixtures } = require('./fixtures/embedded-photoshop-documents.cjs');
+const { createFixtures, withLayerBlock, withDocumentBlock, withComposite, pixelSourcePayload } = require('./fixtures/embedded-photoshop-documents.cjs');
 
 const { isProvenEmbeddedDocumentBytes: isProven, createEmbeddedDocumentClassifier, inspectPsdLinkFraming, EMBEDDED_DOCUMENT_LIMITS } = worker;
 const fixtures = createFixtures(agPsd);
@@ -103,22 +104,69 @@ test('external and alias type codes anywhere in the bytes leave a document not p
   }
 });
 
+for (const [format, options] of [['PSD', { psb: false }], ['PSB', { psb: true }]]) {
+  test(`${format}: a movie link in a media source ag-psd drops is not self-contained`, () => {
+    const plain = plainDocument(`media-${format}`, options);
+    assert.equal(isProven(plain), true, 'control');
+    const movie = withLayerBlock(plain, 'PxSc', pixelSourcePayload({ pixelType: 99, fullPath: '/Users/synthetic/outside/clip.mov' }));
+    assert.equal(read(movie).children[0].pixelSource, undefined, 'the parser does not show it');
+    assert.equal(isProven(movie), false);
+    assert.equal(isProven(documentHolding([embedded('inner.psb', movie)])), false, 'at any depth');
+    const { results } = classifyParent([embedded('Movie.psb', movie)]);
+    assert.deepEqual(Object.values(results), [false]);
+  });
+
+  test(`${format}: an alternate layer carrier ag-psd does not read is not self-contained`, () => {
+    const carrier = withDocumentBlock(plainDocument(`carrier-${format}`, options), 'Lr16', Buffer.alloc(2), { wideLength: options.psb });
+    assert.ok(read(carrier).children.length > 0);
+    assert.equal(isProven(carrier), false);
+  });
+
+  test(`${format}: a compressed composite is not proven, whatever it holds`, () => {
+    const plain = plainDocument(`zip-${format}`, options);
+    const valid = zlib.deflateSync(Buffer.alloc(8 * 8 * 4, 7));
+    for (const compression of [2, 3]) {
+      for (const [label, payload] of [['one byte', Buffer.from([1])], ['garbage', Buffer.from('not-a-zip-stream-but-nonzero')], ['a real stream', valid]]) {
+        const bytes = withComposite(plain, compression, payload);
+        assert.doesNotThrow(() => read(bytes));
+        assert.equal(isProven(bytes), false, `compression ${compression}: ${label}`);
+      }
+    }
+  });
+}
+
+test('raw link records must agree with the parsed ones', () => {
+  const inner = documentHolding([embedded('inner.png', png(9), { type: 'png ' })]);
+  assert.equal(isProven(inner), true);
+  const parsed = read(inner);
+  assert.equal(workerParsing({ ...parsed, linkedFiles: [] }).isProvenEmbeddedDocumentBytes(inner), false, 'a raw record the parser did not return');
+  const extra = { id: guid('extra'), name: 'extra.png', data: new Uint8Array(png(10)) };
+  assert.equal(workerParsing({ ...parsed, linkedFiles: [...parsed.linkedFiles, extra] }).isProvenEmbeddedDocumentBytes(inner), false, 'a parsed record with no raw one');
+});
+
+test('the raw walk of ordinary callers still refuses large documents', () => {
+  const facts = inspectPsdLinkFraming(plainDocument('ordinary'));
+  assert.equal(facts.status, 'incomplete');
+  assert.equal(inspectPsdLinkFraming(plainDocument('allowed'), { allowLarge: true }).status, 'framed');
+});
+
 test('parsed link fields refuse the document even when the bytes look clean', () => {
-  const bytes = plainDocument('parsed');
   const id = guid('parsed');
   const record = { id, name: 'in.png', data: new Uint8Array(png(5)) };
+  // Raw records and parsed records agree, so only the parsed field can refuse.
+  const bytes = documentHolding([{ ...embedded('in.png', png(5), { type: 'png ' }), id }]);
   const cases = {
-    'layer linkedFile': { children: [{ linkedFile: { fullPath: '/Users/synthetic/a.png' } }] },
-    'media link': { children: [{ pixelSource: { frameReader: { link: { fullPath: '/Users/synthetic/a.mov' } } } }] },
-    'empty media link': { children: [{ pixelSource: { frameReader: { link: {} } } }] },
-    'timeline clip link': { imageResources: { timelineInformation: { audioClipGroups: [{ audioClips: [{ frameReader: { link: { fullPath: '/Users/synthetic/a.wav' } } }] }] } } },
-    'malformed timeline': { imageResources: { timelineInformation: { audioClipGroups: {} } } },
+    'layer linkedFile': { linkedFiles: [record], children: [{ linkedFile: { fullPath: '/Users/synthetic/a.png' } }] },
+    'media link': { linkedFiles: [record], children: [{ pixelSource: { frameReader: { link: { fullPath: '/Users/synthetic/a.mov' } } } }] },
+    'empty media link': { linkedFiles: [record], children: [{ pixelSource: { frameReader: { link: {} } } }] },
+    'timeline clip link': { linkedFiles: [record], imageResources: { timelineInformation: { audioClipGroups: [{ audioClips: [{ frameReader: { link: { fullPath: '/Users/synthetic/a.wav' } } }] }] } } },
+    'malformed timeline': { linkedFiles: [record], imageResources: { timelineInformation: { audioClipGroups: {} } } },
     'record with descriptor': { linkedFiles: [{ ...record, linkedFile: { fullPath: '/Users/synthetic/a.png' } }] },
     'record without bytes': { linkedFiles: [{ id, name: 'in.png' }] },
     'record without id': { linkedFiles: [{ name: 'in.png', data: record.data }] },
     'duplicate ids': { linkedFiles: [record, { ...record }] },
-    'placed layer with no record': { children: [{ placedLayer: { id: guid('missing') } }] },
-    'placed layer without id': { children: [{ placedLayer: {} }] },
+    'placed layer with no record': { linkedFiles: [record], children: [{ placedLayer: { id: guid('missing') } }] },
+    'placed layer without id': { linkedFiles: [record], children: [{ placedLayer: {} }] },
   };
   for (const [name, parsed] of Object.entries(cases)) assert.equal(workerParsing(parsed).isProvenEmbeddedDocumentBytes(bytes), false, name);
   assert.equal(workerParsing({ linkedFiles: [record], children: [{ placedLayer: { id } }] }).isProvenEmbeddedDocumentBytes(bytes), true, 'control');

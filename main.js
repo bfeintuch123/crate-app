@@ -16668,12 +16668,29 @@ function createEmbeddedDocumentScan(projectId, psdFilePath, isCurrent) {
     typeof receipt.parentPath === 'string' && normalizeTrackedFilePath(receipt.parentPath) === parentKey;
   const isLogicalChild = row => isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.parentPsd || row.path) === parentKey;
   const samePlace = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
-  const isObjectOfRow = (record, receipt) => receipt.originalName === record.originalName && (receipt.outputDigest === record.outputDigest ||
-    (receipt.linkedIndex === record.linkedIndex && samePlace(receipt.layerPath, record.layerPath)) ||
-    (!!record.producerId && receipt.producerId === record.producerId));
-  const isRecordOfLogicalRow = (record, row) => record.layerPath === null && row.embeddedIndex === record.linkedIndex &&
-    row.embeddedOriginalName === record.originalName;
   const fingerprintOf = record => `${record.byteLength}:${record.outputDigest}`;
+
+  // The objects of this read a row of this PSD can stand for: a cache output and
+  // a logical save row of one object are the same object. An exact match decides
+  // alone; otherwise every object sharing its place, bytes or producer counts, and
+  // more than one is ambiguous. Null means the row is not of this PSD.
+  function objectsOfRow(row, records) {
+    const isOutput = row.source === 'psd-embedded';
+    const receipt = isOutput ? row.psdExtractionReceipt || row.psdResource : null;
+    if (isOutput ? !isOwnReceipt(receipt) : !isLogicalChild(row)) return null;
+    const named = records.filter(record => record.originalName === (isOutput ? receipt.originalName : row.embeddedOriginalName));
+    const isAtPlace = record => (isOutput
+      ? record.linkedIndex === receipt.linkedIndex && samePlace(record.layerPath, receipt.layerPath)
+      : record.layerPath === null && record.linkedIndex === row.embeddedIndex);
+    const hasBytes = record => (isOutput ? record.outputDigest === receipt.outputDigest
+      : [row.embeddedContentFingerprint, row.individualContentExclusion, row.individualContentInclude].includes(fingerprintOf(record)));
+    const exact = named.filter(record => isAtPlace(record) && hasBytes(record));
+    if (exact.length === 1) return exact;
+    const producerId = isOutput && receipt.producerId;
+    const isProducer = record => !!producerId && record.producerId === producerId &&
+      records.filter(item => item.producerId === producerId).length === 1;
+    return named.filter(record => isAtPlace(record) || hasBytes(record) || isProducer(record));
+  }
 
   async function isProvenCachedRow(row, receipt, provenDigests, directory) {
     const found = fs.lstatSync(row.path);
@@ -16694,9 +16711,9 @@ function createEmbeddedDocumentScan(projectId, psdFilePath, isCurrent) {
     classify(psd, buffer) {
       return createEmbeddedDocumentClassifier(psd, () => inspectPsdLinkFraming(buffer));
     },
-    // `records` are this read's embedded objects. With `logicalRows`, the rows
-    // that keep an object are the save scan's logical rows, not cache outputs.
-    async prepare(records, { logicalRows = false } = {}) {
+    // `records` are this read's embedded objects. Each proven object is decided
+    // once, from all of its rows of either kind.
+    async prepare(records) {
       const project = getProjects().find(item => item.id === projectId);
       const plan = { retire: [], retiringKeys: new Set(), ignoredRowKeys: new Set(), omitted: new Set(), records };
       scan.plan = plan;
@@ -16706,8 +16723,7 @@ function createEmbeddedDocumentScan(projectId, psdFilePath, isCurrent) {
       const pathCounts = new Map();
       for (const { row } of members) { const key = normalizeTrackedFilePath(row.path); pathCounts.set(key, (pathCounts.get(key) || 0) + 1); }
       const canRetire = getRetiredEmbeddedDocumentEntries(project) !== null;
-      const proven = records.filter(record => record.proven);
-      const provenDigests = new Set(proven.map(record => record.outputDigest));
+      const provenDigests = new Set(records.filter(record => record.proven).map(record => record.outputDigest));
       const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + projectId);
       let directory = null;
       try { directory = captureCacheDirectoryIdentity(extractDir, 'psd-extract-directory'); } catch (_) {}
@@ -16716,61 +16732,53 @@ function createEmbeddedDocumentScan(projectId, psdFilePath, isCurrent) {
       const isNamedElsewhere = row => Object.entries(project.workingSourceVerification || {}).some(([key, record]) => key !== parentRecordKey &&
         [...(record?.requiredEmbeddedOutputs || []), ...(record?.requiredReferences || [])]
           .some(ref => normalizeTrackedFilePath(ref?.path) === normalizeTrackedFilePath(row.path)));
-      const choices = new Map();
-      const retire = (row, collection, snapshot, receipt = null) => {
-        plan.retire.push({ collection, json: JSON.stringify(row), snapshot, receipt, key: getTrackedFileDedupKey(row),
+      const choices = new Map(), objectsByRow = new Map(), retirable = new Map();
+      const rowsByObject = new Map(records.map(record => [record, []]));
+      for (const member of members) {
+        const { row, collection } = member, objects = objectsOfRow(row, records);
+        if (!objects) continue;
+        objectsByRow.set(row, objects);
+        for (const record of objects) rowsByObject.get(record).push(row);
+        const choice = getEmbeddedRowOwnerChoice(project, row, context);
+        choices.set(row, choice);
+        if (choice || !canRetire || objects.length > 1 || objects.some(record => !record.proven)) continue;
+        if (row.source !== 'psd-embedded') {
+          if (objects.length === 1 && row.embeddedContentFingerprint === fingerprintOf(objects[0])) retirable.set(row, { collection, snapshot: null, receipt: null });
+          continue;
+        }
+        const receipt = row.psdExtractionReceipt || row.psdResource, evidence = row.captureEvidence || {};
+        const relationship = [row.assetBaselineSourcePath, evidence.relationshipSourcePath, evidence.sourceDocumentPath, ...(row.dependencyOwners || [])];
+        if (!directory || !isDirectCacheChild(extractDir, row.path) || pathCounts.get(normalizeTrackedFilePath(row.path)) !== 1 ||
+            !/^[a-f0-9]{64}$/.test(receipt.outputDigest || '') || typeof receipt.originalName !== 'string' ||
+            relationship.some(value => value !== undefined && value !== null && normalizeTrackedFilePath(value) !== parentKey) ||
+            isNamedElsewhere(row)) continue;
+        try {
+          await new Promise(resolve => setImmediate(resolve));
+          if (!isCurrent()) return plan;
+          const snapshot = await isProvenCachedRow(row, receipt, provenDigests, directory);
+          if (snapshot) retirable.set(row, { collection, snapshot, receipt });
+        } catch (_) { if (!isCurrent()) return plan; }
+      }
+      const retire = (row, record) => {
+        const { collection, snapshot, receipt } = retirable.get(row);
+        plan.retire.push({ collection, json: JSON.stringify(row), snapshot, receipt, record, key: getTrackedFileDedupKey(row),
           reason: EMBEDDED_DOCUMENT_RETIREMENT_REASON });
         plan.retiringKeys.add(getTrackedFileDedupKey(row));
       };
-      for (const { row, collection } of members) {
-        if (row.source === 'psd-embedded') {
-          const receipt = row.psdExtractionReceipt || row.psdResource;
-          if (!isOwnReceipt(receipt)) continue;
-          const choice = getEmbeddedRowOwnerChoice(project, row, context);
-          choices.set(row, choice);
-          const evidence = row.captureEvidence || {};
-          const relationship = [row.assetBaselineSourcePath, evidence.relationshipSourcePath, evidence.sourceDocumentPath, ...(row.dependencyOwners || [])];
-          if (choice || !canRetire || !directory || !isDirectCacheChild(extractDir, row.path) ||
-              pathCounts.get(normalizeTrackedFilePath(row.path)) !== 1 ||
-              !/^[a-f0-9]{64}$/.test(receipt.outputDigest || '') || typeof receipt.originalName !== 'string' ||
-              relationship.some(value => value !== undefined && value !== null && normalizeTrackedFilePath(value) !== parentKey) ||
-              isNamedElsewhere(row) ||
-              records.some(record => !record.proven && record.outputDigest === receipt.outputDigest &&
-                record.originalName === receipt.originalName)) continue;
-          try {
-            await new Promise(resolve => setImmediate(resolve));
-            if (!isCurrent()) return plan;
-            const snapshot = await isProvenCachedRow(row, receipt, provenDigests, directory);
-            if (snapshot) retire(row, collection, snapshot, receipt);
-          } catch (_) { if (!isCurrent()) return plan; }
-        } else if (isLogicalChild(row)) {
-          const choice = getEmbeddedRowOwnerChoice(project, row, context);
-          choices.set(row, choice);
-          const record = proven.find(item => isRecordOfLogicalRow(item, row));
-          if (!record) continue;
-          if (choice === 'excluded') plan.ignoredRowKeys.add(getTrackedFileDedupKey(row));
-          if (!choice && canRetire && (row.embeddedContentFingerprint === undefined ||
-              row.embeddedContentFingerprint === fingerprintOf(record))) retire(row, collection, null);
+      for (const record of records.filter(item => item.proven)) {
+        const rows = rowsByObject.get(record);
+        // Anything but an exclusion or a retirable row keeps the object's complete
+        // handling, so a kept row never loses its bytes.
+        if (rows.some(row => objectsByRow.get(row).length > 1 || choices.get(row) === 'kept' ||
+            (!choices.get(row) && !retirable.has(row)))) continue;
+        plan.omitted.add(record);
+        for (const row of rows) {
+          if (choices.get(row) === 'excluded') plan.ignoredRowKeys.add(getTrackedFileDedupKey(row));
+          else retire(row, record);
         }
       }
-      const isRemaining = row => !plan.retiringKeys.has(getTrackedFileDedupKey(row));
-      const outputOwners = record => members.map(({ row }) => row).filter(row => isRemaining(row) && row.source === 'psd-embedded' &&
-        isOwnReceipt(row.psdExtractionReceipt || row.psdResource) && isObjectOfRow(record, row.psdExtractionReceipt || row.psdResource));
-      const logicalOwners = record => members.map(({ row }) => row).filter(row => isRemaining(row) && isLogicalChild(row) && isRecordOfLogicalRow(record, row));
-      const isKept = row => choices.get(row) !== 'excluded';
-      // An excluded row stays as it is and packages nothing. Any other kept row
-      // keeps its object's complete handling, so it keeps its bytes, and that
-      // object's own outputs stay: retiring one would only make it again.
-      for (const record of proven.filter(item => outputOwners(item).some(isKept))) {
-        plan.retire = plan.retire.filter(item => !item.receipt || !isObjectOfRow(record, item.receipt));
-      }
-      plan.retiringKeys = new Set(plan.retire.map(item => item.key));
-      for (const record of proven) {
-        const owners = logicalRows ? logicalOwners(record) : outputOwners(record);
-        if (owners.some(isKept)) continue;
-        plan.omitted.add(record);
-        for (const row of owners) plan.ignoredRowKeys.add(getTrackedFileDedupKey(row));
-      }
+      // An output of an object this PSD no longer holds is judged by its own bytes.
+      for (const row of retirable.keys()) if (!objectsByRow.get(row).length) retire(row, null);
       for (const key of plan.retiringKeys) plan.ignoredRowKeys.add(key);
       return plan;
     },
@@ -16781,11 +16789,15 @@ function createEmbeddedDocumentScan(projectId, psdFilePath, isCurrent) {
     apply(project) {
       const plan = scan.plan, entries = getRetiredEmbeddedDocumentEntries(project);
       if (!plan?.retire.length || !entries) return 0;
-      const context = {}, retired = [], byJson = new Map();
-      for (const collection of ['files', 'pendingFiles']) for (const row of project[collection] || []) byJson.set(collection + '\0' + JSON.stringify(row), row);
+      const context = {}, retired = [], byJson = new Map(), keptObjects = new Set();
+      for (const collection of ['files', 'pendingFiles']) for (const row of project[collection] || []) {
+        byJson.set(collection + '\0' + JSON.stringify(row), row);
+        const objects = objectsOfRow(row, plan.records);
+        if (objects?.length && getEmbeddedRowOwnerChoice(project, row, context) === 'kept') for (const record of objects) keptObjects.add(record);
+      }
       for (const item of plan.retire) {
         const row = byJson.get(item.collection + '\0' + item.json);
-        if (!row || getEmbeddedRowOwnerChoice(project, row, context)) continue;
+        if (!row || keptObjects.has(item.record) || getEmbeddedRowOwnerChoice(project, row, context)) continue;
         try { if (item.snapshot) assertPsdBaselineSnapshot(item.snapshot); } catch (_) { continue; }
         project[item.collection].splice(project[item.collection].indexOf(row), 1);
         retired.push({ row, parentPath: psdFilePath, reason: item.reason, retiredAt: Date.now() });
@@ -18089,7 +18101,7 @@ function getRestagedEmbeddedPsdChoices(project, isStaleEntry) {
   }
   return { choices, unchosen, unproven, size: choices.size + (unproven ? 1 : 0) };
 }
-function carryRestagedEmbeddedPsdChoices(project, restaged, entries, linkedFiles) {
+function carryRestagedEmbeddedPsdChoices(project, restaged, entries, linkedFiles, neverHeldEntries = null) {
   const staged = new Map(entries.filter(isScanOnSaveEmbeddedPsdFile).map(entry => [entry.fileId, entry]));
   const excluded = new Set(project.excludedAssetKeys || []), carried = new Set(), uncarried = [];
   let changed = false;
@@ -18104,7 +18116,7 @@ function carryRestagedEmbeddedPsdChoices(project, restaged, entries, linkedFiles
       row.individualContentExclusion = fingerprint; delete row.individualContentInclude; carried.add(fingerprint); changed = true;
     } else if (choice === 'include') {
       row.individualContentInclude = fingerprint; carried.add(fingerprint); changed = true;
-    } else if (!(fingerprint && restaged.unchosen.has(fingerprint)) && accepted.has(row)) uncarried.push(row);
+    } else if (!(fingerprint && restaged.unchosen.has(fingerprint)) && accepted.has(row) && !neverHeldEntries?.has(entry)) uncarried.push(row);
   }
   if (changed) project.excludedAssetKeys = [...excluded];
   // Any choice without a proven successor holds every restaged row it could
@@ -19182,18 +19194,14 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null, ope
     }
 
     if (!isCurrent()) return;
-    const embeddedPlan = await embeddedDocuments.prepare(embeddedRecords, { logicalRows: true });
+    const embeddedPlan = await embeddedDocuments.prepare(embeddedRecords);
     if (!isCurrent()) return;
-    const provenFingerprints = new Set(embeddedRecords.filter(record => record.proven).map(record => record.fingerprint));
+    const provenEntries = new Set(embeddedRecords.filter(record => record.proven).map(record => record.entry));
     const omittedEntries = new Set(embeddedRecords.filter(record => embeddedPlan.omitted.has(record)).map(record => record.entry));
 
     const result = mutateProject(projectId, (proj) => {
       if (!isCurrent()) return null;
       const retiredEmbeddedRows = embeddedDocuments.apply(proj);
-      const ownerChoiceContext = {};
-      // An excluded row whose object is now proven stays as it is.
-      const isExcludedProvenRow = entry => provenFingerprints.has(entry.individualContentExclusion || entry.embeddedContentFingerprint) &&
-        getEmbeddedRowOwnerChoice(proj, entry, ownerChoiceContext) === 'excluded';
       const currentEmbeddedKeys = new Set(
         newEntries
           .filter(entry => entry.source === 'scan-on-save-embedded')
@@ -19202,12 +19210,10 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null, ope
       const isStaleEmbeddedEntry = entry => (
         isScanOnSaveEmbeddedPsdFile(entry) &&
         normalizeTrackedFilePath(entry.parentPsd || entry.path) === normalizeTrackedFilePath(psdFilePath) &&
-        !currentEmbeddedKeys.has(getEmbeddedPsdDedupKey(entry)) && !isExcludedProvenRow(entry)
+        !currentEmbeddedKeys.has(getEmbeddedPsdDedupKey(entry)) && !embeddedDocuments.isIgnoredRow(entry)
       );
       const restagedChoices = getRestagedEmbeddedPsdChoices(proj, isStaleEmbeddedEntry);
-      // An include carried from a renamed row still needs its successor row.
-      const stageProvenObjects = restagedChoices.unproven || [...restagedChoices.choices.values()].some(choice => choice !== 'exclude');
-      const entriesToStage = stageProvenObjects ? newEntries : newEntries.filter(entry => !omittedEntries.has(entry));
+      const entriesToStage = newEntries.filter(entry => !omittedEntries.has(entry));
       let changed = reconcilePsdEmbeddedMembership(proj, isStaleEmbeddedEntry) || retiredEmbeddedRows > 0;
       // Rows that keep their identity record their current bytes once.
       for (const entry of entriesToStage) {
@@ -19228,7 +19234,7 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null, ope
         }
         changed = true;
       }
-      if (restagedChoices.size) carryRestagedEmbeddedPsdChoices(proj, restagedChoices, entriesToStage, psd.linkedFiles);
+      if (restagedChoices.size) carryRestagedEmbeddedPsdChoices(proj, restagedChoices, entriesToStage, psd.linkedFiles, provenEntries);
       if (retiredEmbeddedRows) invalidatePackageReviewForProject(projectId);
 
       if (changed) {
