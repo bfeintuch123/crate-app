@@ -511,6 +511,8 @@ async function sendPsdRecords(parsed, send) {
     }
   }
   collectLinkedFiles(psd.linkedFiles, null);
+  // Add Files scans only: Quick Package reads links and never embedded records.
+  const isSelfContained = parsed.sourceIdentity ? createEmbeddedDocumentClassifier(psd, () => parsed.framing) : () => false;
   async function record(kind, text, data, index) {
     await send({ type: 'record', kind, index, textUnits: text.length, byteLength: data ? data.byteLength : 0 });
     for (let offset = 0; offset < text.length; offset += TEXT_UNITS) {
@@ -575,7 +577,8 @@ async function sendPsdRecords(parsed, send) {
     }
     const { data, ...fields } = file;
     await metadata({ origin: 'linked-file', index, layerPath, metadata: fields, dataPresent: !!data,
-      byteLength: data ? data.byteLength : 0, embeddedIndex: data ? embeddedIndex++ : null });
+      byteLength: data ? data.byteLength : 0, embeddedIndex: data ? embeddedIndex++ : null,
+      ...(data && isSelfContained(file) ? { selfContained: true } : {}) });
   }
   for (const [index, fields] of mediaSources.entries()) await metadata({ origin: 'media-reference', index, ...fields });
   async function walkLayerPaths(layers) {
