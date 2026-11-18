@@ -20,6 +20,7 @@ let accountWatchRecoveryReady = false;
 let accountWorkspaceAllowed = false;
 let accountWorkspaceId = null;
 let accountWorkspaceGeneration = null;
+let watchSessionOwnersDistrusted = false;
 const path = require('path');
 const fs = require('fs');
 const {
@@ -225,6 +226,7 @@ function initializeAccountSession() {
     openExternal: url => shell.openExternal(url),
   });
   accountSession.on('change', snapshot => {
+    syncWatchSessionAccount();
     const allowed = snapshot.canUseWorkspace;
     const identityChanged = accountWorkspaceId !== snapshot.identity?.id;
     const generationChanged = accountWorkspaceGeneration !== accountSession.generation;
@@ -1416,22 +1418,55 @@ function startWatchSession(project) {
   return project.watchSessionId;
 }
 
-// One-way marker of the account that owns a project's watch session, so a
-// session change can tell "same account" from "another account" after a restart.
-// The markers live beside the projects in the store, never on a project, so no
-// project object sent to the renderer can contain one.
-function getWatchSessionOwnerDigest(projectId) {
-  if (typeof projectId !== 'string' || !projectId || !accountSession?.canUseWorkspace()) return null;
+// One-way markers that let a new watch session tell whether the rows of the one
+// that ended can be trusted. A project's marker binds the signed-in identity to
+// the session it started; the account marker records which identity last had
+// workspace access, so a change of identity ends every project's claim. They
+// live beside the projects in the store, never on a project, so no project
+// object sent to the renderer can contain one.
+function digestWatchSessionValue(parts) {
+  return crypto.createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+}
+
+function getWorkspaceIdentityId() {
+  if (!accountSession?.canUseWorkspace()) return null;
   const identityId = accountSession.snapshot().identity?.id;
-  if (typeof identityId !== 'string' || !identityId) return null;
-  return crypto.createHash('sha256')
-    .update(JSON.stringify(['crate.watch-session-owner.v1', projectId, identityId]))
-    .digest('hex');
+  return typeof identityId === 'string' && identityId ? identityId : null;
+}
+
+function getWatchSessionAccountDigest() {
+  const identityId = getWorkspaceIdentityId();
+  return identityId ? digestWatchSessionValue(['crate.watch-session-account.v1', identityId]) : null;
+}
+
+function getWatchSessionOwnerDigest(projectId, sessionId) {
+  const identityId = getWorkspaceIdentityId();
+  if (!identityId || typeof projectId !== 'string' || !projectId || typeof sessionId !== 'string' || !sessionId) return null;
+  return digestWatchSessionValue(['crate.watch-session-owner.v1', projectId, identityId, sessionId]);
+}
+
+// Runs whenever account state is published, before the new identity can use the
+// workspace. If the clear cannot be written, no marker is trusted until an
+// activation has replaced them.
+function syncWatchSessionAccount() {
+  const accountDigest = getWatchSessionAccountDigest();
+  if (!accountDigest || !store || store.get('watchSessionAccount') === accountDigest) return;
+  try {
+    store.set({ watchSessionOwners: {}, watchSessionAccount: accountDigest });
+    watchSessionOwnersDistrusted = false;
+  } catch (_) {
+    watchSessionOwnersDistrusted = true;
+  }
 }
 
 function readWatchSessionOwners() {
   const owners = store.get('watchSessionOwners', null);
   return owners && typeof owners === 'object' && !Array.isArray(owners) ? owners : {};
+}
+
+function readTrustedWatchSessionOwners(accountDigest) {
+  if (watchSessionOwnersDistrusted || !accountDigest || store.get('watchSessionAccount') !== accountDigest) return {};
+  return readWatchSessionOwners();
 }
 
 // The markers to keep: only string markers of projects that still exist. An
@@ -1457,13 +1492,14 @@ function isReadableRegularFile(filePath) {
 }
 
 // A new watch session keeps the questions the designer had not answered yet.
-// A row moves into the new session only when the same account owned the session
-// that ended, the row was visible in it, and it is still an undecided, eligible
-// row for a file that is still there. Only the row's session stamp changes: it
-// stays a question, and every other row is left as it is.
-function carryUndecidedReviewRows(project, endedSessionId, endedOwnerDigest, ownerDigest) {
+// The caller has established that this identity started the session that ended
+// and that no other identity has had access since. A row moves only when it was
+// visible in that session and is still an undecided, eligible row for a file
+// that is still there. Only the row's session stamp changes: it stays a
+// question, and every other row is left as it is.
+function carryUndecidedReviewRows(project, endedSessionId) {
   const endedSession = typeof endedSessionId === 'string' ? endedSessionId.trim() : '';
-  if (!endedSession || !ownerDigest || endedOwnerDigest !== ownerDigest || !Array.isArray(project.pendingFiles)) return;
+  if (!endedSession || !Array.isArray(project.pendingFiles)) return;
   const excludedRecords = readExcludedPendingRecords(project);
   if (!excludedRecords.valid) return;
   const excludedKeys = new Set(Array.isArray(project.excludedAssetKeys) ? project.excludedAssetKeys : []);
@@ -11538,20 +11574,24 @@ function activateSingleWatchingProject(projectId, settings, { preserveWatchStart
     project.watchStartedAt = Date.now();
   }
   const endedSessionId = project.watchSessionId;
-  const watchSessionOwners = readWatchSessionOwners();
-  const endedOwnerDigest = watchSessionOwners[project.id];
+  const accountDigest = getWatchSessionAccountDigest();
+  const watchSessionOwners = readTrustedWatchSessionOwners(accountDigest);
+  const endedOwnerDigest = getWatchSessionOwnerDigest(project.id, endedSessionId);
+  const endedSessionOwned = !!endedOwnerDigest && watchSessionOwners[project.id] === endedOwnerDigest;
   startWatchSession(project);
-  const ownerDigest = getWatchSessionOwnerDigest(project.id);
+  const ownerDigest = getWatchSessionOwnerDigest(project.id, project.watchSessionId);
   project.figmaSession = buildFigmaSessionSnapshot(project, settings);
   normalizeAutoCaptureProjectState(project);
-  carryUndecidedReviewRows(project, endedSessionId, endedOwnerDigest, ownerDigest);
+  if (endedSessionOwned) carryUndecidedReviewRows(project, endedSessionId);
   safelyEnsureProjectProvenance(project);
   clearFileVisualProjectCache();
   // One write: a session's rows and its owner can never disagree after a crash.
   store.set({
     projects,
     watchSessionOwners: getNextWatchSessionOwners(watchSessionOwners, projects, project.id, ownerDigest),
+    ...(accountDigest ? { watchSessionAccount: accountDigest } : {}),
   });
+  if (accountDigest) watchSessionOwnersDistrusted = false;
 
   for (const pausedProjectId of pausedProjectIds) {
     stopWatching(pausedProjectId);

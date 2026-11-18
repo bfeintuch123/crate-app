@@ -15,6 +15,7 @@ compiled._compile(harness + '\n(' + cases.toString() + ')();', harnessPath);
 
 function cases() {
   const OWNERS_KEY = 'watchSessionOwners';
+  const ACCOUNT_KEY = 'watchSessionAccount';
   const ownerOf = id => (storeInstance.data[OWNERS_KEY] || {})[id];
   const DAY_MS = 86400000;
   const stored = id => storeInstance.data.projects.find(project => project.id === id);
@@ -316,6 +317,183 @@ function cases() {
     assert.equal(stored(first.id).pendingFiles.some(item => item.path === secondRow.path || item.path === foreign.path), false);
   });
 
+  // The real store hands out a new copy on every read; the harness store does not.
+  async function withCopyingStore(action) {
+    const copied = value => (value === undefined ? undefined : clone(value));
+    const { get, set } = storeInstance;
+    storeInstance.get = function copyingGet(key, ...rest) { return copied(get.call(this, key, ...rest)); };
+    storeInstance.set = function copyingSet(key, value) { return set.call(this, copied(key), copied(value)); };
+    try { return await action(); } finally { delete storeInstance.get; delete storeInstance.set; }
+  }
+
+  lifecycleTest('a row staged on a paused project under another account is not carried when the first account returns', async () => {
+    const { dir, file } = setup('carry-paused-account');
+    const project = await createProject('Carry paused account');
+    const ownRow = await addReviewRow(project.id, file('OwnRow.psd'));
+    await callIpcRaw('projects:pause', project.id);
+    const anchor = path.join(dir, 'Anchor.ai');
+    writeSyntheticAiFile(anchor);
+    await setProjectFiles(project.id, { files: [{ path: anchor, ext: '.ai', name: 'Anchor.ai', source: 'manual-browse' }], pendingFiles: stored(project.id).pendingFiles });
+    await withCopyingStore(async () => {
+      const endedSession = stored(project.id).watchSessionId;
+      assert.ok(ownerOf(project.id));
+      useAccount('second-account');
+      assert.equal(ownerOf(project.id), undefined, 'a new identity ends the earlier claim before it can stage anything');
+      const staged = file('StagedByOther.png');
+      setChildProcessHandler(request => {
+        const paths = bulkXattrPaths(request);
+        return { stdout: paths.length ? formatBulkXattrOutput(paths, () => encodeLastUsedXattr(Date.now())) : '' };
+      });
+      assert.equal((await callIpcRaw('projects:pre-package-scan', project.id)).error, undefined);
+      await projection(project.id); // the ordinary store read fills in derived fields
+      const row = clone(storedRow(project.id, staged)), ownBefore = clone(storedRow(project.id, ownRow.path));
+      assert.equal(row.captureState, 'pending');
+      assert.equal(row.captureSessionId, endedSession, 'the row carries the stored session id');
+      assert.equal(ownBefore.captureSessionId, endedSession);
+      useAccount('test-account');
+      setChildProcessHandler(() => ({ stdout: '' }));
+      await callIpcRaw('projects:start-watching', project.id);
+      await idle(project.id);
+      assert.notEqual(stored(project.id).watchSessionId, endedSession);
+      await assertLeftHidden(project.id, row);
+      await assertLeftHidden(project.id, ownBefore); // fail closed: A, then B, then A carries nothing
+    });
+  });
+
+  lifecycleTest('a marker written for one session does not carry rows of another session of the project', async () => {
+    const { file } = setup('carry-other-session');
+    const project = await createProject('Carry other session');
+    const ownRow = await addReviewRow(project.id, file('OwnSession.psd'));
+    stored(project.id).watchSessionId = 'session-started-without-a-marker'; // as a build without markers would
+    const otherRow = await pushRow(project.id, file('OtherSession.psd'));
+    assert.equal(otherRow.captureSessionId, 'session-started-without-a-marker');
+    await pauseThenWatch(project.id);
+    await assertLeftHidden(project.id, otherRow);
+    await assertLeftHidden(project.id, ownRow);
+  });
+
+  lifecycleTest('a stale projects write during a delayed project creation does not make its older session trusted', async () => {
+    const { file } = setup('carry-stale-write');
+    const project = await createProject('Carry stale write');
+    await addReviewRow(project.id, file('StaleWrite.psd'));
+    await callIpcRaw('projects:pause', project.id);
+    const olderSession = stored(project.id).watchSessionId;
+    const previousStub = STUBS.get('./parsers/figma');
+    const { FigmaParser } = require('../parsers/figma');
+    let entered = false, release;
+    const released = new Promise(resolve => { release = resolve; });
+    class DelayedFigmaParser extends FigmaParser {
+      async validateTrackedFileScope(fileKey, scopeEntry = {}) {
+        entered = true;
+        await released;
+        const lockedPageId = scopeEntry.requestedPageId || scopeEntry.requestedNodeId || null;
+        return { valid: true, scope: { scopeMode: scopeEntry.scopeMode, lockStatus: 'locked', lockedPageId, lockedPageName: 'Verified test page', statusReason: null } };
+      }
+      async autoTrackScan() { return { files: [], assets: [], errors: [], warnings: [], scopeEntries: [] }; }
+    }
+    setStub('./parsers/figma', () => ({ FigmaParser: DelayedFigmaParser }));
+    try {
+      await withCopyingStore(async () => {
+        const creating = callIpcRaw('projects:create', 'Carry delayed create', 'branding', 'current-page', 'https://www.figma.com/file/CARRY1/Layout?node-id=1-1');
+        await waitForCondition(() => entered, 'the creation should reach its preflight');
+        await callIpcRaw('projects:start-watching', project.id);
+        await idle(project.id);
+        const newerSession = stored(project.id).watchSessionId;
+        assert.notEqual(newerSession, olderSession);
+        release();
+        const created = await creating;
+        assert.equal(created.error, undefined);
+        await idle(created.id);
+        assert.equal(stored(project.id).watchSessionId, olderSession, 'the stale write put the older session back');
+        const staleRow = clone(stored(project.id).pendingFiles[0]);
+        assert.equal(staleRow.captureSessionId, olderSession);
+        await callIpcRaw('projects:start-watching', project.id);
+        await idle(project.id);
+        await assertLeftHidden(project.id, staleRow);
+      });
+    } finally {
+      release();
+      if (previousStub) STUBS.set('./parsers/figma', previousStub); else STUBS.delete('./parsers/figma');
+    }
+  });
+
+  lifecycleTest('a change of identity clears every project marker in one store write', async () => {
+    setup('carry-identity-change');
+    const first = await createProject('Carry identity first');
+    const second = await createProject('Carry identity second');
+    await idle(second.id);
+    await callIpcRaw('projects:pause', second.id);
+    assert.ok(ownerOf(first.id) && ownerOf(second.id));
+    const accountBefore = storeInstance.data[ACCOUNT_KEY];
+    const writes = await recordStoreWrites(() => useAccount('second-account'));
+    assert.deepEqual(storeInstance.data[OWNERS_KEY], {});
+    assert.match(String(storeInstance.data[ACCOUNT_KEY]), /^[0-9a-f]{64}$/);
+    assert.notEqual(storeInstance.data[ACCOUNT_KEY], accountBefore);
+    assert.deepEqual(writes, [{ [OWNERS_KEY]: {}, [ACCOUNT_KEY]: storeInstance.data[ACCOUNT_KEY] }]);
+  });
+
+  lifecycleTest('the same identity after a relaunch keeps every project marker', async () => {
+    setup('carry-identity-same');
+    const first = await createProject('Carry same identity first');
+    const second = await createProject('Carry same identity second');
+    await idle(second.id);
+    await callIpcRaw('projects:pause', second.id);
+    const owners = clone(storeInstance.data[OWNERS_KEY]), account = storeInstance.data[ACCOUNT_KEY];
+    assert.ok(owners[first.id] && owners[second.id] && account);
+    roundTripFakeStore();
+    const writes = await recordStoreWrites(() => { testAccountSession.invalidate(); useAccount('test-account'); });
+    assert.deepEqual(storeInstance.data[OWNERS_KEY], owners);
+    assert.equal(storeInstance.data[ACCOUNT_KEY], account);
+    assert.equal(writes.some(write => OWNERS_KEY in write || ACCOUNT_KEY in write), false);
+  });
+
+  lifecycleTest('a malformed marker for another project does not stop this project, and is repaired', async () => {
+    const { file } = setup('carry-mixed-owners');
+    const other = await createProject('Carry mixed other');
+    await idle(other.id);
+    const project = await createProject('Carry mixed');
+    const row = await addReviewRow(project.id, file('MixedOwners.psd'));
+    storeInstance.data[OWNERS_KEY][other.id] = 123;
+    await pauseThenWatch(project.id);
+    await assertCarried(project.id, row);
+    assert.deepEqual(Object.keys(storeInstance.data[OWNERS_KEY]), [project.id]);
+  });
+
+  lifecycleTest('an account marker that does not match carries nothing and is replaced at activation', async () => {
+    const { file } = setup('carry-account-marker');
+    const project = await createProject('Carry account marker');
+    const row = await addReviewRow(project.id, file('AccountMarker.psd'));
+    const account = storeInstance.data[ACCOUNT_KEY];
+    storeInstance.data[ACCOUNT_KEY] = 'b'.repeat(64);
+    await pauseThenWatch(project.id);
+    await assertLeftHidden(project.id, row);
+    assert.equal(storeInstance.data[ACCOUNT_KEY], account);
+    const next = await addReviewRow(project.id, file('AfterAccountMarker.psd'));
+    await pauseThenWatch(project.id);
+    await assertCarried(project.id, next);
+  });
+
+  lifecycleTest('when clearing markers fails, none is trusted until an activation replaces them', async () => {
+    const { file } = setup('carry-clear-fails');
+    const project = await createProject('Carry clear fails');
+    const row = await addReviewRow(project.id, file('ClearFails.psd'));
+    await callIpcRaw('projects:pause', project.id);
+    const originalSet = storeInstance.set;
+    storeInstance.set = function failingSet(key, value) {
+      if (key && typeof key === 'object' && ACCOUNT_KEY in key) throw new Error('synthetic write failure');
+      return originalSet.call(this, key, value);
+    };
+    try { useAccount('second-account'); } finally { delete storeInstance.set; }
+    assert.ok(ownerOf(project.id), 'the failed write left the old marker in place');
+    useAccount('test-account');
+    await callIpcRaw('projects:start-watching', project.id);
+    await idle(project.id);
+    await assertLeftHidden(project.id, row);
+    const next = await addReviewRow(project.id, file('AfterClearFails.psd'));
+    await pauseThenWatch(project.id);
+    await assertCarried(project.id, next);
+  });
+
   // The account listener stops the watching project and restarts it, keeping its
   // watch start time: the same path a relaunch or sign-in restore takes.
   async function restartThroughAccountChange(id, change) {
@@ -408,7 +586,7 @@ function cases() {
     await restartThroughAccountChange(project.id, () => useAccount('test-account'));
     await assertLeftHidden(project.id, rowA);
     await assertLeftHidden(project.id, rowB);
-    assert.equal(ownerOf(project.id), digestA, 'the digest is stable for one account and project');
+    assert.notEqual(ownerOf(project.id), digestA, 'a marker belongs to one session');
   });
 
   lifecycleTest('the same account keeps its rows through a session refresh and a sign-in restore', async () => {
@@ -476,10 +654,11 @@ function cases() {
       assert.notEqual(otherDigest, digest, 'digests are per project');
       assert.ok(testRendererEvents.some(event => event.channel === 'files:pending'), 'the file-state channels were exercised');
       for (const text of [JSON.stringify(replies), JSON.stringify(testRendererEvents), logged.join('\n')]) {
-        for (const secret of [digest, otherDigest, OWNERS_KEY]) assert.equal(text.includes(secret), false);
+        for (const secret of [digest, otherDigest, storeInstance.data[ACCOUNT_KEY], OWNERS_KEY, ACCOUNT_KEY]) assert.equal(text.includes(secret), false);
       }
       assert.equal(JSON.stringify(stored(project.id)).includes(digest), false, 'the digest is not on the project');
-      assert.equal(JSON.stringify([stored(project.id), storeInstance.data[OWNERS_KEY]]).includes('test-account'), false, 'the identity itself is never stored');
+      assert.match(String(storeInstance.data[ACCOUNT_KEY]), /^[0-9a-f]{64}$/);
+      assert.equal(JSON.stringify([stored(project.id), storeInstance.data[OWNERS_KEY], storeInstance.data[ACCOUNT_KEY]]).includes('test-account'), false, 'the identity itself is never stored');
     } finally { for (const restore of restores) restore(); }
   });
 
