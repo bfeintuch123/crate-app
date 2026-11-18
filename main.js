@@ -16098,7 +16098,6 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
     },
     // This read's embedded objects with what is now known about their bytes.
     describeEmbeddedRecords() {
-      check();
       const embeddedRecords = linkedMetadata.filter(item => item.origin === 'linked-file' && item.dataPresent);
       return stages.map((stage, ordinal) => {
         const item = embeddedRecords[ordinal];
