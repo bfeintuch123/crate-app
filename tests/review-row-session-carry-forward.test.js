@@ -661,6 +661,22 @@ function cases() {
     });
   }
 
+  lifecycleTest('an activation honors an earlier read failure even with no account publish after it', async () => {
+    const { file } = setup('carry-latch-activation');
+    const project = await createProject('Carry latch activation');
+    const row = await addReviewRow(project.id, file('LatchActivation.psd'));
+    await callIpcRaw('projects:pause', project.id);
+    const reads = failStoreReads(ACCOUNT_KEY);
+    reads.failing = true;
+    try { assert.doesNotThrow(() => testAccountSession.publish('offline', 'Account could not be checked online.')); } finally { reads.failing = false; delete storeInstance.get; }
+    await callIpcRaw('projects:start-watching', project.id);
+    await idle(project.id);
+    await assertLeftHidden(project.id, row);
+    const next = await addReviewRow(project.id, file('AfterLatchActivation.psd'));
+    await pauseThenWatch(project.id);
+    await assertCarried(project.id, next);
+  });
+
   lifecycleTest('a failed read of the account marker at activation trusts nothing, and the activation replaces the markers', async () => {
     const { file } = setup('carry-activation-read');
     const project = await createProject('Carry activation read');
