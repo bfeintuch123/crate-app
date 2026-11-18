@@ -63,8 +63,10 @@
 //                                                  as the system's ps, then what CRATE_GUARD_SHAPE says, with the guard's clock
 //                                                  standing still: dying-then-ended, dying-twice-then-gone or collected, after
 //                                                  which no scan lists it (it is still running); or other-start, wrong-parent,
-//                                                  other-owner or still-dying, after which every scan shows the row it got. At
-//                                                  exit it prints each row it got that way
+//                                                  other-owner or still-dying, after which every scan shows the row it got. With
+//                                                  other-helper there are no such scans: its first scan reads it as another
+//                                                  set-uid tool, dying at the next read and ended at the one after. At exit it
+//                                                  prints each row it got that way
 //   CRATE_GUARD_FAULT=exiting-over-limit:<role>    once the tree is up, one scan reads that process in full at 1300 MB; after that
 //                                                  it reads as exiting with no memory, and `nested-child` reads 1100 MB more than it holds
 //   CRATE_GUARD_FAULT=system-tool:<role>           that process reads exactly as the system's set-uid ps does, for as long as it lives
@@ -122,6 +124,7 @@ const deadSamplers = new Set();
 // sampler's own code makes it from scripted answers of the kernel.
 const scriptedRows = [];
 let scriptedRemembered = {};
+let scriptedTools = {};
 let scriptedLast = null;
 if (kind === 'sampler-script') {
   process.on('exit', () => {
@@ -144,37 +147,47 @@ function shapeReads(shown) {
   const noInfo = ['info', ESRCH];
   const table = (status, start = STARTED, ppid = shown.ppid, ruid = owner) => ['record', [ppid, shown.pgid, 0, ruid, status, start, WEXIT]];
   const dying = [noInfo, denied, table(2)];
-  const ended = start => [noInfo, denied, table(guard.ZOMBIE, start)];
+  const ended = [noInfo, denied, table(guard.ZOMBIE)];
   const gone = [noInfo, ['usage', ESRCH]];
+  const shape = process.env.CRATE_GUARD_SHAPE;
   return {
-    'dying-then-ended': [...dying, ...ended(STARTED)],
-    'dying-twice-then-gone': [...dying, ...dying, ...gone],
-    collected: [noInfo, denied, ['record', 'absent'], ['usage', ESRCH]],
-    'other-start': [...dying, ...ended([STARTED[0], STARTED[1] + 1])],
-    'wrong-parent': [noInfo, denied, table(2, STARTED, process.pid)],
-    'other-owner': [noInfo, denied, table(2, STARTED, shown.ppid, owner + 1)],
-    'still-dying': [...dying, ...dying, ...dying, ...dying],
-  }[process.env.CRATE_GUARD_SHAPE];
+    reads: {
+      'dying-then-ended': [...dying, ...ended],
+      'dying-twice-then-gone': [...dying, ...dying, ...gone],
+      collected: [noInfo, denied, ['record', 'absent'], ...gone],
+      'other-start': [noInfo, denied, table(2, [STARTED[0], STARTED[1] + 1])],
+      'wrong-parent': [noInfo, denied, table(2, STARTED, process.pid)],
+      'other-owner': [noInfo, denied, table(2, STARTED, shown.ppid, owner + 1)],
+      'still-dying': [...dying, ...dying, ...dying, ...dying],
+      'other-helper': [['info', 0, [shown.ppid, shown.pgid, 0, owner, 2]], denied, ['path', '/usr/bin/su'], ...dying, ...ended],
+    }[shape],
+    alive: [shown.ppid, shown.pgid, 0, owner, 2, STARTED, 0],
+  };
 }
 async function samplerScript(rows) {
   if (!recorded().has('ready')) return rows;
   const target = recorded().get(role);
   const shown = rows.find(row => row.pid === target);
   if (!shown) return rows;
-  if (scriptedRows.length >= 3) {
+  const shape = process.env.CRATE_GUARD_SHAPE;
+  const toolScans = shape === 'other-helper' ? 0 : 2;
+  if (scriptedRows.length > toolScans) {
     return scriptedLast ? rows.map(row => (row.pid === target ? { ...scriptedLast } : row)) : rows.filter(row => row.pid !== target);
   }
   if (fixed === null) fixed = performance.now();
   const tool = [['info', 0, [shown.ppid, shown.pgid, 0, process.getuid(), 2]], ['usage', EPERM], ['path', '/bin/ps']];
   const number = scriptedRows.length + 1;
-  const reads = number === 1 ? [...tool, ...tool] : number === 2 ? tool : shapeReads(shown);
-  const answer = await askSampler({ uid: process.getuid(), guard: process.pid, scans: [[target]], known: scriptedRemembered, script: { [target]: reads } });
+  const { reads: shaped, alive } = shapeReads(shown);
+  const reads = number > toolScans ? shaped : number === 1 ? [...tool, ...tool] : tool;
+  const answer = await askSampler({
+    uid: process.getuid(), guard: process.pid, scans: [[target]], known: scriptedRemembered, tools: scriptedTools, learn: { [target]: alive }, script: { [target]: reads },
+  });
   const text = answer.scans[0].rows[0];
   scriptedRemembered = answer.scans[0].remembered;
+  scriptedTools = answer.scans[0].tools;
   scriptedRows.push(text);
   const row = guard.parseRow(text);
-  const passes = ['dying-then-ended', 'dying-twice-then-gone', 'collected'].includes(process.env.CRATE_GUARD_SHAPE);
-  if (number === 3 && !passes) scriptedLast = row;
+  if (number > toolScans && !['dying-then-ended', 'dying-twice-then-gone', 'collected'].includes(shape)) scriptedLast = row;
   return rows.map(item => (item.pid === target ? row : item));
 }
 // What a scan shows of `target` after the end of the run, by CRATE_GUARD_LATE.

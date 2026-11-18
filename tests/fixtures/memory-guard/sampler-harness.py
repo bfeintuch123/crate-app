@@ -12,8 +12,9 @@ test decides what that should have been.
                     and not collected, and collected
   scan              two scans with a real ps that is new, then already seen
   table-decoding    the longer process record, as sysctl could hand it back
-  table             what the process table says of a real child and a real
-                    set-uid ps, alive and then ended and not collected
+  table             what the process table says of a real child, alive and
+                    ended, and of a real set-uid ps once it has ended by itself
+                    and is not collected
   exit-window [n]   a probe, run by hand and by no test: n real set-uid ps (150
                     by default) in each of three ways of ending, read in a tight
                     loop. What it catches depends on timing, so it decides
@@ -51,6 +52,10 @@ def scripted(scenario):
       "uid": the user the sampler runs as, "guard": the guard's pid,
       "scans": [[pid, ...], ...]         the pids each scan lists
       "known": {pid: row}                what the scan before the first reported, if anything
+      "tools": {pid: [seconds, microseconds]}   the live tools remembered from before the first scan
+      "learn": {pid: record}             what the process table says when a live tool's start time is
+                                         looked up: null, "absent" or a record as in "record" below
+      "framed": true                     each scan goes through the sampler's answer to a scan request
       "script": {pid: [step, ...]}       the answers for that pid, in the order they are asked for
     }
     A step is ["info", errno, [ppid, pgid, uid, ruid, status]], ["usage", errno,
@@ -100,14 +105,23 @@ def scripted(scenario):
         answer = step(pid, "path")
         return answer[1] if answer else "-"
 
+    def table_answer(facts):
+        if not facts:
+            return None
+        if facts == "absent":
+            return module.NO_RECORD
+        facts = list(facts) + [[0, 0], 0][len(facts) - 5:]
+        return (*facts[:5], tuple(facts[5]), facts[6])
+
     def read_table(pid):
         answer = step(pid, "record")
-        if not answer or not answer[1]:
-            return None
-        if answer[1] == "absent":
-            return module.NO_RECORD
-        facts = list(answer[1]) + [[0, 0], 0][len(answer[1]) - 5:]
-        return (*facts[:5], tuple(facts[5]), facts[6])
+        return table_answer(answer[1]) if answer else None
+
+    learned = []
+
+    def read_tool_record(pid):
+        learned.append(pid)
+        return table_answer(scenario.get("learn", {}).get(str(pid)))
 
     # A sampler without read_table (the one this change started from) asks for the five facts.
     def read_record(pid):
@@ -115,17 +129,21 @@ def scripted(scenario):
         return tuple(answer[1][:5]) if answer and answer[1] and answer[1] != "absent" else None
 
     sampler.read_info, sampler.read_usage, sampler.read_path, sampler.read_record = read_info, read_usage, read_path, read_record
-    sampler.read_table = read_table
+    sampler.read_table, sampler.read_tool_record = read_table, read_tool_record
+    sampler.tool_starts = {int(pid): tuple(start) for pid, start in scenario.get("tools", {}).items()}
     sampler.pause = pauses.append
     scans = []
-    for pids in scenario["scans"]:
+    for number, pids in enumerate(scenario["scans"], 1):
         sampler.list_pids = lambda pids=pids: list(pids)
         before = len(pauses)
-        rows = sampler.scan()
-        scans.append({"rows": rows, "pauses": pauses[before:], "remembered": {str(pid): row for pid, row in sampler.denied.items()}})
+        framed = module.answer(sampler, ["scan", str(number)]) if scenario.get("framed") else None
+        rows = framed.splitlines()[1:-1] if framed else sampler.scan()
+        scans.append({"rows": rows, "pauses": pauses[before:], "remembered": {str(pid): row for pid, row in sampler.denied.items()},
+                      "tools": {str(pid): list(start) for pid, start in getattr(sampler, "tool_starts", {}).items()}, "framed": framed})
     return {
         "scans": scans,
         "calls": calls,
+        "learned": learned,
         "errors": errors,
         "unused": {str(pid): [item[0] for item in steps] for pid, steps in script.items() if steps},
     }
@@ -332,26 +350,36 @@ def wait_until(condition):
 
 
 def table():
-    """Nothing here depends on catching a moment: an ended process stays as it is until collected."""
+    """Nothing here depends on catching a moment: the sleeping child lives until
+    it is killed, the ps ends by itself, and an ended process stays as it is
+    until it is collected."""
     sampler = module.Sampler()
     before = int(time.time())
-    children = {
-        "ordinary": subprocess.Popen(["/bin/sleep", "30"]),
-        "ps": subprocess.Popen(["/bin/ps", "-axwwo", ",".join(["command="] * 16)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL),
-    }
+    ordinary = subprocess.Popen(["/bin/sleep", "30"])
+    ps = subprocess.Popen(["/bin/ps", "-axo", "pid="], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     result = {"before": before, "after": None, "self": os.getuid(), "wexit": module.P_WEXIT}
+
+    def ended(child):
+        def read():
+            record = sampler.read_table(child.pid)
+            return record if record not in (None, module.NO_RECORD) and record[4] == module.ENDED else None
+        return wait_until(read)
+
+    def observed(child, alive=None):
+        record = ended(child)
+        row, transition, state = sampler.read_row(child.pid)
+        return {"pid": child.pid, "alive": alive, "ended": record, "row": row, "transition": transition, "state": state}
+
     try:
-        wait_until(lambda: sampler.read_path(children["ordinary"].pid).endswith("/sleep"))
-        wait_until(lambda: sampler.read_path(children["ps"].pid) == "/bin/ps")
+        wait_until(lambda: sampler.read_path(ordinary.pid).endswith("/sleep"))
+        alive = sampler.read_table(ordinary.pid)
         result["after"] = int(time.time())
-        for name, child in children.items():
-            alive = sampler.read_table(child.pid)
-            child.kill()
-            ended = wait_until(lambda: (lambda record: record if record not in (None, module.NO_RECORD) and record[4] == module.ENDED else None)(sampler.read_table(child.pid)))
-            row, transition, leaving = sampler.read_row(child.pid)
-            result[name] = {"pid": child.pid, "alive": alive, "ended": ended, "row": row, "transition": transition, "leaving": leaving}
+        ordinary.kill()
+        result["ordinary"] = observed(ordinary, alive)
+        result["ps"] = observed(ps)
+        result["after"] = int(time.time())
     finally:
-        for child in children.values():
+        for child in (ordinary, ps):
             child.kill()
             child.wait()
     return result
@@ -363,16 +391,15 @@ def exit_window():
     wide = ["/bin/ps", "-axwwo", ",".join(["command="] * 16)]
     report = {}
     for way in ("killed", "killed and collected at once", "ended by itself"):
-        spans, kept, broken = [], 0, 0
+        spans, same, other = [], 0, 0
         for _ in range(count):
             itself = way == "ended by itself"
             child = subprocess.Popen(["/bin/ps", "-axo", "pid="] if itself else wide, stdout=subprocess.DEVNULL if itself else subprocess.PIPE, stderr=subprocess.DEVNULL)
-            alive = None
-            until = time.monotonic() + 0.03
-            while not itself and time.monotonic() < until:
-                record = sampler.read_table(child.pid)
-                if record not in (None, module.NO_RECORD):
-                    alive = record
+            # The start time is set when the process is created and stays through exec.
+            started = sampler.read_table(child.pid)
+            started = None if started in (None, module.NO_RECORD) else started[5]
+            if not itself:
+                time.sleep(0.03)
             collector = None
             if way == "killed and collected at once":
                 collector = threading.Thread(target=child.wait)
@@ -382,16 +409,16 @@ def exit_window():
             first = last = None
             until = time.monotonic() + 3
             while time.monotonic() < until:
-                _, _, leaving = sampler.read_row(child.pid)
+                info_errno = sampler.read_info(child.pid)
+                usage_errno = sampler.read_usage(child.pid)
+                record = sampler.read_table(child.pid)
                 now = time.monotonic()
-                if leaving and leaving[0] == "dying":
+                whole = record not in (None, module.NO_RECORD)
+                if info_errno == errno.ESRCH and usage_errno == errno.EPERM and whole and record[4] != module.ENDED and record[6] & module.P_WEXIT:
                     first, last = first or now, now
-                    if alive:
-                        if leaving[1] == alive[5]:
-                            kept += 1
-                        else:
-                            broken += 1
-                elif leaving or (first and sampler.read_info(child.pid) == errno.ESRCH and sampler.read_usage(child.pid) == errno.ESRCH):
+                    same += record[5] == started
+                    other += record[5] != started
+                elif (whole and record[4] == module.ENDED) or usage_errno == errno.ESRCH:
                     break
             if first:
                 spans.append((last - first) * 1000000)
@@ -404,7 +431,7 @@ def exit_window():
                 child.stdout.close()
         spans.sort()
         report[way] = {
-            "runs": count, "runs in which it was seen dying": len(spans), "readings with the start time it had alive": kept, "readings with another": broken,
+            "runs": count, "runs in which it was seen dying": len(spans), "readings with the start time it was created with": same, "readings with another": other,
             "microseconds": None if not spans else {"median": round(spans[len(spans) // 2]), "p99": round(spans[min(len(spans) - 1, len(spans) * 99 // 100)]), "longest": round(spans[-1])},
         }
     report["note"] = "zero sightings would prove nothing: this probe decides no test"
