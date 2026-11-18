@@ -577,11 +577,11 @@ function cases() {
     fs.mkdirSync(dir, { recursive: true });
     const file = name => path.join(dir, name);
     const existing = [];
-    for (const group of ['A', 'B']) for (let i = 1; i <= 6; i++) existing.push(file(`Opt_${group}${i}.png`));
-    const fixture = { dir, doc: file('Board.ai'), existing, mockupA: file('MockupA.psd'), mockupB: file('MockupB.psd'), mockupC: file('MockupC.psd'),
-      jpgs: [1, 2, 3].map(i => file(`Photo${i}.jpg`)), oldShots: [1, 2, 3].map(i => file(`OldShot${i}.png`)) };
-    for (const p of [...existing, ...fixture.jpgs, ...fixture.oldShots]) fs.writeFileSync(p, Buffer.concat([createSyntheticPngBytes(), Buffer.from(`sequence:${tag}:${path.basename(p)}`)]));
-    for (const p of [fixture.mockupA, fixture.mockupB, fixture.mockupC]) fs.writeFileSync(p, `8BPS synthetic ${tag} ${path.basename(p)}`);
+    for (let i = 1; i <= 12; i++) existing.push(file(`Asset${String(i).padStart(2, '0')}.png`));
+    const fixture = { dir, doc: file('Board.ai'), existing, layeredA: file('LayeredA.psd'), layeredB: file('LayeredB.psd'), layeredC: file('LayeredC.psd'),
+      jpgs: [1, 2, 3].map(i => file(`Photo${i}.jpg`)), earlierImages: [1, 2, 3].map(i => file(`Earlier${i}.png`)) };
+    for (const p of [...existing, ...fixture.jpgs, ...fixture.earlierImages]) fs.writeFileSync(p, Buffer.concat([createSyntheticPngBytes(), Buffer.from(`sequence:${tag}:${path.basename(p)}`)]));
+    for (const p of [fixture.layeredA, fixture.layeredB, fixture.layeredC]) fs.writeFileSync(p, `8BPS synthetic ${tag} ${path.basename(p)}`);
     return fixture;
   }
   async function save(id, fixture, app) {
@@ -626,12 +626,12 @@ function cases() {
     await admitDocument(project.id, fixture.doc, app, fixture.existing.join('\n'));
     await callIpcRaw('projects:set-existing-assets-decision', project.id, 'include');
     await poll(project.id);
-    const secondPath = second === 'placed-later' ? fixture.mockupB : fixture.mockupC;
-    await addReviewRow(project.id, fixture.mockupA);
+    const secondPath = second === 'placed-later' ? fixture.layeredB : fixture.layeredC;
+    await addReviewRow(project.id, fixture.layeredA);
     await addReviewRow(project.id, secondPath);
     const state = await sequenceState(project.id);
     assert.deepEqual([state.existing, state.added, state.excluded, state.working], [12, [], [], 1]);
-    assert.deepEqual(state.decidable, [path.basename(fixture.mockupA), path.basename(secondPath)].sort());
+    assert.deepEqual(state.decidable, [path.basename(fixture.layeredA), path.basename(secondPath)].sort());
     return { fixture, app, project, secondName: path.basename(secondPath) };
   }
   async function afterSessionChange(gap, id) {
@@ -648,13 +648,13 @@ function cases() {
     await realWait(200);
     await poll(id, 2);
   }
-  const shots = fixture => fixture.oldShots.map(file => path.basename(file)).sort();
+  const earlierNames = fixture => fixture.earlierImages.map(file => path.basename(file)).sort();
   const photos = fixture => fixture.jpgs.map(file => path.basename(file)).sort();
 
   for (const gap of ['pause-then-watch', 'switch-and-back', 'relaunch']) for (const second of ['placed-later', 'never-placed']) {
     lifecycleTest(`full sequence, ${gap}, second row ${second}: undecided rows survive and resolve only by decision or saved link`, async () => {
       const { fixture, app, project, secondName } = await reachReviewState(`${gap}_${second}`.replace(/[^a-z_]/g, '_'), second);
-      const id = project.id, nameA = path.basename(fixture.mockupA), nameB = path.basename(fixture.mockupB);
+      const id = project.id, nameA = path.basename(fixture.layeredA), nameB = path.basename(fixture.layeredB);
       await afterSessionChange(gap, id);
       let state = await sequenceState(id);
       assert.deepEqual(state.decidable, [nameA, secondName].sort(), 'both PSD rows are still decidable after the session change');
@@ -666,39 +666,39 @@ function cases() {
       assert.deepEqual([state.existing, state.added, state.excluded, state.working, state.keys], [12, [], [], 1, 0], 'nothing was added or excluded');
 
       await save(id, fixture, app);
-      await place(id, app, [...fixture.oldShots, fixture.mockupB]);
+      await place(id, app, [...fixture.earlierImages, fixture.layeredB]);
       await save(id, fixture, app);
       state = await sequenceState(id);
-      assert.ok(state.added.includes(nameB), 'the placed and saved mockup is Included');
-      assert.ok(state.decidable.includes(nameA), 'the unplaced mockup is still decidable');
+      assert.ok(state.added.includes(nameB), 'the placed and saved layered file is Included');
+      assert.ok(state.decidable.includes(nameA), 'the unplaced layered file is still decidable');
       assert.equal(state.decidable.includes(nameB), false);
       assert.deepEqual([state.existing, state.working], [12, 1]);
 
-      await unlink(id, app, fixture.oldShots);
+      await unlink(id, app, fixture.earlierImages);
       await save(id, fixture, app);
-      for (const shot of fixture.oldShots) await callIpcRaw('projects:remove-file', id, shot);
-      await place(id, app, [fixture.mockupA]);
+      for (const image of fixture.earlierImages) await callIpcRaw('projects:remove-file', id, image);
+      await place(id, app, [fixture.layeredA]);
       await save(id, fixture, app);
       state = await sequenceState(id);
-      assert.ok(state.added.includes(nameA), 'the mockup placed and saved later is Included');
+      assert.ok(state.added.includes(nameA), 'the layered file placed and saved later is Included');
       assert.equal(state.decidable.includes(nameA), false);
-      assert.deepEqual(state.excluded, shots(fixture), 'the three screenshots stay excluded');
+      assert.deepEqual(state.excluded, earlierNames(fixture), 'the three earlier images stay excluded');
 
       await unlink(id, app, fixture.jpgs);
       await save(id, fixture, app);
       state = await sequenceState(id);
       assert.deepEqual([state.existing, state.working], [12, 1], 'existing assets and the working file never change');
-      assert.deepEqual(state.excluded, shots(fixture));
+      assert.deepEqual(state.excluded, earlierNames(fixture));
       assert.deepEqual(state.decidable, second === 'never-placed' ? [secondName] : [], 'an undecided file that was never placed is still only a question');
       assert.ok(state.added.includes(nameA) && state.added.includes(nameB));
-      assert.equal(stored(id).files.some(file => file.path === fixture.mockupC), false, 'an unplaced undecided file is never admitted');
+      assert.equal(stored(id).files.some(file => file.path === fixture.layeredC), false, 'an unplaced undecided file is never admitted');
     });
   }
 
   for (const bulk of ['skip-all', 'add-all']) for (const second of ['placed-later', 'never-placed']) {
     lifecycleTest(`full sequence, ${bulk}, second row ${second}: bulk decisions behave as before`, async () => {
       const { fixture, app, project, secondName } = await reachReviewState(`${bulk}_${second}`.replace(/[^a-z_]/g, '_'), second);
-      const id = project.id, nameA = path.basename(fixture.mockupA), nameB = path.basename(fixture.mockupB);
+      const id = project.id, nameA = path.basename(fixture.layeredA), nameB = path.basename(fixture.layeredB);
       const channel = bulk === 'skip-all' ? 'projects:reject-pending' : 'projects:accept-pending';
       for (const row of (await projection(id)).pendingFiles.filter(file => file.captureState === 'pending')) await callIpcRaw(channel, id, row.path);
       await idle(id); await realWait(200); await poll(id, 2);
@@ -715,19 +715,19 @@ function cases() {
       }
 
       await save(id, fixture, app);
-      await place(id, app, [...fixture.oldShots, fixture.mockupB]);
+      await place(id, app, [...fixture.earlierImages, fixture.layeredB]);
       await save(id, fixture, app);
-      await unlink(id, app, fixture.oldShots);
+      await unlink(id, app, fixture.earlierImages);
       await save(id, fixture, app);
-      for (const shot of fixture.oldShots) await callIpcRaw('projects:remove-file', id, shot);
-      await place(id, app, [fixture.mockupA]);
+      for (const image of fixture.earlierImages) await callIpcRaw('projects:remove-file', id, image);
+      await place(id, app, [fixture.layeredA]);
       await save(id, fixture, app);
       await unlink(id, app, fixture.jpgs);
       await save(id, fixture, app);
       state = await sequenceState(id);
-      assert.equal(state.added.includes(nameA), false, 'an earlier bulk decision on the mockup still stands');
+      assert.equal(state.added.includes(nameA), false, 'an earlier bulk decision on the layered file still stands');
       assert.equal(state.added.includes(nameB), second === 'never-placed');
-      assert.deepEqual(state.excluded, shots(fixture));
+      assert.deepEqual(state.excluded, earlierNames(fixture));
       assert.deepEqual(state.decidable, []);
     });
   }
