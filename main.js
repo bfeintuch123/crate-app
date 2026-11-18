@@ -1445,14 +1445,17 @@ function getWatchSessionOwnerDigest(projectId, sessionId) {
   return digestWatchSessionValue(['crate.watch-session-owner.v1', projectId, identityId, sessionId]);
 }
 
-// Runs whenever account state is published, before the new identity can use the
-// workspace. If the clear cannot be written, no marker is trusted until an
-// activation has replaced them.
+// Runs first whenever account state is published, before a new identity can use
+// the workspace, and never throws into the account listener. If the settings
+// cannot be read or written, no marker is trusted until a later write succeeds:
+// every following publish retries the clear, and an activation also replaces
+// the markers.
 function syncWatchSessionAccount() {
-  const accountDigest = getWatchSessionAccountDigest();
-  if (!accountDigest || !store || store.get('watchSessionAccount') === accountDigest) return;
   try {
-    store.set({ watchSessionOwners: {}, watchSessionAccount: accountDigest });
+    const accountDigest = getWatchSessionAccountDigest();
+    const identityChanged = !!accountDigest && store.get('watchSessionAccount') !== accountDigest;
+    if (!watchSessionOwnersDistrusted && !identityChanged) return;
+    store.set({ watchSessionOwners: {}, ...(accountDigest ? { watchSessionAccount: accountDigest } : {}) });
     watchSessionOwnersDistrusted = false;
   } catch (_) {
     watchSessionOwnersDistrusted = true;
@@ -1460,22 +1463,32 @@ function syncWatchSessionAccount() {
 }
 
 function readWatchSessionOwners() {
-  const owners = store.get('watchSessionOwners', null);
-  return owners && typeof owners === 'object' && !Array.isArray(owners) ? owners : {};
+  try {
+    const owners = store.get('watchSessionOwners', null);
+    return owners && typeof owners === 'object' && !Array.isArray(owners) ? owners : {};
+  } catch (_) {
+    watchSessionOwnersDistrusted = true;
+    return {};
+  }
 }
 
 function readTrustedWatchSessionOwners(accountDigest) {
-  if (watchSessionOwnersDistrusted || !accountDigest || store.get('watchSessionAccount') !== accountDigest) return {};
-  return readWatchSessionOwners();
+  if (watchSessionOwnersDistrusted || !accountDigest) return {};
+  try {
+    return store.get('watchSessionAccount') === accountDigest ? readWatchSessionOwners() : {};
+  } catch (_) {
+    watchSessionOwnersDistrusted = true;
+    return {};
+  }
 }
 
-// The markers to keep: only string markers of projects that still exist. An
+// The markers to keep: only well-formed markers of projects that still exist. An
 // activation with no known owner records none, so it can never match later.
 function getNextWatchSessionOwners(owners, projects, projectId, ownerDigest) {
   const next = {};
   for (const { id } of projects) {
     const digest = id === projectId ? ownerDigest : owners[id];
-    if (typeof digest === 'string' && digest) next[id] = digest;
+    if (typeof digest === 'string' && /^[0-9a-f]{64}$/.test(digest)) next[id] = digest;
   }
   return next;
 }

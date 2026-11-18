@@ -487,9 +487,12 @@ function cases() {
     const { file } = setup('carry-mixed-owners');
     const other = await createProject('Carry mixed other');
     await idle(other.id);
+    const textOther = await createProject('Carry mixed text');
+    await idle(textOther.id);
     const project = await createProject('Carry mixed');
     const row = await addReviewRow(project.id, file('MixedOwners.psd'));
     storeInstance.data[OWNERS_KEY][other.id] = 123;
+    storeInstance.data[OWNERS_KEY][textOther.id] = 'not-a-digest';
     await pauseThenWatch(project.id);
     await assertCarried(project.id, row);
     assert.deepEqual(Object.keys(storeInstance.data[OWNERS_KEY]), [project.id]);
@@ -526,6 +529,152 @@ function cases() {
     await idle(project.id);
     await assertLeftHidden(project.id, row);
     const next = await addReviewRow(project.id, file('AfterClearFails.psd'));
+    await pauseThenWatch(project.id);
+    await assertCarried(project.id, next);
+  });
+
+  // While `reads.failing` is true, reads of `onlyKey` throw, or every read when no key is given.
+  function failStoreReads(onlyKey = null) {
+    const reads = { failing: false }, { get } = storeInstance;
+    storeInstance.get = function failableGet(key, ...rest) {
+      if (reads.failing && (!onlyKey || key === onlyKey)) throw new Error('synthetic settings read failure');
+      return get.call(this, key, ...rest);
+    };
+    return reads;
+  }
+  async function stageRecentRow(projectId, filePath) {
+    setChildProcessHandler(request => {
+      const paths = bulkXattrPaths(request);
+      return { stdout: paths.length ? formatBulkXattrOutput(paths, () => encodeLastUsedXattr(Date.now())) : '' };
+    });
+    assert.equal((await callIpcRaw('projects:pre-package-scan', projectId)).error, undefined);
+    await projection(projectId);
+    setChildProcessHandler(() => ({ stdout: '' }));
+    return clone(storedRow(projectId, filePath));
+  }
+  const ignoreFailure = async action => { try { await action(); } catch (_) { /* the outcome is checked below */ } };
+
+  // With every read failing, the listener still stops at its own project read,
+  // as it does without this change; the row must stay hidden either way.
+  for (const [readsLabel, failingKey] of [['every settings read', null], ['the account marker read', ACCOUNT_KEY]]) {
+    lifecycleTest(`a sign-in while ${readsLabel} fails cannot leave the first account marker trusted`, async () => {
+      const { dir } = setup('carry-read-failure');
+      const project = await createProject('Carry read failure');
+      await callIpcRaw('projects:pause', project.id);
+      const anchor = path.join(dir, 'Anchor.ai');
+      writeSyntheticAiFile(anchor);
+      await setProjectFiles(project.id, { files: [{ path: anchor, ext: '.ai', name: 'Anchor.ai', source: 'manual-browse' }], pendingFiles: [] });
+      const session = testAccountSession, saved = { provider: session.provider, credentials: session.credentials, openExternal: session.openExternal, config: session.config };
+      const identity = { id: '00000000-0000-4000-8000-00000000000b', email: 'second@example.invalid', verified: true };
+      Object.assign(session, {
+        config: session.config || { issuer: 'https://accounts.example.invalid', clientId: 'synthetic', redirectUri: 'https://accounts.example.invalid/callback' },
+        openExternal: async () => {},
+        credentials: { read: () => null, write() {}, clear() {} },
+        provider: {
+          exchange: async () => ({ access_token: 'second-access', refresh_token: 'second-refresh' }),
+          validate: async () => ({ subject: identity.id, expiresAt: Date.now() + 3600000 }),
+          me: async () => identity,
+        },
+      });
+      try {
+        await withCopyingStore(async () => {
+          const reads = failStoreReads(failingKey);
+          const endedSession = stored(project.id).watchSessionId;
+          await session.begin();
+          const { CALLBACK } = require('../account-config');
+          const callback = `${CALLBACK}?code=synthetic-code&state=${session.pending.state}`;
+          reads.failing = true;
+          await ignoreFailure(() => session.callback(callback));
+          await ignoreFailure(() => session.begin());
+          await ignoreFailure(() => session.cancel());
+          reads.failing = false;
+          assert.equal(session.canUseWorkspace(), true, 'the second account has workspace access');
+          assert.equal(session.snapshot().identity.id, identity.id);
+          const staged = path.join(dir, 'StagedDuringFailure.png');
+          fs.writeFileSync(staged, 'synthetic');
+          const row = await stageRecentRow(project.id, staged);
+          assert.equal(row.captureSessionId, endedSession);
+          useAccount('test-account');
+          await callIpcRaw('projects:start-watching', project.id);
+          await idle(project.id);
+          await assertLeftHidden(project.id, row);
+        });
+      } finally { Object.assign(session, saved); }
+    });
+  }
+
+  lifecycleTest('a failed read of the account marker does not stop the account listener', async () => {
+    const { file } = setup('carry-listener-read');
+    const project = await createProject('Carry listener read');
+    const row = await addReviewRow(project.id, file('ListenerRead.psd'));
+    const endedSession = stored(project.id).watchSessionId, watchers = watcherRecords.length, closedBefore = watcherCloseCount;
+    testRendererEvents.length = 0;
+    const reads = failStoreReads(ACCOUNT_KEY);
+    reads.failing = true;
+    try {
+      assert.doesNotThrow(() => useAccount('second-account'));
+      assert.ok(watcherCloseCount > closedBefore, 'the old watch is stopped');
+      assert.ok(testRendererEvents.some(event => event.channel === 'account:changed'), 'the window is told');
+      assert.notEqual(stored(project.id).watchSessionId, endedSession, 'Watch restarts as it does on a healthy store');
+      await waitForCondition(() => watcherRecords.length > watchers, 'Watch should restart');
+      await idle(project.id);
+    } finally { reads.failing = false; delete storeInstance.get; }
+    await assertLeftHidden(project.id, row);
+  });
+
+  lifecycleTest('offline grace for the same identity keeps every marker and its rows', async () => {
+    const { file } = setup('carry-offline-grace');
+    const project = await createProject('Carry offline grace');
+    const row = await addReviewRow(project.id, file('OfflineGrace.psd'));
+    await callIpcRaw('projects:pause', project.id);
+    const owners = clone(storeInstance.data[OWNERS_KEY]), account = storeInstance.data[ACCOUNT_KEY];
+    const writes = await recordStoreWrites(() => testAccountSession.publish('offline', 'Account could not be checked online.'));
+    assert.equal(testAccountSession.canUseWorkspace(), true);
+    assert.equal(writes.some(write => OWNERS_KEY in write || ACCOUNT_KEY in write), false);
+    assert.deepEqual(storeInstance.data[OWNERS_KEY], owners);
+    assert.equal(storeInstance.data[ACCOUNT_KEY], account);
+    await callIpcRaw('projects:start-watching', project.id);
+    await idle(project.id);
+    await assertCarried(project.id, row);
+  });
+
+  for (const [label, publishNext] of [
+    ['the same identity', () => useAccount('test-account')],
+    ['a signed-out state', () => { testAccountSession.invalidate(); testAccountSession.accessToken = null; testAccountSession.publish('signed_out', '', null); }],
+  ]) {
+    lifecycleTest(`after a read failure, the next publish (${label}) clears the markers on disk`, async () => {
+      const { file } = setup('carry-retry-clear');
+      const project = await createProject('Carry retry clear');
+      const row = await addReviewRow(project.id, file('RetryClear.psd'));
+      await callIpcRaw('projects:pause', project.id);
+      const reads = failStoreReads(ACCOUNT_KEY);
+      reads.failing = true;
+      try { assert.doesNotThrow(() => useAccount('second-account')); } finally { reads.failing = false; delete storeInstance.get; }
+      assert.ok(ownerOf(project.id), 'nothing could be cleared while the read failed');
+      publishNext();
+      assert.deepEqual(storeInstance.data[OWNERS_KEY], {}, 'the retry cleared the markers');
+      roundTripFakeStore();
+      useAccount('test-account');
+      await callIpcRaw('projects:start-watching', project.id);
+      await idle(project.id);
+      await assertLeftHidden(project.id, row);
+    });
+  }
+
+  lifecycleTest('a failed read of the account marker at activation trusts nothing, and the activation replaces the markers', async () => {
+    const { file } = setup('carry-activation-read');
+    const project = await createProject('Carry activation read');
+    const row = await addReviewRow(project.id, file('ActivationRead.psd'));
+    await callIpcRaw('projects:pause', project.id);
+    const { get } = storeInstance;
+    storeInstance.get = function accountReadFails(key, ...rest) {
+      if (key === ACCOUNT_KEY) throw new Error('synthetic settings read failure');
+      return get.call(this, key, ...rest);
+    };
+    try { await callIpcRaw('projects:start-watching', project.id); } finally { delete storeInstance.get; }
+    await idle(project.id);
+    await assertLeftHidden(project.id, row);
+    const next = await addReviewRow(project.id, file('AfterActivationRead.psd'));
     await pauseThenWatch(project.id);
     await assertCarried(project.id, next);
   });
