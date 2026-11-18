@@ -16717,8 +16717,9 @@ function createEmbeddedDocumentScan(projectId, psdFilePath, isCurrent) {
         [...(record?.requiredEmbeddedOutputs || []), ...(record?.requiredReferences || [])]
           .some(ref => normalizeTrackedFilePath(ref?.path) === normalizeTrackedFilePath(row.path)));
       const choices = new Map();
-      const retire = (row, collection, snapshot) => {
-        plan.retire.push({ collection, json: JSON.stringify(row), snapshot, reason: EMBEDDED_DOCUMENT_RETIREMENT_REASON });
+      const retire = (row, collection, snapshot, receipt = null) => {
+        plan.retire.push({ collection, json: JSON.stringify(row), snapshot, receipt, key: getTrackedFileDedupKey(row),
+          reason: EMBEDDED_DOCUMENT_RETIREMENT_REASON });
         plan.retiringKeys.add(getTrackedFileDedupKey(row));
       };
       for (const { row, collection } of members) {
@@ -16740,7 +16741,7 @@ function createEmbeddedDocumentScan(projectId, psdFilePath, isCurrent) {
             await new Promise(resolve => setImmediate(resolve));
             if (!isCurrent()) return plan;
             const snapshot = await isProvenCachedRow(row, receipt, provenDigests, directory);
-            if (snapshot) retire(row, collection, snapshot);
+            if (snapshot) retire(row, collection, snapshot, receipt);
           } catch (_) { if (!isCurrent()) return plan; }
         } else if (isLogicalChild(row)) {
           const choice = getEmbeddedRowOwnerChoice(project, row, context);
@@ -16752,14 +16753,21 @@ function createEmbeddedDocumentScan(projectId, psdFilePath, isCurrent) {
               row.embeddedContentFingerprint === fingerprintOf(record))) retire(row, collection, null);
         }
       }
+      const isRemaining = row => !plan.retiringKeys.has(getTrackedFileDedupKey(row));
+      const outputOwners = record => members.map(({ row }) => row).filter(row => isRemaining(row) && row.source === 'psd-embedded' &&
+        isOwnReceipt(row.psdExtractionReceipt || row.psdResource) && isObjectOfRow(record, row.psdExtractionReceipt || row.psdResource));
+      const logicalOwners = record => members.map(({ row }) => row).filter(row => isRemaining(row) && isLogicalChild(row) && isRecordOfLogicalRow(record, row));
+      const isKept = row => choices.get(row) !== 'excluded';
+      // An excluded row stays as it is and packages nothing. Any other kept row
+      // keeps its object's complete handling, so it keeps its bytes, and that
+      // object's own outputs stay: retiring one would only make it again.
+      for (const record of proven.filter(item => outputOwners(item).some(isKept))) {
+        plan.retire = plan.retire.filter(item => !item.receipt || !isObjectOfRow(record, item.receipt));
+      }
+      plan.retiringKeys = new Set(plan.retire.map(item => item.key));
       for (const record of proven) {
-        const owners = members.map(({ row }) => row).filter(row => !plan.retiringKeys.has(getTrackedFileDedupKey(row)) && (logicalRows
-          ? isLogicalChild(row) && isRecordOfLogicalRow(record, row)
-          : row.source === 'psd-embedded' && isOwnReceipt(row.psdExtractionReceipt || row.psdResource) &&
-            isObjectOfRow(record, row.psdExtractionReceipt || row.psdResource)));
-        // An excluded row stays as it is and packages nothing. Any other kept
-        // row keeps its object's complete handling, so it keeps its bytes.
-        if (owners.some(row => choices.get(row) !== 'excluded')) continue;
+        const owners = logicalRows ? logicalOwners(record) : outputOwners(record);
+        if (owners.some(isKept)) continue;
         plan.omitted.add(record);
         for (const row of owners) plan.ignoredRowKeys.add(getTrackedFileDedupKey(row));
       }
