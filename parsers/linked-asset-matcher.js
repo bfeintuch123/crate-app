@@ -36,6 +36,7 @@ function extractLinkedAssetPaths(content, filePath) {
 }
 
 const SLASH = 0x2f;
+const NEARBY_BYTES = 32;
 const USERS_PREFIX = Buffer.from('/users/', 'latin1');
 const VOLUMES_PREFIX = Buffer.from('/volumes/', 'latin1');
 
@@ -47,6 +48,20 @@ function hasPrefixAt(buffer, at, prefix) {
     if ((byte >= 0x41 && byte <= 0x5a ? byte + 0x20 : byte) !== prefix[i]) return false;
   }
   return true;
+}
+
+// Finds the next prefix. Design data can be dense with slash bytes, so a miss
+// looks a short way ahead itself instead of paying for a native search per byte.
+function nextPrefixAt(buffer, from) {
+  let at = buffer.indexOf(SLASH, from);
+  while (at !== -1) {
+    if (hasPrefixAt(buffer, at, USERS_PREFIX) || hasPrefixAt(buffer, at, VOLUMES_PREFIX)) return at;
+    const nearbyEnd = Math.min(at + NEARBY_BYTES, buffer.length);
+    let next = at + 1;
+    while (next < nearbyEnd && buffer[next] !== SLASH) next++;
+    at = next < nearbyEnd ? next : buffer.indexOf(SLASH, next);
+  }
+  return -1;
 }
 
 function isPathDelimiterByte(byte) {
@@ -63,15 +78,11 @@ function linkedPathSearchText(buffer, maxStringLength = MAX_STRING_LENGTH) {
   // Past the string limit the whole-file decode decides the outcome, as before.
   if (!Buffer.isBuffer(buffer) || buffer.length > maxStringLength) return buffer.toString('utf8');
   const runs = [];
-  let from = 0;
-  while (true) {
-    const at = buffer.indexOf(SLASH, from);
-    if (at === -1) break;
-    if (!hasPrefixAt(buffer, at, USERS_PREFIX) && !hasPrefixAt(buffer, at, VOLUMES_PREFIX)) { from = at + 1; continue; }
+  for (let at = nextPrefixAt(buffer, 0); at !== -1;) {
     let end = at + 1;
     while (end < buffer.length && !isPathDelimiterByte(buffer[end])) end++;
     runs.push(buffer.subarray(at, end).toString('utf8'));
-    from = end + 1;
+    at = nextPrefixAt(buffer, end + 1);
   }
   return runs.join('\n');
 }

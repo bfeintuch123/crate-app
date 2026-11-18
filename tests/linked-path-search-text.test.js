@@ -136,6 +136,16 @@ test('overlapping, adjacent and boundary prefixes', () => {
   }
 });
 
+test('a prefix is found at every distance after other slashes', () => {
+  for (let gap = 0; gap < 80; gap++) {
+    for (const filler of ['/', 'x', 'é', '/x']) {
+      const lead = `/${filler.repeat(gap)}`;
+      assert.ok(checkSame(bytes(`${lead}/Users/a.png`), `gap ${gap} ${filler}`) > 0, `gap ${gap} ${filler}`);
+      assert.ok(searchText(join(lead, [0x00], '/Volumes/b.jpg')).endsWith('/Volumes/b.jpg'), `gap ${gap} ${filler}`);
+    }
+  }
+});
+
 test('code points that fold toward ASCII, and byte-order marks', () => {
   const inputs = [
     '/Uſers/a.png', '/Userſ/a.png', '/VOLUMEſ/a.png', '/volumeſ/a.png', '/Uſerſ/a.png', '/K/a.png',
