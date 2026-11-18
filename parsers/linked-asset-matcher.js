@@ -92,8 +92,8 @@ function linkedPathSearchText(buffer, options = {}) {
     slashMissHeadroom = Math.max(MIN_SLASH_MISSES, Math.floor(buffer.length / BYTES_PER_SLASH_MISS_HEADROOM)),
     maxRuns = MAX_KEPT_RUNS,
     maxRunBytes = Math.max(MIN_RUN_BYTES, Math.floor(buffer.length / BYTES_PER_RUN_BYTE)),
+    keptRuns: runs = [],
   } = options;
-  const runs = [];
   // The kept strings are released before the larger decode begins.
   const decodeWholeBuffer = () => { runs.length = 0; return buffer.toString('utf8'); };
   let slashMisses = 0, runBytes = 0;

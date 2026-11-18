@@ -335,6 +335,31 @@ test('each budget, once exceeded, gives exactly the whole-buffer text', () => {
   }
 });
 
+test('every fallback releases the kept runs before the whole-buffer decode', t => {
+  const twoRuns = join([0xff], '/Users/a.png', [0x00], '/Users/b.png', [0x00]);
+  const runThenSlashes = join([0xff], '/Users/a.png', [0x00], ' /b /c /d /e');
+  const cases = [
+    ['slash budget', runThenSlashes, { maxSlashMisses: 2 }],
+    ['slash density', runThenSlashes, { slashMissHeadroom: 1 }],
+    ['run limit', twoRuns, { maxRuns: 1 }],
+    ['run bytes', twoRuns, { maxRunBytes: 13 }],
+  ];
+  const realToString = Buffer.prototype.toString;
+  for (const [name, buffer, options] of cases) {
+    const whole = buffer.toString('utf8'), keptRuns = [];
+    let keptDuringDecode = null, runDecodes = 0;
+    t.mock.method(Buffer.prototype, 'toString', function (...args) {
+      if (this === buffer) keptDuringDecode = keptRuns.length; else runDecodes++;
+      return realToString.apply(this, args);
+    });
+    const text = scanText(buffer, { ...options, keptRuns });
+    t.mock.restoreAll();
+    assert.equal(text, whole, name);
+    assert.equal(runDecodes, 1, `${name}: one run was kept first`);
+    assert.equal(keptDuringDecode, 0, name);
+  }
+});
+
 function repeated(unit, byteLength) {
   const pattern = Buffer.from(unit, 'latin1'), out = Buffer.alloc(byteLength);
   for (let offset = 0; offset < byteLength; offset += pattern.length) pattern.copy(out, offset, 0, Math.min(pattern.length, byteLength - offset));
