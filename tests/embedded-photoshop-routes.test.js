@@ -440,6 +440,45 @@ function cases() {
     } finally { hold.restore(); }
   });
 
+  // Exclude then Include on a row with no content fingerprint leaves nothing on
+  // the row or the project, so such a row cannot be told from an untouched one.
+  routeTest('a cached .psb row excluded and included again leaves no trace and is retired', { timeout: 60000 }, async () => {
+    const f = await seededProject(), row = seedRow(f); delete row.fileId; f.project().files.push(row); await settled(f);
+    const byPath = () => memberRows(f).find(item => item.path === row.path), before = plain(byPath());
+    await callIpcRaw('projects:remove-file', f.id, row.path);
+    assert.deepEqual(plain(f.project().excludedAssetKeys), [row.path]);
+    await callIpcRaw('projects:remove-file', f.id, row.path);
+    assert.deepEqual(plain(f.project().excludedAssetKeys), []);
+    assert.deepEqual(plain(byPath()), before, 'no marker of either action');
+    await scanOn('pre-package scan', f);
+    assert.equal(byPath(), undefined);
+    assert.deepEqual(retiredEntries(f).map(entry => plain(entry.row)), [before]);
+    f.project().files.push(plain(retiredEntries(f)[0].row));
+    assert.deepEqual(plain(byPath()), before, 'the record gives the identical row back');
+  });
+
+  routeTest('Skip then Include of existing assets also leaves such a row retirable', { timeout: 60000 }, async () => {
+    const f = await seededProject(), row = seedRow(f); row.assetOrigin = 'existing'; row.projectRole = 'asset'; f.project().files.push(row);
+    f.project().assetBaseline = { schemaVersion: 1, status: 'decision-required', decision: null, establishedAt: Date.now() }; await settled(f);
+    const before = plain(findRow(f, 'seed-row'));
+    assert.equal((await callIpcRaw('projects:set-existing-assets-decision', f.id, 'skip'))?.success, true);
+    assert.deepEqual(plain(f.project().excludedAssetKeys), ['seed-row']);
+    assert.equal((await callIpcRaw('projects:set-existing-assets-decision', f.id, 'include'))?.success, true);
+    assert.deepEqual(plain(f.project().excludedAssetKeys), []);
+    assert.deepEqual(plain(findRow(f, 'seed-row')), before);
+    await scanOn('pre-package scan', f);
+    assert.equal(findRow(f, 'seed-row'), undefined); assert.deepEqual(retiredEntries(f).map(entry => plain(entry.row)), [before]);
+  });
+
+  routeTest('Include of a row with a content fingerprint leaves a marker that keeps it', { timeout: 60000 }, async () => {
+    const f = await seededProject(), row = seedRow(f, { name: 'Stored As Picture.png' }); f.project().files.push(row); await settled(f);
+    await callIpcRaw('projects:remove-file', f.id, row.fileId); await callIpcRaw('projects:remove-file', f.id, row.fileId);
+    const after = findRow(f, 'seed-row');
+    assert.equal(after.individualContentInclude, `${f.smart.length}:${sha(f.smart)}`);
+    await scanOn('pre-package scan', f);
+    assert.ok(findRow(f, 'seed-row')); assert.deepEqual(retiredEntries(f), []);
+  });
+
   routeTest('a simple receipt hold on a retired row is released with its last member', { timeout: 60000 }, async () => {
     const f = await seededProject(), row = seedRow(f); f.project().files.push(row);
     f.project().workingSourceRelationshipHolds = [{ reason: 'psd-extraction-receipt-unverified', sourcePath: row.path }];
