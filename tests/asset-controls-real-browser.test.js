@@ -181,9 +181,23 @@ function bootstrap() {
   window.__label = element => !element ? null : element === document.body ? 'BODY'
     : (element.getAttribute('aria-label') || element.id || element.tagName);
   window.__button = label => Array.from(document.querySelectorAll('button')).find(button => button.getAttribute('aria-label') === label) || null;
+  // Every press target, so a click can prove it reached the control it aimed at.
+  // Chromium also delivers pointerdown to a disabled button, which the in-flight checks press.
+  window.__pressTargets = [];
+  document.addEventListener('pointerdown', event => window.__pressTargets.push(event.target), true);
+  // Under prefers-reduced-motion (CI's macOS runner), Crate's 0.01ms transitions keep a
+  // re-rendered row at its old top until the next frames, and a hit test agrees with that
+  // stale layout. A point read then can land on the next row once a frame runs before the
+  // press. Finish the running transitions so the point is where the press will hit.
+  // (Only CSS transitions: they are always finite, unlike an infinite animation.)
+  const settleTransitions = () => document.getAnimations().forEach(animation => {
+    if (animation instanceof CSSTransition) animation.finish();
+  });
   window.__centerOf = selector => {
     const element = document.querySelector(selector);
     if (!element) return null;
+    settleTransitions();
+    window.__pressTargets = [];
     element.scrollIntoView({ block: 'center' });
     const rect = element.getBoundingClientRect();
     return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, hit: true };
@@ -191,6 +205,8 @@ function bootstrap() {
   window.__center = label => {
     const button = window.__button(label);
     if (!button) return null;
+    settleTransitions();
+    window.__pressTargets = [];
     button.scrollIntoView({ block: 'center' });
     const rect = button.getBoundingClientRect();
     const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
@@ -222,6 +238,8 @@ async function clickSelector(page, selector) {
   const point = await page.evaluate(`window.__centerOf(${json(selector)})`);
   assert.ok(point, selector);
   await page.clickAt(point.x, point.y);
+  const pressed = await page.evaluate(`window.__pressTargets.map(target => [window.__label(target), !!target.closest(${json(selector)})])`);
+  assert.ok(pressed.length === 1 && pressed[0][1], `the press reached ${selector}: ${json(pressed)}`);
   await page.sleep(100);
 }
 async function click(page, label, count = 1) {
@@ -230,6 +248,9 @@ async function click(page, label, count = 1) {
   assert.ok(point.hit, `button ${label} receives the pointer`);
   await page.clickAt(point.x, point.y, 1);
   if (count === 2) await page.clickAt(point.x, point.y, 2);
+  // One pointerdown per press, each on the requested button (an empty record fails).
+  const pressed = await page.evaluate("window.__pressTargets.map(target => window.__label(target.closest('button')))");
+  assert.deepEqual(pressed, Array(count).fill(label), `the press for ${label} reached ${json(pressed)}`);
 }
 // Tab at a human pace: a virtual list re-mounts rows on the scroll that focus causes.
 async function tabTo(page, label, limit = 120, visited = null) {
