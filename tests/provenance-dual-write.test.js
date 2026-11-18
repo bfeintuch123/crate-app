@@ -1066,6 +1066,12 @@ Module._extensions['.js'] = function loadMainWithMetadataTestHooks(module, filen
 module.exports.__crateMetadataTestHooks = {
   // The "Assets need save" notice body, for wording cases no live observer produces.
   needsSaveNotificationBody(rows) { return getNeedsSaveNotificationBody(rows); },
+  normalizeFailedRequiredAssetBaselineSources(project, baseline) {
+    return normalizeFailedRequiredAssetBaselineSources(project, baseline);
+  },
+  assetBaselineSourceRecoveryRouteKey(project, file) {
+    return getAssetBaselineSourceRecoveryRouteKey(project, file);
+  },
   // An app restart, for extracted Photoshop outputs: forget what this session wrote and hashed.
   forgetPsdOutputSessionMemory() { psdOutputsWrittenThisSession.clear(); psdOutputContentDigests.clear(); verifiedPsdOutputDigests.clear(); },
   controlLiveAppStartupPoll() {
@@ -13177,6 +13183,55 @@ test('malformed and future failed-source recovery state never makes a source rem
     }
   } finally {
     fs.rmSync(sourcePath, { force: true });
+  }
+});
+
+test('failed-required-source normalization resolves source paths only when there are records to check', () => {
+  // Every project read runs this normalization while the first scan is
+  // pending. Resolving each source path when there is no record to check made
+  // a large Add Files quadratic. Counts calls; makes no timing claim.
+  const fixtureRoot = makeTempDir();
+  const originalRealpath = fs.realpathSync.native;
+  let realpathCalls = 0;
+  const countRealpath = run => {
+    realpathCalls = 0;
+    fs.realpathSync.native = function countedRealpath(...args) {
+      realpathCalls += 1;
+      return originalRealpath.apply(this, args);
+    };
+    try { return run(); } finally { fs.realpathSync.native = originalRealpath; }
+  };
+  try {
+    const files = Array.from({ length: 3 }, (_, index) => {
+      const filePath = path.join(fixtureRoot, `Pending first scan ${index}.ai`);
+      writeSyntheticAiFile(filePath);
+      return { path: filePath, name: path.basename(filePath), ext: '.ai', addedAt: 1, source: 'manual-browse', projectRole: 'source' };
+    });
+    const project = { id: '00000000-0000-4000-8000-00000000f41d', files };
+    const baseline = failedRequiredSources => ({
+      schemaVersion: 1, status: 'awaiting-first-scan', decision: null, establishedAt: null,
+      ...(failedRequiredSources === undefined ? {} : { failedRequiredSources }),
+    });
+
+    for (const [name, records] of [
+      ['missing', undefined], ['empty', []], ['null', null], ['object', {}], ['string', 'not-a-list'],
+    ]) {
+      const normalized = countRealpath(() => metadataTestHooks.normalizeFailedRequiredAssetBaselineSources(project, baseline(records)));
+      assert.deepEqual(normalized, [], name);
+      assert.equal(realpathCalls, 0, `${name} records must not resolve any source path`);
+    }
+
+    // With records present, each record is still checked against the current sources.
+    const sourceKeyHash = metadataTestHooks.assetBaselineSourceRecoveryRouteKey(project, files[1]);
+    assert.match(sourceKeyHash, /^[a-f0-9]{64}$/);
+    const kept = { schemaVersion: 1, sourceKeyHash, physicalIdentityHash: 'b'.repeat(64) };
+    const unknown = { schemaVersion: 1, sourceKeyHash: 'c'.repeat(64), physicalIdentityHash: 'd'.repeat(64) };
+    const normalized = countRealpath(() => metadataTestHooks.normalizeFailedRequiredAssetBaselineSources(project, baseline([unknown, kept, { ...kept }])));
+    assert.deepEqual(normalized, [kept]);
+    assert.ok(realpathCalls >= files.length, `records are checked against every source (${realpathCalls} resolutions)`);
+  } finally {
+    fs.realpathSync.native = originalRealpath;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
 });
 
