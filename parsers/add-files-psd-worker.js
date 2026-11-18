@@ -308,6 +308,160 @@ function inspectPsdLinkFraming(buffer) {
   return facts;
 }
 
+// A proven self-contained embedded Photoshop document: its bytes alone carry
+// everything it needs. Name, extension and file type are never evidence. Any
+// parse error, limit or unexplained field leaves the object not proven, and
+// callers then treat it as every other embedded file.
+const EMBEDDED_DOCUMENT_LIMITS = Object.freeze({
+  depth: 4, records: 1024, layers: 8192, layerNesting: 64, parsedBytes: MAX_PARSE_FILE_SIZE,
+});
+
+function asBuffer(data) {
+  return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+}
+
+function hasPhotoshopSignature(data) {
+  return data instanceof Uint8Array && data.byteLength >= 4 &&
+    data[0] === 0x38 && data[1] === 0x42 && data[2] === 0x50 && data[3] === 0x53;
+}
+
+// The metadata-only read stops before the composite image, so a cut-off file
+// can still parse. Every declared section and the composite must be present.
+function hasCompletePhotoshopSections(bytes) {
+  if (bytes.length < 26) return false;
+  const version = bytes.readUInt16BE(4);
+  if (version !== 1 && version !== 2) return false;
+  const channels = bytes.readUInt16BE(12), height = bytes.readUInt32BE(14), width = bytes.readUInt32BE(18);
+  const depth = bytes.readUInt16BE(22);
+  let offset = 26;
+  const skipSection = wide => {
+    if (offset + (wide ? 8 : 4) > bytes.length) return false;
+    let size;
+    if (wide) {
+      const high = bytes.readUInt32BE(offset);
+      if (high > 0x1fffff) return false;
+      size = high * 2 ** 32 + bytes.readUInt32BE(offset + 4);
+      offset += 8;
+    } else { size = bytes.readUInt32BE(offset); offset += 4; }
+    if (size > bytes.length - offset) return false;
+    offset += size;
+    return true;
+  };
+  if (!skipSection(false) || !skipSection(false) || !skipSection(version === 2)) return false;
+  if (bytes.length - offset < 2) return false;
+  const compression = bytes.readUInt16BE(offset);
+  offset += 2;
+  const remaining = bytes.length - offset;
+  if (compression === 0) return remaining === channels * height * Math.ceil(width * depth / 8);
+  if (compression === 2 || compression === 3) return remaining > 0;
+  if (compression !== 1) return false;
+  const rows = channels * height, entryBytes = version === 2 ? 4 : 2;
+  if (rows * entryBytes > remaining) return false;
+  let total = 0;
+  for (let row = 0; row < rows; row++, offset += entryBytes) {
+    total += version === 2 ? bytes.readUInt32BE(offset) : bytes.readUInt16BE(offset);
+  }
+  return total === bytes.length - offset;
+}
+
+function collectDocumentLinkRecords(psd, budget) {
+  const records = [...(Array.isArray(psd.linkedFiles) ? psd.linkedFiles : [])];
+  if (psd.linkedFiles !== undefined && !Array.isArray(psd.linkedFiles)) return null;
+  const placedIds = [];
+  const walk = (layers, nesting) => {
+    if (layers === undefined) return true;
+    if (!Array.isArray(layers) || nesting > EMBEDDED_DOCUMENT_LIMITS.layerNesting) return false;
+    for (const layer of layers) {
+      if (!layer || typeof layer !== 'object' || ++budget.layers > EMBEDDED_DOCUMENT_LIMITS.layers) return false;
+      if (layer.linkedFile !== undefined || layer.pixelSource?.frameReader?.link !== undefined) return false;
+      if (layer.linkedFiles !== undefined) {
+        if (!Array.isArray(layer.linkedFiles)) return false;
+        records.push(...layer.linkedFiles);
+      }
+      if (layer.placedLayer !== undefined) {
+        if (typeof layer.placedLayer?.id !== 'string' || !layer.placedLayer.id) return false;
+        placedIds.push(layer.placedLayer.id);
+      }
+      if (!walk(layer.children, nesting + 1)) return false;
+    }
+    return true;
+  };
+  if (!walk(psd.children, 0)) return null;
+  const groups = psd.imageResources?.timelineInformation?.audioClipGroups;
+  if (groups !== undefined) {
+    if (!Array.isArray(groups)) return null;
+    for (const group of groups) {
+      if (!Array.isArray(group?.audioClips)) return null;
+      if (group.audioClips.some(clip => clip?.frameReader?.link !== undefined)) return null;
+    }
+  }
+  return { records, placedIds };
+}
+
+function isProvenEmbeddedDocument(data, budget, depth = 1) {
+  if (!hasPhotoshopSignature(data) || depth > EMBEDDED_DOCUMENT_LIMITS.depth) return false;
+  budget.parsedBytes += data.byteLength;
+  if (budget.parsedBytes > EMBEDDED_DOCUMENT_LIMITS.parsedBytes) return false;
+  const bytes = asBuffer(data);
+  // External and alias records carry these literal type codes. A chance match
+  // in other data only leaves the document not proven.
+  if (!hasCompletePhotoshopSections(bytes) || bytes.includes('liFE', 0, 'latin1') || bytes.includes('liFA', 0, 'latin1')) return false;
+  let psd;
+  try {
+    psd = readPsd(bytes, { skipLayerImageData: true, skipCompositeImageData: true, totalMemoryLimit: -Infinity });
+  } catch (_) { return false; }
+  if (!psd || typeof psd !== 'object') return false;
+  const links = collectDocumentLinkRecords(psd, budget);
+  if (!links) return false;
+  const ids = new Set();
+  for (const record of links.records) {
+    if (!record || typeof record !== 'object' || ++budget.records > EMBEDDED_DOCUMENT_LIMITS.records) return false;
+    if (record.linkedFile !== undefined || !(record.data instanceof Uint8Array) || !record.data.byteLength) return false;
+    if (typeof record.id !== 'string' || !record.id || ids.has(record.id)) return false;
+    ids.add(record.id);
+    if (hasPhotoshopSignature(record.data) && !isProvenEmbeddedDocument(record.data, budget, depth + 1)) return false;
+  }
+  return links.placedIds.every(id => ids.has(id));
+}
+
+function isProvenEmbeddedDocumentBytes(data) {
+  return isProvenEmbeddedDocument(data, { parsedBytes: 0, records: 0, layers: 0 });
+}
+
+// Decides each linked-file record of one parsed parent. `getFraming` supplies
+// the parent's wire facts: parsed fields alone cannot show that a record is
+// stored as embedded data, because a record of another form can parse the same.
+function createEmbeddedDocumentClassifier(psd, getFraming) {
+  const idCounts = new Map();
+  const count = records => {
+    for (const record of Array.isArray(records) ? records : []) {
+      if (typeof record?.id === 'string') idCounts.set(record.id, (idCounts.get(record.id) || 0) + 1);
+    }
+  };
+  count(psd?.linkedFiles);
+  const walk = layers => {
+    for (const layer of Array.isArray(layers) ? layers : []) { count(layer?.linkedFiles); walk(layer?.children); }
+  };
+  walk(psd?.children);
+  let framing;
+  const decisions = new Map();
+  return record => {
+    if (decisions.has(record)) return decisions.get(record);
+    let proven = false;
+    try {
+      if (record && record.linkedFile === undefined && hasPhotoshopSignature(record.data) &&
+          typeof record.id === 'string' && record.id && idCounts.get(record.id) === 1) {
+        if (framing === undefined) framing = getFraming() || null;
+        const wire = (framing?.records || []).filter(item => item.id === record.id);
+        proven = wire.length === 1 && wire[0].type === 'liFD' && wire[0].carrier !== 'lnkE' &&
+          wire[0].tailBytes === 0 && isProvenEmbeddedDocumentBytes(record.data);
+      }
+    } catch (_) { proven = false; }
+    decisions.set(record, proven);
+    return proven;
+  };
+}
+
 const CHUNK_BYTES = 1024 * 1024;
 const TEXT_UNITS = 16384;
 const PSD_RECORD_PROTOCOL_VERSION = 3;
@@ -513,4 +667,7 @@ module.exports = {
   TEXT_UNITS,
   sendPsdRecords,
   startAddFilesPsdWorker,
+  EMBEDDED_DOCUMENT_LIMITS,
+  createEmbeddedDocumentClassifier,
+  isProvenEmbeddedDocumentBytes,
 };
