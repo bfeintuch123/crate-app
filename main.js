@@ -6497,6 +6497,9 @@ async function getAssetBaselineSourceRecoveryRecord(project, file) {
 
 function normalizeFailedRequiredAssetBaselineSources(project, baseline) {
   if (!baseline || baseline.status !== 'awaiting-first-scan') return [];
+  // Every project read runs this while the first scan is pending. With no
+  // record to check, skip resolving each source path: the result is [] anyway.
+  if (!Array.isArray(baseline.failedRequiredSources) || baseline.failedRequiredSources.length === 0) return [];
   const validSourceKeys = new Set(
     (project.files || [])
       .filter(isProjectAssetBaselineSource)
