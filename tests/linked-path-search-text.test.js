@@ -14,6 +14,9 @@ const { mainExtractor } = require('./fixtures/linked-asset-main.cjs');
 const root = path.resolve(__dirname, '..');
 const mainSource = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
 const searchText = (buffer, ...rest) => extractLinkedAssetPaths.searchText(buffer, ...rest);
+// Valid UTF-8 goes straight to the whole-buffer decode. This runs the byte scan
+// on any input, so the reduced text itself stays under test.
+const scanText = (buffer, options) => searchText(buffer, { isValidUtf8: () => false, ...options });
 
 // The two greedy literals come from main.js, so these cases follow the code.
 function literalAt(anchor) {
@@ -45,15 +48,18 @@ const describe = buffer => `${buffer.length} bytes: ${buffer.subarray(0, 120).to
 // prove that it exercised something.
 function checkSame(buffer, label, options) {
   const whole = buffer.toString('utf8');
-  const reduced = searchText(buffer, options);
-  if (reduced.length > buffer.length) assert.fail(`${label}: text is longer than the buffer (${describe(buffer)})`);
+  const texts = options ? [scanText(buffer, options)] : [searchText(buffer), scanText(buffer)];
   let matches = 0;
   for (const [name, run] of GRAMMARS) {
-    const expected = run(whole), actual = run(reduced);
+    const expected = run(whole);
     matches += expected.length;
-    if (!sameList(actual, expected)) {
-      assert.fail(`${label}: ${name} differs for ${describe(buffer)}\n` +
-        `expected ${JSON.stringify(expected).slice(0, 400)}\nactual ${JSON.stringify(actual).slice(0, 400)}`);
+    for (const reduced of texts) {
+      if (reduced.length > buffer.length) assert.fail(`${label}: text is longer than the buffer (${describe(buffer)})`);
+      const actual = run(reduced);
+      if (!sameList(actual, expected)) {
+        assert.fail(`${label}: ${name} differs for ${describe(buffer)}\n` +
+          `expected ${JSON.stringify(expected).slice(0, 400)}\nactual ${JSON.stringify(actual).slice(0, 400)}`);
+      }
     }
   }
   return matches;
@@ -224,7 +230,7 @@ test('empty and prefix-only inputs', () => {
   for (const input of ['', '/', '/Users/', '/Volumes/', '/USERS/', '/Users//Volumes/', '\0', '"', "'"]) {
     assert.equal(checkSame(bytes(input), JSON.stringify(input)), 0);
   }
-  assert.equal(searchText(Buffer.alloc(0)), '');
+  assert.equal(scanText(Buffer.alloc(0)), '');
 });
 
 test('a seeded generator over those atoms produces identical results on both paths', () => {
@@ -245,7 +251,7 @@ test('a seeded generator over those atoms produces identical results on both pat
     const buffer = Buffer.concat(parts), options = round % 2 ? tinyBudget(round) : undefined;
     matches += checkSame(buffer, `round ${round}`, options);
     const whole = buffer.toString('utf8');
-    if (whole !== searchText(buffer)) (searchText(buffer, options) === whole ? fellBack++ : reducedRounds++);
+    if (options && whole !== scanText(buffer)) (scanText(buffer, options) === whole ? fellBack++ : reducedRounds++);
   }
   assert.ok(matches > 20000, `only ${matches} matches`);
   assert.ok(fellBack > 1000, `only ${fellBack} rounds used the whole-buffer path`);
@@ -259,27 +265,27 @@ test('only candidate runs are decoded, and they are joined by a delimiter', t =>
     spans.push((args[2] ?? this.length) - (args[1] ?? 0));
     return realToString.apply(this, args);
   });
-  const text = searchText(buffer);
+  const text = scanText(buffer);
   t.mock.restoreAll();
   assert.equal(text, '/Users/a.png\n/VOLUMES/é/b.jpg');
   assert.deepEqual(spans, [12, 17]);
-  assert.equal(searchText(join('no candidates', [0x00], '/tmp/a.png')), '');
+  assert.equal(scanText(join('no candidates', [0x00], '/tmp/a.png')), '');
 });
 
 test('every delimiter byte ends a run, and no other byte does', () => {
   for (const delimiter of DELIMITERS) {
-    assert.equal(searchText(join('/Users/a.png', [delimiter], 'tail')), '/Users/a.png', `byte ${delimiter}`);
+    assert.equal(scanText(join('/Users/a.png', [delimiter], 'tail')), '/Users/a.png', `byte ${delimiter}`);
   }
   for (const byte of [0x20, 0x21, 0x23, 0x26, 0x28, 0x7f]) {
     const text = String.fromCharCode(byte);
-    assert.equal(searchText(join('/Users/a.png', [byte], 'tail')), `/Users/a.png${text}tail`, `byte ${byte}`);
+    assert.equal(scanText(join('/Users/a.png', [byte], 'tail')), `/Users/a.png${text}tail`, `byte ${byte}`);
   }
-  assert.equal(searchText(join('/Users/a.png', [0xff], 'tail')), '/Users/a.png�tail');
+  assert.equal(scanText(join('/Users/a.png', [0xff], 'tail')), '/Users/a.png�tail');
 });
 
 test('a run ends at its delimiter even when a later prefix sits inside it', () => {
-  assert.equal(searchText(bytes('/Users/a/Volumes/b.png')), '/Users/a/Volumes/b.png');
-  assert.equal(searchText(bytes('/Use/Users/a.png')), '/Users/a.png');
+  assert.equal(scanText(bytes('/Users/a/Volumes/b.png')), '/Users/a/Volumes/b.png');
+  assert.equal(scanText(bytes('/Use/Users/a.png')), '/Users/a.png');
 });
 
 test('a buffer over the string limit takes the old whole-buffer decode', t => {
@@ -289,16 +295,16 @@ test('a buffer over the string limit takes the old whole-buffer decode', t => {
     calls.push({ same: this === buffer, args });
     return realToString.apply(this, args);
   });
-  assert.equal(searchText(buffer, { maxStringLength: buffer.length - 1 }), 'noise /Users/a.png noise');
+  assert.equal(scanText(buffer, { maxStringLength: buffer.length - 1 }), 'noise /Users/a.png noise');
   assert.deepEqual(calls, [{ same: true, args: ['utf8'] }]);
   calls.length = 0;
-  assert.equal(searchText(buffer, { maxStringLength: buffer.length }), '/Users/a.png noise', 'exactly at the limit is still reduced');
+  assert.equal(scanText(buffer, { maxStringLength: buffer.length }), '/Users/a.png noise', 'exactly at the limit is still reduced');
   assert.equal(calls.some(call => call.same), false);
 });
 
 // A Buffer in type only: it reports any length without allocating it.
 function bufferReporting(length, toString) {
-  const fake = Object.setPrototypeOf(new Uint8Array(0), Buffer.prototype);
+  const fake = Object.setPrototypeOf(new Uint8Array([0xff]), Buffer.prototype); // one invalid byte
   Object.defineProperty(fake, 'length', { value: length });
   fake.toString = toString;
   return fake;
@@ -318,11 +324,12 @@ test('each budget, once exceeded, gives exactly the whole-buffer text', () => {
     ['slash misses', join('head /a /b /Users/x.png', [0x00], 'tail'), { maxSlashMisses: 2 }, { maxSlashMisses: 1 }],
     ['runs', join('head', [0x00], '/Users/a.png', [0x00], '/Users/b.png', [0x00]), { maxRuns: 2 }, { maxRuns: 1 }],
     ['run bytes', join('head', [0x00], '/Users/a.png', [0x00], '/Users/b.png', [0x00]), { maxRunBytes: 24 }, { maxRunBytes: 23 }],
+    ['slash density', join('/a/b/c ', 'x'.repeat(2000), ' /Users/x.png', [0x00]), { slashMissHeadroom: 3 }, { slashMissHeadroom: 2 }],
   ];
   for (const [name, buffer, atLimit, overLimit] of cases) {
     const whole = buffer.toString('utf8');
-    assert.notEqual(searchText(buffer, atLimit), whole, `${name}: exactly at the budget stays reduced`);
-    assert.equal(searchText(buffer, overLimit), whole, `${name}: over the budget`);
+    assert.notEqual(scanText(buffer, atLimit), whole, `${name}: exactly at the budget stays reduced`);
+    assert.equal(scanText(buffer, overLimit), whole, `${name}: over the budget`);
     checkSame(buffer, name, atLimit);
     checkSame(buffer, name, overLimit);
   }
@@ -346,6 +353,7 @@ function slashEvery(step) {
   for (let offset = 0; offset < out.length; offset += step) out[offset] = 0x2f;
   return out;
 }
+const withInvalidByte = buffer => Buffer.concat([buffer, Buffer.from([0xff])]);
 const DENSE_INPUTS = {
   'all slashes': () => Buffer.alloc(DENSE_BYTES, 0x2f),
   'a slash every 24 bytes': () => slashEvery(24),
@@ -356,7 +364,7 @@ const DENSE_INPUTS = {
 
 test('dense input with the default budgets gives exactly the whole-buffer text', () => {
   for (const [name, build] of Object.entries(DENSE_INPUTS)) {
-    const buffer = build();
+    const buffer = withInvalidByte(build());
     assert.ok(searchText(buffer) === buffer.toString('utf8'), name);
   }
 });
@@ -375,12 +383,53 @@ function countDecodes(t, buffer, run) {
 test('dense input costs at most the run limit plus one decode', t => {
   const RUN_LIMIT = 4096;
   for (const [name, build] of Object.entries(DENSE_INPUTS)) {
-    const buffer = build(), counts = countDecodes(t, buffer, () => searchText(buffer));
+    const buffer = withInvalidByte(build()), counts = countDecodes(t, buffer, () => searchText(buffer));
     assert.ok(counts.total <= RUN_LIMIT + 1, `${name}: ${counts.total} decodes`);
     assert.equal(counts.whole, 1, name);
   }
-  const prefixes = DENSE_INPUTS['prefixes with delimiters']();
+  const prefixes = withInvalidByte(DENSE_INPUTS['prefixes with delimiters']());
   assert.equal(countDecodes(t, prefixes, () => searchText(prefixes)).total, RUN_LIMIT + 1);
+});
+
+test('valid UTF-8 goes straight to one whole-buffer decode', t => {
+  const { isUtf8 } = require('node:buffer');
+  assert.equal(typeof isUtf8, 'function');
+  const inputs = [
+    DENSE_INPUTS['all slashes'](), DENSE_INPUTS['prefixes with delimiters'](), DENSE_INPUTS['one prefix per line'](),
+    DENSE_INPUTS['prefixes without delimiters'](), Buffer.from('/Users/é/日本語/😀.png\n'.repeat(4096)),
+  ];
+  for (const buffer of inputs) {
+    assert.ok(isUtf8(buffer));
+    assert.deepEqual(countDecodes(t, buffer, () => searchText(buffer)), { total: 1, whole: 1 });
+  }
+});
+
+test('without a UTF-8 check the budgets still apply', () => {
+  for (const build of [DENSE_INPUTS['all slashes'], DENSE_INPUTS['prefixes with delimiters']]) {
+    const buffer = build();
+    assert.ok(searchText(buffer, { isValidUtf8: null }) === buffer.toString('utf8'));
+  }
+  assert.equal(searchText(bytes('x /Users/a.png'), { isValidUtf8: null }), '/Users/a.png');
+});
+
+test('long kept runs reach the default byte budget before the run limit', t => {
+  // 2,000 runs of 100 bytes in 3 MiB: under 4,096 runs, over length / 32 bytes.
+  const buffer = seededBytes(DENSE_BYTES, 0x44aa1c09);
+  for (let i = 0; i < 2000; i++) Buffer.from(`\0/Users/${'r'.repeat(90)}.png\0`).copy(buffer, 1000 + i * 1400);
+  const counts = countDecodes(t, buffer, () => assert.ok(searchText(buffer) === buffer.toString('utf8')));
+  assert.equal(counts.whole, 2, 'the fallback decode and this comparison');
+  assert.ok(counts.total <= 1002, `${counts.total} decodes`);
+});
+
+test('slash-dense data gives up early instead of spending the whole budget', t => {
+  const buffer = withInvalidByte(repeated(`/${'x'.repeat(39)}`, DENSE_BYTES));
+  const realIndexOf = Buffer.prototype.indexOf;
+  let searches = 0;
+  t.mock.method(Buffer.prototype, 'indexOf', function (...args) { if (this === buffer) searches++; return realIndexOf.apply(this, args); });
+  const text = searchText(buffer);
+  t.mock.restoreAll();
+  assert.ok(text === buffer.toString('utf8'));
+  assert.ok(searches < 7000, `${searches} searches`);
 });
 
 test('sparse binary data stays on the reduced path', t => {
@@ -396,7 +445,15 @@ test('sparse binary data stays on the reduced path', t => {
 
 test('a value that is not a Buffer keeps the old toString behavior', () => {
   assert.equal(searchText('/Users/a.png as text'), '/Users/a.png as text');
+  assert.equal(searchText(new Uint8Array([1, 2])), '1,2');
   assert.throws(() => searchText(undefined), TypeError);
+  assert.throws(() => searchText(null), TypeError);
+  const throwing = { get length() { throw new Error('length inspected'); }, toString(encoding) { return `/Users/x.png ${encoding}`; } };
+  assert.equal(searchText(throwing), '/Users/x.png utf8');
+  let lengthReads = 0;
+  const counting = { get length() { lengthReads++; return 5; }, toString: encoding => encoding };
+  assert.equal(searchText(counting), 'utf8');
+  assert.equal(lengthReads, 0);
 });
 
 function trackedOptions() {

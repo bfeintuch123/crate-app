@@ -150,12 +150,14 @@ function cases() {
     return fake;
   }
 
-  for (const [label, failRead, expectDecode] of [
-    ['a read error', () => { throw Object.assign(new Error('synthetic read failure'), { code: 'EIO' }); }, false],
+  // Decodes expected on the failing file: the pre-package pass and its later
+  // double-check each decode once; Watch start reads it once for its snapshot.
+  for (const [label, failRead, preScanDecodes, watchDecodes] of [
+    ['a read error', () => { throw Object.assign(new Error('synthetic read failure'), { code: 'EIO' }); }, 0, 0],
     ['an over-limit decode error', state => oversizedBuffer(() => {
       state.decodes++;
       throw Object.assign(new Error('synthetic string limit'), { code: 'ERR_STRING_TOO_LONG' });
-    }), true],
+    }), 2, 1],
   ]) {
     routeTest(`pre-package scan: ${label} on one file leaves the other file's links intact`, { timeout: 120000 }, async () => {
       const f = await twoSourceFixture();
@@ -170,7 +172,7 @@ function cases() {
         assert.equal(result?.error, undefined);
       } finally { fs.promises.readFile = realReadFile; }
       assert.ok(attempts > 0);
-      assert.equal(state.decodes > 0, expectDecode);
+      assert.equal(state.decodes, preScanDecodes);
       assert.deepEqual(rowsBesideSources(f), f.links);
     });
 
@@ -189,7 +191,7 @@ function cases() {
       };
       try { await startWatchingAndStop(f.id); } finally { fs.readFileSync = realReadFileSync; }
       assert.ok(attempts > 0);
-      assert.equal(state.decodes > 0, expectDecode);
+      assert.equal(state.decodes, watchDecodes);
       assert.deepEqual(rowsBesideSources(f), f.links);
     });
   }
@@ -212,7 +214,8 @@ function cases() {
   ]) {
     routeTest(`${label}: links in an over-limit file's successful decode are still found`, { timeout: 120000 }, async () => {
       const f = await twoSourceFixture();
-      const [decodedLink] = createLinks(['Only In Oversized Decode.png']);
+      // Only the greedy site can produce this row: no .png file exists before it.
+      const [decodedLink] = createLinks(['Only In Oversized.png-retouched.jpg']);
       installRead(f, () => oversizedBuffer(() => `\0${decodedLink}\0`));
       try { await run(f); } finally { fs.promises.readFile = realReadFile; fs.readFileSync = realReadFileSync; }
       assert.ok(rowsBesideSources(f).includes(decodedLink));
