@@ -1,6 +1,6 @@
 'use strict';
 // Illustrator link rows under Needs Review are re-checked against every trusted
-// Illustrator reading (Olivia Q8). Source harness: Electron, the store and the
+// Illustrator reading. Source harness: Electron, the store and the
 // native collectors (Illustrator AppleScript, pgrep/ps, Photoshop and InDesign
 // scripts) are simulated by tests/provenance-dual-write.test.js, loaded through
 // the same adapter tests/cross-app-live-pipeline.test.js uses. Synthetic files only.
@@ -28,7 +28,7 @@ function cases() {
   function unconfirmableDir() {
     const tmp = fs.realpathSync(os.tmpdir());
     const base = /^\/(Users|Volumes)\//.test(tmp + '/') ? '/private/tmp' : tmp;
-    return fs.mkdtempSync(path.join(base, 'q8-unconfirmable-'));
+    return fs.mkdtempSync(path.join(base, 'link-unconfirmable-'));
   }
 
   function illustratorRows(docs) {
@@ -85,7 +85,7 @@ function cases() {
   async function watchedDocument(label, { extra = null, docs = ['Board.ai'] } = {}) {
     resetTestHomeWorkspace();
     fs.mkdirSync(path.join(TEST_HOME, 'Desktop'), { recursive: true });
-    const dir = fs.mkdtempSync(path.join(TEST_HOME, 'Desktop', 'q8-link-'));
+    const dir = fs.mkdtempSync(path.join(TEST_HOME, 'Desktop', 'link-row-'));
     const paths = docs.map(name => { const filePath = path.join(dir, name); writeSyntheticAiFile(filePath, 'no links'); return filePath; });
     const ill = illustrator(extra);
     const project = await createProject(label);
@@ -112,8 +112,8 @@ function cases() {
   function setDoc(f, patch, docIndex = 0) { f.ill.docs[docIndex] = { ...f.ill.docs[docIndex], ...patch }; }
 
   // 1. Link deleted while the document is unsaved.
-  adapterTest('Q8-1: a link deleted while unsaved leaves Needs Review at the next trusted reading and stays gone after save', async () => {
-    const f = await watchedDocument('Q8 1 deleted link');
+  adapterTest('link-row-1: a link deleted while unsaved leaves Needs Review at the next trusted reading and stays gone after save', async () => {
+    const f = await watchedDocument('Link row 1 deleted link');
     const link = png(f.dir, 'Deleted.png');
     await placeUnsaved(f, link);
     setDoc(f, { modified: true, links: [] });
@@ -128,8 +128,8 @@ function cases() {
   });
 
   // 2. Document closed without saving.
-  adapterTest('Q8-2: closing the document without saving withdraws its link row', async () => {
-    const f = await watchedDocument('Q8 2 closed');
+  adapterTest('link-row-2: closing the document without saving withdraws its link row', async () => {
+    const f = await watchedDocument('Link row 2 closed');
     await placeUnsaved(f, png(f.dir, 'Closed.png'));
     f.ill.docs = [];
     await poll(f.id);
@@ -137,8 +137,8 @@ function cases() {
   });
 
   // 3. Illustrator quits; a failed process check is not a reading.
-  adapterTest('Q8-3: Illustrator quitting withdraws the row; a failed process check keeps it', async () => {
-    const f = await watchedDocument('Q8 3 quit');
+  adapterTest('link-row-3: Illustrator quitting withdraws the row; a failed process check keeps it', async () => {
+    const f = await watchedDocument('Link row 3 quit');
     await placeUnsaved(f, png(f.dir, 'Quit.png'));
     const before = clone(storedRow(f.id, 'Quit.png'));
     f.ill.running = false;
@@ -151,8 +151,8 @@ function cases() {
   });
 
   // 4 and 5. Link kept and saved, path the save scan cannot confirm.
-  adapterTest('Q8-4/5: a saved link the scan cannot confirm becomes decidable on the second clean reading, stays decidable, and Include/Exclude work', async () => {
-    const f = await watchedDocument('Q8 4 unconfirmable');
+  adapterTest('link-row-4/5: a saved link the scan cannot confirm becomes decidable on the second clean reading, stays decidable, and Include/Exclude work', async () => {
+    const f = await watchedDocument('Link row 4 unconfirmable');
     const tempDir = unconfirmableDir();
     try {
       const keep = png(tempDir, 'Screenshot Keep.png'), drop = png(tempDir, 'Screenshot Drop.png');
@@ -202,8 +202,8 @@ function cases() {
   });
 
   // 6. A decidable PSD row overwritten by a live link is restored exactly.
-  adapterTest('Q8-6: a decidable PSD row placed and deleted is restored deep-equal; placed and saved it is Included', async () => {
-    const f = await watchedDocument('Q8 6 PSD');
+  adapterTest('link-row-6: a decidable PSD row placed and deleted is restored deep-equal; placed and saved it is Included', async () => {
+    const f = await watchedDocument('Link row 6 PSD');
     const psd = path.join(f.dir, 'PinMockup.psd');
     fs.writeFileSync(psd, '8BPS synthetic');
     const watchStartedAt = stored(f.id).watchStartedAt;
@@ -229,8 +229,8 @@ function cases() {
   });
 
   // 7. Two documents link the same file.
-  adapterTest('Q8-7: a link kept by one of two documents stays; removed from both it is withdrawn', async () => {
-    const f = await watchedDocument('Q8 7 shared', { docs: ['First.ai', 'Second.ai'] });
+  adapterTest('link-row-7: a link kept by one of two documents stays; removed from both it is withdrawn', async () => {
+    const f = await watchedDocument('Link row 7 shared', { docs: ['First.ai', 'Second.ai'] });
     const link = png(f.dir, 'Shared.png');
     await placeUnsaved(f, link, 0);
     setDoc(f, { modified: true, links: [link] }, 1);
@@ -245,8 +245,8 @@ function cases() {
 
   // 8. Untrusted readings change no row.
   for (const kind of ['error row', 'count mismatch', 'pathless document']) {
-    adapterTest(`Q8-8: an untrusted reading (${kind}) and the scope it leaves not ready change no row`, async () => {
-      const f = await watchedDocument('Q8 8 ' + kind);
+    adapterTest(`link-row-8: an untrusted reading (${kind}) and the scope it leaves not ready change no row`, async () => {
+      const f = await watchedDocument('Link row 8 ' + kind);
       await placeUnsaved(f, png(f.dir, 'Guarded.png'));
       const before = clone(storedRow(f.id, 'Guarded.png'));
       const name = path.basename(f.ai);
@@ -268,8 +268,8 @@ function cases() {
     });
   }
 
-  adapterTest('Q8-8: a stale reading (activation ended during the query) changes no row', async () => {
-    const f = await watchedDocument('Q8 8 stale');
+  adapterTest('link-row-8: a stale reading (activation ended during the query) changes no row', async () => {
+    const f = await watchedDocument('Link row 8 stale');
     await placeUnsaved(f, png(f.dir, 'Stale.png'));
     const before = clone(storedRow(f.id, 'Stale.png'));
     let paused = null;
@@ -283,7 +283,7 @@ function cases() {
   });
 
   // 9. Other apps' rows, earlier-session rows and project files are untouched.
-  adapterTest('Q8-9: Photoshop and InDesign link rows, earlier-session rows and project files are untouched', async () => {
+  adapterTest('link-row-9: Photoshop and InDesign link rows, earlier-session rows and project files are untouched', async () => {
     const other = { photoshop: false, indesign: false, psLink: null, inddDoc: null, inddLink: null };
     const extra = request => {
       if (request.kind === 'exec' && request.command.includes("grep -i 'Adobe Photoshop'")) {
@@ -299,7 +299,7 @@ function cases() {
       }
       return null;
     };
-    const f = await watchedDocument('Q8 9 untouched', { extra });
+    const f = await watchedDocument('Link row 9 untouched', { extra });
     // An Illustrator link row from an earlier watch session.
     await placeUnsaved(f, png(f.dir, 'Earlier.png'));
     await callIpcRaw('projects:pause', f.id);
@@ -343,8 +343,8 @@ function cases() {
   // 9b. An earlier-session row restaged by this session's reading is restored
   // unchanged (still hidden) when the link goes; the scoped view never carries
   // the review state.
-  adapterTest('Q8-9b: an earlier-session row restaged in this session is restored unchanged when the link goes', async () => {
-    const f = await watchedDocument('Q8 9b restaged');
+  adapterTest('link-row-9b: an earlier-session row restaged in this session is restored unchanged when the link goes', async () => {
+    const f = await watchedDocument('Link row 9b restaged');
     const kept = png(f.dir, 'Restaged.png'), gone = png(f.dir, 'HiddenEarlier.png');
     await placeUnsaved(f, kept);
     await placeUnsaved(f, gone);
@@ -369,8 +369,8 @@ function cases() {
   });
 
   // 10. A link reported only by an excluded working file.
-  adapterTest('Q8-10: a link reported only by an excluded working file keeps Needs Save on clean readings and is withdrawn when unlinked', async () => {
-    const f = await watchedDocument('Q8 10 excluded working file');
+  adapterTest('link-row-10: a link reported only by an excluded working file keeps Needs Save on clean readings and is withdrawn when unlinked', async () => {
+    const f = await watchedDocument('Link row 10 excluded working file');
     const link = png(f.dir, 'OwnedByExcluded.png');
     await placeUnsaved(f, link);
     const workspace = await callIpcRaw('projects:get-asset-workspace', f.id);
@@ -389,8 +389,8 @@ function cases() {
   });
 
   // 11. Withdrawal is not a designer decision.
-  adapterTest('Q8-11: withdrawal writes no exclusion key, no Excluded record and no decision provenance', async () => {
-    const f = await watchedDocument('Q8 11 not a decision');
+  adapterTest('link-row-11: withdrawal writes no exclusion key, no Excluded record and no decision provenance', async () => {
+    const f = await watchedDocument('Link row 11 not a decision');
     await placeUnsaved(f, png(f.dir, 'Withdrawn.png'));
     const keys = clone(stored(f.id).excludedAssetKeys || []);
     const records = clone(stored(f.id).excludedPendingFiles || []);
@@ -406,9 +406,9 @@ function cases() {
   });
 
   // 12. The Needs Save notification follows the rows.
-  adapterTest('Q8-12: the Needs Save notice is withdrawn with its rows; none is raised for a row that stayed decidable', async () => {
+  adapterTest('link-row-12: the Needs Save notice is withdrawn with its rows; none is raised for a row that stayed decidable', async () => {
     backgroundNeedsSave();
-    const f = await watchedDocument('Q8 12 notice');
+    const f = await watchedDocument('Link row 12 notice');
     await placeUnsaved(f, png(f.dir, 'Noticed.png'));
     await waitForNeedsSave(() => needsSaveNotices().length === 1, 'first notice');
     const first = needsSaveNotices()[0];
@@ -442,9 +442,9 @@ function cases() {
 
   // 12b. A same-account refresh starts a new watch session: stored rows stay
   // stored, its first reading reconciles nothing, and nothing is re-announced.
-  adapterTest('Q8-12b: rows stored across a refresh stay stored exactly and are not announced again', async () => {
+  adapterTest('link-row-12b: rows stored across a refresh stay stored exactly and are not announced again', async () => {
     backgroundNeedsSave();
-    const f = await watchedDocument('Q8 12b refresh');
+    const f = await watchedDocument('Link row 12b refresh');
     const restaged = png(f.dir, 'StaysLinked.png'), gone = png(f.dir, 'GoneBeforeRefresh.png');
     await placeUnsaved(f, restaged);
     await placeUnsaved(f, gone);
@@ -478,8 +478,8 @@ function cases() {
   });
 
   // 13. The pre-package Illustrator refresh reconciles too.
-  for (const gone of ['link deleted', 'Illustrator quit']) adapterTest(`Q8-13: the pre-package Illustrator refresh withdraws a link that is gone (${gone})`, async () => {
-    const f = await watchedDocument('Q8 13 pre-package ' + gone);
+  for (const gone of ['link deleted', 'Illustrator quit']) adapterTest(`link-row-13: the pre-package Illustrator refresh withdraws a link that is gone (${gone})`, async () => {
+    const f = await watchedDocument('Link row 13 pre-package ' + gone);
     await placeUnsaved(f, png(f.dir, 'PrePackage.png'));
     if (gone === 'link deleted') setDoc(f, { modified: true, links: [] });
     else f.ill.running = false;
@@ -490,10 +490,157 @@ function cases() {
     assert.equal(storedRow(f.id, 'PrePackage.png'), undefined);
   });
 
+  // One chronological workflow through a document with existing links. It pins
+  // what reconciliation must remove (the new screenshot's row) and what it must
+  // not disturb. Whether undecided rows stay visible after pause then Watch is
+  // deliberately not asserted here.
+  function workflowFixture() {
+    resetTestHomeWorkspace();
+    fs.mkdirSync(path.join(TEST_HOME, 'Desktop'), { recursive: true });
+    const dir = fs.mkdtempSync(path.join(TEST_HOME, 'Desktop', 'link-workflow-'));
+    const file = name => path.join(dir, name);
+    // Crate excludes by content, so every fixture has its own bytes.
+    const write = (filePath, label = path.basename(filePath)) => { fs.writeFileSync(filePath, Buffer.concat([createSyntheticPngBytes(), Buffer.from('workflow:' + label)])); return filePath; };
+    const mockup = name => { const filePath = file(name); fs.writeFileSync(filePath, '8BPS synthetic ' + name); return filePath; };
+    return {
+      dir, write, doc: file('Board.ai'),
+      existing: Array.from({ length: 12 }, (_, i) => write(file(`Existing${i + 1}.png`))),
+      firstMockup: mockup('FirstMockup.psd'), secondMockup: mockup('SecondMockup.psd'),
+      photos: [1, 2, 3].map(i => write(file(`Photo${i}.jpg`))),
+      olderShots: [1, 2, 3].map(i => write(file(`OlderScreenshot${i}.png`))),
+    };
+  }
+  async function workflowState(id) {
+    const workspace = await callIpcRaw('projects:get-asset-workspace', id);
+    const files = workspace.files || [];
+    const isAsset = file => file.projectRole !== 'source' && file.protectedSource !== true;
+    const isExcluded = file => file.excluded === true || file.included === false;
+    const assets = files.filter(isAsset);
+    const included = assets.filter(file => !isExcluded(file));
+    return {
+      workingFiles: files.filter(file => !isAsset(file)).map(file => file.name),
+      existing: included.filter(file => file.assetOrigin === 'existing').map(file => file.name).sort(),
+      added: included.filter(file => file.assetOrigin !== 'existing').map(file => file.name).sort(),
+      excluded: assets.filter(isExcluded).map(file => file.name).sort(),
+      excludedRecords: (workspace.excludedPendingFiles || []).map(file => file.name).sort(),
+    };
+  }
+  for (const session of ['no session change', 'pause then Watch']) for (const shot of ['removed before any save', 'unconfirmable path saved then removed']) {
+    adapterTest(`link-row workflow (${session}; new screenshot ${shot}): only the removed link's row leaves`, { timeout: 120000 }, async () => {
+      const f = workflowFixture(), ill = illustrator();
+      const names = paths => paths.map(item => path.basename(item));
+      let tempDir = null;
+      const doc = () => ill.docs[0];
+      const place = async paths => { ill.docs = [{ ...doc(), modified: true, links: [...doc().links, ...paths] }]; await poll(id); };
+      const unlink = async paths => { ill.docs = [{ ...doc(), modified: true, links: doc().links.filter(link => !paths.includes(link)) }]; await poll(id); };
+      const saveDoc = async () => {
+        ill.docs = [{ ...doc(), modified: false }];
+        writeSyntheticAiFile(f.doc, `${doc().links.join('\n')}\nsaved ${++saves}`);
+        await emitWatcher('change', f.doc);
+        await metadataTestHooks.waitForWatcherIdle(id);
+        await pause(150);
+        await poll(id);
+        await poll(id);
+      };
+      const includedAfterSave = async paths => {
+        const expected = names(paths);
+        await waitForCondition(() => expected.every(name => isProjectFile(id, name)), 'saved links Included: ' + expected.join(', '), 10000);
+        await metadataTestHooks.waitForWatcherIdle(id);
+        const state = await workflowState(id);
+        for (const name of expected) assert.ok(state.added.includes(name), name + ' Included: ' + JSON.stringify(state.added));
+      };
+      const secondMockupDecidable = async label => {
+        if (session !== 'no session change') return;
+        const name = path.basename(f.secondMockup);
+        assert.equal(storedRow(id, name)?.captureState, 'pending', label + ': stored row decidable');
+        assert.equal((await viewRow(id, name))?.captureState, 'pending', label + ': visible row decidable');
+      };
+      const checkpoint = async (label, { added, excluded }) => {
+        assert.equal(storedRow(id, 'NewScreenshot.png'), undefined, label + ': no stored row for the removed link');
+        assert.equal(await viewRow(id, 'NewScreenshot.png'), undefined, label + ': no visible row for the removed link');
+        const state = await workflowState(id);
+        assert.deepEqual(state.workingFiles, ['Board.ai'], label + ': one working file');
+        assert.deepEqual(state.existing, names(f.existing).sort(), label + ': existing assets still included');
+        assert.deepEqual(state.added, names(added).sort(), label + ': added assets');
+        assert.deepEqual([...state.excluded, ...state.excludedRecords].sort(), names(excluded).sort(), label + ': excluded assets');
+      };
+      let saves = 0;
+      const project = await createProject('Link row workflow');
+      const id = project.id;
+      try {
+        await waitForCondition(() => ill.queries >= 1, 'activation query');
+        writeSyntheticAiFile(f.doc, f.existing.join('\n'));
+        await emitWatcher('add', f.doc);
+        await metadataTestHooks.waitForWatcherIdle(id);
+        ill.docs = [{ path: f.doc, modified: false, links: [...f.existing] }];
+        await poll(id);
+        await poll(id);
+        const decision = await callIpcRaw('projects:set-existing-assets-decision', id, 'include');
+        assert.equal(decision.success, true, JSON.stringify(decision));
+        await poll(id);
+        const watchStart = stored(id).watchStartedAt;
+        for (const mockup of [f.secondMockup, f.firstMockup]) {
+          await emitWatcherWithStats('add', mockup, { mtimeMs: watchStart - 86_400_000, birthtimeMs: watchStart - 86_400_000 });
+        }
+        await metadataTestHooks.waitForWatcherIdle(id);
+        await secondMockupDecidable('offered for review');
+        if (session === 'pause then Watch') {
+          await callIpcRaw('projects:pause', id);
+          await callIpcRaw('projects:start-watching', id);
+          await metadataTestHooks.waitForWatcherIdle(id);
+          await pause(200);
+          await poll(id);
+          await poll(id);
+        }
+
+        await place(f.photos);
+        await saveDoc();
+        await includedAfterSave(f.photos);
+        await secondMockupDecidable('after the photos');
+
+        await place([...f.olderShots, f.firstMockup]);
+        await saveDoc();
+        await includedAfterSave([...f.olderShots, f.firstMockup]);
+        await secondMockupDecidable('after the first mockup');
+
+        let newShot = f.write(path.join(f.dir, 'NewScreenshot.png'));
+        if (shot !== 'removed before any save') {
+          tempDir = unconfirmableDir();
+          newShot = f.write(path.join(tempDir, 'NewScreenshot.png'), 'NewScreenshot-unconfirmable');
+        }
+        await place([newShot]);
+        assert.ok(storedRow(id, 'NewScreenshot.png'), 'the new screenshot is under Needs Review while linked');
+        if (shot !== 'removed before any save') await saveDoc();
+        await unlink([newShot]);
+        await saveDoc();
+        await saveDoc();
+        const beforeExclusions = [...f.photos, ...f.olderShots, f.firstMockup];
+        await checkpoint('after the removed link and two saves', { added: beforeExclusions, excluded: [] });
+        await secondMockupDecidable('after the removed link');
+
+        await unlink(f.olderShots);
+        await saveDoc();
+        for (const shotPath of f.olderShots) await callIpcRaw('projects:remove-file', id, shotPath);
+        await secondMockupDecidable('after the exclusions');
+        await place([f.secondMockup]);
+        await saveDoc();
+        await includedAfterSave([f.secondMockup]);
+        const afterExclusions = [...f.photos, f.firstMockup, f.secondMockup];
+        await checkpoint('after the exclusions and second mockup', { added: afterExclusions, excluded: f.olderShots });
+
+        await unlink(f.photos);
+        await saveDoc();
+        await checkpoint('at the end', { added: afterExclusions, excluded: f.olderShots });
+      } finally {
+        if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+  }
+
   // 14. Unchanged: a confirmable saved link is promoted as before.
   for (const cleanReadings of [0, 1, 2]) {
-    adapterTest(`Q8-14 (unchanged): a confirmable saved link is promoted after ${cleanReadings} clean reading(s) first`, async () => {
-      const f = await watchedDocument('Q8 14 promoted ' + cleanReadings);
+    adapterTest(`link-row-14 (unchanged): a confirmable saved link is promoted after ${cleanReadings} clean reading(s) first`, async () => {
+      const f = await watchedDocument('Link row 14 promoted ' + cleanReadings);
       const link = png(f.dir, 'Confirmed.png');
       await placeUnsaved(f, link);
       setDoc(f, { modified: false, links: [link] });
