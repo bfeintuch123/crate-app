@@ -15,7 +15,7 @@ replaceOnce('                  psd: fixture,',
   "                  psd: originalLoad.call(Module, 'ag-psd/dist/index.js', module).readPsd(fs.readFileSync(filePath), { skipLayerImageData: true, skipCompositeImageData: true, totalMemoryLimit: -Infinity }),\n" +
   "                  framing: require('../parsers/add-files-psd-worker').inspectPsdLinkFraming(fs.readFileSync(filePath)),");
 replaceOnce('      return nextOpenDialogResult;', '      if (globalThis.__embeddedDialog) return globalThis.__embeddedDialog();\n      return nextOpenDialogResult;');
-replaceOnce('  captureProjectOperation,\n  runScanOnOpen', '  clearPsdParseDebounce() { psdParseDebounce.clear(); },\n  isRowExcludedForReview(project, row) { return isAssetReviewFileExcluded(project, row); },\n  fileNodeId(filePath) { return createNodeId(NODE_TYPES.FILE, { normalizedPath: normalizeTrackedFilePath(filePath) }); },\n  sourceRouteKey(project, row) { return getAssetBaselineSourceRecoveryRouteKey(project, row); },\n  watchStagedFiles(observe) { const stage = stageLiveObservedFile; stageLiveObservedFile = (project, file, ...rest) => { observe(file); return stage(project, file, ...rest); }; return () => { stageLiveObservedFile = stage; }; },\n  captureProjectOperation,\n  runScanOnOpen');
+replaceOnce('  captureProjectOperation,\n  runScanOnOpen', '  clearPsdParseDebounce() { psdParseDebounce.clear(); },\n  isRowExcludedForReview(project, row) { return isAssetReviewFileExcluded(project, row); },\n  fileNodeId(filePath) { return createNodeId(NODE_TYPES.FILE, { normalizedPath: normalizeTrackedFilePath(filePath) }); },\n  sourceRouteKey(project, row) { return getAssetBaselineSourceRecoveryRouteKey(project, row); },\n  watchStagedFiles(observe) { const stage = stageLiveObservedFile; stageLiveObservedFile = (project, file, ...rest) => { observe(file); return stage(project, file, ...rest); }; return () => { stageLiveObservedFile = stage; }; },\n  selectForPackaging: selectProjectFilesForPackagingSnapshot,\n  packagingRowKey(row) { return getTrackedFileDedupKey(row); },\n  watchEmbeddedScans(observe) { const create = createEmbeddedDocumentScan; createEmbeddedDocumentScan = (projectId, psdFilePath, isCurrent) => { const scan = create(projectId, psdFilePath, isCurrent); observe(scan, psdFilePath); return scan; }; },\n  captureProjectOperation,\n  runScanOnOpen');
 source += '\n(' + cases.toString() + ')();\n';
 const compiled = new Module(entry, module); compiled.filename = entry; compiled.paths = Module._nodeModulePaths(path.dirname(entry)); compiled._compile(source, entry);
 
@@ -26,6 +26,28 @@ function cases() {
   const { embedded, external, plainDocument, documentHolding, parentPsd, png } = psdFixtures;
   const sha = data => nodeCrypto.createHash('sha256').update(data).digest('hex');
   routeTest.after(() => { fs.rmSync(TEST_HOME, { recursive: true, force: true }); });
+  // After a scan, nothing it left out may still reach the package: no extracted
+  // copy of an omitted object, and no row it left in place as excluded.
+  const finishedScans = [];
+  metadataTestHooks.watchEmbeddedScans((scan, psdPath) => finishedScans.push({ scan, psdPath }));
+  async function assertNothingOmittedIsPackaged(id) {
+    const selected = await metadataTestHooks.selectForPackaging(storeInstance.data.projects.find(item => item.id === id));
+    for (const { scan, psdPath } of finishedScans.splice(0)) {
+      const plan = scan.plan;
+      if (!plan) continue;
+      const copyKey = (digest, name) => `${digest}\0${name}`, keyOf = record => copyKey(record.outputDigest, record.originalName);
+      const otherCopies = new Set(plan.records.filter(record => !plan.omitted.has(record)).map(keyOf));
+      const omittedCopies = new Set([...plan.omitted].map(keyOf).filter(key => !otherCopies.has(key)));
+      for (const row of selected) {
+        assert.equal(plan.ignoredRowKeys.has(metadataTestHooks.packagingRowKey(row)), false, `selected although left out: ${row.name}`);
+        const receipt = row.psdExtractionReceipt || row.psdResource;
+        const logical = row.source === 'scan-on-save-embedded' && row.parentPsd === psdPath;
+        const copy = receipt?.parentPath === psdPath ? copyKey(receipt.outputDigest, receipt.originalName)
+          : logical ? copyKey(String(row.embeddedContentFingerprint).split(':')[1], row.embeddedOriginalName) : null;
+        assert.equal(omittedCopies.has(copy), false, `extracted copy selected: ${row.name}`);
+      }
+    }
+  }
   const SMART = '[YOUR IMAGE HERE].psb';
   // What the sequence shows besides the 12 linked PNGs: every step equals the same
   // sequence on the previous code with the proven documents' rows removed.
@@ -186,6 +208,7 @@ function cases() {
     };
     const check = async name => {
       await rendererReads();
+      await assertNothingOmittedIsPackaged(f.id);
       seen[name] = rowsOf(f.id);
       assert.deepEqual(seen[name].filter(row => !isLinkedArt(row)), EXPECTED_ROWS[name], name);
       assert.equal(seen[name].filter(isLinkedArt).length, 12, name);
@@ -266,7 +289,7 @@ function cases() {
     'scan on open': async f => { assert.equal((await metadataTestHooks.runScanOnOpen(f.id, f.psd, null, null, { allowPausedBaseline: true, establishBaseline: false }))?.success, true); },
     'save scan': async f => { await metadataTestHooks.runScanOnSave(f.id, f.psd, null); },
   };
-  const scanOn = async (route, f) => { metadataTestHooks.clearPsdParseDebounce(); await ROUTES[route](f); };
+  const scanOn = async (route, f) => { metadataTestHooks.clearPsdParseDebounce(); finishedScans.length = 0; await ROUTES[route](f); await assertNothingOmittedIsPackaged(f.id); };
   // The save scan offers each object to staging; this records the names offered.
   function stagedSaveEntries() {
     const seen = new Set(), restore = metadataTestHooks.watchStagedFiles(file => seen.add(file.embeddedOriginalName));
@@ -282,7 +305,6 @@ function cases() {
   for (const route of Object.keys(ROUTES)) {
     for (const [label, setup] of Object.entries({
       'accepted row with an extraction receipt': (f, row) => f.project().files.push(row),
-      'pending row with an extraction receipt': (f, row) => { f.project().pendingFiles = [row]; },
       'row with a resource record': (f, _row) => f.project().files.push(seedRow(f, { field: 'psdResource' })),
       'row of an object no longer in the PSD': (f, _row) => f.project().files.push(seedRow(f, { name: 'Old Smart.psb', data: plainDocument('old-smart'), linkedIndex: 9 })),
     })) {
@@ -315,7 +337,8 @@ function cases() {
 
   routeTest('save scan: an excluded logical row of a proven object stays when its index changes', { timeout: 60000 }, async () => {
     const f = await seededProject();
-    f.project().files.push(logicalRow(f, { fileId: 'moved', embeddedIndex: 5, individualContentExclusion: `${f.smart.length}:${sha(f.smart)}` })); await settled(f);
+    const moved = logicalRow(f, { fileId: 'moved', embeddedIndex: 5, individualContentExclusion: `${f.smart.length}:${sha(f.smart)}` });
+    f.project().files.push(moved); f.project().excludedAssetKeys = [metadataTestHooks.packagingRowKey(moved)]; await settled(f);
     const before = plain(findRow(f, 'moved'));
     await scanOn('save scan', f);
     assert.deepEqual(plain(findRow(f, 'moved')), before);
@@ -392,6 +415,119 @@ function cases() {
       findRow(f, 'logical-row').individualContentInclude = `${f.smart.length}:${sha(f.smart)}`; hold.release(); await scan;
       assert.ok(findRow(f, 'seed-row')); assert.deepEqual(retiredEntries(f).map(entry => entry.row.fileId), []);
     } finally { hold.restore(); }
+  });
+
+  // --- A row's choice is its own, as packaging reads it ------------------------
+  const selectedNames = async f => (await metadataTestHooks.selectForPackaging(f.project())).map(row => row.name);
+  const excludeLogicalRow = async f => {
+    assert.equal((await callIpcRaw('projects:remove-file', f.id, 'logical-row')) !== undefined, true);
+    assert.ok(findRow(f, 'logical-row').individualContentExclusion, 'the Exclude was recorded');
+  };
+  for (const route of Object.keys(ROUTES)) {
+    routeTest(`${route}: an Exclude on the logical row does not protect the object's cache row`, { timeout: 60000 }, async () => {
+      const f = await seededProject(), row = seedRow(f); f.project().files.push(row, logicalRow(f)); await settled(f); await excludeLogicalRow(f);
+      const logicalBefore = plain(findRow(f, 'logical-row'));
+      await scanOn(route, f);
+      assert.equal(findRow(f, 'seed-row'), undefined); assert.deepEqual(retiredEntries(f).map(entry => entry.row.fileId), ['seed-row']);
+      assert.deepEqual(plain(findRow(f, 'logical-row')), logicalBefore);
+      assert.equal((await selectedNames(f)).some(name => name.startsWith('Smart')), false);
+    });
+    routeTest(`${route}: after a byte change an Excluded object leaves no extracted copy`, { timeout: 60000 }, async () => {
+      const f = await seededProject(), row = seedRow(f); f.project().files.push(row, logicalRow(f)); await settled(f); await excludeLogicalRow(f);
+      const edited = plainDocument(`excluded-edit-${route}`); f.rewrite(edited, 'excluded-edit-parent');
+      await scanOn(route, f);
+      assert.equal(findRow(f, 'seed-row'), undefined); assert.ok(findRow(f, 'logical-row'));
+      assert.equal(memberRows(f).some(item => item.psdExtractionReceipt?.outputDigest === sha(edited)), false);
+      assert.equal((await selectedNames(f)).some(name => name.startsWith('Smart')), false);
+    });
+  }
+  routeTest('two objects with the same name and bytes: an Exclude on one leaves the other row retirable', { timeout: 60000 }, async () => {
+    const f = await seededProject(), secondId = psdFixtures.guid('second');
+    fs.writeFileSync(f.psd, parentPsd([{ ...embedded('Smart.psb', f.smart), id: f.smartId }, { ...embedded('Smart.psb', f.smart), id: secondId }], 'same-bytes'));
+    const row = seedRow(f, { linkedIndex: 1 }); f.project().files.push(row, logicalRow(f)); await settled(f); await excludeLogicalRow(f);
+    await scanOn('pre-package scan', f);
+    assert.equal(findRow(f, 'seed-row'), undefined); assert.ok(findRow(f, 'logical-row'));
+    assert.equal((await selectedNames(f)).some(name => name.startsWith('Smart')), false);
+  });
+  routeTest('a row packaging itself leaves out by its content stays as excluded', { timeout: 60000 }, async () => {
+    const f = await seededProject(), row = seedRow(f, { name: 'Stored As Picture.png' }); row.psdExtractionReceipt.originalName = 'Smart.psb';
+    f.project().files.push(row, logicalRow(f)); await settled(f); await excludeLogicalRow(f);
+    assert.equal(metadataTestHooks.isRowExcludedForReview(f.project(), findRow(f, 'seed-row')), true);
+    const before = plain(findRow(f, 'seed-row'));
+    await scanOn('pre-package scan', f);
+    assert.deepEqual(plain(findRow(f, 'seed-row')), before); assert.deepEqual(retiredEntries(f), []);
+    assert.equal((await selectedNames(f)).includes('Stored As Picture.png'), false);
+  });
+
+  // Exclusion records packaging does not act on are decisions, not exclusions.
+  for (const [label, record] of Object.entries({
+    'a content exclusion with no key': row => { row.individualContentExclusion = `9:${'c'.repeat(64)}`; },
+    'a path key on a row identified by its file id': (row, f) => { f.project().excludedAssetKeys = [row.path]; },
+  })) {
+    routeTest(`${label} keeps the object's complete handling`, { timeout: 60000 }, async () => {
+      const f = await seededProject(), row = seedRow(f); f.project().files.push(row); record(row, f); await settled(f);
+      assert.equal(metadataTestHooks.isRowExcludedForReview(f.project(), findRow(f, 'seed-row')), false, 'packaging would include it');
+      const edited = plainDocument('edited-ignored-exclusion'); f.rewrite(edited, 'ignored-exclusion-parent');
+      await scanOn('pre-package scan', f);
+      assert.ok(findRow(f, 'seed-row')); assert.deepEqual(retiredEntries(f), []);
+      assert.ok(memberRows(f).some(item => item.psdExtractionReceipt?.outputDigest === sha(edited)), 'the replacement output is made as before');
+    });
+  }
+
+  routeTest('a remembered review exclusion for a row keeps that row', { timeout: 60000 }, async () => {
+    // A store write drops such a record once its file is a project row, so only
+    // the save scan, which plans first, can meet one.
+    const f = await seededProject(), row = seedRow(f); f.project().files.push(row);
+    f.project().excludedPendingFiles = [{ path: row.path, name: row.name, ext: row.ext, source: 'lsof', addedAt: row.addedAt, excludedRecordVersion: 1, excludedAt: 1700000000001 }];
+    await scanOn('save scan', f);
+    assert.ok(findRow(f, 'seed-row')); assert.deepEqual(retiredEntries(f), []);
+  });
+  routeTest('an accepted row keeps its object even when only an existing-assets Include names its own path', { timeout: 60000 }, async () => {
+    const f = await seededProject(), row = seedRow(f); f.project().files.push(row);
+    f.project().provenance.observations.push({ objectNodeId: metadataTestHooks.fileNodeId(row.path), observer: { kind: 'manual_user_action', method: 'projects:set-existing-assets-decision' }, payload: { decision: 'include' } });
+    await settled(f); await scanOn('pre-package scan', f);
+    assert.ok(findRow(f, 'seed-row')); assert.deepEqual(retiredEntries(f), []);
+  });
+  routeTest('an existing-assets Include on the parent is not a choice on its logical rows', { timeout: 60000 }, async () => {
+    const f = await seededProject(); f.project().files.push(logicalRow(f));
+    f.project().provenance.observations.push({ objectNodeId: metadataTestHooks.fileNodeId(f.psd), observer: { kind: 'manual_user_action', method: 'projects:set-existing-assets-decision' }, payload: { decision: 'include' } });
+    await settled(f); await scanOn('save scan', f);
+    assert.equal(findRow(f, 'logical-row'), undefined);
+  });
+  routeTest('an accept record for a logical child keeps logical rows of that parent, as packaging reads it', { timeout: 60000 }, async () => {
+    const f = await seededProject(); f.project().files.push(logicalRow(f));
+    f.project().provenance.observations.push({ objectNodeId: metadataTestHooks.fileNodeId(f.psd), observer: { kind: 'manual_user_action', method: 'projects:accept-pending' }, payload: { source: 'scan-on-save-embedded' } });
+    await settled(f); await scanOn('save scan', f);
+    assert.ok(findRow(f, 'logical-row')); assert.deepEqual(retiredEntries(f), []);
+  });
+  routeTest('working-source state naming a longer path is not a choice on this row', { timeout: 60000 }, async () => {
+    const f = await seededProject(), row = seedRow(f); f.project().files.push(row);
+    f.project().workingSourceRecoveryGuards = { note: `${row.path}.backup` }; await settled(f);
+    await scanOn('save scan', f);
+    assert.equal(findRow(f, 'seed-row'), undefined);
+  });
+
+  // --- Undecided review rows ----------------------------------------------------
+  for (const route of Object.keys(ROUTES)) {
+    routeTest(`${route}: an undecided review row stays and keeps its object's handling`, { timeout: 60000 }, async () => {
+      const f = await seededProject(), row = seedRow(f); f.project().pendingFiles = [row]; await settled(f);
+      const edited = plainDocument(`undecided-edit-${route}`); f.rewrite(edited, 'undecided-parent');
+      await scanOn(route, f);
+      assert.ok(findRow(f, 'seed-row')); assert.deepEqual(retiredEntries(f), []);
+      if (route !== 'save scan') assert.ok(memberRows(f).some(item => item.psdExtractionReceipt?.outputDigest === sha(edited)), 'handled as before');
+    });
+  }
+  routeTest('an undecided review row of an object no longer in the PSD stays', { timeout: 60000 }, async () => {
+    const f = await seededProject(), row = seedRow(f, { name: 'Old Smart.psb', data: plainDocument('old-pending'), linkedIndex: 9 }); f.project().pendingFiles = [row]; await settled(f);
+    await scanOn('pre-package scan', f);
+    assert.ok(findRow(f, 'seed-row')); assert.deepEqual(retiredEntries(f), []);
+  });
+  routeTest('an excluded review row stays and its object gets no new row', { timeout: 60000 }, async () => {
+    const f = await seededProject(), row = seedRow(f); f.project().pendingFiles = [row]; f.project().excludedAssetKeys = [row.fileId]; await settled(f);
+    const before = plain(findRow(f, 'seed-row')), edited = plainDocument('excluded-pending-edit'); f.rewrite(edited, 'excluded-pending-parent');
+    await scanOn('pre-package scan', f);
+    assert.deepEqual(plain(findRow(f, 'seed-row')), before);
+    assert.equal(memberRows(f).some(item => item.psdExtractionReceipt?.outputDigest === sha(edited)), false);
   });
 
   // --- A sibling cannot bring a proven object in -------------------------------
@@ -630,7 +766,7 @@ function cases() {
   async function engagedProject() {
     const f = await seededProject('Engaged'); f.project().workingSourceSelections = {};
     const scan = () => metadataTestHooks.runScanOnOpen(f.id, f.psd, null, null, { allowPausedBaseline: true, establishBaseline: false });
-    f.scan = async () => { metadataTestHooks.clearPsdParseDebounce(); const result = await scan(); assert.equal(result?.success, true, serialize(result)); };
+    f.scan = async () => { metadataTestHooks.clearPsdParseDebounce(); finishedScans.length = 0; const result = await scan(); assert.equal(result?.success, true, serialize(result)); await assertNothingOmittedIsPackaged(f.id); };
     f.record = () => Object.values(f.project().workingSourceVerification || {})[0];
     return f;
   }
@@ -670,12 +806,24 @@ function cases() {
     assert.ok(findRow(f, 'seed-row'));
     assert.ok(f.record().requiredEmbeddedOutputs.some(output => path.basename(output.path) === 'Smart.psb'));
   });
-  routeTest('engaged route: an excluded resource row stays and raises no hold after its bytes change', { timeout: 60000 }, async () => {
+  routeTest('engaged route: an excluded row a working file still requires keeps its object', { timeout: 60000 }, async () => {
+    const f = await engagedProject(); await f.scan();
+    const row = seedRow(f, { field: 'psdResource' }); f.project().files.push(row); f.project().excludedAssetKeys = [row.fileId];
+    const record = f.record();
+    record.requiredEmbeddedOutputs.push({ path: row.path, sourceDigest: record.sourceFingerprint, outputDigest: sha(f.smart) }); await settled(f);
+    assert.ok((await selectedNames(f)).includes('Smart.psb'), 'packaging includes it as a dependency');
+    await f.scan();
+    assert.ok(findRow(f, 'seed-row')); assert.deepEqual(retiredEntries(f), []);
+    assert.ok(f.record().requiredEmbeddedOutputs.some(output => output.path === row.path), 'its output is still required');
+  });
+  // Packaging still takes this row as its working file's dependency, so the key
+  // does not leave it out: the object keeps its handling, as on base.
+  routeTest('engaged route: a keyed resource row packaging still requires is replaced as before when its bytes change', { timeout: 60000 }, async () => {
     const f = await engagedProject(); await f.scan();
     const row = seedRow(f, { field: 'psdResource' }); f.project().files.push(row); f.project().excludedAssetKeys = [row.fileId]; await settled(f);
-    const before = plain(findRow(f, 'seed-row')); f.rewrite(plainDocument('engaged-edit'), 'engaged-parent');
+    const edited = plainDocument('engaged-edit'); f.rewrite(edited, 'engaged-parent');
     await f.scan();
-    assert.deepEqual(plain(findRow(f, 'seed-row')), before);
+    assert.equal(findRow(f, 'seed-row').psdResource.outputDigest, sha(edited)); assert.deepEqual(retiredEntries(f), []);
     assert.equal(f.project().workingSourceRelationshipHolds?.length || 0, 0);
     assert.equal((await callIpcRaw('projects:prepare-package-review', f.id))?.error, undefined);
   });

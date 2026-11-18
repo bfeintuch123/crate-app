@@ -16629,46 +16629,46 @@ function getRetiredEmbeddedDocumentEntries(project) {
   return record && record.version === 1 && Array.isArray(record.entries) ? record.entries : null;
 }
 
-// 'excluded' when the owner left this row out, 'kept' for any other recorded
-// decision about it (which also wins over an exclusion), otherwise null.
+// What this row itself records, read as packaging reads it. 'excluded' means
+// packaging leaves this row out; 'kept' is any other recorded decision, including
+// an exclusion record packaging does not act on; null is no decision. One row's
+// choice is never lent to another.
 function getEmbeddedRowOwnerChoice(project, row, context) {
   const logical = isScanOnSaveEmbeddedPsdFile(row);
-  const key = getAssetReviewExclusionKey(row), rowPath = normalizeTrackedFilePath(row.path);
   const decided = ['individualContentInclude', 'keptAfterSourceExclusion', 'individualChoiceReview', 'explicitUserAuthority',
     'existingIncludeEpisode', 'presentationChoiceSuperseded'].some(field => row[field] !== undefined);
   if (decided || row.acceptedPending === true || isExplicitUserCapturedFile(row) ||
       row.captureEvidence?.explicitUserAdd || row.captureEvidence?.acceptedPending) return 'kept';
   context.records ||= getOwnerAcceptanceRecords(project);
   const node = createNodeId(NODE_TYPES.FILE, { normalizedPath: normalizeTrackedFilePath(logical ? row.parentPsd || row.path : row.path) });
-  if (context.records.bulk.has(node) || (logical ? context.records.logicalChildAccepted : context.records.accepted).has(node)) return 'kept';
+  if (logical ? context.records.logicalChildAccepted.has(node) : context.records.accepted.has(node) || context.records.bulk.has(node)) return 'kept';
   context.ownerState ??= JSON.stringify([project.workingSourceSelections, project.workingFileChoices, project.workingSourceRecovery,
     project.workingSourceRecoveryGuards, project.workingSourceContinuations]) || '';
   const routeKey = getAssetBaselineSourceRecoveryRouteKey(project, row);
-  if ((routeKey && context.ownerState.includes(routeKey)) ||
-      (!logical && context.ownerState.includes(JSON.stringify(row.path).slice(1, -1)))) return 'kept';
+  if ((routeKey && context.ownerState.includes(routeKey)) || (!logical && context.ownerState.includes(JSON.stringify(row.path)))) return 'kept';
+  if (isAssetReviewFileExcluded(project, row)) {
+    context.membership ||= getWorkingSourceMembership(project);
+    return context.membership.facts.get(getTrackedFileDedupKey(row))?.includedAsDependency ? 'kept' : 'excluded';
+  }
   context.excludedKeys ||= new Set(project.excludedAssetKeys || []);
   context.excludedPaths ||= new Set([...context.excludedKeys].filter(value => typeof value === 'string' && path.isAbsolute(value))
     .map(normalizeTrackedFilePath));
   context.pendingExclusions ||= new Set(readExcludedPendingRecords(project).records.map(getTrackedFileDedupKey));
-  context.excludedDigests ||= new Set([...(project.files || []), ...(project.pendingFiles || [])]
-    .filter(item => isPackageContentFingerprint(item.individualContentExclusion))
-    .map(item => item.individualContentExclusion.slice(item.individualContentExclusion.indexOf(':') + 1)));
-  const receipt = row.psdExtractionReceipt || row.psdResource;
-  const digest = logical && isPackageContentFingerprint(row.embeddedContentFingerprint)
-    ? row.embeddedContentFingerprint.slice(row.embeddedContentFingerprint.indexOf(':') + 1) : receipt?.outputDigest;
-  return context.excludedKeys.has(key) || row.individualContentExclusion !== undefined ||
-    (!logical && (context.excludedKeys.has(row.path) || context.excludedPaths.has(rowPath))) ||
-    context.pendingExclusions.has(getTrackedFileDedupKey(row)) || (digest && context.excludedDigests.has(digest))
-    ? 'excluded' : null;
+  return row.individualContentExclusion !== undefined || context.pendingExclusions.has(getTrackedFileDedupKey(row)) ||
+    (!logical && (context.excludedKeys.has(row.path) || context.excludedPaths.has(normalizeTrackedFilePath(row.path)))) ? 'kept' : null;
 }
 
 function createEmbeddedDocumentScan(projectId, psdFilePath, isCurrent) {
   const parentKey = normalizeTrackedFilePath(psdFilePath);
-  const isOwnReceipt = receipt => receipt?.version === 1 && receipt.current !== false &&
+  // A record its producer no longer claims still names this PSD: such a row counts
+  // for its object, and can never retire.
+  const isOwnReceipt = receipt => receipt?.version === 1 &&
     typeof receipt.parentPath === 'string' && normalizeTrackedFilePath(receipt.parentPath) === parentKey;
   const isLogicalChild = row => isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.parentPsd || row.path) === parentKey;
   const samePlace = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
   const fingerprintOf = record => `${record.byteLength}:${record.outputDigest}`;
+  const effectiveChoice = (project, row, collection, context) =>
+    getEmbeddedRowOwnerChoice(project, row, context) || (collection === 'pendingFiles' ? 'kept' : null);
 
   // The objects of this read a row of this PSD can stand for: a cache output and
   // a logical save row of one object are the same object. An exact match decides
@@ -16739,7 +16739,9 @@ function createEmbeddedDocumentScan(projectId, psdFilePath, isCurrent) {
         if (!objects) continue;
         objectsByRow.set(row, objects);
         for (const record of objects) rowsByObject.get(record).push(row);
-        const choice = getEmbeddedRowOwnerChoice(project, row, context);
+        // A row still waiting in review has no decision yet: it stays, and so does
+        // its object's handling.
+        const choice = effectiveChoice(project, row, collection, context);
         choices.set(row, choice);
         if (choice || !canRetire || objects.length > 1 || objects.some(record => !record.proven)) continue;
         if (row.source !== 'psd-embedded') {
@@ -16747,6 +16749,7 @@ function createEmbeddedDocumentScan(projectId, psdFilePath, isCurrent) {
           continue;
         }
         const receipt = row.psdExtractionReceipt || row.psdResource, evidence = row.captureEvidence || {};
+        if (receipt.current === false) continue;
         const relationship = [row.assetBaselineSourcePath, evidence.relationshipSourcePath, evidence.sourceDocumentPath, ...(row.dependencyOwners || [])];
         if (!directory || !isDirectCacheChild(extractDir, row.path) || pathCounts.get(normalizeTrackedFilePath(row.path)) !== 1 ||
             !/^[a-f0-9]{64}$/.test(receipt.outputDigest || '') || typeof receipt.originalName !== 'string' ||
@@ -16793,7 +16796,7 @@ function createEmbeddedDocumentScan(projectId, psdFilePath, isCurrent) {
       for (const collection of ['files', 'pendingFiles']) for (const row of project[collection] || []) {
         byJson.set(collection + '\0' + JSON.stringify(row), row);
         const objects = objectsOfRow(row, plan.records);
-        if (objects?.length && getEmbeddedRowOwnerChoice(project, row, context) === 'kept') for (const record of objects) keptObjects.add(record);
+        if (objects?.length && effectiveChoice(project, row, collection, context) === 'kept') for (const record of objects) keptObjects.add(record);
       }
       for (const item of plan.retire) {
         const row = byJson.get(item.collection + '\0' + item.json);
