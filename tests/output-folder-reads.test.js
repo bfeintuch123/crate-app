@@ -233,6 +233,31 @@ function cases() {
       assert.equal(staged.includes(second), false);
     });
   }
+  // Directory order is not fixed, so whichever file is staged first excludes the other.
+  routeTest('Figma folder walk: the next file in the same top folder is judged against a staging write', { timeout: 60000 }, async () => {
+    const f = await freshProject(), files = [touch(desktop('WalkA', 'a.fig')), touch(desktop('WalkB', 'b.fig'))], staged = [];
+    const restore = hooks.watchStagedFiles(file => {
+      if (!files.includes(file.path)) return;
+      if (!staged.length) storeInstance.set('quickPackageOutputPaths', [path.dirname(files.find(item => item !== file.path))]);
+      staged.push(file.path);
+    });
+    try { await scan(f); } finally { restore(); }
+    assert.equal(new Set(staged).size, 1, `${staged.length} staged`);
+  });
+  routeTest('Figma folder walk: after a staging write and a throw, the next folder is judged against the new output folders', { timeout: 60000 }, async () => {
+    const f = await freshProject(), folder = documentsFolder('Generated'), staged = [];
+    const first = touch(desktop('first.fig')), second = touch(path.join(folder, 'second.fig')), later = touch(path.join(TEST_HOME, 'Downloads', 'later.fig'));
+    let thrown = false;
+    const restore = hooks.watchStagedFiles(file => {
+      staged.push(file.path);
+      if (file.path !== first || thrown) return;
+      thrown = true; storeInstance.set('quickPackageOutputPaths', [folder]);
+      throw new Error('synthetic staging failure');
+    });
+    try { await scan(f); } finally { restore(); }
+    assert.equal(thrown, true); assert.ok(staged.includes(later), 'the walk went on to the following folders');
+    assert.equal(staged.includes(second), false);
+  });
   function holdRead(file) {
     const real = fs.promises.readFile; let reached, release;
     const started = new Promise(resolve => { reached = resolve; }), gate = new Promise(resolve => { release = resolve; });
@@ -243,7 +268,8 @@ function cases() {
     routeTest(`${label}: a store change during one file's read is seen for that file`, { timeout: 60000 }, async () => {
       const f = await freshProject(), folder = documentsFolder('Generated');
       const present = touch(desktop('present.png')), generated = touch(path.join(folder, 'generated.png'));
-      const firstDocument = linkDocument(desktop(`A${ext}`), [desktop('missing.png')]), secondDocument = linkDocument(desktop(`B${ext}`), [present, generated]);
+      // The excluded link comes first, so no staging call has refreshed anything yet.
+      const firstDocument = linkDocument(desktop(`A${ext}`), [desktop('missing.png')]), secondDocument = linkDocument(desktop(`B${ext}`), [generated, present]);
       await addSource(f, firstDocument); await addSource(f, secondDocument);
       const staged = [], restore = hooks.watchStagedFiles(file => staged.push(file.path)), hold = holdRead(secondDocument);
       try {

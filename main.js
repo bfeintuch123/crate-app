@@ -1252,8 +1252,9 @@ function getKnownPackageOutputPaths(projects = getProjects()) {
 // one read of the output folders, taken when the first path needs it, even if that
 // path is decided without them. Use it only within one synchronous stretch: never
 // across an await, a callback turn, a store write or a publication, and call
-// refresh() after anything that can write the store. Inside such a stretch every
-// result is what isAutoCaptureExcludedPath(filePath) alone would have returned.
+// refresh() after anything that can write the store. A view must not outlive a
+// catch that swallows a throw from such a call. Inside such a stretch every result
+// is what isAutoCaptureExcludedPath(filePath) alone would have returned.
 function createSynchronousOutputExclusion() {
   let outputPaths = null;
   const isExcluded = filePath => isAutoCaptureExcludedPath(filePath, [], outputPaths ||= getKnownPackageOutputPaths());
@@ -21594,10 +21595,10 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     // lsof pass failed — continue with other scan methods
   }
 
-  const isFigScanOutputExcluded = createSynchronousOutputExclusion();
   for (const dir of scanDirs) {
     try {
       if (!fs.existsSync(dir)) continue;
+      const isFigScanOutputExcluded = createSynchronousOutputExclusion();
       // Scan at depth 0 (direct children) and depth 1 (one subfolder deep)
       const scanFolder = (folder, depth) => {
         let entries;
