@@ -372,6 +372,20 @@ function cases() {
     await assertLeftHidden(project.id, ownRow);
   });
 
+  lifecycleTest('a marker written for another project is not accepted, even for the same session id', async () => {
+    const { file } = setup('carry-other-project-marker');
+    const project = await createProject('Carry marker target');
+    const other = await createProject('Carry marker source');
+    await idle(other.id);
+    await callIpcRaw('projects:pause', other.id);
+    stored(project.id).watchSessionId = stored(other.id).watchSessionId;
+    storeInstance.data[OWNERS_KEY][project.id] = ownerOf(other.id);
+    const row = await pushRow(project.id, file('OtherProjectMarker.psd'));
+    await callIpcRaw('projects:start-watching', project.id);
+    await idle(project.id);
+    await assertLeftHidden(project.id, row);
+  });
+
   lifecycleTest('a stale projects write during a delayed project creation does not make its older session trusted', async () => {
     const { file } = setup('carry-stale-write');
     const project = await createProject('Carry stale write');
