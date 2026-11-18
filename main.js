@@ -3057,8 +3057,19 @@ function getIllustratorLinkReview(project, row) {
     !Array.isArray(review) && review.version === ILLUSTRATOR_LINK_REVIEW_VERSION ? review : null;
 }
 
-// Keeps the review state of a row this session's Illustrator readings own, and
-// remembers (one level) the row a link claim first overwrites.
+// The review row a link claim overwrote. It is never itself a link row, and it
+// keeps its own session stamp, so the session rule decides its visibility.
+function getRememberedIllustratorLinkRow(row) {
+  const review = row?.illustratorLinkReview;
+  const prior = review?.version === ILLUSTRATOR_LINK_REVIEW_VERSION ? review.prior : null;
+  return prior && typeof prior === 'object' && !Array.isArray(prior) && !isIllustratorLiveLinkRow(prior) &&
+    normalizeTrackedFilePath(prior.path) === normalizeTrackedFilePath(row.path) ? prior : null;
+}
+
+// Keeps the review state of a row this session's readings own. A link claim
+// over a review row remembers that row (one level). A claim over an earlier
+// session's link row inherits only what that row remembered: its clean-reading
+// state belongs to its own session, and it is never remembered itself.
 function carryIllustratorLinkReview(project, previousRow, nextRow) {
   const { illustratorLinkReview, ...row } = nextRow;
   if (!isIllustratorLiveLinkRow(row)) return row;
@@ -3066,7 +3077,14 @@ function carryIllustratorLinkReview(project, previousRow, nextRow) {
     const review = getIllustratorLinkReview(project, previousRow);
     return review ? { ...row, illustratorLinkReview: { ...review } } : row;
   }
-  const { illustratorLinkReview: ignoredPriorReview, ...prior } = previousRow;
+  let prior;
+  if (isIllustratorLiveLinkRow(previousRow)) {
+    prior = getRememberedIllustratorLinkRow(previousRow);
+    if (!prior) return row;
+  } else {
+    const { illustratorLinkReview: ignoredReview, ...reviewRow } = previousRow;
+    prior = reviewRow;
+  }
   return { ...row, illustratorLinkReview: { version: ILLUSTRATOR_LINK_REVIEW_VERSION, prior: structuredClone(prior) } };
 }
 
@@ -3082,15 +3100,14 @@ function areLiveLinkOwnersExcluded(project, liveMembership, owners) {
 // A reading is trusted when it is current and complete, and Illustrator is
 // either definitively not running or this reading made the activation scope
 // ready. Its link set is the links of admitted documents (the records row
-// creation uses). Untrusted readings return null and change no row.
-let illustratorLinkReadingSequence = 0;
-const illustratorLinkReconciledReadings = new Map();
+// creation uses). "Not running" counts only when the full process listing
+// completed. Untrusted readings return null and change no row.
 function createIllustratorLinkReading(projectId, activationToken, queryResult, scopeResult, records) {
   if (!queryResult || queryResult.stale || getIllustratorSnapshotFailureReason(queryResult)) return null;
   const scope = getIllustratorActivationScope(projectId, activationToken);
   if (!scope || !getFreshActiveWatchingProject(projectId, activationToken)) return null;
   const notRunning = queryResult.running === false;
-  if (!notRunning && !(scopeResult?.ready === true && scopeResult.scope === scope)) return null;
+  if (notRunning ? queryResult.notRunningConfirmed !== true : !(scopeResult?.ready === true && scopeResult.scope === scope)) return null;
   const links = new Map();
   if (!notRunning) {
     for (const record of records || []) {
@@ -3104,18 +3121,14 @@ function createIllustratorLinkReading(projectId, activationToken, queryResult, s
       links.set(linkedPath, entry);
     }
   }
-  return { projectId, scope, links, sequence: ++illustratorLinkReadingSequence };
+  return { projectId, scope, links };
 }
 
-// Runs inside the project mutation that staged the same reading. A reading the
-// activation scope has moved past (another reading or a save scan revised it)
-// or that is older than one already reconciled is stale: no row changes.
+// Runs inside the project mutation that staged the same reading, and only for
+// a reading applyLiveAppEvidenceRefresh found current before staging anything.
 function reconcileIllustratorLinkRows(project, reading, liveMembership) {
   const outcome = { changed: 0, withdrawnPaths: [] };
   if (!reading || !project || project.id !== reading.projectId || !Array.isArray(project.pendingFiles)) return outcome;
-  if (getIllustratorActivationScope(project.id) !== reading.scope) return outcome;
-  if ((illustratorLinkReconciledReadings.get(project.id) || 0) > reading.sequence) return outcome;
-  illustratorLinkReconciledReadings.set(project.id, reading.sequence);
   const acceptedKeys = getTrackedFileKeySet(project.files);
   const nextRows = [];
   for (const row of project.pendingFiles) {
@@ -3125,7 +3138,8 @@ function reconcileIllustratorLinkRows(project, reading, liveMembership) {
     if (!link) {
       // Withdraw: the link is in no admitted open document.
       outcome.changed++;
-      if (review?.prior && typeof review.prior === 'object') nextRows.push(structuredClone(review.prior));
+      const remembered = getRememberedIllustratorLinkRow(row);
+      if (remembered) nextRows.push(structuredClone(remembered));
       else outcome.withdrawnPaths.push(normalizeTrackedFilePath(row.path));
       continue;
     }
@@ -11643,7 +11657,7 @@ function activateSingleWatchingProject(projectId, settings, { preserveWatchStart
   // initial snapshot. Existing interval handles are stopped below by
   // startWatching, while this gate makes their ticks harmless in the gap.
   cancelWatcherCoordinator(projectId);
-  illustratorActivationScopes.set(projectId, { activationToken, revision: 0, status: 'initializing', baselineDocumentPaths: new Set(), admittedDocumentPaths: new Set(), allowedLinkedPaths: new Set(), excludedLinkedPaths: new Set() });
+  illustratorActivationScopes.set(projectId, { activationToken, revision: 0, status: 'initializing', queryOrder: { started: 0, applied: 0 }, baselineDocumentPaths: new Set(), admittedDocumentPaths: new Set(), allowedLinkedPaths: new Set(), excludedLinkedPaths: new Set() });
 
   return {
     activationToken,
@@ -14469,7 +14483,16 @@ const SCOPED_PRIMARY_PATH_FIELDS = ['path', 'filePath', 'localPath', 'normalized
 function scopedRecordReferencesHidden(value, info, hiddenPaths, hiddenIds, nodePaths) { const ancestors = new Set(); let visited = 0; const visit = (item, key = '') => { if (++visited > 50000) return true; if (typeof item === 'string') { if (hiddenIds.has(item)) return true; const nodePath = /NodeId$/i.test(key) ? nodePaths.get(item) : null, normalized = (path.isAbsolute(item) || /paths?$/i.test(key)) ? normalizeTrackedFilePath(item) : null, deniedPath = nodePath || (normalized && hiddenPaths.has(normalized) ? normalized : null); return !!deniedPath && !(info.authorized && info.primaryPath === deniedPath); } if (!Array.isArray(item) && !isRecord(item)) return false; if (ancestors.has(item)) return true; ancestors.add(item); try { for (const childKey of Object.keys(item)) if (childKey !== 'illustratorLinkReview' && visit(item[childKey], childKey)) return true; return false; } catch (_) { return true; } finally { ancestors.delete(item); } }; return visit(value); }
 // Illustrator link review state (it can hold a copy of an overwritten row) is
 // private bookkeeping: it never authorizes or hides a path, and is left out.
-function getIllustratorScopedProjectView(project) { if (!project) return project; const scope = getIllustratorActivationScope(project.id), hiddenPaths = new Set(scope ? [...scope.baselineDocumentPaths, ...scope.excludedLinkedPaths] : []), hiddenPendingPaths = new Set(), stalePendingFiles = new Set(), scopeAllowedPaths = new Set(); for (const file of [...(project.files || []), ...(project.pendingFiles || [])]) { const filePath = normalizeTrackedFilePath(file?.path); if ((project.pendingFiles || []).includes(file) && !isCurrentWatchSessionPendingFile(project, file)) { hiddenPaths.add(filePath); hiddenPendingPaths.add(filePath); stalePendingFiles.add(file); } else if (!isIllustratorScopedFileAllowed(project, file)) hiddenPaths.add(filePath); else if (hiddenPaths.has(filePath) && !hiddenPendingPaths.has(filePath) && getScopedFileAppFamily(project, file) === 'illustrator') scopeAllowedPaths.add(filePath); } hiddenPaths.delete(null); if (!hiddenPaths.size) return project;
+function withoutIllustratorLinkReview(project) {
+  const rows = project.pendingFiles, hasReview = row => !!row && Object.hasOwn(row, 'illustratorLinkReview');
+  if (!Array.isArray(rows) || !rows.some(hasReview)) return project;
+  return { ...project, pendingFiles: rows.map(row => {
+    if (!hasReview(row)) return row;
+    const { illustratorLinkReview, ...visibleRow } = row;
+    return visibleRow;
+  }) };
+}
+function getIllustratorScopedProjectView(project) { if (!project) return project; const scope = getIllustratorActivationScope(project.id), hiddenPaths = new Set(scope ? [...scope.baselineDocumentPaths, ...scope.excludedLinkedPaths] : []), hiddenPendingPaths = new Set(), stalePendingFiles = new Set(), scopeAllowedPaths = new Set(); for (const file of [...(project.files || []), ...(project.pendingFiles || [])]) { const filePath = normalizeTrackedFilePath(file?.path); if ((project.pendingFiles || []).includes(file) && !isCurrentWatchSessionPendingFile(project, file)) { hiddenPaths.add(filePath); hiddenPendingPaths.add(filePath); stalePendingFiles.add(file); } else if (!isIllustratorScopedFileAllowed(project, file)) hiddenPaths.add(filePath); else if (hiddenPaths.has(filePath) && !hiddenPendingPaths.has(filePath) && getScopedFileAppFamily(project, file) === 'illustrator') scopeAllowedPaths.add(filePath); } hiddenPaths.delete(null); if (!hiddenPaths.size) return withoutIllustratorLinkReview(project);
   const nodePaths = new Map(), ledgerPaths = new Map(); for (const hiddenPath of hiddenPaths) { nodePaths.set(createNodeId(NODE_TYPES.FILE, { normalizedPath: hiddenPath }), hiddenPath); const ledgerId = getLiveEvidenceKeyHash(hiddenPath); if (ledgerId) ledgerPaths.set(ledgerId, hiddenPath); } for (const [id, node] of Object.entries(project.provenance?.nodes || {})) { const nodePath = normalizeTrackedFilePath(node?.path || node?.normalizedPath); if (hiddenPaths.has(nodePath)) { nodePaths.set(id, nodePath); if (typeof node?.id === 'string') nodePaths.set(node.id, nodePath); } }
   const hiddenEntries = new WeakMap(), records = [], infos = [], infoByObject = new WeakMap(), markHidden = (parent, key) => { if (!parent) return false; let keys = hiddenEntries.get(parent); if (!keys) hiddenEntries.set(parent, keys = new Set()); const fresh = !keys.has(key); keys.add(key); return fresh; }, isHidden = (parent, key) => !!hiddenEntries.get(parent)?.has(key); let collected = 0; const collect = (value, parent, key, ancestors) => { if (!Array.isArray(value) && !isRecord(value)) return; if (++collected > 50000 || ancestors.has(value)) { markHidden(parent, key); return; } if (isScopedRecord(value)) records.push({ item: value, parent, key }); ancestors.add(value); try { for (const [childKey, child] of Object.entries(value)) { if ((path.isAbsolute(childKey) && hiddenPaths.has(normalizeTrackedFilePath(childKey))) || childKey === 'illustratorLinkReview') markHidden(value, childKey); else collect(child, value, childKey, ancestors); } } catch (_) { markHidden(parent, key); } finally { ancestors.delete(value); } }; for (const [key, value] of Object.entries(project)) collect(value, project, key, new Set());
   for (const entry of records) { const families = getScopedRecordFamilies(entry.item); if ((project.files || []).includes(entry.item) || (project.pendingFiles || []).includes(entry.item)) { const family = getScopedFileAppFamily(project, entry.item); if (family) families.add(family); } const info = { families, primaryPath: scopedRecordPrimaryPath(entry.item, entry.key, nodePaths, ledgerPaths), authorized: false, entry }; infos.push(info); infoByObject.set(entry.item, info); } const allowedPaths = new Set(scopeAllowedPaths); for (const info of infos) if (!stalePendingFiles.has(info.entry.item) && hiddenPaths.has(info.primaryPath) && !info.families.has('illustrator') && (info.families.size || isExplicitUserCapturedFile(info.entry.item))) allowedPaths.add(info.primaryPath); for (const info of infos) info.authorized = !stalePendingFiles.has(info.entry.item) && allowedPaths.has(info.primaryPath) && ((scopeAllowedPaths.has(info.primaryPath) && info.families.size === 1 && info.families.has('illustrator')) || (!info.families.has('illustrator') && info.families.size > 0) || isExplicitUserCapturedFile(info.entry.item) || (info.entry.item.type === NODE_TYPES.FILE && info.families.size === 0));
@@ -14631,7 +14654,7 @@ async function isIllustratorRunningForLiveEvidence(projectId = null, activationT
   }).catch(() => ({ stdout: '', failed: true }));
   if (!stillCurrent()) return null;
   if (ps.failed && psCommand.failed) return 'failed';
-  return String(psCommand.stdout || '')
+  const foundInCommands = String(psCommand.stdout || '')
     .split('\n')
     .some(line => {
       const commandText = line.trim();
@@ -14639,21 +14662,49 @@ async function isIllustratorRunningForLiveEvidence(projectId = null, activationT
       if (/^Adobe Illustrator(?:\s|$)/i.test(commandText)) return true;
       return /\/(?:adobe )?illustrator(?: \d{4})?\.app\/contents\/macos\/(?:adobe )?illustrator(?:\s|$)/i.test(commandText);
     });
+  // Without the full listing Crate only failed to find Illustrator.
+  return foundInCommands || (psCommand.failed ? 'not-found-unconfirmed' : false);
 }
 
+// Readings can overlap (poll, Add Files, pre-package scan, activation). Their
+// order is fixed when each query starts, per activation; the counters live on
+// the activation scope and end with it. A result that started before one
+// already applied is older than what Crate knows and is discarded whole.
+function isIllustratorQuerySuperseded(projectId, activationToken, queryResult) {
+  const started = queryResult?.queryOrder;
+  if (!started) return false;
+  const order = getIllustratorActivationScope(projectId, activationToken)?.queryOrder;
+  return order !== started.tracker || started.position < order.applied;
+}
+function claimIllustratorQueryResult(projectId, activationToken, queryResult) {
+  if (isIllustratorQuerySuperseded(projectId, activationToken, queryResult)) return false;
+  const started = queryResult?.queryOrder;
+  if (started) started.tracker.applied = started.position;
+  return true;
+}
 async function queryIllustratorActiveState(projectId, activationToken) {
+  const tracker = getIllustratorActivationScope(projectId, activationToken)?.queryOrder;
+  const position = tracker ? ++tracker.started : null;
+  const result = await readIllustratorActiveState(projectId, activationToken);
+  return tracker ? { ...result, queryOrder: { tracker, position } } : result;
+}
+async function readIllustratorActiveState(projectId, activationToken) {
   const running = await isIllustratorRunningForLiveEvidence(projectId, activationToken); if (running === null || !getFreshActiveWatchingProject(projectId, activationToken)) return { stale: true };
   if (running === 'failed') return { running: true, errorCategory: 'illustrator-query-failed', activeState: parseIllustratorActiveSessionOutput('') };
-  if (!running) return { running: false, activeState: parseIllustratorActiveSessionOutput('STATUS\tno-documents\nCOMPLETE\t0\t0') };
+  if (!running || running === 'not-found-unconfirmed') return { running: false, notRunningConfirmed: running === false, activeState: parseIllustratorActiveSessionOutput('STATUS\tno-documents\nCOMPLETE\t0\t0') };
   try { const { stdout } = await runOsascriptInPrivateTemp(() => ({ 'crate-ai-active-session.applescript': AI_ACTIVE_SESSION_APPLESCRIPT }), 'crate-ai-active-session.applescript', { timeout: 10000, encoding: 'utf8' });
     if (!getFreshActiveWatchingProject(projectId, activationToken)) return { stale: true }; return { running: true, outputEmpty: !String(stdout || '').trim(), activeState: parseIllustratorActiveSessionOutput(stdout) }; }
   catch (error) { if (!getFreshActiveWatchingProject(projectId, activationToken)) return { stale: true }; logLiveAppEvidenceUnavailable('Illustrator', error); return { running: true, errorCategory: getSafeLiveAppUnavailableReason(error), activeState: parseIllustratorActiveSessionOutput('') }; }
 }
 async function initializeIllustratorActivationScope(projectId, activationToken) {
   const queryResult = await queryIllustratorActiveState(projectId, activationToken); if (queryResult.stale || !getFreshActiveWatchingProject(projectId, activationToken)) return null;
+  // The activation reading always defines the session's baseline, even if a
+  // later-started reading finished first; only its records can be superseded.
+  const superseded = isIllustratorQuerySuperseded(projectId, activationToken, queryResult);
+  if (!superseded) claimIllustratorQueryResult(projectId, activationToken, queryResult);
   const updated = updateIllustratorActivationScope(projectId, activationToken, queryResult, true); if (!updated || !updated.ready) return updated;
-  await applyLiveAppEvidenceRefresh(projectId, createIllustratorLiveEvidenceRecords(projectId, queryResult.activeState, updated.project), activationToken);
-  observeIllustratorWorkingSourceContinuation(projectId, activationToken, queryResult);
+  const refreshed = await applyLiveAppEvidenceRefresh(projectId, createIllustratorLiveEvidenceRecords(projectId, queryResult.activeState, updated.project), activationToken, null, { illustratorQuery: queryResult, illustratorScope: updated.scope });
+  if (!refreshed.illustratorSuperseded) observeIllustratorWorkingSourceContinuation(projectId, activationToken, queryResult);
   return updated;
 }
 function admitIllustratorSourcesForProject(projectId, filePaths) {
@@ -14751,7 +14802,7 @@ function getLiveAppEvidenceCandidates(liveEvidenceRecords = []) {
   return collectLiveAppEvidenceCandidates(liveEvidenceRecords).candidates;
 }
 
-async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], activationToken = null, parentOperation = null, illustratorReading = null) {
+async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], activationToken = null, parentOperation = null, { illustratorQuery = null, illustratorReading = null, illustratorScope = illustratorReading?.scope || null } = {}) {
   if (!isBoundWatchingActivationCurrent(projectId, activationToken)) {
     return { changed: false, stagedCount: 0, skipped: {} };
   }
@@ -14770,8 +14821,15 @@ async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], 
   }
   if (candidates.length === 0 && !reconcileReading) return { changed: false, stagedCount: 0, skipped };
 
+  let illustratorSuperseded = false;
   const result = mutateProject(projectId, (proj) => {
     if (proj.status !== 'watching' || !isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
+    // Decided here, before staging: while this batch waited (other apps' checks,
+    // locator refresh) a later-started reading may have been applied, or the
+    // activation scope replaced. Then this snapshot's Illustrator records and
+    // reconciliation are dropped; other apps' records still stage.
+    illustratorSuperseded = isIllustratorQuerySuperseded(projectId, activationToken, illustratorQuery) ||
+      (!!illustratorScope && getIllustratorActivationScope(projectId, activationToken) !== illustratorScope);
     let changed = false;
     let evidenceChanged = false;
     let stagedCount = 0;
@@ -14785,6 +14843,7 @@ async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], 
       ? getWorkingSourceMembership(proj) : null;
 
     for (const { evidence, ext, owners: batchOwners = [] } of candidates) {
+      if (illustratorSuperseded && evidence.observerMethod === LIVE_APP_OBSERVER_METHODS.ILLUSTRATOR_ACTIVE_SESSION) continue;
       const fileEntry = buildAutoCaptureFileEntry(evidence.filePath, evidence.source, { ext });
       // A link reported for a document the owner excluded (and that no
       // included file retains) is never admitted directly; record which
@@ -14847,13 +14906,14 @@ async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], 
       }
     }
 
-    const reconciled = reconcileIllustratorLinkRows(proj, reconcileReading, liveMembership);
+    const reconciled = reconcileIllustratorLinkRows(proj, illustratorSuperseded ? null : reconcileReading, liveMembership);
     if (reconciled.changed) changed = true;
 
     return {
       changed,
       evidenceChanged,
       stagedCount,
+      illustratorSuperseded,
       reconciledCount: reconciled.changed,
       withdrawnPaths: reconciled.withdrawnPaths,
       stagedStates: Array.from(stagedStates.entries()),
@@ -14866,7 +14926,7 @@ async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], 
   }, { persistIfChanged: true, trustResultChanged: true });
 
   if (!result || (result.stagedCount === 0 && result.evidenceChanged !== true && !result.reconciledCount)) {
-    return { changed: false, stagedCount: 0, skipped };
+    return { changed: false, stagedCount: 0, skipped, illustratorSuperseded };
   }
 
   if (result.stagedCount > 0) {
@@ -15305,9 +15365,12 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
         () => watcherGeneration === null || getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration));
       if (!getFreshActiveWatchingProject(projectId, activationToken)) return;
     }
+    // A reading older than one already applied adds nothing for Illustrator;
+    // the Photoshop and InDesign parts of this poll still run.
+    const illustratorCurrent = claimIllustratorQueryResult(projectId, activationToken, illustratorQuery);
     const illustratorRunning = illustratorQuery.running;
     logLiveAppDiagnostic(projectId, 'illustrator-running', `Illustrator running=${illustratorRunning ? 'true' : 'false'} for project ${projectId}`);
-    recordLiveAppStatusBreadcrumb(projectId, 'illustrator', {
+    if (illustratorCurrent) recordLiveAppStatusBreadcrumb(projectId, 'illustrator', {
       pollFired: true,
       projectWatching: true,
       appRunning: illustratorRunning,
@@ -15316,10 +15379,10 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
       stagedCount: 0,
       errorCategory: illustratorRunning ? 'script-not-attempted' : 'app-not-running',
     });
-    if (illustratorQuery.running === false) {
+    if (illustratorCurrent && illustratorQuery.running === false) {
       illustratorReading = createIllustratorLinkReading(projectId, activationToken, illustratorQuery, null, []);
     }
-    if (illustratorRunning) {
+    if (illustratorCurrent && illustratorRunning) {
       polledApps.push('illustrator');
       try {
         recordLiveAppStatusBreadcrumb(projectId, 'illustrator', {
@@ -15586,10 +15649,11 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
       adoptScope: scope => coordinatorCurrent() && capturedOperation.adoptScope(scope) && coordinatorCurrent(),
     };
     if (!refreshOperation.current()) return;
-    const refreshResult = await applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords, activationToken, refreshOperation, illustratorReading);
+    const refreshResult = await applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords, activationToken, refreshOperation, { illustratorQuery, illustratorReading });
     if (refreshResult.cancelled || !refreshOperation.current()) return;
-    // A poll with no records keeps today's continuation handling (cleared below).
-    if (liveEvidenceRecords.length > 0) {
+    // A poll with no records keeps today's continuation handling (cleared below),
+    // and so does one whose Illustrator reading was discarded.
+    if (liveEvidenceRecords.length > 0 && illustratorCurrent && !refreshResult.illustratorSuperseded) {
       observeIllustratorWorkingSourceContinuation(projectId, activationToken, illustratorQuery);
       continuationObserved = true;
     }
@@ -21999,13 +22063,21 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   const appScanComplete = await runPackageScanPhase(operation, PRE_PACKAGE_APP_SCAN_TIMEOUT_MS, async () => {
   const illustratorActivationToken = getActiveWatchingActivationToken(projectId);
   if (illustratorActivationToken !== null) {
-    const illustratorQuery = await queryIllustratorActiveState(projectId, illustratorActivationToken); if (!operationCurrent()) return;
-    if (!illustratorQuery.stale && getFreshActiveWatchingProject(projectId, illustratorActivationToken)) {
+    const illustratorQuery = await queryIllustratorActiveState(projectId, illustratorActivationToken);
+    const illustratorSuperseded = isIllustratorQuerySuperseded(projectId, illustratorActivationToken, illustratorQuery);
+    if (illustratorSuperseded) {
+      // Discard this older reading and go on under the scope the newer one left.
+      const currentScope = getIllustratorActivationScope(projectId, illustratorActivationToken);
+      if (!currentScope || !operation.adoptScope(currentScope)) return;
+    }
+    if (!operationCurrent()) return;
+    if (!illustratorSuperseded && !illustratorQuery.stale && getFreshActiveWatchingProject(projectId, illustratorActivationToken)) {
+      claimIllustratorQueryResult(projectId, illustratorActivationToken, illustratorQuery);
       const scopeResult = updateIllustratorActivationScope(projectId, illustratorActivationToken, illustratorQuery, false); if (!scopeResult || !operation.adoptScope(scopeResult.scope) || !operationCurrent()) return;
       const records = scopeResult.ready ? createIllustratorLiveEvidenceRecords(projectId, illustratorQuery.activeState, scopeResult.project, { skipped: {} }) : [];
       const illustratorReading = createIllustratorLinkReading(projectId, illustratorActivationToken, illustratorQuery, scopeResult, records);
       if (scopeResult.ready || illustratorReading) {
-        const refreshed = await applyLiveAppEvidenceRefresh(projectId, records, illustratorActivationToken, operation, illustratorReading); newCount += refreshed.stagedCount || 0;
+        const refreshed = await applyLiveAppEvidenceRefresh(projectId, records, illustratorActivationToken, operation, { illustratorQuery, illustratorReading }); newCount += refreshed.stagedCount || 0;
         project = getFreshActiveWatchingProject(projectId, illustratorActivationToken) || project;
         for (const file of project.files || []) existingPaths.add(normalizeTrackedFilePath(file.path));
         for (const file of project.pendingFiles || []) pendingPaths.add(normalizeTrackedFilePath(file.path));
