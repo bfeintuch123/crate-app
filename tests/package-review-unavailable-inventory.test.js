@@ -159,6 +159,15 @@ function assertCountsScreen(f, files) {
   for (const label of COUNT_LABELS) assert.equal(rows.get(label), expected.get(label), label);
 }
 
+// The fixture workspace's one row, as a window-built review counts it.
+function assertWorkspaceCountsScreen(f) {
+  assert.equal(f.element('package-review-total').textContent, '1 visual asset');
+  const rows = summaryRows(f);
+  for (const [label, count] of [['Working files', '1'], ['Existing assets', '0'], ['Added while working', '0'], ['Needs Review', '1']]) {
+    assert.equal(rows.get(label), count, label);
+  }
+}
+
 const hasField = review => Object.prototype.hasOwnProperty.call(review, 'inventoryUnavailable');
 
 // ===== Part 1a: the two direct refusal routes =====
@@ -375,8 +384,7 @@ test('the window-built state ends when a later workspace read yields files', asy
   f.crate.getAssetWorkspace = async () => clone(f.workspace);
   await f.show({ message: RECOVERY_MESSAGE });
   assert.equal(hasField(f.last()), false);
-  assert.equal(f.element('package-review-total').textContent, '1 visual asset');
-  assert.equal(summaryRows(f).get('Working files'), '1');
+  assertWorkspaceCountsScreen(f);
 });
 
 test('control: a workspace read with an empty list shows zero and carries no field', async () => {
@@ -402,8 +410,7 @@ test('control: a workspace read with files shows their counts and carries no fie
   FAILURES[1][1](f);
   await f.show({ message: RECOVERY_MESSAGE });
   assert.equal(hasField(f.last()), false);
-  assert.equal(f.element('package-review-total').textContent, '1 visual asset');
-  assert.equal(summaryRows(f).get('Working files'), '1');
+  assertWorkspaceCountsScreen(f);
 });
 
 test('control: a pair refusal with no valid candidate and a readable workspace shows its counts', async () => {
@@ -412,5 +419,5 @@ test('control: a pair refusal with no valid candidate and a readable workspace s
   await f.show({ message: RECOVERY_MESSAGE });
   assert.equal(f.built.length, 1);
   assert.equal(hasField(f.last()), false);
-  assert.equal(f.element('package-review-total').textContent, '1 visual asset');
+  assertWorkspaceCountsScreen(f);
 });
