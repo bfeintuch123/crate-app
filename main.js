@@ -11300,6 +11300,28 @@ let mainWindowHiddenShowAttempts = 0;
 let mainWindowVisibleSinceStartup = false;
 let packageForegroundSuppressionUntil = 0;
 let mainWindowInitialDiagnosticsScheduled = false;
+// The one pending Package Review destination chooser, a sheet on its owner
+// window: { owner, abandoned }. See `projects:select-output`.
+let packageDestinationChooser = null;
+// Open inactivity prompt sheets per window, as a count.
+const inactivityPromptSheetWindows = new WeakMap();
+
+function isPackageDestinationSheetAttached(win) {
+  return !!win && !!packageDestinationChooser && packageDestinationChooser.owner === win;
+}
+
+// Marks the pending chooser's result as a cancel. `win` limits this to a
+// chooser on that window; `release` also frees the slot for a new chooser.
+function abandonPackageDestinationChooser(win, { release = false } = {}) {
+  const chooser = packageDestinationChooser;
+  if (!chooser || (win && chooser.owner !== win)) return;
+  chooser.abandoned = true;
+  if (release) packageDestinationChooser = null;
+}
+
+function hasInactivityPromptSheet(win) {
+  return !!win && (inactivityPromptSheetWindows.get(win) || 0) > 0;
+}
 
 function suppressPackageAutoForeground() {
   packageForegroundSuppressionUntil = Math.max(
@@ -19440,6 +19462,10 @@ function verifyMainWindowVisible(reason = 'show') {
     return true;
   }
 
+  // Destroying a window does not end its attached destination sheet, so the
+  // chooser could never settle. Leave that window in place until it does.
+  if (isPackageDestinationSheetAttached(trayWindow)) return false;
+
   mainWindowHiddenShowAttempts += 1;
   console.warn('[main-window] window remained hidden after show:', redactFigmaLogText(`${reason} attempt=${mainWindowHiddenShowAttempts}`));
   if (mainWindowHiddenShowAttempts >= MAIN_WINDOW_HIDDEN_RECREATE_AFTER) {
@@ -19587,7 +19613,12 @@ function createMainWindow() {
   }
 
   const createdWindow = trayWindow;
+  // Closing a window ends its attached destination sheet with a response
+  // Electron reports as a choice, so a result after these events is a cancel.
+  trayWindow.on('close', () => abandonPackageDestinationChooser(createdWindow));
   trayWindow.on('closed', () => {
+    // Before the early return: a replaced window still owns its chooser.
+    abandonPackageDestinationChooser(createdWindow, { release: true });
     if (trayWindow !== createdWindow) return;
     mainWindowIdentities.delete(createdWindow);
     clearMainWindowShowFallback();
@@ -20743,6 +20774,12 @@ function startInactivityChecker() {
           continue;
         }
 
+        // One native modal per window: while the destination chooser is
+        // attached, show nothing and leave the project unmarked, so the next
+        // minute retries. This comes before the visibility branch because
+        // Electron's isVisible() can be false for a visible window.
+        if (isPackageDestinationSheetAttached(trayWindow)) continue;
+
         const assertAccountCurrent = captureAccountAuthorization();
         const operation = captureProjectOperation(project.id);
         const isCurrent = () => {
@@ -20777,17 +20814,37 @@ function startInactivityChecker() {
         const controller = new AbortController();
         const cancel = () => controller.abort();
         inactivityPromptCancellations.add(cancel);
-        // A parent is required for AbortSignal cancellation on macOS.
-        dialog.showMessageBox(trayWindow, {
-          signal: controller.signal,
-          type: 'question',
-          title: 'Crate — Still working?',
-          message: `⏸ Still working on "${project.name}"?`,
-          detail: `No new design files detected for 3 hours.`,
-          buttons: ['Keep Watching', 'Pause', 'Package Now'],
-          defaultId: 0,
-          cancelId: 0
-        }).then(({ response }) => {
+        // The prompt is a sheet on this window; the destination chooser stays
+        // closed while it is open. Release exactly once, however it ends.
+        const promptWindow = trayWindow;
+        let promptSheetHeld = true;
+        inactivityPromptSheetWindows.set(promptWindow, (inactivityPromptSheetWindows.get(promptWindow) || 0) + 1);
+        const releasePromptSheet = () => {
+          if (!promptSheetHeld) return;
+          promptSheetHeld = false;
+          const remaining = (inactivityPromptSheetWindows.get(promptWindow) || 0) - 1;
+          if (remaining > 0) inactivityPromptSheetWindows.set(promptWindow, remaining);
+          else inactivityPromptSheetWindows.delete(promptWindow);
+        };
+        let prompt;
+        try {
+          // A parent is required for AbortSignal cancellation on macOS.
+          prompt = dialog.showMessageBox(promptWindow, {
+            signal: controller.signal,
+            type: 'question',
+            title: 'Crate — Still working?',
+            message: `⏸ Still working on "${project.name}"?`,
+            detail: `No new design files detected for 3 hours.`,
+            buttons: ['Keep Watching', 'Pause', 'Package Now'],
+            defaultId: 0,
+            cancelId: 0
+          });
+        } catch (error) {
+          releasePromptSheet();
+          throw error;
+        }
+        prompt.then(({ response }) => {
+          releasePromptSheet();
           if (!isCurrent()) return;
           if (response === 0) {
             // Keep Watching — reset timer
@@ -20808,7 +20865,10 @@ function startInactivityChecker() {
               trayWindow.webContents.send('package:trigger', { projectId: project.id });
             }
           }
-        }).catch(() => {}).finally(() => inactivityPromptCancellations.delete(cancel));
+        }).catch(() => {}).finally(() => {
+          inactivityPromptCancellations.delete(cancel);
+          releasePromptSheet();
+        });
       }
     }
   }, 60 * 1000); // Check every minute
@@ -27091,21 +27151,70 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
   }
 });
 
-registerTrustedIpcHandler('projects:select-output', async () => {
-  const result = await dialog.showOpenDialog({
-    properties: ['openDirectory', 'createDirectory'],
-    title: 'Choose Package Destination',
-    defaultPath: path.join(os.homedir(), 'Desktop')
-  });
-  if (result.canceled) {
-    // Restore the app after canceling the picker so the user can continue editing.
-    showTrayWindow();
-    return null;
+// The destination chooser is a sheet on the window that asked for it, so it
+// stays with that window through hiding, minimizing, Spaces and activation.
+// Electron ends a sheet with a non-Cancel response when its window closes
+// (NativeWindowMac::Close calls endSheet:), and reports every response except
+// Cancel as a choice of the panel's current folder. So a result that arrives
+// after its window closed or was replaced, after quit began, or after the
+// account changed is a cancel: no folder, no raise, no foreground change.
+// Never call hide() or setEnabled() on a window while its destination sheet is
+// attached: hide() and setEnabled(true) end the sheet with no abandon signal,
+// and setEnabled(false) attaches another sheet. Crate calls neither.
+registerTrustedIpcHandler('projects:select-output', async (event) => {
+  const owner = BrowserWindow.fromWebContents(event.sender);
+  if (!owner || owner.isDestroyed() || isQuitting) return null;
+  const held = packageDestinationChooser;
+  if (held && (held.owner.isDestroyed() || held.owner !== trayWindow)) {
+    held.abandoned = true;
+    packageDestinationChooser = null;
   }
-  // Do not force foreground after a successful destination selection. Packaging may
-  // continue in the background so macOS can deliver the package-complete banner.
-  suppressPackageAutoForeground();
-  return result.filePaths[0];
+  // One chooser at a time, and never over an open inactivity prompt sheet.
+  if (packageDestinationChooser || hasInactivityPromptSheet(owner)) return null;
+  const assertAccountCurrent = captureAccountAuthorization();
+  const chooser = { owner, abandoned: false };
+  packageDestinationChooser = chooser;
+  try {
+    const isStale = () => {
+      if (chooser.abandoned || isQuitting || owner.isDestroyed() ||
+          trayWindow !== owner || !mainWindowIdentities.has(owner)) return true;
+      try {
+        assertAccountCurrent();
+        return false;
+      } catch (_) {
+        return true;
+      }
+    };
+    let result;
+    try {
+      result = await dialog.showOpenDialog(owner, {
+        properties: ['openDirectory', 'createDirectory'],
+        title: 'Choose Package Destination',
+        defaultPath: path.join(os.homedir(), 'Desktop')
+      });
+    } catch (error) {
+      if (isStale()) return null;
+      throw error;
+    }
+    if (isStale()) return null;
+    if (!result || typeof result !== 'object') return null;
+    if (result.canceled) {
+      // Restore the app after canceling the picker so the user can continue editing.
+      // This runs while the chooser is still held, so visibility recovery does not
+      // count it as a hidden attempt or re-create the window the user just used.
+      showTrayWindow();
+      return null;
+    }
+    const { filePaths } = result;
+    if (!Array.isArray(filePaths) || filePaths.length !== 1 ||
+        typeof filePaths[0] !== 'string' || !filePaths[0]) return null;
+    // Do not force foreground after a successful destination selection. Packaging may
+    // continue in the background so macOS can deliver the package-complete banner.
+    suppressPackageAutoForeground();
+    return filePaths[0];
+  } finally {
+    if (packageDestinationChooser === chooser) packageDestinationChooser = null;
+  }
 });
 
 registerTrustedIpcHandler('projects:delete', (event, id) => {
@@ -27671,6 +27780,8 @@ app.on('window-all-closed', (e) => {
 });
 
 app.on('before-quit', () => {
+  // Any destination result from here on is a cancel.
+  abandonPackageDestinationChooser(null, { release: true });
   closeInactivityPrompts();
   closeExistingAssetsNotifications();
   closeNeedsSaveNotifications();
