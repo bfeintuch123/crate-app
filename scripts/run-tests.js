@@ -336,6 +336,13 @@ function formatOver(megabytes) {
   return `${Math.ceil(megabytes)} MB`;
 }
 
+// The same for a time past a limit given in whole seconds: tenths of a second,
+// rounded up. Rounded to the nearest, 6.04 s past a limit of 6 s read "after
+// 6.0 s (limit 6 s)".
+function formatSecondsOver(milliseconds) {
+  return (Math.ceil(milliseconds / 100) / 10).toFixed(1);
+}
+
 // One line of a scan. `start` stays text: it identifies the process and must
 // compare exactly, whatever its size.
 function parseRow(line) {
@@ -1204,7 +1211,8 @@ async function runGuard({
       };
     }
     const memory = unreadable.exitingMilliseconds !== undefined
-      ? `It had been exiting for ${Math.round(unreadable.exitingMilliseconds)} ms, longer than the ${EXITING.milliseconds} ms allowed; `
+      // Rounded up, like every figure shown next to the limit it passed.
+      ? `It had been exiting for ${Math.ceil(unreadable.exitingMilliseconds)} ms, longer than the ${EXITING.milliseconds} ms allowed; `
         + `while exiting it was counted at up to ${formatOver(unreadable.countedMegabytes)}.`
       : 'Its memory is unknown.';
     const lines = [{
@@ -1279,7 +1287,7 @@ async function runGuard({
         report = [`MEMORY LIMIT EXCEEDED after ${seconds()} s: the run reached ${formatOver(total)} across ${owned.size} processes (limit ${limits.total} MB in total).`];
       } else if (Date.now() - started > limits.deadlineSeconds * 1000) {
         reason = 'deadline';
-        report = [`DEADLINE PASSED after ${seconds()} s (limit ${limits.deadlineSeconds} s).`];
+        report = [`DEADLINE PASSED after ${formatSecondsOver(Date.now() - started)} s (limit ${limits.deadlineSeconds} s).`];
       }
     } else if (runnerExit || received.length > 0) {
       // The end of the run, or a signal, seen without a scan (this one failed):
@@ -1474,6 +1482,7 @@ module.exports = {
   createGuard,
   measureRun,
   formatOver,
+  formatSecondsOver,
   describeUnreadable,
   parseDescription,
   printable,
