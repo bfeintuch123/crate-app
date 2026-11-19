@@ -519,20 +519,35 @@ function scopeCases() {
   // ===== Controls: each also holds on the base =====
   scopeCase('control 16: after a failed first reading another project\'s document is not staged by the poll, the open-files observer or accept-pending', async () => {
     const c = await setup('other_project_closed');
+    // In the session before, the other project's unsaved document and its link get review rows
+    // through the live reading, as any open document's do.
+    c.app.docs = [{ path: c.f.doc, links: [...c.f.swatches] }, { path: c.f.flyer, links: [c.f.flyerArt], modified: true }];
+    await poll(c.id, 2);
+    const others = ['Flyer.ai', 'FlyerArt.png'];
+    assert.deepEqual(pendingNames(c).filter(name => others.includes(name)).sort(), others, 'review rows for the other project');
     c.app.docs = [{ path: c.f.doc, links: [...c.f.swatches] }, { path: c.f.flyer, links: [c.f.flyerArt] }];
     await restart(c, { fail: 'count-mismatch' });
     await poll(c.id);
     c.app.openFiles = [c.f.flyer, c.f.flyerArt];
     await metadataTestHooks.pollLsofForProject(c.id, metadataTestHooks.getActiveWatchingActivationToken(c.id));
     await metadataTestHooks.waitForWatcherIdle(c.id);
-    assert.equal(await callIpcRaw('projects:accept-pending', c.id, c.f.flyer), null);
-    const notStaged = () => [...projectFileNames(c), ...pendingNames(c)].filter(name => name === 'Flyer.ai' || name === 'FlyerArt.png');
-    assert.deepEqual(notStaged(), []);
+    for (const target of [c.f.flyer, c.f.flyerArt]) {
+      assert.equal(await callIpcRaw('projects:accept-pending', c.id, target), null, base(target) + ': accept refused');
+    }
+    // No route stages an Illustrator row while the scope is closed, so a row of this session is
+    // the earlier row moved into it.
+    for (const row of stored(c.id).pendingFiles.filter(item => others.includes(base(item.path)))) row.captureSessionId = stored(c.id).watchSessionId;
+    for (const target of [c.f.flyer, c.f.flyerArt]) {
+      assert.equal(await callIpcRaw('projects:accept-pending', c.id, target), null, base(target) + ': accept refused in this session');
+    }
+    const accepted = () => projectFileNames(c).filter(name => others.includes(name));
+    assert.deepEqual(accepted(), []);
+    assert.deepEqual(pendingNames(c).filter(name => others.includes(name)).sort(), others, 'the rows stay undecided');
     const ws = await workspace(c);
-    assert.equal(ws.names.includes('FlyerArt.png') || ws.names.includes('Flyer.ai'), false);
+    for (const name of others) assert.equal(ws.names.includes(name) || ws.pending.some(([shown]) => shown === name), false, name + ' not shown');
     const pkg = await packageStep(c);
-    assert.equal((pkg.files || []).includes('FlyerArt.png') || (pkg.files || []).includes('Flyer.ai'), false, JSON.stringify(pkg));
-    assert.deepEqual(notStaged(), []);
+    for (const name of others) assert.equal((pkg.files || []).includes(name), false, name + ' not packaged: ' + JSON.stringify(pkg));
+    assert.deepEqual(accepted(), []);
   });
 
   for (const recovery of ['automatic', 'explicit add']) {
@@ -597,9 +612,13 @@ function scopeCases() {
     const c = await setup('negatives', { swatchCount: 5 });
     const rows = stored(c.id).files;
     const row = filePath => rows.find(item => item.path === filePath);
+    // A document of no project that no reading lists, so no hidden set names it and only
+    // change 2's own conditions can keep the rows that name it hidden.
+    const unlisted = path.join(path.dirname(c.f.flyer), 'Unlisted.ai');
+    writeSyntheticAiFile(unlisted, '');
     delete row(c.f.swatches[0]).dependencyOwners;
-    row(c.f.swatches[1]).dependencyOwners = [c.f.flyer];
-    row(c.f.swatches[3]).assetBaselineSourcePath = c.f.flyer;
+    row(c.f.swatches[1]).dependencyOwners = [unlisted];
+    row(c.f.swatches[3]).assetBaselineSourcePath = unlisted;
     row(c.f.swatches[4]).dependencyOwnersOverflow = true;
     // The package scan re-records the referencing document as an owner, so the saved
     // document no longer references the two files whose owner records are under test.
@@ -612,6 +631,7 @@ function scopeCases() {
     stored(c.id).pendingFiles.push({ path: pendingArt, name: 'PendingArt.png', ext: '.png', source: 'ai-linked', addedAt: Date.now(),
       captureState: 'needs-save', captureSessionId: stored(c.id).watchSessionId, dependencyOwners: [c.f.doc],
       captureEvidence: { appFamily: 'illustrator', observerMethod: 'illustrator-active-session', state: 'needs-save' } });
+    assert.equal(hasPath(scope(c.id).baselineDocumentPaths, unlisted), false, 'no reading lists the unlisted document');
     // Swatch1 no owner and no source; Swatch2 owner not accepted; Swatch3 in the excluded set;
     // Swatch4 a recorded baseline source; Swatch5 an overflowed owner list and no source; a review row.
     const hidden = ['Swatch1.png', 'Swatch2.png', 'Swatch3.png', 'Swatch4.png', 'Swatch5.png', 'PendingArt.png'];
