@@ -6,7 +6,7 @@ const path = require('node:path');
 const { spawn, execFileSync } = require('node:child_process');
 const assert = require('./bounded-assert');
 const {
-  parseArguments, parseRow, createOwnership, createGuard, measureRun, formatOver, startCheckedSampler, UsageError, TIMING,
+  parseArguments, parseRow, createOwnership, createGuard, measureRun, formatOver, formatSecondsOver, startCheckedSampler, UsageError, TIMING,
   describeUnreadable, parseDescription, EXITING,
   DEFAULT_PROCESS_LIMIT_MB, DEFAULT_TOTAL_LIMIT_MB, DEFAULT_DEADLINE_SECONDS, UNREADABLE_SAMPLES,
   EXIT_MEMORY_LIMIT, EXIT_DEADLINE, EXIT_GUARD_FAILURE, ZOMBIE, ESRCH, EPERM, SYSTEM_TOOL,
@@ -451,6 +451,22 @@ test('a process of the run that is exiting is let through for a second, counted 
   applied(larger, tree(full102), true);
   const owned = applied(larger, tree(exitingRow(102, 101, RUNNER, { start: 'started-102', megabytes: 120, resident: 120 })), true);
   assert.equal(owned.get(102).megabytes, 120);
+});
+
+test('the exiting second ends exactly at 1000 ms: not stopped at 1000, stopped at 1000.25, with the figure as measured', () => {
+  const clock = { now: 0 };
+  const ownership = newOwnership(clock);
+  applied(ownership, tree(full102), true);
+  clock.now = 10;
+  const exiting = tree(exitingRow(102, 101, RUNNER, { start: 'started-102' }));
+  applied(ownership, exiting, true);
+  clock.now = 10 + EXITING.milliseconds;
+  assert.equal(ownership.expiredExiting(clock.now), null);
+  assert.equal(ownership.take(exiting, true).stop, null);
+  assert.equal(ownership.readFailure(), null);
+  clock.now = 10 + EXITING.milliseconds + 0.25;
+  assert.equal(ownership.expiredExiting(clock.now).exitingMilliseconds, 1000.25);
+  assert.equal(ownership.take(exiting, true).stop.exitingMilliseconds, 1000.25);
 });
 
 test('an exiting process that is still exiting after a second stops the run, as one the guard cannot read', () => {
@@ -1365,6 +1381,14 @@ test('a size that passed a limit is never reported as the limit itself', () => {
   }
 });
 
+test('a time past the deadline is never reported as the deadline itself', () => {
+  // A run stopped 1 ms past 6 s does not read "after 6.0 s (limit 6 s)".
+  assert.deepEqual([6001, 6040, 6099, 6100, 6101, 2400001].map(formatSecondsOver), ['6.1', '6.1', '6.1', '6.1', '6.2', '2400.1']);
+  for (const [milliseconds, limit] of [[6001, 6], [6049, 6], [3400001, 3400]]) {
+    assert.ok(Number(formatSecondsOver(milliseconds)) > limit, `${milliseconds} ms over ${limit} s`);
+  }
+});
+
 test('a process that passes the per-process limit is stopped, named, and the run confirmed gone', { timeout: 60000 }, async t => {
   const { bystanderSurvived } = scenario(t);
   const result = await startGuard(['--memory-limit-mb=128', growing]).done;
@@ -1520,15 +1544,29 @@ test('a process that is exiting and gone within a second does not stop the run, 
 
 test('a process that is still exiting after a second stops the run as before, saying how long and at what it was counted', { timeout: 60000 }, async t => {
   const { environment, recorded, allGone, bystanderSurvived } = scenario(t);
-  const result = await startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'exiting:nested' }, faultyGuard).done;
+  // On the guard's own clock, so that nothing depends on where a real sample lands: five scans inside the
+  // second, the last of them at exactly 1000 ms, and the next one past it, which is judged and not applied.
+  const result = await startGuard([descendants], {
+    ...environment('idle'), CRATE_GUARD_FAULT: 'exiting-stepped:nested', CRATE_GUARD_ELAPSED: '250,500,750,1000,1250',
+  }, faultyGuard).done;
   const nested = recorded().get('nested');
   assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
-  assert.match(result.stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${ESRCH}, \\d+ samples in a row\\)\\. It had been exiting for (\\d+) ms, longer than the 1000 ms allowed; while exiting it was counted at up to \\d+ MB\\.\\nrun-tests:   .*\\nrun-tests: Stopping the test run \\(\\d+ processes\\)\\.`));
-  assert.ok(Number(/exiting for (\d+) ms, longer/.exec(result.stderr)[1]) > EXITING.milliseconds);
+  assert.match(result.stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${ESRCH}, 5 samples in a row\\)\\. It had been exiting for 1250 ms, longer than the 1000 ms allowed; while exiting it was counted at up to \\d+ MB\\.\\nrun-tests:   .*\\nrun-tests: Stopping the test run \\(\\d+ processes\\)\\.`));
   assert.match(result.stderr, /run-tests: Every process of the run has ended\./);
-  const samples = Number(new RegExp(`PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno 3, (\\d+) samples`).exec(result.stderr)[1]);
-  assertReport(result, nested, { scans: Math.min(samples, 8), exiting: true });
+  assertReport(result, nested, { scans: 5, exiting: true });
   assert.match(result.stderr, /^run-tests: memory guard: 1 processes were let through while exiting/m);
+  await allGone(['nested', 'nested-child', 'short-lived', 'ready']);
+  assert.equal(bystanderSurvived(), true);
+});
+
+test('a process stopped a fraction of a millisecond past the exiting second is reported as past it, not as at the limit', { timeout: 60000 }, async t => {
+  const { environment, recorded, allGone, bystanderSurvived } = scenario(t);
+  const result = await startGuard([descendants], {
+    ...environment('idle'), CRATE_GUARD_FAULT: 'exiting-stepped:nested', CRATE_GUARD_ELAPSED: '1000,1000.25',
+  }, faultyGuard).done;
+  const nested = recorded().get('nested');
+  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+  assert.match(result.stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${ESRCH}, 2 samples in a row\\)\\. It had been exiting for 1001 ms, longer than the 1000 ms allowed;`));
   await allGone(['nested', 'nested-child', 'short-lived', 'ready']);
   assert.equal(bystanderSurvived(), true);
 });
@@ -2321,6 +2359,7 @@ test('a run that passes its deadline is stopped and reported as 124', { timeout:
   const result = await run.done;
   assert.equal(result.code, EXIT_DEADLINE, result.stderr);
   assert.match(result.stderr, /run-tests: DEADLINE PASSED after [\d.]+ s \(limit 6 s\)\./);
+  assert.ok(Number(/DEADLINE PASSED after ([\d.]+) s/.exec(result.stderr)[1]) > 6, result.stderr);
   assert.match(result.stderr, /run-tests: Every process of the run has ended\./);
   assert.ok(result.seconds < 18, `took ${result.seconds} s`);
   await allGone([...treeRoles, 'ready']);
