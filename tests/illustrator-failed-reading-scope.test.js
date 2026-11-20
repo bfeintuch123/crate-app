@@ -998,5 +998,19 @@ function scopeCases() {
     const pausedPkg = await runPackage(c, pausedReview.token, 'paused_healthy_ai');
     assert.equal(pausedPkg.result?.success, true, JSON.stringify(pausedPkg.result));
     assert.equal(pausedPkg.result.totalFiles, 5);
+
+    // Part C: Pausing after a genuine Illustrator read failure does not bypass the guard;
+    // resuming watching with a complete reading recovers normal packaging.
+    await restart(c, { fail: 'osascript-timeout' });
+    assert.equal(status(c.id), 'failed-closed');
+    await callIpcRaw('projects:pause', c.id);
+    clearTrackedTimers();
+    await assertFullProject(c, 'paused after genuine Illustrator read failure', { scan: false, materializable: false });
+    await restart(c, { fail: null });
+    assert.equal(status(c.id), 'ready');
+    const { pkg: resumedReview } = await assertFullProject(c, 'resumed after complete Illustrator reading', { scan: false, materializable: true });
+    const resumedPkg = await runPackage(c, resumedReview.token, 'resumed_healthy_ai');
+    assert.equal(resumedPkg.result?.success, true, JSON.stringify(resumedPkg.result));
+    assert.equal(resumedPkg.result.totalFiles, 5);
   });
 }
