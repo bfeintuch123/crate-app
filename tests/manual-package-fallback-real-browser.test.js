@@ -125,13 +125,16 @@ function cases() {
       await page.evaluate(`window.__installCrate(${json(Object.keys(api))})`);
       let stopped = false;
       const calls = [];
+      // A held method is answered only after its release, like a slow native call.
+      const holds = new Map();
+      page.hold = name => { let release; const gate = new Promise(resolve => { release = resolve; }); holds.set(name, gate); return () => { holds.delete(name); release(); }; };
       const pump = (async () => {
         while (!stopped) {
           let taken = [];
           try { taken = await page.evaluate('window.__takeIpc()'); } catch (_) { if (stopped) break; }
           for (const call of taken) {
             calls.push([call.name, ...call.args.slice(0, 1)]);
-            Promise.resolve().then(() => api[call.name](...call.args)).then(
+            Promise.resolve(holds.get(call.name)).then(() => api[call.name](...call.args)).then(
               value => page.evaluate(`window.__settleIpc(${call.id}, true, ${json(value ?? null)})`),
               error => page.evaluate(`window.__settleIpc(${call.id}, false, ${json(String(error?.message || error))})`)).catch(() => {});
           }
@@ -149,13 +152,13 @@ function cases() {
         }
         throw new Error('bridge calls did not settle');
       };
-      page.click = async selector => {
+      page.click = async (selector, { wait = true } = {}) => {
         const point = await page.evaluate(`window.__center(${json(selector)})`);
         assert.ok(point?.hit, `${selector} receives the pointer: ${json(point)}`);
         await page.clickAt(point.x, point.y);
         const pressed = await page.evaluate(`window.__pressTargets.map(target => !!target.closest(${json(selector)}))`);
         assert.deepEqual(pressed, [true], `the press reached ${selector}`);
-        await page.idle();
+        if (wait) await page.idle(); else await page.sleep(120);
       };
       page.focusOn = selector => page.evaluate(`document.querySelector(${json(selector)}).focus()`);
       page.active = () => page.evaluate('window.__label(document.activeElement)');
@@ -451,6 +454,67 @@ function cases() {
       assert.equal(shown.title, 'Package Review');
       assert.equal(shown.manualView, false);
       assert.equal(shown.message, 'Your project changed. Review the updated files before packaging.');
+      assert.deepEqual(fs.readdirSync(f.out), []);
+    });
+  });
+
+  browserTest('Package Review: closing during Retry or a folder picker never leaves stale busy or disabled controls', { skip, timeout: 90000 }, async () => {
+    const f = await fixture();
+    await withPage({}, async page => {
+      await page.evaluate(`window.__start(${json(f.id)})`);
+      await page.evaluate('showPackageModal({ runPreScan: false })');
+      await page.idle();
+      // Retry in flight, then the review is closed and opened again.
+      const releaseRetry = page.hold('retryPackageVerification');
+      await page.focusOn('#btn-retry-package-verification');
+      await page.press('Enter');
+      await page.sleep(80);
+      assert.deepEqual((await screen(page)).retry, ['Verifying…', true]);
+      await page.press('Escape');
+      await page.sleep(80);
+      await page.evaluate('showPackageModal({ runPreScan: false })');
+      await page.sleep(300);
+      assert.deepEqual((await screen(page)).retry, ['Retry verification', false], 'a new review never inherits the old Retry');
+      releaseRetry();
+      await page.idle();
+      let shown = await screen(page);
+      assert.deepEqual(shown.retry, ['Retry verification', false], 'the old Retry settles without disabling the new review');
+      // Open the review again to read the completed Retry's result.
+      await page.press('Escape');
+      await page.evaluate('showPackageModal({ runPreScan: false })');
+      await page.idle();
+      shown = await screen(page);
+      assert.deepEqual(shown.manual, ['Review files manually', false]);
+      // The folder picker is open: the fallback controls wait for it, then return.
+      const releasePicker = page.hold('selectOutputFolder');
+      await page.click('#btn-change-dest', { wait: false });
+      shown = await screen(page);
+      assert.deepEqual([shown.retry, shown.manual], [['Retry verification', true], ['Review files manually', true]]);
+      manualDialogFor([f.out]);
+      releasePicker();
+      await page.idle();
+      shown = await screen(page);
+      assert.deepEqual([shown.retry, shown.manual], [['Retry verification', false], ['Review files manually', false]]);
+      // In the manual view, the folder picker holds Back, Escape and Package until it closes.
+      await page.click('#btn-review-files-manually');
+      const releaseManualPicker = page.hold('selectOutputFolder');
+      await page.click('#btn-manual-change-dest', { wait: false });
+      let manual = await manualScreen(page);
+      assert.equal(manual.packageButton[1], true);
+      assert.equal(await page.evaluate("document.querySelector('#btn-manual-back').disabled"), true);
+      await page.press('Escape');
+      await page.sleep(80);
+      assert.equal((await manualScreen(page)).title, 'Review files manually', 'Escape waits for the folder picker');
+      manualDialogFor([f.out]);
+      releaseManualPicker();
+      await page.idle();
+      manual = await manualScreen(page);
+      assert.deepEqual(manual.packageButton, ['Package these 3 files', false]);
+      assert.equal(await page.evaluate("document.querySelector('#btn-manual-back').disabled"), false);
+      assert.equal(await page.evaluate("window.__text('#package-manual-dest-path')"), 'Selected output folder');
+      await page.press('Escape');
+      await page.idle();
+      assert.equal((await screen(page)).title, 'Package Review');
       assert.deepEqual(fs.readdirSync(f.out), []);
     });
   });

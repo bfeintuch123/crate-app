@@ -4870,6 +4870,8 @@ function openPackageReviewDialog(suppliedLease = null) {
 
 function hidePackageReviewDialog({ restoreFocus = false, preserveOpener = false } = {}) {
   if (packageManualReview) resetManualPackageView();
+  // A Retry still running belongs to the review being closed.
+  packageVerificationRetryOwner = null;
   if (packageReviewContents?.expanded) {
     packageReviewContents.expanded = false;
     renderPackageReviewContents();
@@ -5058,6 +5060,9 @@ function syncPackageDestinationControls() {
     manualButton.disabled = Boolean(packageDestinationPicker) || !!packageManualReview?.busy;
     manualButton.setAttribute('aria-busy', String(Boolean(packageDestinationPicker)));
   }
+  // The fallback and manual controls follow the folder picker both ways.
+  if (packageManualReview) syncManualPackageActions();
+  else if (currentPackageVerificationFallback) renderPackageVerificationControls(currentPackageVerificationFallback);
 }
 
 function acquirePackageDestinationPicker(operation) {
@@ -6673,6 +6678,8 @@ async function confirmPackage() {
 // review token, and the main process re-checks every file and decision.
 let packageVerificationRetryOwner = null;
 let packageManualReview = null;
+// The fallback the visible review was rendered with, to repaint its controls.
+let currentPackageVerificationFallback = null;
 
 function getPackageVerificationFallbackPresentation(review) {
   const fallback = review?.verificationFallback;
@@ -6692,17 +6699,20 @@ function renderPackageVerificationControls(fallback) {
   const retry = $('#btn-retry-package-verification');
   const manual = $('#btn-review-files-manually');
   if (!region) return;
+  currentPackageVerificationFallback = fallback || null;
   region.classList.toggle('hidden', !fallback);
   if (region.dataset) region.dataset.fallbackReason = fallback ? fallback.reason : '';
-  const busy = !!packageVerificationRetryOwner;
+  // Only a Retry started from this very review shows as busy here.
+  const busy = isPackageReviewInteractionCurrent(packageVerificationRetryOwner);
+  const blocked = busy || packageReviewConfirmationInFlight || !!packageDestinationPicker;
   if (retry) {
     retry.textContent = busy ? 'Verifying…' : 'Retry verification';
-    retry.disabled = !fallback || busy || packageReviewConfirmationInFlight;
+    retry.disabled = !fallback || blocked;
     retry.setAttribute('aria-busy', String(busy));
   }
   if (manual) {
     manual.classList.toggle('hidden', !fallback?.manual);
-    manual.disabled = !fallback?.manual || busy || packageReviewConfirmationInFlight;
+    manual.disabled = !fallback?.manual || blocked;
   }
 }
 
@@ -6737,7 +6747,11 @@ async function retryPackageVerificationFromReview() {
   } finally {
     if (packageVerificationRetryOwner === owner) packageVerificationRetryOwner = null;
   }
-  if (!isPackageReviewInteractionCurrent(owner)) return false;
+  if (!isPackageReviewInteractionCurrent(owner)) {
+    // A newer review may be open; repaint its own controls, never this Retry's.
+    if (!packageManualReview && !$('#modal-package')?.classList.contains('hidden')) renderPackageVerificationControls(currentPackageVerificationFallback);
+    return false;
+  }
   // A finished Retry reports through a fresh review: verified, still failed,
   // or held for another reason. It never packages.
   const message = result?.success ? '' : result?.error === 'package_verification_busy'
@@ -6810,6 +6824,29 @@ function createManualPackageToggle(file) {
   return button;
 }
 
+// Button states that depend on in-flight work; safe to call from any sync.
+function syncManualPackageActions() {
+  const manual = packageManualReview;
+  if (!manual) return;
+  const included = getManualPackageIncludedFiles(manual);
+  const packageButton = $('#btn-manual-package');
+  if (packageButton) {
+    packageButton.textContent = manual.busy === 'packaging' ? 'Packaging…' : getManualPackageButtonLabel(included.length);
+    packageButton.disabled = !!manual.busy || !included.length || getManualPackageCollisionNames(included).length > 0 ||
+      included.some(file => file.changed) || !!packageDestinationPicker;
+    packageButton.setAttribute('aria-busy', String(manual.busy === 'packaging'));
+  }
+  const choose = $('#btn-manual-choose-files');
+  if (choose) {
+    choose.textContent = manual.busy === 'choosing' ? 'Choosing…' : 'Choose Files…';
+    choose.disabled = !!manual.busy;
+  }
+  const back = $('#btn-manual-back');
+  if (back) back.disabled = manual.busy === 'packaging' || !!packageDestinationPicker;
+  const destination = $('#package-manual-dest-path');
+  if (destination) destination.textContent = getPackageDestinationLabel(state.packageOutputPath);
+}
+
 function renderManualPackageReview() {
   const manual = packageManualReview;
   const active = !!manual;
@@ -6857,22 +6894,6 @@ function renderManualPackageReview() {
   const collisions = getManualPackageCollisionNames(included);
   const total = $('#package-manual-total');
   if (total) total.textContent = included.length ? `${included.length} file${included.length === 1 ? '' : 's'} Included` : 'No files Included';
-  const packageButton = $('#btn-manual-package');
-  if (packageButton) {
-    packageButton.textContent = manual.busy === 'packaging' ? 'Packaging…' : getManualPackageButtonLabel(included.length);
-    packageButton.disabled = !!manual.busy || !included.length || collisions.length > 0 || included.some(file => file.changed) ||
-      !!packageDestinationPicker;
-    packageButton.setAttribute('aria-busy', String(manual.busy === 'packaging'));
-  }
-  const choose = $('#btn-manual-choose-files');
-  if (choose) {
-    choose.textContent = manual.busy === 'choosing' ? 'Choosing…' : 'Choose Files…';
-    choose.disabled = !!manual.busy;
-  }
-  const back = $('#btn-manual-back');
-  if (back) back.disabled = manual.busy === 'packaging';
-  const destination = $('#package-manual-dest-path');
-  if (destination) destination.textContent = getPackageDestinationLabel(state.packageOutputPath);
   const folderName = $('#package-manual-folder-name');
   if (folderName) folderName.textContent = manual.folderName || '';
   syncPackageDestinationControls();
@@ -6896,14 +6917,19 @@ function resetManualPackageView({ end = true } = {}) {
 async function openManualPackageReview() {
   const button = $('#btn-review-files-manually');
   if (!button || button.disabled || button.classList.contains('hidden') || packageManualReview || packageVerificationRetryOwner ||
-      packageReviewConfirmationInFlight || typeof window.crate?.beginManualPackage !== 'function') return false;
+      packageDestinationPicker || packageReviewConfirmationInFlight || typeof window.crate?.beginManualPackage !== 'function') return false;
   const owner = capturePackageReviewInteraction();
   if (!isPackageReviewInteractionCurrent(owner)) return false;
   state.packageReviewToken = null;
   button.disabled = true;
   let result = null;
   try { result = await window.crate.beginManualPackage(owner.projectId); } catch (_) { result = null; }
-  if (!isPackageReviewInteractionCurrent(owner) || packageManualReview) return false;
+  if (!isPackageReviewInteractionCurrent(owner) || packageManualReview || packageDestinationPicker) {
+    // This review moved on; end the session it opened.
+    if (typeof result?.sessionId === 'string') Promise.resolve(window.crate.endManualPackage?.(owner.projectId, result.sessionId)).catch(() => {});
+    if (isPackageReviewInteractionCurrent(owner) && !packageManualReview) renderPackageVerificationControls(currentPackageVerificationFallback);
+    return false;
+  }
   if (!result || result.error || typeof result.sessionId !== 'string' || result.projectId !== owner.projectId || !Array.isArray(result.files)) {
     await showPackageModal({ runPreScan: false, message: PACKAGE_REVIEW_CHANGED_MESSAGE });
     return false;
@@ -6943,7 +6969,7 @@ function describeManualPackageRefusals(refused) {
   if (reasons.has('font')) parts.push('Fonts can’t be added to a manual package.');
   if (reasons.has('hidden-or-invalid')) parts.push('Hidden files can’t be added.');
   if (reasons.has('unavailable')) parts.push('Some files couldn’t be read.');
-  if (reasons.has('limit')) parts.push('This package has too many files.');
+  if (reasons.has('limit')) parts.push('This package has too many files; some weren’t added.');
   return parts.join(' ');
 }
 
@@ -7009,6 +7035,7 @@ function getManualPackageErrorMessage(error) {
   if (error === 'manual_package_copy_unverified') return 'A copy didn’t match its file. Nothing was packaged. Try again.';
   if (error === 'package_output_changed') return 'The package folder changed. Choose Folder, then try again.';
   if (error === 'package_in_flight' || error === 'manual_package_busy') return 'Crate is already packaging. Try again in a moment.';
+  if (error === 'package_cleanup_failed') return 'Packaging could not finish and nothing was published, but Crate couldn’t remove its temporary folder. Try again.';
   return 'Packaging could not finish. Nothing was packaged. Try again.';
 }
 
@@ -7078,7 +7105,7 @@ async function packageManualFilesFromReview() {
   }
   const error = result?.error;
   if (error === 'limit_reached') {
-    packageManualReview = null;
+    resetManualPackageView();
     const opener = hidePackageReviewDialog();
     showPackageLimitModal(result, opener);
     return false;
@@ -7105,7 +7132,7 @@ async function packageManualFilesFromReview() {
 
 async function returnToPackageReviewFromManual() {
   const manual = packageManualReview;
-  if (!isManualPackageReviewCurrent(manual) || manual.busy === 'packaging') return false;
+  if (!isManualPackageReviewCurrent(manual) || manual.busy === 'packaging' || packageDestinationPicker) return false;
   resetManualPackageView();
   await showPackageModal({ runPreScan: false });
   return true;
