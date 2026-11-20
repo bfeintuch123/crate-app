@@ -436,8 +436,18 @@ function cases() {
       await drain();
       assert.equal((await pending).error, 'package_review_changed');
       await callIpcRaw('projects:pause', f.id); clearTrackedTimers();
+      // The receipt as retireInterruptedWorkingSourceScan leaves an interrupted
+      // reading: failed, reason scan-interrupted, the Retry's own attempt.
+      const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.stored(), f.stored().files.find(file => file.path === desktop('Cover.psd')));
+      metadataTestHooks.mutateProject(f.id, project => {
+        const record = project.workingSourceVerification[key];
+        project.workingSourceVerification[key] = { ...record, status: 'failed', reason: 'scan-interrupted',
+          unresolved: [...(record.unresolved || []), { reason: 'scan-interrupted' }] };
+        return true;
+      });
       const review = await f.review();
-      assert.notEqual(review.verificationFallback?.manual, true, 'an interrupted Retry is not a failed reading');
+      assert.ok(review.verificationFallback, 'Retry is still offered');
+      assert.equal(review.verificationFallback.manual, false, 'an interrupted Retry is not a failed reading');
       assert.equal((await f.begin()).error, 'manual_package_unavailable');
     } finally { held = false; release(); unpause(); global.setTimeout = timer; await pause(50); }
   });
