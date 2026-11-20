@@ -1818,24 +1818,17 @@ function baselineCases() {
           assert.deepEqual(d.counts.otherObserverScripts, ['crate-ai-active-session.applescript']);
           const noQuery = scenario === 'closed-lookalike-processes';
           assert.deepEqual(d.counts.observerScripts, noQuery ? [] : ['crate-indd-poll.applescript']);
-          if (foreignOutput === 'empty-control') {
-            assert.equal(result, null, 'invalid foreign output must still retire the production lease');
-            assert.equal(after.scopeRevision, before.scopeRevision + 1);
-            assert.equal(record?.status, 'pending');
-            assert.equal(project.files.some(file => file.path === d.savedLink), false);
-          } else {
-            assert.ok(Array.isArray(result), 'valid foreign callback must preserve the InDesign operation');
-            assert.equal(after.scopeRevision, before.scopeRevision);
-            assert.equal(record?.status, 'scanned');
-            assert.equal(record.provider, 'ordinary-indd');
-            assert.equal(record.sourceFingerprint, crypto.createHash('sha256').update(fs.readFileSync(d.source)).digest('hex'));
-            assert.ok(record.notes.includes('saved-byte-regex-fallback'));
-            assert.deepEqual(record.unresolved, []);
-            assert.equal(project.files.filter(file => file.path === d.savedLink).length, 1);
-            assert.ok(record.requiredReferences.some(ref => ref.path === d.savedLink));
-          }
-          assert.equal(d.counts.processChecks, foreignOutput === 'empty-control' ? 1 : 2);
-          assert.equal(d.counts.queries, foreignOutput === 'empty-control' || noQuery ? 0 : 1);
+          assert.ok(Array.isArray(result), 'a foreign callback, valid or empty, must preserve the InDesign operation');
+          assert.equal(after.scopeRevision, before.scopeRevision);
+          assert.equal(record?.status, 'scanned');
+          assert.equal(record.provider, 'ordinary-indd');
+          assert.equal(record.sourceFingerprint, crypto.createHash('sha256').update(fs.readFileSync(d.source)).digest('hex'));
+          assert.ok(record.notes.includes('saved-byte-regex-fallback'));
+          assert.deepEqual(record.unresolved, []);
+          assert.equal(project.files.filter(file => file.path === d.savedLink).length, 1);
+          assert.ok(record.requiredReferences.some(ref => ref.path === d.savedLink));
+          assert.equal(d.counts.processChecks, 2);
+          assert.equal(d.counts.queries, noQuery ? 0 : 1);
           assert.equal([...project.files, ...project.pendingFiles].some(file => [d.liveLink, d.otherLink].includes(file.path)), false);
           assert.equal(JSON.stringify(project.provenance).includes(d.otherLink), false);
           assert.deepEqual(project.pendingFiles, []);
@@ -6159,6 +6152,13 @@ function excludedSourceMembershipCases() {
     assert.deepEqual(f.anyRowAt(desk(f.names.newLink)), [], 'the excluded file is not parsed for links');
   }));
 
+  // Model a responsive Illustrator active-session read alongside /bin/ps + /usr/sbin/lsof
+  // snapshot stubs so realTmp snapshot tests exercise the lsof snapshot route rather than
+  // falling through to empty osascript output (which marks Illustrator verification failed-closed).
+  const illustratorActiveDocsOutput = docs => docs
+    .map((doc, i) => `DOC\t${doc}\t${path.basename(doc)}\tfalse\t${i === 0}`)
+    .join('\n') + `\nCOMPLETE\t${docs.length}\t0\n`;
+
   // ---- Owner records: every route that observes an asset for a working file.
   const ROUTES = [['regex', '.ai'], ['doublecheck', '.sketch'], ['psdparse', '.psd'], ['snapshot', '.ai']];
   for (const [route, ext] of ROUTES) for (const order of ['W-only', 'W-first', 'K-first']) {
@@ -6180,6 +6180,7 @@ function excludedSourceMembershipCases() {
           const open = [f.W, K2].map((file, i) => `f${14 + i}\ntREG\nn${file}\n`).join('');
           setChildProcessHandler(request => {
             if (request.kind === 'execFile' && request.command === '/bin/ps') return { stdout: '444 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
+            if (isOsascriptInvocation(request, 'crate-ai-active-session.applescript')) return { stdout: illustratorActiveDocsOutput([f.W, K2]) };
             if (request.kind === 'execFile' && request.command === '/usr/sbin/lsof') return { stdout: `p444\n${open}` };
             return passthroughInner(request);
           });
@@ -7496,6 +7497,7 @@ function excludedSourceMembershipCases() {
     if (route === 'snapshot') {
       setChildProcessHandler(request => {
         if (request.kind === 'execFile' && request.command === '/bin/ps') return { stdout: '444 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
+        if (isOsascriptInvocation(request, 'crate-ai-active-session.applescript')) return { stdout: illustratorActiveDocsOutput([K]) };
         if (request.kind === 'execFile' && request.command === '/usr/sbin/lsof') return { stdout: `p444\nf14\ntREG\nn${K}\n` };
         return passthroughInner(request);
       });
@@ -7549,6 +7551,7 @@ function excludedSourceMembershipCases() {
         await callIpcRaw('projects:pause', f.id); clearTrackedTimers();
         setChildProcessHandler(request => {
           if (request.kind === 'execFile' && request.command === '/bin/ps') return { stdout: '444 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
+          if (isOsascriptInvocation(request, 'crate-ai-active-session.applescript')) return { stdout: illustratorActiveDocsOutput([f.W, f.K]) };
           if (request.kind === 'execFile' && request.command === '/usr/sbin/lsof') return { stdout: `p444\nf14\ntREG\nn${f.W}\nf15\ntREG\nn${f.K}\n` };
           return passthroughInner(request);
         });
