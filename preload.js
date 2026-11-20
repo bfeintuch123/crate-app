@@ -52,6 +52,12 @@ contextBridge.exposeInMainWorld('crate', {
     ? ipcRenderer.invoke('projects:prepare-package-review', id)
     : ipcRenderer.invoke('projects:prepare-package-review', id, outputPath),
   packageProject: (id, outputPath, reviewToken) => ipcRenderer.invoke('projects:package', id, outputPath, reviewToken),
+  // Manual packaging fallback: the main process re-derives every decision.
+  retryPackageVerification: (projectId) => ipcRenderer.invoke('projects:retry-package-verification', projectId),
+  beginManualPackage: (projectId) => ipcRenderer.invoke('projects:begin-manual-package', projectId),
+  chooseManualPackageFiles: (projectId, sessionId) => ipcRenderer.invoke('projects:manual-package-choose-files', projectId, sessionId),
+  endManualPackage: (projectId, sessionId) => ipcRenderer.invoke('projects:end-manual-package', projectId, sessionId),
+  packageManualFiles: (projectId, sessionId, request, outputPath) => ipcRenderer.invoke('projects:package-manual', projectId, sessionId, request, outputPath),
   listInstalledFonts: (projectId) => ipcRenderer.invoke('fonts:list-installed', projectId),
   addInstalledFonts: (projectId, families) => ipcRenderer.invoke('fonts:add-installed', projectId, { families }),
   chooseInstalledFontCopy: (projectId, offerId) => ipcRenderer.invoke('fonts:choose-installed-copy', projectId, offerId),

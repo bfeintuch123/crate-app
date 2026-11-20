@@ -4869,6 +4869,7 @@ function openPackageReviewDialog(suppliedLease = null) {
 }
 
 function hidePackageReviewDialog({ restoreFocus = false, preserveOpener = false } = {}) {
+  if (packageManualReview) resetManualPackageView();
   if (packageReviewContents?.expanded) {
     packageReviewContents.expanded = false;
     renderPackageReviewContents();
@@ -5015,6 +5016,11 @@ function handlePackageReviewKeydown(event) {
   if (event.key === 'Escape') {
     if (packageReviewConfirmationInFlight) return;
     event.preventDefault();
+    // The manual view steps back to Package Review, as its Back button does.
+    if (packageManualReview) {
+      if (packageManualReview.busy !== 'packaging' && !packageDestinationPicker) void returnToPackageReviewFromManual();
+      return;
+    }
     return cancelPackageReview();
   }
   if (event.key !== 'Tab') return;
@@ -5046,6 +5052,12 @@ function syncPackageDestinationControls() {
   }
   const confirmButton = $('#btn-confirm-package');
   if (confirmButton) confirmButton.disabled = Boolean(packageDestinationPicker) || packageReviewConfirmationInFlight || !state.packageReviewToken;
+  const manualButton = $('#btn-manual-change-dest');
+  if (manualButton) {
+    manualButton.textContent = packageDestinationPicker ? 'Choosing…' : state.packageOutputPath ? 'Change Folder' : 'Choose Folder';
+    manualButton.disabled = Boolean(packageDestinationPicker) || !!packageManualReview?.busy;
+    manualButton.setAttribute('aria-busy', String(Boolean(packageDestinationPicker)));
+  }
 }
 
 function acquirePackageDestinationPicker(operation) {
@@ -6073,6 +6085,12 @@ function renderPackageReview(project, review, message = '', suppliedLease = null
   const hasWorkingFileChoices = review?.error === 'working_file_choice_required' ||
     (review?.workingFileChoices?.version === 1 && (review.workingFileChoices.blocked === true || review.workingFileChoices.choices?.length > 0));
   const canPackage = !inventoryUnavailable && !hasWorkingFileChoices && !hasUnresolvedContinuation && !hasContinuationChoices && review.materializable !== false && typeof review.token === 'string';
+  // A fresh review always replaces the manual view.
+  if (packageManualReview) resetManualPackageView();
+  else renderManualPackageReview();
+  // Only a review the main process marked as a failed reading offers Retry.
+  const verificationFallback = !canPackage && !inventoryUnavailable && !hasWorkingFileChoices && !hasUnresolvedContinuation && !hasContinuationChoices
+    ? getPackageVerificationFallbackPresentation(review) : null;
   renderSourceContinuationChoices(project, review, lease);
   state.packageReviewToken = canPackage ? review.token : null;
 
@@ -6130,13 +6148,15 @@ function renderPackageReview(project, review, message = '', suppliedLease = null
   }
   const reviewMessage = $('#modal-package-review-message');
   if (reviewMessage) {
-    const visibleMessage = message || review.message || '';
+    const visibleMessage = message ||
+      (verificationFallback ? getPackageVerificationFallbackMessage(verificationFallback, project) : review.message) || '';
     reviewMessage.textContent = visibleMessage;
     reviewMessage.classList.remove('hidden');
     reviewMessage.classList.toggle('is-empty', !visibleMessage);
   }
   const confirmButton = $('#btn-confirm-package');
   if (confirmButton) confirmButton.disabled = !canPackage;
+  renderPackageVerificationControls(verificationFallback);
   const ready = $('#package-review-ready');
   if (ready) {
     ready.textContent = canPackage ? 'Ready to package' : 'Review required';
@@ -6614,6 +6634,7 @@ async function confirmPackage() {
     }
 
     const totalPackaged = (result.copiedCount || 0) + (result.embeddedCount || 0);
+    resetPackageSuccessPresentation();
     $('#success-message').textContent = `${totalPackaged} file${totalPackaged !== 1 ? 's' : ''} packaged.`;
     $('#success-path').textContent = result.folderPath;
     renderPackageDetails(result);
@@ -6643,6 +6664,451 @@ async function confirmPackage() {
     hidePackageProgressModal();
     syncPackageDestinationControls();
   }
+}
+
+// ===== Manual packaging fallback =====
+// Package Review shows Retry verification only for a failed or timed-out
+// reading the main process names; after a failed Retry it offers Review files
+// manually. The manual view is a mode of the same dialog. It never issues a
+// review token, and the main process re-checks every file and decision.
+let packageVerificationRetryOwner = null;
+let packageManualReview = null;
+
+function getPackageVerificationFallbackPresentation(review) {
+  const fallback = review?.verificationFallback;
+  if (!fallback || fallback.version !== 1 || fallback.retry !== true || !['failed', 'timed-out', 'changed'].includes(fallback.reason)) return null;
+  return { reason: fallback.reason, manual: fallback.manual === true && fallback.reason !== 'changed' };
+}
+
+// The same sentences as the working-file card for the same reasons.
+function getPackageVerificationFallbackMessage(fallback, project) {
+  const reason = fallback.reason === 'timed-out' ? 'working-file-verification-timed-out'
+    : fallback.reason === 'changed' ? 'working-file-source-changed' : 'working-file-verification-failed';
+  return getWorkingFileVerificationGuidance(reason, project || {}).text;
+}
+
+function renderPackageVerificationControls(fallback) {
+  const region = $('#package-review-verification');
+  const retry = $('#btn-retry-package-verification');
+  const manual = $('#btn-review-files-manually');
+  if (!region) return;
+  region.classList.toggle('hidden', !fallback);
+  if (region.dataset) region.dataset.fallbackReason = fallback ? fallback.reason : '';
+  const busy = !!packageVerificationRetryOwner;
+  if (retry) {
+    retry.textContent = busy ? 'Verifying…' : 'Retry verification';
+    retry.disabled = !fallback || busy || packageReviewConfirmationInFlight;
+    retry.setAttribute('aria-busy', String(busy));
+  }
+  if (manual) {
+    manual.classList.toggle('hidden', !fallback?.manual);
+    manual.disabled = !fallback?.manual || busy || packageReviewConfirmationInFlight;
+  }
+}
+
+function isPackageReviewInteractionCurrent(owner) {
+  return !!owner && owner.projectId === state.selectedProjectId && owner.projectId === packageReviewModalProjectId &&
+    owner.requestId === packageReviewRequestId && owner.sessionId === packageReviewModalSessionId &&
+    owner.selection === projectSelectionEpoch && owner.account === accountWorkspaceEpoch && accountStatus.canUseWorkspace &&
+    isCurrentModalLease('modal-package', owner.sessionId) && !$('#modal-package')?.classList.contains('hidden');
+}
+
+function capturePackageReviewInteraction() {
+  return { projectId: packageReviewModalProjectId, requestId: packageReviewRequestId, sessionId: packageReviewModalSessionId,
+    selection: projectSelectionEpoch, account: accountWorkspaceEpoch };
+}
+
+async function retryPackageVerificationFromReview() {
+  const region = $('#package-review-verification');
+  if (!region || region.classList.contains('hidden') || packageVerificationRetryOwner || packageManualReview ||
+      packageReviewConfirmationInFlight || packageDestinationPicker || typeof window.crate?.retryPackageVerification !== 'function') return false;
+  const owner = capturePackageReviewInteraction();
+  if (!isPackageReviewInteractionCurrent(owner)) return false;
+  packageVerificationRetryOwner = owner;
+  state.packageReviewToken = null;
+  const confirmButton = $('#btn-confirm-package');
+  if (confirmButton) confirmButton.disabled = true;
+  renderPackageVerificationControls({ reason: region.dataset?.fallbackReason || 'failed', manual: false });
+  let result = null;
+  try {
+    result = await window.crate.retryPackageVerification(owner.projectId);
+  } catch (_) {
+    result = { success: false, error: 'package_verification_retry_failed' };
+  } finally {
+    if (packageVerificationRetryOwner === owner) packageVerificationRetryOwner = null;
+  }
+  if (!isPackageReviewInteractionCurrent(owner)) return false;
+  // A finished Retry reports through a fresh review: verified, still failed,
+  // or held for another reason. It never packages.
+  const message = result?.success ? '' : result?.error === 'package_verification_busy'
+    ? 'Crate is already checking this file. Try again in a moment.'
+    : result?.error === 'package_in_flight' ? 'Crate is already packaging. Try again in a moment.'
+    : result?.error === 'package_verification_retry_unavailable' || result?.error === 'package_review_changed'
+      ? PACKAGE_REVIEW_CHANGED_MESSAGE : 'Verification couldn’t finish. Try again.';
+  await showPackageModal({ runPreScan: false, message });
+  return result?.success === true;
+}
+
+function getManualPackageIncludedFiles(manual = packageManualReview) {
+  return manual ? manual.files.filter(file => file.included) : [];
+}
+
+function getManualPackageCollisionNames(files) {
+  const groups = new Map();
+  for (const file of files) {
+    const key = String(file.name || '').normalize('NFC').toLowerCase();
+    groups.set(key, [...(groups.get(key) || []), file.name]);
+  }
+  return [...groups.values()].filter(group => group.length > 1).map(group => group[0]);
+}
+
+function getManualPackageButtonLabel(count) {
+  if (count === 1) return 'Package this file';
+  return count > 1 ? `Package these ${count} files` : 'Package these files';
+}
+
+function setManualPackageMessage(text, { focus = false } = {}) {
+  const message = $('#package-manual-message');
+  if (!message) return;
+  message.textContent = text || '';
+  message.classList.toggle('is-empty', !text);
+  if (focus && text) message.focus?.({ preventScroll: true });
+}
+
+function isManualPackageReviewCurrent(manual) {
+  return !!manual && packageManualReview === manual && isPackageReviewInteractionCurrent(manual.owner);
+}
+
+function getManualPackageFileDetail(file) {
+  const role = file.role === 'source' ? 'Working file'
+    : file.role === 'chosen' ? 'Chosen for this package'
+      : file.origin === 'existing' ? 'Existing' : file.origin === 'added' ? 'Added' : 'Asset';
+  if (file.changed) return `${role} · Changed or missing. Exclude it or choose it again.`;
+  return `${role} · ${file.included ? 'Included' : 'Excluded'}`;
+}
+
+function createManualPackageToggle(file) {
+  const action = file.included ? 'exclude' : 'include';
+  const label = `${action === 'include' ? 'Include' : 'Exclude'} ${file.name}`;
+  let button;
+  if (file.role === 'source') {
+    button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'working-source-action package-manual-toggle';
+    button.textContent = action === 'include' ? 'Include' : 'Exclude';
+    button.setAttribute('aria-label', label);
+  } else {
+    button = createRowIconButton(action, label, 'package-manual-toggle');
+  }
+  button.dataset.manualId = file.id;
+  button.dataset.manualAction = action;
+  button.disabled = !!packageManualReview?.busy;
+  button.addEventListener('click', event => {
+    event.stopPropagation();
+    toggleManualPackageFile(file.id);
+  });
+  return button;
+}
+
+function renderManualPackageReview() {
+  const manual = packageManualReview;
+  const active = !!manual;
+  $('#package-review-body')?.classList.toggle('hidden', active);
+  $('#package-manual-body')?.classList.toggle('hidden', !active);
+  document.querySelector?.('.package-review-navigation')?.classList.toggle('hidden', active);
+  const title = $('#package-review-title');
+  if (title) {
+    title.textContent = active ? 'Review files manually' : 'Package Review';
+    if (active) title.setAttribute('tabindex', '-1'); else title.removeAttribute('tabindex');
+  }
+  if (!active) return;
+  const list = $('#package-manual-file-list');
+  if (list) {
+    list.replaceChildren();
+    for (const file of manual.files) {
+      const row = document.createElement('li');
+      row.className = `package-manual-file${file.included ? '' : ' is-excluded'}${file.changed ? ' is-changed' : ''}`;
+      row.dataset.manualId = file.id;
+      const copy = document.createElement('div');
+      copy.className = 'package-manual-file-copy';
+      const name = document.createElement('div');
+      name.className = 'package-manual-file-name';
+      name.textContent = file.name;
+      name.title = file.name;
+      const detail = document.createElement('div');
+      detail.className = 'package-manual-file-detail';
+      detail.textContent = getManualPackageFileDetail(file);
+      copy.appendChild(name);
+      copy.appendChild(detail);
+      row.appendChild(copy);
+      row.appendChild(createManualPackageToggle(file));
+      list.appendChild(row);
+    }
+    if (!manual.files.length) {
+      const empty = document.createElement('li');
+      empty.className = 'package-manual-empty';
+      empty.textContent = manual.preselectionUnavailable
+        ? 'Crate couldn’t list this project’s Included files. Choose Files… to add the files for this package.'
+        : 'No files are listed. Choose Files… to add the files for this package.';
+      list.appendChild(empty);
+    }
+  }
+  const included = getManualPackageIncludedFiles(manual);
+  const collisions = getManualPackageCollisionNames(included);
+  const total = $('#package-manual-total');
+  if (total) total.textContent = included.length ? `${included.length} file${included.length === 1 ? '' : 's'} Included` : 'No files Included';
+  const packageButton = $('#btn-manual-package');
+  if (packageButton) {
+    packageButton.textContent = manual.busy === 'packaging' ? 'Packaging…' : getManualPackageButtonLabel(included.length);
+    packageButton.disabled = !!manual.busy || !included.length || collisions.length > 0 || included.some(file => file.changed) ||
+      !!packageDestinationPicker;
+    packageButton.setAttribute('aria-busy', String(manual.busy === 'packaging'));
+  }
+  const choose = $('#btn-manual-choose-files');
+  if (choose) {
+    choose.textContent = manual.busy === 'choosing' ? 'Choosing…' : 'Choose Files…';
+    choose.disabled = !!manual.busy;
+  }
+  const back = $('#btn-manual-back');
+  if (back) back.disabled = manual.busy === 'packaging';
+  const destination = $('#package-manual-dest-path');
+  if (destination) destination.textContent = getPackageDestinationLabel(state.packageOutputPath);
+  const folderName = $('#package-manual-folder-name');
+  if (folderName) folderName.textContent = manual.folderName || '';
+  syncPackageDestinationControls();
+  if (collisions.length) {
+    setManualPackageMessage(`Two Included files are named ${collisions[0]}. Exclude one to continue.`);
+  } else if (manual.message !== undefined) {
+    setManualPackageMessage(manual.message);
+  }
+}
+
+function resetManualPackageView({ end = true } = {}) {
+  const manual = packageManualReview;
+  packageManualReview = null;
+  if (manual && end && typeof window.crate?.endManualPackage === 'function') {
+    Promise.resolve(window.crate.endManualPackage(manual.projectId, manual.sessionId)).catch(() => {});
+  }
+  setManualPackageMessage('');
+  renderManualPackageReview();
+}
+
+async function openManualPackageReview() {
+  const button = $('#btn-review-files-manually');
+  if (!button || button.disabled || button.classList.contains('hidden') || packageManualReview || packageVerificationRetryOwner ||
+      packageReviewConfirmationInFlight || typeof window.crate?.beginManualPackage !== 'function') return false;
+  const owner = capturePackageReviewInteraction();
+  if (!isPackageReviewInteractionCurrent(owner)) return false;
+  state.packageReviewToken = null;
+  button.disabled = true;
+  let result = null;
+  try { result = await window.crate.beginManualPackage(owner.projectId); } catch (_) { result = null; }
+  if (!isPackageReviewInteractionCurrent(owner) || packageManualReview) return false;
+  if (!result || result.error || typeof result.sessionId !== 'string' || result.projectId !== owner.projectId || !Array.isArray(result.files)) {
+    await showPackageModal({ runPreScan: false, message: PACKAGE_REVIEW_CHANGED_MESSAGE });
+    return false;
+  }
+  packageManualReview = {
+    owner, projectId: owner.projectId, sessionId: result.sessionId, folderName: typeof result.folderName === 'string' ? result.folderName : '',
+    preselectionUnavailable: result.preselectionUnavailable === true, busy: false,
+    message: Number.isSafeInteger(result.omittedCount) && result.omittedCount > 0
+      ? `${result.omittedCount} Included file${result.omittedCount === 1 ? ' can’t be packaged manually, so it isn’t' : 's can’t be packaged manually, so they aren’t'} listed.`
+      : '',
+    files: result.files.filter(file => file && typeof file.id === 'string' && typeof file.name === 'string')
+      .map(file => ({ id: file.id, name: file.name, role: file.role, origin: file.origin, included: true, changed: false })),
+  };
+  renderManualPackageReview();
+  const title = $('#package-review-title');
+  title?.focus?.({ preventScroll: true });
+  return true;
+}
+
+function toggleManualPackageFile(id) {
+  const manual = packageManualReview;
+  if (!isManualPackageReviewCurrent(manual) || manual.busy) return;
+  const file = manual.files.find(item => item.id === id);
+  if (!file) return;
+  file.included = !file.included;
+  if (!file.included) file.changed = false;
+  manual.message = `${file.name} ${file.included ? 'included' : 'excluded'}.`;
+  renderManualPackageReview();
+  // Keep focus on the same row's control, which now offers the opposite action.
+  const control = Array.from(document.querySelectorAll('.package-manual-toggle')).find(button => button.dataset.manualId === id);
+  control?.focus?.({ preventScroll: true });
+}
+
+function describeManualPackageRefusals(refused) {
+  const reasons = new Set((Array.isArray(refused) ? refused : []).map(item => item?.reason));
+  const parts = [];
+  if (reasons.has('font')) parts.push('Fonts can’t be added to a manual package.');
+  if (reasons.has('hidden-or-invalid')) parts.push('Hidden files can’t be added.');
+  if (reasons.has('unavailable')) parts.push('Some files couldn’t be read.');
+  if (reasons.has('limit')) parts.push('This package has too many files.');
+  return parts.join(' ');
+}
+
+async function chooseManualPackageFilesFromReview() {
+  const manual = packageManualReview;
+  if (!isManualPackageReviewCurrent(manual) || manual.busy || typeof window.crate?.chooseManualPackageFiles !== 'function') return false;
+  manual.busy = 'choosing';
+  renderManualPackageReview();
+  let result = null;
+  try { result = await window.crate.chooseManualPackageFiles(manual.projectId, manual.sessionId); } catch (_) { result = { error: 'picker_failed' }; }
+  if (!isManualPackageReviewCurrent(manual)) return false;
+  manual.busy = false;
+  if (result?.error === 'manual_package_stale') {
+    resetManualPackageView({ end: false });
+    await showPackageModal({ runPreScan: false, message: PACKAGE_REVIEW_CHANGED_MESSAGE });
+    return false;
+  }
+  if (!result || result.error || !Array.isArray(result.files)) {
+    manual.message = 'The file picker could not open. Try again.';
+    renderManualPackageReview();
+    $('#btn-manual-choose-files')?.focus?.({ preventScroll: true });
+    return false;
+  }
+  const previous = new Map(manual.files.map(file => [file.id, file]));
+  const chosen = new Set([...(result.addedIds || []), ...(result.matchedIds || [])]);
+  manual.files = result.files.filter(file => file && typeof file.id === 'string' && typeof file.name === 'string').map(file => ({
+    id: file.id, name: file.name, role: file.role, origin: file.origin,
+    included: chosen.has(file.id) ? true : previous.get(file.id)?.included ?? false,
+    changed: chosen.has(file.id) ? false : previous.get(file.id)?.changed === true,
+  }));
+  const added = (result.addedIds || []).length;
+  manual.message = result.canceled ? '' : [
+    added ? `${added} file${added === 1 ? '' : 's'} chosen for this package.` : '',
+    describeManualPackageRefusals(result.refused),
+  ].filter(Boolean).join(' ');
+  renderManualPackageReview();
+  $('#btn-manual-choose-files')?.focus?.({ preventScroll: true });
+  return true;
+}
+
+async function chooseManualPackageDestination() {
+  const manual = packageManualReview;
+  if (!isManualPackageReviewCurrent(manual) || manual.busy) return;
+  const operation = { manual };
+  if (!acquirePackageDestinationPicker(operation)) return;
+  renderManualPackageReview();
+  try {
+    const folder = await window.crate.selectOutputFolder();
+    if (packageDestinationPicker !== operation || !isManualPackageReviewCurrent(manual)) return;
+    if (typeof folder === 'string' && folder) state.packageOutputPath = folder;
+  } catch (_) {
+    if (isManualPackageReviewCurrent(manual)) manual.message = 'The folder picker could not open. Try again.';
+  } finally {
+    releasePackageDestinationPicker(operation);
+    if (isManualPackageReviewCurrent(manual)) {
+      renderManualPackageReview();
+      $('#btn-manual-change-dest')?.focus?.({ preventScroll: true });
+    }
+  }
+}
+
+function getManualPackageErrorMessage(error) {
+  if (error === 'manual_package_copy_unverified') return 'A copy didn’t match its file. Nothing was packaged. Try again.';
+  if (error === 'package_output_changed') return 'The package folder changed. Choose Folder, then try again.';
+  if (error === 'package_in_flight' || error === 'manual_package_busy') return 'Crate is already packaging. Try again in a moment.';
+  return 'Packaging could not finish. Nothing was packaged. Try again.';
+}
+
+function showManualPackageSuccess(result) {
+  const count = Number.isSafeInteger(result.copiedCount) && result.copiedCount > 0 ? result.copiedCount : 0;
+  $('#success-title').textContent = 'Packaged Manually';
+  $('#success-message').textContent = `${count} file${count === 1 ? '' : 's'} packaged manually.`;
+  $('#success-manual-note')?.classList.remove('hidden');
+  $('#success-path').textContent = result.folderPath;
+  // Package Details describe a verified package; a manual package has none.
+  $('#package-details')?.classList.add('hidden');
+  state.lastPackagedPath = result.folderPath;
+  hidePackageReviewDialog({ preserveOpener: true });
+  showPackageSuccessModal();
+}
+
+function resetPackageSuccessPresentation() {
+  const title = $('#success-title');
+  if (title) title.textContent = 'Package Complete';
+  $('#success-manual-note')?.classList.add('hidden');
+}
+
+async function packageManualFilesFromReview() {
+  const manual = packageManualReview;
+  const button = $('#btn-manual-package');
+  if (!isManualPackageReviewCurrent(manual) || manual.busy || !button || button.disabled ||
+      typeof window.crate?.packageManualFiles !== 'function') return false;
+  const included = getManualPackageIncludedFiles(manual);
+  if (!included.length || getManualPackageCollisionNames(included).length || included.some(file => file.changed)) return false;
+  manual.busy = 'packaging';
+  manual.message = '';
+  renderManualPackageReview();
+  let outputPath = state.packageOutputPath;
+  if (!outputPath) {
+    const operation = { manual };
+    if (!acquirePackageDestinationPicker(operation)) { manual.busy = false; renderManualPackageReview(); return false; }
+    try { outputPath = await window.crate.selectOutputFolder(); } catch (_) { outputPath = null; }
+    finally { releasePackageDestinationPicker(operation); }
+    if (!isManualPackageReviewCurrent(manual)) return false;
+    if (typeof outputPath !== 'string' || !outputPath) {
+      manual.busy = false;
+      renderManualPackageReview();
+      $('#btn-manual-package')?.focus?.({ preventScroll: true });
+      return false;
+    }
+    state.packageOutputPath = outputPath;
+  }
+  let result = null;
+  try {
+    result = await window.crate.packageManualFiles(manual.projectId, manual.sessionId,
+      { includedIds: included.map(file => file.id), expectedCount: included.length }, outputPath);
+  } catch (_) { result = { error: 'package_failed' }; }
+  if (!isManualPackageReviewCurrent(manual)) return false;
+  manual.busy = false;
+  if (result?.success === true && typeof result.folderPath === 'string') {
+    packageManualReview = null;
+    showManualPackageSuccess(result);
+    try {
+      state.projects = await getAccountCurrentProjects();
+      state.usage = await window.crate.getUsage();
+      renderFiles();
+      renderFooter();
+    } catch (refreshError) {
+      logRendererError('Manual package completed, but the project summary could not refresh', refreshError);
+    }
+    return true;
+  }
+  const error = result?.error;
+  if (error === 'limit_reached') {
+    packageManualReview = null;
+    const opener = hidePackageReviewDialog();
+    showPackageLimitModal(result, opener);
+    return false;
+  }
+  if (['package_review_changed', 'manual_package_stale', 'manual_package_unavailable', 'manual_package_invalid', 'not_found'].includes(error)) {
+    resetManualPackageView({ end: false });
+    await showPackageModal({ runPreScan: false, message: PACKAGE_REVIEW_CHANGED_MESSAGE });
+    return false;
+  }
+  if (error === 'manual_package_name_collision') {
+    manual.message = `Two Included files are named ${Array.isArray(result.names) && result.names[0] ? result.names[0] : 'the same'}. Exclude one to continue.`;
+  } else if (error === 'manual_package_files_changed') {
+    const ids = new Set(Array.isArray(result.ids) ? result.ids : []);
+    for (const file of manual.files) if (ids.has(file.id) && file.included) file.changed = true;
+    manual.message = 'Some files changed or are missing. Exclude them or choose them again. Nothing was packaged.';
+  } else {
+    if (error === 'package_output_changed') state.packageOutputPath = null;
+    manual.message = getManualPackageErrorMessage(error);
+  }
+  renderManualPackageReview();
+  setManualPackageMessage(manual.message, { focus: true });
+  return false;
+}
+
+async function returnToPackageReviewFromManual() {
+  const manual = packageManualReview;
+  if (!isManualPackageReviewCurrent(manual) || manual.busy === 'packaging') return false;
+  resetManualPackageView();
+  await showPackageModal({ runPreScan: false });
+  return true;
 }
 
 // ===== Delete Project =====
@@ -6812,6 +7278,12 @@ function setupEventListeners() {
   });
 
   $('#btn-change-dest').addEventListener('click', choosePackageDestination);
+  $('#btn-retry-package-verification')?.addEventListener('click', () => { void retryPackageVerificationFromReview(); });
+  $('#btn-review-files-manually')?.addEventListener('click', () => { void openManualPackageReview(); });
+  $('#btn-manual-choose-files')?.addEventListener('click', () => { void chooseManualPackageFilesFromReview(); });
+  $('#btn-manual-change-dest')?.addEventListener('click', () => { void chooseManualPackageDestination(); });
+  $('#btn-manual-back')?.addEventListener('click', () => { void returnToPackageReviewFromManual(); });
+  $('#btn-manual-package')?.addEventListener('click', () => { void packageManualFilesFromReview(); });
 
   // Success modal
   $('#btn-success-done').addEventListener('click', hidePackageSuccessModal);

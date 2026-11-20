@@ -172,6 +172,7 @@ async function launch({ browser, rendererDir, bootstrapSource, width = 1100, hei
       Tab: { key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 },
       Enter: { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' },
       Space: { key: ' ', code: 'Space', windowsVirtualKeyCode: 32, text: ' ' },
+      Escape: { key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 },
     };
     async function press(name, modifiers = 0) {
       const key = keys[name];
