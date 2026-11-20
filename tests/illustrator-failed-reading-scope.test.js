@@ -24,6 +24,14 @@ replaceOnce("  isLsofPollInProgress(projectId) {", `  scopeFlag(projectId) { ret
     return staged;
   },
   isLsofPollInProgress(projectId) {`);
+// Deterministic test-only pause immediately before finalManifest inside projects:package.
+replaceOnce(
+  "  return module._compile(`${source}",
+  "  const finalManifestAnchor = '    const finalManifest = await buildCanonicalPackageReviewManifest(id);';\n" +
+  "  assert.equal(source.split(finalManifestAnchor).length - 1, 1, 'final package manifest anchor');\n" +
+  "  source = source.replace(finalManifestAnchor, '    if (global.__crateBeforeFinalPackageManifest) await global.__crateBeforeFinalPackageManifest(id);\\n' + finalManifestAnchor);\n" +
+  "  return module._compile(`${source}"
+);
 const compiled = new Module(harnessPath, module);
 compiled.filename = harnessPath;
 compiled.paths = Module._nodeModulePaths(__dirname);
@@ -57,7 +65,8 @@ function scopeCases() {
   }
 
   // A simulated Illustrator. `fail` fails every reading until cleared; `failOnce` fails the next one.
-  // Failure kinds: 'empty' (nothing comes back) and 'count-mismatch' (rows listed, wrong end counts).
+  // Failure kinds: 'empty', 'count-mismatch', 'osascript-timeout', 'applescript-timeout-error',
+  // 'osascript-exec-error', 'automation-denied', and 'pathless-untitled-doc'.
   function illustrator() {
     const app = { running: true, docs: [], fail: null, failOnce: null, hold: null, queries: 0, openFiles: [] };
     setChildProcessHandler(request => {
@@ -76,18 +85,43 @@ function scopeCases() {
         app.queries++;
         const mode = app.failOnce || app.fail;
         app.failOnce = null;
-        const rows = [];
-        let links = 0;
-        app.docs.forEach((doc, index) => {
-          const name = base(doc.path), current = index === 0;
-          rows.push(`DOC\t${doc.path}\t${name}\t${doc.modified === true}\t${current}`);
-          for (const link of doc.links || []) { rows.push(`LINK\t${doc.path}\t${name}\t${link}\t${doc.modified === true}\t${current}`); links++; }
-        });
-        let stdout;
-        if (mode === 'empty') stdout = '';
-        else if (mode === 'count-mismatch') stdout = [...rows, `COMPLETE\t${app.docs.length}\t${links + 1}`].join('\n') + '\n';
-        else stdout = app.docs.length ? [...rows, `COMPLETE\t${app.docs.length}\t${links}`].join('\n') + '\n' : 'STATUS\tno-documents\nCOMPLETE\t0\t0\n';
-        const result = { stdout }, held = app.hold;
+        let result;
+        if (mode === 'osascript-timeout') {
+          result = {
+            error: Object.assign(new Error('Command failed: /usr/bin/osascript timed out'), {
+              code: 'ETIMEDOUT',
+              killed: true,
+              signal: 'SIGTERM',
+              stderr: 'execution error: Adobe Illustrator got an error: AppleEvent timed out. (-1712)',
+            }),
+          };
+        } else if (mode === 'applescript-timeout-error') {
+          result = { stdout: 'ERROR\tillustrator-query-timeout\n' };
+        } else if (mode === 'osascript-exec-error') {
+          result = {
+            error: Object.assign(new Error('execution error: Adobe Illustrator got an error: Connection is invalid. (-609)'), {
+              code: 1,
+              stderr: 'execution error: Adobe Illustrator got an error: Connection is invalid. (-609)',
+            }),
+          };
+        } else if (mode === 'automation-denied') {
+          result = { stdout: 'ERROR\tautomation-permission-denied\n' };
+        } else {
+          const rows = [];
+          let links = 0;
+          app.docs.forEach((doc, index) => {
+            const name = base(doc.path), current = index === 0;
+            rows.push(`DOC\t${doc.path}\t${name}\t${doc.modified === true}\t${current}`);
+            for (const link of doc.links || []) { rows.push(`LINK\t${doc.path}\t${name}\t${link}\t${doc.modified === true}\t${current}`); links++; }
+          });
+          let stdout;
+          if (mode === 'empty') stdout = '';
+          else if (mode === 'count-mismatch') stdout = [...rows, `COMPLETE\t${app.docs.length}\t${links + 1}`].join('\n') + '\n';
+          else if (mode === 'pathless-untitled-doc') stdout = [...rows, 'DOC\t\tUntitled-1\ttrue\tfalse', `COMPLETE\t${app.docs.length + 1}\t${links}`].join('\n') + '\n';
+          else stdout = app.docs.length ? [...rows, `COMPLETE\t${app.docs.length}\t${links}`].join('\n') + '\n' : 'STATUS\tno-documents\nCOMPLETE\t0\t0\n';
+          result = { stdout };
+        }
+        const held = app.hold;
         app.hold = null;
         return held ? held.reach(result) : result;
       }
@@ -167,22 +201,42 @@ function scopeCases() {
     }
   }
 
+  const UNRESOLVED_MESSAGE = 'Working-source verification is unresolved. Review the files and try again.';
+
   async function packageStep(c, { scan = true } = {}) {
     if (scan) await callIpcRaw('projects:pre-package-scan', c.id);
     await metadataTestHooks.waitForWatcherIdle(c.id);
     await keepNewWorkingFiles(c);
     const answer = await callIpcRaw('projects:prepare-package-review', c.id);
     return { error: answer?.error || null, materializable: answer?.materializable ?? null,
+      token: answer?.token || null, message: answer?.message || null,
+      statuses: Array.isArray(answer?.files) ? answer.files.map(item => item.status) : null,
       files: Array.isArray(answer?.files) ? answer.files.map(item => item.name).sort() : null };
   }
 
+  async function runPackage(c, token, label) {
+    const output = path.join(TEST_HOME, 'Documents', `Package_${label}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+    fs.mkdirSync(output, { recursive: true });
+    const result = await callIpcRaw('projects:package', c.id, output, token);
+    const written = fs.readdirSync(output);
+    return { result, output, written };
+  }
+
   const FULL = ['Layout.ai', 'Swatch1.png', 'Swatch2.png', 'Swatch3.png', 'Swatch4.png'];
-  async function assertFullProject(c, label, { scan = true, extra = [] } = {}) {
+  async function assertFullProject(c, label, { scan = true, extra = [], materializable = true } = {}) {
     const ws = await workspace(c);
     assert.equal(ws.included, 4, label + ': four included assets: ' + JSON.stringify(ws.names));
     for (const name of FULL) assert.ok(ws.names.includes(name), label + ': workspace shows ' + name);
     const pkg = await packageStep(c, { scan });
     assert.deepEqual(pkg.files, [...FULL, ...extra].sort(), label + ': package: ' + JSON.stringify(pkg));
+    assert.equal(pkg.materializable, materializable, label + ': materializable: ' + JSON.stringify(pkg));
+    if (materializable) {
+      assert.equal(typeof pkg.token, 'string', label + ': approval token issued');
+    } else {
+      assert.equal(pkg.token, null, label + ': no approval token while verification is incomplete');
+      assert.equal(pkg.message, UNRESOLVED_MESSAGE, label + ': established retry message');
+      assert.ok((pkg.statuses || []).every(state => state === 'unavailable'), label + ': review rows marked unavailable');
+    }
     return { ws, pkg };
   }
 
@@ -226,17 +280,17 @@ function scopeCases() {
   };
 
   // ===== Fail on the base, pass with the rules =====
-  scopeCase('failed-reading 1: a first reading that returns nothing keeps the project visible and packaged', async () => {
+  scopeCase('failed-reading 1: a first reading that returns nothing keeps the project visible while blocking incomplete packaging', async () => {
     const c = await setup('first_empty');
     await restart(c, { fail: 'empty' });
-    await assertFullProject(c, 'readings keep failing');
+    await assertFullProject(c, 'readings keep failing', { materializable: false });
     assert.equal(status(c.id), 'failed-closed');
   });
 
-  scopeCase('failed-reading 2: a first reading with a count mismatch keeps the project visible and packaged', async () => {
+  scopeCase('failed-reading 2: a first reading with a count mismatch keeps the project visible while blocking incomplete packaging', async () => {
     const c = await setup('first_mismatch');
     await restart(c, { fail: 'count-mismatch' });
-    await assertFullProject(c, 'readings keep failing');
+    await assertFullProject(c, 'readings keep failing', { materializable: false });
     assert.equal(status(c.id), 'failed-closed');
   });
 
@@ -253,15 +307,15 @@ function scopeCases() {
     await assertFullProject(c, 'after recovery');
   });
 
-  scopeCase('failed-reading 4: a mid-session count mismatch changes nothing', async () => {
+  scopeCase('failed-reading 4: a mid-session count mismatch preserves scope and visibility while blocking incomplete packaging until recovery', async () => {
     const c = await setup('mid_mismatch');
     c.app.fail = 'count-mismatch';
     await poll(c.id);
-    await assertFullProject(c, 'while readings fail');
+    await assertFullProject(c, 'while readings fail', { materializable: false });
     assert.equal(status(c.id), 'ready');
     c.app.fail = null;
     await poll(c.id);
-    await assertFullProject(c, 'after readings complete again');
+    await assertFullProject(c, 'after readings complete again', { materializable: true });
   });
 
   scopeCase('failed-reading 5: a mid-session reading that returns nothing does not end link tracking', async () => {
@@ -283,7 +337,7 @@ function scopeCases() {
     await poll(c.id);
     snapshot = scope(c.id);
     assert.deepEqual([snapshot.status, snapshot.baselineDocumentPaths, snapshot.excludedLinkedPaths], ['failed-closed', [], []], 'after the second failed reading');
-    await assertFullProject(c, 'while readings fail');
+    await assertFullProject(c, 'while readings fail', { materializable: false });
     snapshot = scope(c.id);
     assert.deepEqual([snapshot.baselineDocumentPaths, snapshot.excludedLinkedPaths], [[], []], 'after the package step');
   });
@@ -354,22 +408,32 @@ function scopeCases() {
     });
   }
 
-  scopeCase('failed-reading 9: a Package Review prepared before a mid-session failed reading is still accepted', async () => {
-    const c = await setup('review_kept');
+  scopeCase('failed-reading 9: a mid-session failed reading refuses an earlier Package Review token and requires a fresh review after recovery', async () => {
+    const c = await setup('review_refused_mid');
     const review = await callIpcRaw('projects:prepare-package-review', c.id);
+    assert.equal(review?.materializable, true);
     assert.equal(typeof review.token, 'string', JSON.stringify(review).slice(0, 200));
     c.app.failOnce = 'count-mismatch';
     await poll(c.id);
+    assert.deepEqual([status(c.id), flag(c.id)], ['ready', 'activation'], 'Rule F1 preserves scope state');
     const ws = await workspace(c);
-    assert.equal(ws.included, 4);
-    const output = path.join(TEST_HOME, 'Documents', 'Package_review_kept');
-    fs.mkdirSync(output, { recursive: true });
-    const packaged = await callIpcRaw('projects:package', c.id, output, review.token);
-    assert.equal(packaged?.success, true, JSON.stringify(packaged).slice(0, 300));
-    assert.equal(packaged.totalFiles, 5);
+    assert.equal(ws.included, 4, 'workspace keeps known project files visible');
+    const refusedDuring = await runPackage(c, review.token, 'review_refused_during');
+    assert.equal(refusedDuring.result?.error, 'package_review_stale', JSON.stringify(refusedDuring.result));
+    assert.deepEqual(refusedDuring.written, [], 'no output written while verification is incomplete');
+    await assertFullProject(c, 'review while still unverified after mid-session failure', { scan: false, materializable: false });
+    // Next complete reading recovers verification; old token remains refused, fresh review succeeds.
+    await poll(c.id);
+    const refusedAfter = await runPackage(c, review.token, 'review_refused_after');
+    assert.equal(refusedAfter.result?.error, 'package_review_stale', 'old pre-failure token remains refused after recovery');
+    assert.deepEqual(refusedAfter.written, [], 'no output written for old token');
+    const { pkg: fresh } = await assertFullProject(c, 'fresh review after recovery', { scan: false, materializable: true });
+    const packaged = await runPackage(c, fresh.token, 'review_fresh_after');
+    assert.equal(packaged.result?.success, true, JSON.stringify(packaged.result).slice(0, 300));
+    assert.equal(packaged.result.totalFiles, 5);
   });
 
-  scopeCase('failed-reading 10: an excluded owned asset is not packaged while the scope is closed; not excluded, it is', async () => {
+  scopeCase('failed-reading 10: an excluded owned asset is omitted from closed-scope review; not excluded, it stays visible while packaging stays blocked', async () => {
     const c = await setup('excluded_owned');
     writeSyntheticAiFile(c.f.doc, c.f.swatches.slice(0, 3).join('\n'));
     await emitWatcher('change', c.f.doc);
@@ -378,13 +442,17 @@ function scopeCases() {
     assert.ok(projectFileNames(c).includes('Swatch4.png'), 'still a project file after the save');
     await restart(c, { fail: 'empty' });
     let pkg = await packageStep(c);
-    assert.ok(pkg.files?.includes('Swatch4.png'), 'not excluded: packaged while closed: ' + JSON.stringify(pkg));
+    assert.ok(pkg.files?.includes('Swatch4.png'), 'not excluded: shown in closed-scope review: ' + JSON.stringify(pkg));
+    assert.equal(pkg.materializable, false);
+    assert.equal(pkg.token, null);
     await callIpcRaw('projects:remove-file', c.id, c.f.swatches[3]);
     await metadataTestHooks.waitForWatcherIdle(c.id);
     const ws = await workspace(c);
     assert.equal(ws.raw.files.find(row => row.name === 'Swatch4.png')?.included, false, 'shown as excluded');
     pkg = await packageStep(c);
-    assert.equal(pkg.files?.includes('Swatch4.png'), false, 'excluded: not packaged: ' + JSON.stringify(pkg));
+    assert.equal(pkg.files?.includes('Swatch4.png'), false, 'excluded: omitted from review: ' + JSON.stringify(pkg));
+    assert.equal(pkg.materializable, false);
+    assert.equal(pkg.token, null);
     assert.equal(status(c.id), 'failed-closed');
   });
 
@@ -457,21 +525,21 @@ function scopeCases() {
     for (const name of [...FULL, 'Accepted.ai']) assert.ok(pkg.files?.includes(name), name + ': ' + JSON.stringify(pkg));
   });
 
-  scopeCase('failed-reading 14: an owned asset whose owner document is closed is shown and packaged while the scope is closed', async () => {
+  scopeCase('failed-reading 14: an owned asset whose owner document is closed stays visible while packaging stays blocked until recovery', async () => {
     const c = await setup('owner_closed');
     c.app.docs = [{ path: c.f.flyer, links: [] }];
     await restart(c, { fail: 'count-mismatch' });
-    await assertFullProject(c, 'owner closed');
+    await assertFullProject(c, 'owner closed', { materializable: false });
     assert.equal(status(c.id), 'failed-closed');
   });
 
-  scopeCase('failed-reading 15: an asset with no owner record but an accepted source document is shown while the scope is closed', async () => {
+  scopeCase('failed-reading 15: an asset with no owner record but an accepted source document stays visible while packaging stays blocked until recovery', async () => {
     const c = await setup('source_document');
     const row = stored(c.id).files.find(item => item.path === c.f.swatches[0]);
     delete row.dependencyOwners;
     row.sourceDocumentPath = c.f.doc;
     await restart(c, { fail: 'empty' });
-    await assertFullProject(c, 'source document only');
+    await assertFullProject(c, 'source document only', { materializable: false });
     assert.equal(status(c.id), 'failed-closed');
   });
 
@@ -651,6 +719,9 @@ function scopeCases() {
     const ws = await workspace(c);
     for (const item of c.f.swatches) assert.equal(ws.names.includes(base(item)), false, base(item) + ' hidden as today');
     const pkg = await packageStep(c, { scan: false });
+    assert.equal(pkg.materializable, false);
+    assert.equal(pkg.token, null);
+    assert.equal(pkg.message, UNRESOLVED_MESSAGE);
     for (const item of c.f.swatches) assert.equal((pkg.files || []).includes(base(item)), false, JSON.stringify(pkg));
     held.open();
     await watching;
@@ -730,6 +801,202 @@ function scopeCases() {
     const ws = await workspace(c);
     assert.ok(ws.names.includes('Added.ai'));
     const pkg = await packageStep(c, { scan: false });
+    assert.equal(pkg.materializable, true);
     assert.ok((pkg.files || []).includes('Added.ai'), JSON.stringify(pkg));
+  });
+
+  // ===== Incomplete-verification package guard & ordinary reader failures =====
+  for (const mode of ['osascript-timeout', 'applescript-timeout-error', 'osascript-exec-error', 'automation-denied', 'pathless-untitled-doc']) {
+    scopeCase(`failed-reading 28 (${mode}): ordinary reader failure keeps project visible, blocks incomplete approval, and recovers cleanly`, async () => {
+      const c = await setup(`ordinary_${mode.replace(/-/g, '_')}`);
+      c.app.docs = [{ path: c.f.doc, links: [...c.f.swatches] }, { path: c.f.flyer, links: [c.f.flyerArt] }];
+      await restart(c, { fail: mode });
+      assert.equal(status(c.id), 'failed-closed');
+      const { ws: closedWs, pkg: closedPkg } = await assertFullProject(c, 'during ' + mode, { materializable: false });
+      assert.equal(closedWs.names.includes('Flyer.ai') || closedWs.names.includes('FlyerArt.png'), false);
+      assert.equal((closedPkg.files || []).includes('Flyer.ai') || (closedPkg.files || []).includes('FlyerArt.png'), false);
+
+      // Recovery on next complete running read restores tracking and fresh packaging.
+      c.app.fail = null;
+      await poll(c.id);
+      assert.deepEqual([status(c.id), flag(c.id)], ['ready', 'recovered']);
+      assert.equal(hasPath(scope(c.id).baselineDocumentPaths, c.f.flyer), true);
+      assert.equal(hasPath(scope(c.id).admittedDocumentPaths, c.f.flyer), false);
+
+      c.app.docs = [
+        { path: c.f.doc, modified: true, links: [...c.f.swatches, c.f.fresh] },
+        { path: c.f.flyer, modified: true, links: [c.f.flyerArt] },
+      ];
+      await poll(c.id);
+      const afterWs = await workspace(c);
+      assert.deepEqual(afterWs.pending, [['Fresh1.png', 'needs-save']]);
+      assert.equal(afterWs.names.includes('Flyer.ai') || afterWs.names.includes('FlyerArt.png'), false);
+
+      const { pkg: fresh } = await assertFullProject(c, 'after recovery from ' + mode, { scan: false, materializable: true });
+      const packaged = await runPackage(c, fresh.token, 'ordinary_' + mode.replace(/-/g, '_'));
+      assert.equal(packaged.result?.success, true, JSON.stringify(packaged.result));
+      assert.equal(packaged.result.totalFiles, 5);
+    });
+  }
+
+  scopeCase('failed-reading 29: saved new link in illustrator-family doc without watcher change is blocked while failed-closed and packaged after recovery', async () => {
+    const c = await setup('saved_link_no_watcher');
+    const docRow = stored(c.id).files.find(item => item.path === c.f.doc);
+    docRow.captureEvidence = { ...(docRow.captureEvidence || {}), appFamily: 'illustrator' };
+    await restart(c, { fail: 'osascript-timeout' });
+    assert.equal(status(c.id), 'failed-closed');
+
+    // Save Layout.ai on disk linking Fresh1.png with no watcher change event.
+    writeSyntheticAiFile(c.f.doc, [...c.f.swatches, c.f.fresh].join('\n'));
+    const closedPkg = await packageStep(c, { scan: true });
+    assert.equal(closedPkg.materializable, false, 'must refuse incomplete 5-file approval while failed-closed');
+    assert.equal(closedPkg.token, null);
+    assert.equal(closedPkg.message, UNRESOLVED_MESSAGE);
+    assert.equal(projectFileNames(c).includes('Fresh1.png'), false, 'no implicit scope admission while failed-closed');
+
+    // Next retry scan succeeds: recovers scope and surfaces Fresh1.png for review; accepting it packages all 6 files.
+    c.app.fail = null;
+    c.app.docs = [{ path: c.f.doc, links: [...c.f.swatches, c.f.fresh] }];
+    await callIpcRaw('projects:pre-package-scan', c.id);
+    await metadataTestHooks.waitForWatcherIdle(c.id);
+    assert.equal(status(c.id), 'ready');
+    assert.equal(flag(c.id), 'recovered');
+    assert.ok(pendingNames(c).includes('Fresh1.png') || projectFileNames(c).includes('Fresh1.png'), 'recovery surfaces Fresh1.png');
+    if (pendingNames(c).includes('Fresh1.png')) {
+      assert.ok(await callIpcRaw('projects:accept-pending', c.id, c.f.fresh), 'Fresh1.png accepted after recovery');
+      await metadataTestHooks.waitForWatcherIdle(c.id);
+    }
+    const recoveredPkg = await packageStep(c, { scan: false });
+    assert.equal(recoveredPkg.materializable, true);
+    assert.equal(typeof recoveredPkg.token, 'string');
+    assert.deepEqual(recoveredPkg.files, [...FULL, 'Fresh1.png'].sort());
+    const packaged = await runPackage(c, recoveredPkg.token, 'saved_link_recovered');
+    assert.equal(packaged.result?.success, true, JSON.stringify(packaged.result));
+    assert.equal(packaged.result.totalFiles, 6);
+  });
+
+  scopeCase('failed-reading 30: legacy unowned and overflow-owned ai-linked assets cannot produce a complete approval while failed-closed, then recover to full package', async () => {
+    const c = await setup('incomplete_owner_inventory');
+    const rows = stored(c.id).files;
+    const r1 = rows.find(item => item.path === c.f.swatches[0]);
+    const r2 = rows.find(item => item.path === c.f.swatches[1]);
+    const r3 = rows.find(item => item.path === c.f.swatches[2]);
+    delete r1.dependencyOwners;
+    delete r1.sourceDocumentPath;
+    r2.dependencyOwnersOverflow = true;
+    delete r2.sourceDocumentPath;
+    delete r3.dependencyOwners;
+    delete r3.sourceDocumentPath;
+    writeSyntheticAiFile(c.f.doc, [c.f.swatches[0], c.f.swatches[1], c.f.swatches[3]].join('\n'));
+
+    await restart(c, { fail: 'osascript-timeout' });
+    const noScanPkg = await packageStep(c, { scan: false });
+    assert.equal(noScanPkg.materializable, false);
+    assert.equal(noScanPkg.token, null);
+    assert.equal(noScanPkg.message, UNRESOLVED_MESSAGE);
+    const withScanPkg = await packageStep(c, { scan: true });
+    assert.equal(withScanPkg.materializable, false, 'still blocked while Swatch2/Swatch3 remain hidden');
+    assert.equal(withScanPkg.token, null);
+    assert.equal(withScanPkg.message, UNRESOLVED_MESSAGE);
+
+    // Next complete reading recovers full 5-file inventory and packaging.
+    c.app.fail = null;
+    c.app.docs = [{ path: c.f.doc, links: [...c.f.swatches] }];
+    await poll(c.id);
+    const { pkg: recovered } = await assertFullProject(c, 'after recovery', { scan: false, materializable: true });
+    const packaged = await runPackage(c, recovered.token, 'incomplete_owner_recovered');
+    assert.equal(packaged.result?.success, true, JSON.stringify(packaged.result));
+    assert.equal(packaged.result.totalFiles, 5);
+  });
+
+  scopeCase('failed-reading 31: guard holds in recovering-explicit and at final pre-publish package check if Illustrator fails mid-flight', async () => {
+    const c = await setup('final_package_guard');
+    // Part A: recovering-explicit refuses approval until the recovery reading completes.
+    await restart(c, { fail: 'osascript-timeout' });
+    await addManually(c, newAiFile(c, 'Added.ai'));
+    assert.equal(status(c.id), 'recovering-explicit');
+    const recoveringPkg = await packageStep(c, { scan: false });
+    assert.equal(recoveringPkg.materializable, false);
+    assert.equal(recoveringPkg.token, null);
+    assert.equal(recoveringPkg.message, UNRESOLVED_MESSAGE);
+
+    c.app.fail = null;
+    await poll(c.id);
+    assert.equal(status(c.id), 'ready');
+    const healthyReview = await packageStep(c, { scan: false });
+    assert.equal(healthyReview.materializable, true);
+    assert.equal(typeof healthyReview.token, 'string');
+
+    // Part B: Final-package guard — valid token consumed, staging runs, then mid-session
+    // Illustrator timeout lands right before finalManifest pre-publish verification.
+    let finalHookHit = 0;
+    const output = path.join(TEST_HOME, 'Documents', `Package_final_guard_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+    fs.mkdirSync(output, { recursive: true });
+    global.__crateBeforeFinalPackageManifest = async projectId => {
+      if (projectId !== c.id) return;
+      finalHookHit++;
+      c.app.fail = 'osascript-timeout';
+      await metadataTestHooks.pollOutsideCoordinator(c.id);
+      await pollFinished(c.id);
+    };
+    let pkgResult;
+    try {
+      pkgResult = await callIpcRaw('projects:package', c.id, output, healthyReview.token);
+    } finally {
+      delete global.__crateBeforeFinalPackageManifest;
+    }
+    assert.equal(finalHookHit, 1, 'intercepted final pre-publish manifest check');
+    assert.equal(pkgResult?.success, undefined, 'final package must refuse output: ' + JSON.stringify(pkgResult));
+    assert.equal(pkgResult?.error, 'package_review_changed');
+    assert.equal(pkgResult?.review?.materializable, false);
+    assert.equal(pkgResult?.review?.token, undefined);
+    assert.equal(pkgResult?.review?.message, UNRESOLVED_MESSAGE);
+    assert.deepEqual(fs.readdirSync(output), [], 'zero output published after final-package refusal');
+
+    // Recovery restores clean fresh packaging.
+    c.app.fail = null;
+    await poll(c.id);
+    const freshReview = await packageStep(c, { scan: false });
+    assert.equal(freshReview.materializable, true);
+    const packaged = await runPackage(c, freshReview.token, 'final_guard_recovered');
+    assert.equal(packaged.result?.success, true, JSON.stringify(packaged.result));
+    assert.equal(packaged.result.totalFiles, 6);
+  });
+
+  scopeCase('control 25: non-Illustrator projects and paused healthy Illustrator projects continue packaging normally', async () => {
+    // Part A: Non-Illustrator watching project packages normally even while Illustrator fails to read.
+    resetTestHomeWorkspace();
+    currentPsdFixture = { children: [], linkedFiles: [] };
+    const dir = path.join(TEST_HOME, 'Desktop', 'NonIllustrator');
+    fs.mkdirSync(dir, { recursive: true });
+    const psdPath = path.join(dir, 'Poster.psd');
+    const pngPath = path.join(dir, 'Photo.png');
+    fs.writeFileSync(psdPath, Buffer.from('8BPS\0\x01\0\0\0\0\0\0\0\x03\0\0\0\x01\0\0\0\x01\0\x08\0\x03\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0'));
+    fs.writeFileSync(pngPath, uniqueBytes('non_ai', pngPath));
+    const app = illustrator();
+    app.fail = 'osascript-timeout';
+    const project = await createProject('Non Illustrator');
+    await waitForCondition(() => app.queries >= 1, 'activation query failed');
+    assert.equal(status(project.id), 'failed-closed');
+    manualDialogFor([psdPath, pngPath]);
+    await callIpcRaw('projects:add-files', project.id);
+    await metadataTestHooks.waitForWatcherIdle(project.id);
+    const nonAiReview = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(nonAiReview?.materializable, true, 'non-Illustrator project is not blocked: ' + JSON.stringify(nonAiReview));
+    assert.equal(typeof nonAiReview?.token, 'string');
+    const nonAiOut = path.join(TEST_HOME, 'Documents', `Package_non_ai_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+    fs.mkdirSync(nonAiOut, { recursive: true });
+    const nonAiPkg = await callIpcRaw('projects:package', project.id, nonAiOut, nonAiReview.token);
+    assert.equal(nonAiPkg?.success, true, JSON.stringify(nonAiPkg));
+    assert.equal(nonAiPkg.totalFiles, 2);
+
+    // Part B: Paused healthy Illustrator project packages normally.
+    const c = await setup('paused_healthy_ai');
+    await callIpcRaw('projects:pause', c.id);
+    clearTrackedTimers();
+    const { pkg: pausedReview } = await assertFullProject(c, 'paused healthy Illustrator project', { scan: false, materializable: true });
+    const pausedPkg = await runPackage(c, pausedReview.token, 'paused_healthy_ai');
+    assert.equal(pausedPkg.result?.success, true, JSON.stringify(pausedPkg.result));
+    assert.equal(pausedPkg.result.totalFiles, 5);
   });
 }
