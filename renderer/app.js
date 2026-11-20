@@ -5267,7 +5267,9 @@ function renderPackageReviewContents() {
   const toggle = $('#btn-toggle-package-contents');
   if (toggle) {
     toggle.classList.toggle('hidden', contents.files.length <= 8);
-    toggle.textContent = contents.expanded ? 'Show fewer' : `+${contents.files.length - 8} more — Show all files`;
+    toggle.textContent = contents.expanded
+      ? 'Show fewer'
+      : contents.inventoryUnavailable ? 'Show all files' : `+${contents.files.length - 8} more — Show all files`;
     toggle.setAttribute('aria-expanded', String(contents.expanded));
   }
   if (region) region.scrollTop = 0;
@@ -6063,19 +6065,21 @@ function renderPackageReview(project, review, message = '', suppliedLease = null
   packageReviewModalSelectionEpoch = projectSelectionEpoch;
   packageReviewModalRequestId = packageReviewRequestId;
   packageReviewModalSessionId = lease.sessionId;
+  // Set only by this window, when no file list is available for this review.
+  const inventoryUnavailable = review?.inventoryUnavailable === true;
   const hasContinuationChoices = getContinuationCandidates(review).length > 0;
   const hasUnresolvedContinuation = review?.error === 'working_source_continuation_choice_required' ||
     (Array.isArray(review?.sourceContinuation?.candidates) && review.sourceContinuation.candidates.length > 0);
   const hasWorkingFileChoices = review?.error === 'working_file_choice_required' ||
     (review?.workingFileChoices?.version === 1 && (review.workingFileChoices.blocked === true || review.workingFileChoices.choices?.length > 0));
-  const canPackage = !hasWorkingFileChoices && !hasUnresolvedContinuation && !hasContinuationChoices && review.materializable !== false && typeof review.token === 'string';
+  const canPackage = !inventoryUnavailable && !hasWorkingFileChoices && !hasUnresolvedContinuation && !hasContinuationChoices && review.materializable !== false && typeof review.token === 'string';
   renderSourceContinuationChoices(project, review, lease);
   state.packageReviewToken = canPackage ? review.token : null;
 
   $('#modal-project-name').textContent = project.name;
   const portableRow = $('#package-portable-pictures-row');
   const portableToggle = $('#toggle-package-portable-pictures');
-  if (portableRow) portableRow.classList.toggle('hidden', !(review.files || []).some(file => file.ext === '.pptx'));
+  if (portableRow) portableRow.classList.toggle('hidden', !(inventoryUnavailable ? [] : review.files || []).some(file => file.ext === '.pptx'));
   if (portableToggle) portableToggle.checked = review.planSummary?.portablePictures === true;
 
   const hasFigmaContext = projectHasFigmaContext(project);
@@ -6139,14 +6143,18 @@ function renderPackageReview(project, review, message = '', suppliedLease = null
     ready.classList.toggle('is-blocked', !canPackage);
   }
 
-  const reviewFiles = Array.isArray(review.files) ? review.files : [];
+  const reviewFiles = !inventoryUnavailable && Array.isArray(review.files) ? review.files : [];
   const presentedReviewFiles = reviewFiles;
-  packageReviewContents = { project, files: reviewFiles, expanded: false, lease };
+  packageReviewContents = { project, files: reviewFiles, expanded: false, lease, ...(inventoryUnavailable ? { inventoryUnavailable: true } : {}) };
   renderPackageReviewContents();
   renderPackageReviewFonts(project, review);
 
   const total = $('#package-review-total');
-  if (total) total.textContent = `${reviewFiles.length} visual asset${reviewFiles.length === 1 ? '' : 's'}`;
+  if (total) {
+    total.textContent = inventoryUnavailable
+      ? 'Visual assets unavailable'
+      : `${reviewFiles.length} visual asset${reviewFiles.length === 1 ? '' : 's'}`;
+  }
   const appChips = $('#package-review-apps');
   if (appChips) {
     appChips.innerHTML = '';
@@ -6175,10 +6183,11 @@ function renderPackageReview(project, review, message = '', suppliedLease = null
     const addedCount = presentedReviewFiles.filter(file => file.assetOrigin === 'added' && file.projectRole !== 'source').length;
     const workingCount = presentedReviewFiles.filter(file => file.projectRole === 'source').length;
     const needsLinkingCount = presentedReviewFiles.filter(file => file.status && file.status !== 'ready').length;
-    appendDefinitionRow(summaryList, 'Working files', workingCount);
-    appendDefinitionRow(summaryList, 'Existing assets', existingCount);
-    appendDefinitionRow(summaryList, 'Added while working', addedCount);
-    appendDefinitionRow(summaryList, 'Needs Review', needsLinkingCount, needsLinkingCount ? 'warning' : '');
+    const countText = count => (inventoryUnavailable ? 'Unavailable' : count);
+    appendDefinitionRow(summaryList, 'Working files', countText(workingCount));
+    appendDefinitionRow(summaryList, 'Existing assets', countText(existingCount));
+    appendDefinitionRow(summaryList, 'Added while working', countText(addedCount));
+    appendDefinitionRow(summaryList, 'Needs Review', countText(needsLinkingCount), needsLinkingCount ? 'warning' : '');
     if (!canPackage && needsLinkingCount === 0) {
       appendDefinitionRow(summaryList, 'Package status', 'Review required', 'warning');
     }
@@ -6205,15 +6214,15 @@ function renderPackageReview(project, review, message = '', suppliedLease = null
 
 async function getUnavailableRendererReviewFiles(project) {
   const workspace = await ensureProjectAssetWorkspace(project, { allowDisplayFallback: false });
-  if (Array.isArray(workspace?.files)) return workspace.files;
+  if (Array.isArray(workspace?.files)) return { files: workspace.files, inventoryUnavailable: false };
   // A raw project record cannot reliably reproduce stable exclusion identities.
   // Show no guessed inventory when the authoritative workspace is unavailable.
-  return [];
+  return { files: [], inventoryUnavailable: true };
 }
 
 async function createUnavailableRendererReview(project, message) {
   const excludedKeys = new Set(project?.excludedAssetKeys || []);
-  const reviewFiles = await getUnavailableRendererReviewFiles(project);
+  const { files: reviewFiles, inventoryUnavailable } = await getUnavailableRendererReviewFiles(project);
   const includedFiles = reviewFiles.filter(file => {
     if (typeof file?.included === 'boolean') return file.included;
     if (file?.excluded === true) return false;
@@ -6259,6 +6268,7 @@ async function createUnavailableRendererReview(project, message) {
     totalFiles: includedFiles.length,
     materializable: false,
     message,
+    ...(inventoryUnavailable ? { inventoryUnavailable: true } : {}),
   };
 }
 
@@ -6375,12 +6385,14 @@ async function showPackageModal({
   );
   if (!isCurrentRequest()) return false;
   if (review?.projectId && review.projectId !== projectId) return false;
+  // These refusals come with no file list, so the review has no counts to show.
+  const refusalInventory = Array.isArray(review?.files) ? {} : { inventoryUnavailable: true };
   if (review?.projectId === projectId && review?.error === 'working_file_choice_required' && project) {
-    renderPackageReview(project, { ...review, materializable: false }, message || 'Decide how to use the new working files before packaging.', lease);
+    renderPackageReview(project, { ...review, materializable: false, ...refusalInventory }, message || 'Decide how to use the new working files before packaging.', lease);
     return false;
   }
   if (review?.projectId === projectId && review?.error === 'working_source_continuation_choice_required' && getContinuationCandidates(review).length && project) {
-    renderPackageReview(project, { ...review, materializable: false }, message || review.message || '', lease);
+    renderPackageReview(project, { ...review, materializable: false, ...refusalInventory }, message || review.message || '', lease);
     return false;
   }
   if (!review || review.error) {

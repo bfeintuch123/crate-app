@@ -201,9 +201,13 @@ for (const failure of ['rejection', 'error-response-refresh-failure', 'error-res
       const contents = getElementTreeText(f.elements['modal-file-list']);
       assert.ok(!contents.includes('Original.ai'));
       for (const name of names) assert.ok(contents.includes(name));
-      assert.equal(f.elements['package-review-total'].textContent, `${names.length} visual asset${names.length === 1 ? '' : 's'}`);
+      const inventoryUnavailable = recovery === 'still-unavailable';
+      assert.equal(f.elements['package-review-total'].textContent,
+        inventoryUnavailable ? 'Visual assets unavailable' : `${names.length} visual asset${names.length === 1 ? '' : 's'}`);
       const summary = getElementTreeText(f.elements['package-review-summary-list']);
-      for (const label of ['Working files 0', `Existing assets ${names.length}`, 'Added while working 0', `Needs Review ${names.length}`]) {
+      for (const label of inventoryUnavailable
+        ? ['Working files Unavailable', 'Existing assets Unavailable', 'Added while working Unavailable', 'Needs Review Unavailable']
+        : ['Working files 0', `Existing assets ${names.length}`, 'Added while working 0', `Needs Review ${names.length}`]) {
         assert.ok(summary.includes(label), summary);
       }
       assert.equal(renderedReview.materializable, false);
@@ -265,12 +269,14 @@ for (const failure of ['error-response', 'rejection']) {
     assert.ok(renderedReview, 'the real preparation recovery route must render its fallback');
     assert.deepEqual(Array.from(renderedReview.files, file => file.name), scenario.names);
     assert.equal(renderedReview.totalFiles, scenario.names.length);
-    assert.equal(f.elements['package-review-total'].textContent,
-      `${scenario.names.length} visual asset${scenario.names.length === 1 ? '' : 's'}`);
+    assert.equal(f.elements['package-review-total'].textContent, scenario.unavailable
+      ? 'Visual assets unavailable'
+      : `${scenario.names.length} visual asset${scenario.names.length === 1 ? '' : 's'}`);
     const summary = getElementTreeText(f.elements['package-review-summary-list']);
     for (const [label, count] of [['Working files', scenario.working], ['Existing assets', scenario.existing],
       ['Added while working', scenario.added], ['Needs Review', scenario.names.length]]) {
-      assert.ok(summary.includes(`${label} ${count}`), `${label} agrees with effective fallback contents: ${summary}`);
+      const shown = scenario.unavailable ? 'Unavailable' : count;
+      assert.ok(summary.includes(`${label} ${shown}`), `${label} agrees with effective fallback contents: ${summary}`);
     }
     const contents = getElementTreeText(f.elements['modal-file-list']);
     assert.equal(f.elements['modal-file-list'].children.length, scenario.names.length);
