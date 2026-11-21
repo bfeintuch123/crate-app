@@ -2063,8 +2063,8 @@ const rowOf = {
   otherTool: pid => `${pid} 101 100 0 2 0 0 0 0 ${EPERM} ${OWNER} 0 /usr/bin/top`,
 };
 // Scans as scripted. Every read must be one the script expected next, and every scripted read must be asked for.
-function scripted(script, { scans = [Object.keys(script).map(Number)], known = {} } = {}) {
-  const result = inSampler('scripted', { uid: OWNER, guard: GUARD, scans, known, script });
+function scripted(script, { scans = [Object.keys(script).map(Number)], known = {}, ...rest } = {}) {
+  const result = inSampler('scripted', { uid: OWNER, guard: GUARD, scans, known, script, ...rest });
   assert.deepEqual([result.errors, result.unused], [[], {}]);
   return result;
 }
@@ -2208,6 +2208,267 @@ test('the sampler reads a process in transition again until two readings agree, 
   } else {
     assert.deepEqual(real.reads, [1, 1]);
   }
+});
+
+// The system's ps on its way out (see the sampler). The sampler has read it
+// alive as that tool, so it remembers the pid and the start time the process
+// table gave. Dying: the kernel has marked it dead, libproc no longer describes
+// it, its usage is still denied, and the table still has its whole record.
+const P_WEXIT = 0x2000;
+const STARTED = [1763440000, 123456];
+const ANOTHER_START = [1763440000, 123457];
+const SETTLE_PAUSES = [0.001, 0.001, 0.002];
+const REMEMBERED = { tools: { 7: STARTED } };
+const liveRecord = [101, 100, 0, OWNER, 2, STARTED, 0];
+const leaving = {
+  dying: (start = STARTED) => [read.noInfo(ESRCH), read.noUsage(EPERM), read.record(101, 100, 0, OWNER, 2, start, P_WEXIT)],
+  ended: (start = STARTED) => [read.noInfo(ESRCH), read.noUsage(EPERM), read.record(101, 100, 0, OWNER, ZOMBIE, start, P_WEXIT)],
+  noRecord: [read.noInfo(ESRCH), read.noUsage(EPERM), ['record', 'absent']],
+};
+const deniedRow = pid => `${pid} 0 0 0 0 0 0 0 ${ESRCH} ${EPERM} 0 0 -`;
+const settled = (reads, options = REMEMBERED) => {
+  const result = scripted({ 7: reads.flat() }, options);
+  return { row: result.scans[0].rows[0], pauses: result.scans[0].pauses, remembered: result.scans[0].remembered[7] || null, reads: readsOf(result, 7) };
+};
+const THREE = 'info usage record';
+
+test('a ps already read alive as the tool is read again while dying, and reported as ended or gone once it is', { timeout: 60000 }, () => {
+  const { dying, ended } = leaving;
+  assert.deepEqual(settled([dying(), ended()]), { row: rowOf.ended(7), pauses: SETTLE_PAUSES.slice(0, 1), remembered: null, reads: `${THREE} ${THREE}` });
+  assert.deepEqual(settled([dying(), dying(), ended()]), { row: rowOf.ended(7), pauses: SETTLE_PAUSES.slice(0, 2), remembered: null, reads: `${THREE} ${THREE} ${THREE}` });
+  assert.deepEqual(settled([dying(), dying(), dying(), ended()]), { row: rowOf.ended(7), pauses: SETTLE_PAUSES, remembered: null, reads: `${THREE} ${THREE} ${THREE} ${THREE}` });
+  assert.deepEqual(settled([dying(), reading.gone]), { row: rowOf.gone(7), pauses: SETTLE_PAUSES.slice(0, 1), remembered: null, reads: `${THREE} info usage` });
+  // Read dying, then collected before the table was asked: read once more.
+  assert.deepEqual(settled([dying(), leaving.noRecord, reading.gone]),
+    { row: rowOf.gone(7), pauses: SETTLE_PAUSES.slice(0, 1), remembered: null, reads: `${THREE} ${THREE} info usage` });
+  // From one scan to the next: alive, its start time is learned; dying, it is known by it; then forgotten.
+  const across = scripted({ 7: [...reading.tool, ...reading.tool, ...dying(), ...ended()] }, { scans: [[7], [7]], learn: { 7: liveRecord } });
+  assert.deepEqual(across.scans.map(scan => [scan.rows[0], scan.pauses, scan.tools]),
+    [[rowOf.tool(7), SETTLE_PAUSES.slice(0, 1), { 7: STARTED }], [rowOf.ended(7), SETTLE_PAUSES.slice(0, 1), {}]]);
+  // Killed while the sampler was reading it again as the new, live tool.
+  const killed = scripted({ 7: [...reading.tool, ...dying(), ...ended()] }, { learn: { 7: liveRecord } });
+  assert.deepEqual([killed.scans[0].rows, killed.scans[0].pauses, killed.scans[0].tools], [[rowOf.ended(7)], SETTLE_PAUSES.slice(0, 2), {}]);
+});
+
+test('a remembered ps with no record left is read once more, without a pause, and reads as gone only when the kernel says so', { timeout: 60000 }, () => {
+  const twice = `${THREE} info usage`;
+  assert.deepEqual(settled([leaving.noRecord, reading.gone]), { row: rowOf.gone(7), pauses: [], remembered: null, reads: twice });
+  // Anything else leaves the row as it was, and nothing of that read shows in it.
+  assert.deepEqual(settled([leaving.noRecord, leaving.noRecord]), { row: deniedRow(7), pauses: [], remembered: null, reads: `${THREE} ${THREE}` });
+  assert.deepEqual(settled([leaving.noRecord, [read.noInfo(ESRCH), read.usage(9, 60 * MB, 0), ['record', 'absent']]]),
+    { row: deniedRow(7), pauses: [], remembered: null, reads: `${THREE} ${THREE}` });
+  assert.deepEqual(settled([leaving.noRecord, [read.noInfo(ESRCH), read.noUsage(5)]]), { row: deniedRow(7), pauses: [], remembered: null, reads: twice });
+});
+
+test('a process never read alive as the tool, or read with another start time, is reported as it reads, at once', { timeout: 60000 }, () => {
+  const { dying, ended } = leaving;
+  const asRead = { row: deniedRow(7), pauses: [], remembered: null, reads: THREE };
+  for (const [what, reads, options] of [
+    ['dying, never seen as the tool', [dying()], {}],
+    ['no record, never seen as the tool', [leaving.noRecord], {}],
+    ['dying, a tool of another start time remembered under its pid', [dying()], { tools: { 7: ANOTHER_START } }],
+    ['dying, another process remembered', [dying()], { tools: { 8: STARTED } }],
+    ['no record, another process remembered', [leaving.noRecord], { tools: { 8: STARTED } }],
+  ]) assert.deepEqual(settled(reads, options), asRead, what);
+  // Another set-uid helper: unreadable alive, dying at the next read. Its row is the one the guard stops the run for, and no more is read.
+  for (const helper of [reading.otherTool, reading.changingOwner]) {
+    const result = settled([helper, dying()], {});
+    assert.deepEqual([result.row, result.pauses, result.remembered], [deniedRow(7), SETTLE_PAUSES.slice(0, 1), null]);
+  }
+  // The same helper does not get there through a table record either.
+  const learned = scripted({ 7: [...reading.otherTool, ...dying()] }, { learn: { 7: liveRecord } });
+  assert.deepEqual([learned.scans[0].rows, learned.scans[0].tools, learned.learned], [[deniedRow(7)], {}, []]);
+  // An ended process is reported as ended, as ever, whatever was or was not remembered.
+  assert.equal(settled([ended()], {}).row, rowOf.ended(7));
+});
+
+test('a dying ps keeps its first reading unless it has ended with the same start time or is gone', { timeout: 60000 }, () => {
+  const { dying, ended } = leaving;
+  // Still dying when the pauses run out: no pause more, and the row is the one the guard stops the run for.
+  const stays = settled([dying(), dying(), dying(), dying()]);
+  assert.deepEqual([stays.row, stays.pauses], [deniedRow(7), SETTLE_PAUSES]);
+  for (const next of [ended(ANOTHER_START), dying(ANOTHER_START), ended([STARTED[0] + 1, STARTED[1]]), reading.tool, reading.created,
+    [read.noInfo(ESRCH), read.noUsage(EPERM), read.record()]]) {
+    const result = settled([dying(), next]);
+    assert.deepEqual([result.row, result.pauses], [deniedRow(7), SETTLE_PAUSES.slice(0, 1)]);
+  }
+  const noRecordLeft = settled([dying(), leaving.noRecord, leaving.noRecord]);
+  assert.deepEqual([noRecordLeft.row, noRecordLeft.pauses], [deniedRow(7), SETTLE_PAUSES.slice(0, 1)]);
+  // It costs this once: the memory of it ends with the scan, so the next scan reports it as it reads.
+  const next = scripted({ 7: [...dying(), ...dying(), ...dying(), ...dying(), ...dying()] }, { ...REMEMBERED, scans: [[7], [7]] });
+  assert.deepEqual(next.scans.map(scan => [scan.rows[0], scan.pauses, scan.tools]), [[deniedRow(7), SETTLE_PAUSES, {}], [deniedRow(7), [], {}]]);
+});
+
+test('only that exact state is read again: other parents, owners, flags and records are reported at once, as they read', { timeout: 60000 }, () => {
+  for (const [what, record] of Object.entries({
+    'a child of the guard': [GUARD, 100, 0, OWNER, 2, STARTED, P_WEXIT],
+    'another real owner': [101, 100, 0, OWNER + 1, 2, STARTED, P_WEXIT],
+    'running as this user': [101, 100, OWNER, OWNER, 2, STARTED, P_WEXIT],
+    'not marked as exiting': [101, 100, 0, OWNER, 2, STARTED, 0],
+  })) {
+    assert.deepEqual(settled([[read.noInfo(ESRCH), read.noUsage(EPERM), ['record', record]]]), { row: deniedRow(7), pauses: [], remembered: null, reads: THREE }, what);
+  }
+  assert.deepEqual(settled([[read.noInfo(ESRCH), read.noUsage(EPERM), read.record()]]), { row: deniedRow(7), pauses: [], remembered: null, reads: THREE });
+});
+
+test('the start time of a live tool is learned once, only from a record that shows it alive, and forgotten when the scan no longer shows it', { timeout: 60000 }, () => {
+  const twice = [...reading.tool, ...reading.tool];
+  const learnedFrom = record => scripted({ 7: twice }, { learn: { 7: record } }).scans[0].tools;
+  assert.deepEqual(learnedFrom(liveRecord), { 7: STARTED });
+  for (const [what, record] of Object.entries({
+    'no record': 'absent',
+    'unreadable record': null,
+    ended: [101, 100, 0, OWNER, ZOMBIE, STARTED, P_WEXIT],
+    exiting: [101, 100, 0, OWNER, 2, STARTED, P_WEXIT],
+    'not root': [101, 100, OWNER + 1, OWNER, 2, STARTED, 0],
+    'another real owner': [101, 100, 0, OWNER + 1, 2, STARTED, 0],
+    'a child of the guard': [GUARD, 100, 0, OWNER, 2, STARTED, 0],
+  })) assert.deepEqual(learnedFrom(record), {}, what);
+  // Only the system's ps is ever asked about.
+  for (const state of ['otherTool', 'starting', 'changingOwner', 'ending']) {
+    const result = scripted({ 7: [...reading[state], ...reading[state]] }, { learn: { 7: liveRecord } });
+    assert.deepEqual([result.scans[0].tools, result.learned], [{}, []], state);
+  }
+  const child = [read.info(GUARD, 100, 0, OWNER), read.noUsage(EPERM), read.path('/bin/ps')];
+  assert.deepEqual(scripted({ 7: child }, { learn: { 7: liveRecord } }).learned, []);
+  // Kept while each scan shows it as the live tool, and asked for once.
+  const steady = scripted({ 7: [...twice, ...reading.tool, ...reading.tool] }, { scans: [[7], [7], [7]], learn: { 7: liveRecord } });
+  assert.deepEqual([steady.scans.map(scan => scan.tools), steady.learned], [[{ 7: STARTED }, { 7: STARTED }, { 7: STARTED }], [7]]);
+  // Forgotten when the pid reads as anything else, and when it is no longer listed.
+  const changed = scripted({ 7: [...twice, ...reading.created] }, { scans: [[7], [7]], learn: { 7: liveRecord } });
+  assert.deepEqual(changed.scans.map(scan => scan.tools), [{ 7: STARTED }, {}]);
+  const unlisted = scripted({ 7: twice, 8: reading.created }, { scans: [[7], [8]], learn: { 7: liveRecord } });
+  assert.deepEqual(unlisted.scans.map(scan => scan.tools), [{ 7: STARTED }, {}]);
+  // Whatever was remembered for pids this scan does not show as the tool is gone after it.
+  assert.deepEqual(scripted({ 7: reading.created }, { tools: { 7: STARTED, 8: STARTED, 9: ANOTHER_START } }).scans[0].tools, {});
+});
+
+// These rows, pauses and reads are what the sampler gave before it knew about
+// dying processes; the same cases pass unchanged against that version of it.
+test('every other state is read exactly as before: same reads, same row, same pauses, same memory of the scan', { timeout: 60000 }, () => {
+  const exiting = [read.noInfo(ESRCH), read.exitingUsage(9, 60 * MB, 0, 12345), read.record(101, 100, OWNER, OWNER, 2, STARTED, P_WEXIT)];
+  const endedOrdinary = [read.noInfo(ESRCH), read.usage(9, 60 * MB, 0), read.record(101, 100, OWNER, OWNER, ZOMBIE, STARTED, P_WEXIT)];
+  const foreign = [read.info(101, 100, 0, 0), read.noUsage(EPERM)];
+  const cases = [
+    ['the live tool, new', [...reading.tool, ...reading.tool], {}, rowOf.tool(7), SETTLE_PAUSES.slice(0, 1), { 7: rowOf.tool(7) }, 'info usage path info usage path'],
+    ['the live tool, seen before', reading.tool, { known: { 7: rowOf.tool(7) } }, rowOf.tool(7), [], { 7: rowOf.tool(7) }, 'info usage path'],
+    ['usage denied, this user', [...reading.changingOwner, ...reading.changingOwner], {}, rowOf.changingOwner(7), SETTLE_PAUSES.slice(0, 1), { 7: rowOf.changingOwner(7) }, 'info usage info usage'],
+    ['usage denied, another user', foreign, {}, `7 101 100 0 2 0 0 0 0 ${EPERM} 0 0 -`, [], {}, 'info usage'],
+    ['no such process to both reads', reading.gone, {}, rowOf.gone(7), [], {}, 'info usage'],
+    ['exiting, usage readable', exiting, {}, `7 0 0 0 0 9 ${60 * MB} 0 ${ESRCH} 0 0 1 -`, [], {}, THREE],
+    ['ended, usage readable', endedOrdinary, {}, `7 101 100 ${OWNER} ${ZOMBIE} 9 ${60 * MB} 0 0 0 ${OWNER} 0 -`, [], {}, THREE],
+    ['ended, usage denied', reading.ended, {}, rowOf.ended(7), [], {}, THREE],
+    ['dying, never seen as the tool', leaving.dying(), {}, deniedRow(7), [], {}, THREE],
+    ['usage denied and no record, never seen as the tool', [read.noInfo(ESRCH), read.noUsage(EPERM), ['record', 'absent']], {}, deniedRow(7), [], {}, THREE],
+  ];
+  for (const [what, reads, options, row, pauses, remembered, order] of cases) {
+    const result = scripted({ 7: reads }, options);
+    assert.deepEqual([result.scans[0].rows, result.scans[0].pauses, result.scans[0].remembered, readsOf(result, 7)], [[row], pauses, remembered, order], what);
+  }
+});
+
+test('nothing extra is read before every process has had its first read, and others in transition are read first in every round', { timeout: 60000 }, () => {
+  const others = { 8: [...reading.starting, ...reading.tool, ...reading.tool], 9: reading.created, 10: [...reading.tool, ...reading.tool] };
+  const alone = scripted(others);
+  const dying = [...leaving.dying(), ...leaving.dying(), ...leaving.dying(), ...leaving.dying()];
+  const beside = scripted({ 7: dying, ...others, 11: [...leaving.noRecord, ...reading.gone] }, { tools: { 7: STARTED, 11: STARTED }, scans: [[7, 8, 9, 10, 11]] });
+  assert.deepEqual(beside.scans[0].rows, [deniedRow(7), ...alone.scans[0].rows, rowOf.gone(11)]);
+  for (const pid of [8, 9, 10]) assert.equal(readsOf(beside, pid), readsOf(alone, pid), `process ${pid}`);
+  const infos = beside.calls.filter(([, kind]) => kind === 'info').map(([pid]) => pid);
+  // First reads, all of them; then the one read of the process with no record left, before any pause.
+  assert.deepEqual(infos.slice(0, 6), [7, 8, 9, 10, 11, 11]);
+  // First round: those in transition before the dying one. Second: 8 again before 7. Third: only the dying one.
+  assert.deepEqual(infos.slice(6), [8, 10, 7, 8, 7, 7]);
+  // The pauses are the ones there are. What is new is that a dying process alone causes them.
+  assert.deepEqual([alone.scans[0].pauses, beside.scans[0].pauses], [SETTLE_PAUSES.slice(0, 2), SETTLE_PAUSES]);
+  assert.deepEqual(settled([leaving.dying(), leaving.dying(), leaving.dying(), leaving.dying()]).pauses, SETTLE_PAUSES);
+  // A process with no record left costs no pause, and a ps seen before and unchanged costs nothing at all.
+  assert.deepEqual(settled([leaving.noRecord, reading.gone]).pauses, []);
+  const seen = scripted({ 7: reading.tool }, { known: { 7: rowOf.tool(7) }, ...REMEMBERED });
+  assert.deepEqual([seen.scans[0].pauses, seen.learned, readsOf(seen, 7)], [[], [], 'info usage path']);
+});
+
+test('the sampler\'s answer to a scan frames the row of a ps on its way out like any other', { timeout: 60000 }, () => {
+  const result = scripted({ 7: [...leaving.dying(), ...leaving.ended()] }, { ...REMEMBERED, framed: true });
+  assert.equal(result.scans[0].framed, `begin 1 1\n${rowOf.ended(7)}\nend 1\n`);
+});
+
+test('the process table gives a start time and the exiting flag from a whole record of that pid, and nothing from anything else', { timeout: 60000 }, () => {
+  const table = inSampler('table-decoding');
+  assert.deepEqual(table, {
+    whole: [100, 101, 0, 501, 2, STARTED, P_WEXIT], none: 'no record', short: null, longer: null, 'another pid': null, fails: null, wexit: P_WEXIT,
+  });
+});
+
+test('on this system an ended process keeps its start time and carries the exiting flag', { timeout: 60000 }, () => {
+  // Nothing here depends on catching a moment. The ordinary child sleeps until it
+  // is killed, the ps ends by itself, and an ended process stays until collected.
+  const seen = inSampler('table');
+  assert.equal(seen.wexit, P_WEXIT);
+  const { alive, ended } = seen.ordinary;
+  assert.equal(alive[6] & P_WEXIT, 0);
+  assert.deepEqual(ended[5], alive[5]);
+  for (const name of ['ordinary', 'ps']) {
+    const child = seen[name];
+    assert.ok(child.ended[5][0] >= seen.before - 1 && child.ended[5][0] <= seen.after + 1, `${name} started at ${child.ended[5][0]}, between ${seen.before} and ${seen.after}`);
+    assert.ok(child.ended[5][1] >= 0 && child.ended[5][1] < 1000000, `${name}: ${child.ended[5][1]} microseconds`);
+    assert.equal(child.ended[4], ZOMBIE, name);
+    assert.equal(child.ended[6] & P_WEXIT, P_WEXIT, name);
+    assert.deepEqual([child.state, child.transition, parseRow(child.row).status], [['ended', child.ended[5]], false, ZOMBIE], name);
+  }
+  if (psIsSetUid) assert.deepEqual([seen.ps.ended[2], seen.ps.ended[3]], [0, seen.self]);
+});
+
+for (const [shape, what, shown] of [
+  ['dying-then-ended', 'has ended a moment later', item => item.status === ZOMBIE],
+  ['dying-twice-then-gone', 'is gone a moment later', item => item.infoError === ESRCH && item.usageError === ESRCH],
+  ['collected', 'was collected between two reads', item => item.infoError === ESRCH && item.usageError === ESRCH],
+]) {
+  test(`through the real guard: a ps read alive as the tool and caught on its way out that ${what} does not stop the run`, { timeout: 60000 }, async t => {
+    const { environment, allGone, bystanderSurvived } = scenario(t);
+    const result = await startGuard([descendants], { ...environment('short'), CRATE_GUARD_FAULT: 'sampler-script:nested', CRATE_GUARD_SHAPE: shape }, faultyGuard).done;
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /^# pass 1$/m);
+    assert.doesNotMatch(result.stderr, /CANNOT READ|EXCEEDED|INCOMPLETE|About process/);
+    const rows = /^faulty-guard: scripted rows: (.*)$/m.exec(result.stderr)[1].split(' | ').map(parseRow);
+    assert.equal(rows.length, 3, result.stderr);
+    assert.deepEqual(rows.slice(0, 2).map(item => item.path), [SYSTEM_TOOL.path, SYSTEM_TOOL.path]);
+    assert.ok(shown(rows[2]), result.stderr);
+    assert.match(result.stderr, /for each \/bin\/ps the guard could not read \(let through 2 times, at most 2 samples in a row/);
+    await allGone(treeRoles.filter(role => role !== 'nested'));
+    assert.equal(bystanderSurvived(), true);
+  });
+}
+
+for (const [shape, what] of [
+  ['other-start', 'reads with another start time'],
+  ['wrong-parent', 'has the guard as its parent'],
+  ['other-owner', 'has another real owner'],
+  ['still-dying', 'is still dying when the pauses run out'],
+]) {
+  test(`through the real guard: a ps on its way out that ${what} stops the run as before`, { timeout: 60000 }, async t => {
+    const { environment, recorded, allGone, bystanderSurvived } = scenario(t);
+    const result = await startGuard([descendants], { ...environment('idle'), CRATE_GUARD_FAULT: 'sampler-script:nested', CRATE_GUARD_SHAPE: shape }, faultyGuard).done;
+    const nested = recorded().get('nested');
+    assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+    assert.match(result.stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${EPERM}, 3 samples in a row\\)`));
+    assert.match(result.stderr, /run-tests:     \+\d+ ms: process info errno 3, usage errno 1, not let through \(sample 3\)\n/);
+    assert.equal(/^faulty-guard: scripted rows: (.*)$/m.exec(result.stderr)[1].split(' | ')[2], deniedRow(nested));
+    await allGone(['nested', 'nested-child', 'short-lived', 'ready']);
+    assert.equal(bystanderSurvived(), true);
+  });
+}
+
+test('through the real guard: another set-uid helper that is dying by the next read stops the run, though it would be ended a moment later', { timeout: 60000 }, async t => {
+  const { environment, recorded, allGone, bystanderSurvived } = scenario(t);
+  // In a run that would pass: only this process's row can make it fail.
+  const result = await startGuard([descendants], { ...environment('short'), CRATE_GUARD_FAULT: 'sampler-script:nested', CRATE_GUARD_SHAPE: 'other-helper' }, faultyGuard).done;
+  const nested = recorded().get('nested');
+  assert.equal(result.code, EXIT_GUARD_FAILURE, result.stderr);
+  assert.match(result.stderr, new RegExp(`run-tests: GUARD CANNOT READ PROCESS ${nested} OF THE RUN after [\\d.]+ s \\(errno ${EPERM}, 1 samples in a row\\)`));
+  assert.equal(/^faulty-guard: scripted rows: (.*)$/m.exec(result.stderr)[1], deniedRow(nested));
+  await allGone(['nested', 'nested-child', 'short-lived', 'ready']);
+  assert.equal(bystanderSurvived(), true);
 });
 
 for (const [mode, what] of [['sleep', 'an ordinary child'], ['ps', 'a system ps']]) {

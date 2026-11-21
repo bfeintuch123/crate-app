@@ -29,7 +29,10 @@ usage read still answers for an ordinary ended process (with the resident size
 it had at the end and a footprint of zero) and is denied for a set-uid one. In
 those two cases the sampler asks the system's process table
 
-  sysctl kern.proc.pid.<pid>              state, parent, group and owners
+  sysctl kern.proc.pid.<pid>              state, parent, group and owners, and
+                                          for a process this user may not read,
+                                          its start time and whether it is
+                                          exiting
 
 and reports the process as ended only when the table says so in so many words
 (state 5, awaiting collection by its parent). A record that shows the pid as
@@ -90,6 +93,55 @@ Protocol, one request per line on stdin, one answer on stdout.
     process. All such processes of one scan share those waits. The row is
     always the last reading, complete and fresh, whether or not it agreed with
     the one before; nothing in it comes from an earlier reading or scan.
+
+    The system's ps (/bin/ps, running as root for this user) gets one more
+    such re-reading, on its way out, and only a process this sampler has already
+    read alive as exactly that. When a scan's row for a process is that live
+    tool, the sampler takes the process's start time (seconds and microseconds)
+    from the process table and remembers it under the pid. That memory holds
+    only pids whose row in the latest scan was the live tool, so it is as small
+    as the number of such processes and is rebuilt at the end of every scan.
+
+    A remembered tool is dying when the kernel has marked it dead (P_REF_DEAD)
+    and it is not yet a zombie: proc_pidinfo says there is no such process, the
+    usage read is still denied, and the process table has its whole record, with
+    P_WEXIT set, a state other than ended, the remembered start time, real owner
+    this user, effective owner another, and a parent other than the guard. It is
+    read again on the same pauses for as long as it reads so, and only these
+    readings replace it: ended with that start time, or no such process to both
+    reads, which the guard treats as it treats any such row. Anything else
+    leaves the first reading as the row, and the guard stops the run for that
+    row. So does a tool still dying when the pauses run out. Nothing here lets
+    a process through: the row is the first reading, or one that a scan a few
+    milliseconds later would have given.
+
+    A remembered tool may also have been collected between the usage read and
+    the process table: usage denied, and no record. No start time is left to
+    compare. It is read once more, and the row changes only when both reads now
+    say there is no such process. A row that says so, here or after a dying
+    reading, carries no start time. It establishes that the pid no longer exists
+    and that the pid was the live tool when last read, in the latest scan or
+    earlier in this one. It does not establish that the process just read was
+    that one. The kernel hands out pids in rising order and comes back to a pid
+    only after going round the whole range (forkproc, bsd/kern/kern_fork.c), so
+    another process in between is not expected; if one took the pid and was gone
+    again by the next read, it could not be told apart, and it holds no memory.
+
+    Any other process that reads like these, one never read alive as that tool
+    or read with another start time, is reported as it reads, at once.
+
+    What this costs a scan. Nothing above is read until every listed process has
+    had its first read. Then, once per new live tool, one process-table read, in
+    a scan where that tool is being read again anyway; and for a remembered tool
+    found collected, two reads. A dying tool adds up to three rounds of three
+    reads (two more if it is then found collected), each round after the next
+    pause, and is forgotten at the end of that scan, so this happens once per
+    process. Other processes in transition are read again first in every round,
+    as often and after the same pauses as without it. What is new is the waiting
+    itself: if nothing else in the scan is in transition, the pauses (at most
+    4 ms requested; more under load) happen only because of the dying tool, and
+    the whole scan, every process's row included, reaches the guard that much
+    later. The reads themselves also take time before the first pause.
 
     This means the guard does not get to see a state that lasted less than
     those waits, even one it would have stopped the run for. The exception is
@@ -153,12 +205,20 @@ ENDED = 5  # SZOMB: awaiting collection by parent
 # sampler checks them before it answers anything; see check_records.
 SYSCTL_PROCESS = (1, 14, 1)  # CTL_KERN, KERN_PROC, KERN_PROC_PID
 KINFO_PROC_SIZE = 648
+KINFO_START_SECONDS = 0  # kp_proc.p_starttime.tv_sec
+KINFO_START_MICROSECONDS = 8  # kp_proc.p_starttime.tv_usec
+KINFO_FLAGS = 32  # kp_proc.p_flag
 KINFO_STATUS = 36  # kp_proc.p_stat, one byte
 KINFO_PID = 40  # kp_proc.p_pid
 KINFO_REAL_UID = 392  # kp_eproc.e_pcred.p_ruid
 KINFO_UID = 420  # kp_eproc.e_ucred.cr_uid
 KINFO_PPID = 560  # kp_eproc.e_ppid
 KINFO_PGID = 564  # kp_eproc.e_pgid
+P_WEXIT = 0x2000  # in p_flag: working on exiting, <sys/proc.h>
+# The one set-uid tool the guard lets through (SYSTEM_TOOL in scripts/run-tests.js).
+SYSTEM_TOOL_PATH = "/bin/ps"
+# What read_table gives when the table answers and has no record of the pid.
+NO_RECORD = "no record"
 # How long to wait before reading a process in transition again, in seconds.
 SETTLE_PAUSES = (0.001, 0.001, 0.002)
 SIGNALS = {
@@ -246,6 +306,9 @@ class Sampler:
         # pid -> row, for each process of the last scan that this user started
         # and may not read. Only ever compared with a new reading.
         self.denied = {}
+        # pid -> (seconds, microseconds) from the process table, for each
+        # process whose row in the latest scan was the live system tool.
+        self.tool_starts = {}
 
     def read_info(self, pid):
         """0, or the errno that kept parent, group, owner and state from being read."""
@@ -274,17 +337,23 @@ class Sampler:
             return "-"
         return urllib.parse.quote(buffer.raw[:length], safe="/") or "-"
 
-    def read_record(self, pid):
-        """(ppid, pgid, uid, ruid, status) of <pid> from the system's process table, or None.
+    def read_table(self, pid):
+        """(ppid, pgid, uid, ruid, status, (seconds, microseconds), flags) of <pid>
+        from the system's process table; NO_RECORD when the call succeeds and
+        reports no record; None for anything else.
 
-        None unless the call succeeds, fills exactly one record, and the record
-        is that of <pid>. The buffer is new for every call, so a call that
-        fails or comes back short cannot leave an earlier record to be read.
+        A record counts only when the call fills exactly one and it is that of
+        <pid>. The buffer is new for every call, so a call that fails or comes
+        back short cannot leave an earlier record to be read.
         """
         name = (ctypes.c_int * 4)(*SYSCTL_PROCESS, pid)
         record = ctypes.create_string_buffer(KINFO_PROC_SIZE)
         size = ctypes.c_size_t(KINFO_PROC_SIZE)
-        if self.libc.sysctl(name, 4, record, ctypes.byref(size), None, 0) != 0 or size.value != KINFO_PROC_SIZE:
+        if self.libc.sysctl(name, 4, record, ctypes.byref(size), None, 0) != 0:
+            return None
+        if size.value == 0:
+            return NO_RECORD
+        if size.value != KINFO_PROC_SIZE:
             return None
         raw = record.raw
         if struct.unpack_from("i", raw, KINFO_PID)[0] != pid:
@@ -295,7 +364,18 @@ class Sampler:
             struct.unpack_from("I", raw, KINFO_UID)[0],
             struct.unpack_from("I", raw, KINFO_REAL_UID)[0],
             raw[KINFO_STATUS],
+            (struct.unpack_from("q", raw, KINFO_START_SECONDS)[0], struct.unpack_from("i", raw, KINFO_START_MICROSECONDS)[0]),
+            struct.unpack_from("i", raw, KINFO_FLAGS)[0],
         )
+
+    def read_tool_record(self, pid):
+        """The process table's record of a process just read as the live tool."""
+        return self.read_table(pid)
+
+    def read_record(self, pid):
+        """(ppid, pgid, uid, ruid, status) of <pid> from the process table, or None."""
+        record = self.read_table(pid)
+        return None if record is None or record == NO_RECORD else record[:5]
 
     def check_records(self):
         """True when read_record reads two processes whose facts are known.
@@ -311,10 +391,16 @@ class Sampler:
         return self.read_record(os.getpid()) == own and self.read_record(1) == (0, 1, 0, 0, RUNNING)
 
     def read_row(self, pid):
-        """One reading of <pid>: its row, and whether it may be in transition.
+        """One reading of <pid>: its row, whether it may be in transition, and
+        its state as settle needs it.
 
         In transition can only be a process this user started and may not
-        read, other than a child of the guard.
+        read, other than a child of the guard. The state is ("tool", None) for
+        the live system tool; ("dying", start) for a remembered tool that is
+        dying; ("vanished", None) for a remembered tool whose usage was denied
+        and of which the process table has no record; ("ended", start) for a
+        process the table shows as ended; ("gone", None) when both reads say
+        there is no such process; and None otherwise. Start is the table's.
         """
         info_errno = self.read_info(pid)
         # Each value is taken from the structures only when this pid's own
@@ -333,39 +419,104 @@ class Sampler:
         # something else. The process table is asked last, so that "ended" is
         # the latest thing this row knows about the pid, and it is believed
         # only when it says ended.
+        state = None
+        dying = False
         if info_errno == errno.ESRCH and usage_errno in (0, errno.EPERM):
-            record = self.read_record(pid)
-            if record and record[4] == ENDED:
+            record = self.read_table(pid)
+            if record == NO_RECORD:
+                if usage_errno == errno.EPERM and pid in self.tool_starts:
+                    state = ("vanished", None)
+            elif record and record[4] == ENDED:
                 info_errno = 0
-                ppid, pgid, effective_uid, real_uid, status = record
+                ppid, pgid, effective_uid, real_uid, status = record[:5]
+                state = ("ended", record[5])
+            elif record and usage_errno == errno.EPERM and self.is_dying_tool(pid, record):
+                dying = True
+                state = ("dying", record[5])
+        if info_errno == errno.ESRCH and usage_errno == errno.ESRCH:
+            state = ("gone", None)
         denied = usage_errno == errno.EPERM and not info_errno and status != ENDED and real_uid == self.uid
         path = self.read_path(pid) if denied and effective_uid != self.uid else "-"
+        if denied and path == SYSTEM_TOOL_PATH and effective_uid == 0 and self.uid != 0 and ppid != self.guard:
+            state = ("tool", None)
         row = "%d %d %d %d %d %d %d %d %d %d %d %d %s" % (
             pid, ppid, pgid, effective_uid, status, start, resident, footprint, info_errno, usage_errno, real_uid, exiting, path)
-        return row, denied and ppid != self.guard
+        return row, dying or (denied and ppid != self.guard), state
+
+    def is_dying_tool(self, pid, record):
+        """True when <record> shows the remembered live tool <pid> dying, under its remembered start time."""
+        ppid, _, effective_uid, real_uid, _, start, flags = record
+        return (self.tool_starts.get(pid) == start and flags & P_WEXIT != 0 and real_uid == self.uid
+                and effective_uid != self.uid and ppid != self.guard)
+
+    def learn_tool(self, reading):
+        """Remembers the start time of a process just read as the live tool, once."""
+        pid = reading[0]
+        if reading[3] != ("tool", None) or pid in self.tool_starts:
+            return
+        record = self.read_tool_record(pid)
+        if record is None or record == NO_RECORD:
+            return
+        ppid, _, effective_uid, real_uid, status, start, flags = record
+        if effective_uid == 0 and real_uid == self.uid and status != ENDED and not flags & P_WEXIT and ppid != self.guard:
+            self.tool_starts[pid] = start
+
+    def confirm_gone(self, reading):
+        """Reads a remembered tool of which the table has no record once more;
+        the row changes only when both reads now say there is no such process."""
+        row, transition, state = self.read_row(reading[0])
+        if state == ("gone", None):
+            reading[1:] = row, transition, state
 
     def settle(self, readings):
         """Reads again what may have been read in the middle of a change.
 
-        <readings> is a list of [pid, row, in transition]. Each one that may be
-        in transition, and that the last scan did not report in exactly the
-        same way, is read again after a pause, until two readings in a row
-        agree, it can no longer be in transition, or the pauses run out. The
-        list ends up holding the last reading of every pid.
+        <readings> is a list of [pid, row, in transition, state], as read_row
+        gives them, one for every listed pid: nothing here runs before each has
+        had its first read. Each one that may be in transition, and that the
+        last scan did not report in exactly the same way, is read again after a
+        pause, until two readings in a row agree, it can no longer be in
+        transition, or the pauses run out. The list ends up holding the last
+        reading of every pid, with these exceptions. A dying tool is read again,
+        after the others of the same round, for as long as it is dying with the
+        same start time, and its first reading stays unless it has ended with
+        that start time or is gone. A remembered tool with no record left is
+        read once more, and its row changes only if it is gone.
         """
         pending = [reading for reading in readings if reading[2] and self.denied.get(reading[0]) != reading[1]]
+        for reading in pending:
+            self.learn_tool(reading)
+        for reading in readings:
+            if reading[3] == ("vanished", None):
+                self.confirm_gone(reading)
         for seconds in SETTLE_PAUSES:
             if not pending:
                 break
             self.pause(seconds)
             changed = []
-            for reading in pending:
-                row, transition = self.read_row(reading[0])
+            others = [reading for reading in pending if not (reading[3] and reading[3][0] == "dying")]
+            dying = [reading for reading in pending if reading[3] and reading[3][0] == "dying"]
+            for reading in others:
+                row, transition, state = self.read_row(reading[0])
                 if transition and row != reading[1]:
                     changed.append(reading)
-                reading[1], reading[2] = row, transition
+                reading[1:] = row, transition, state
+            for reading in others:
+                self.learn_tool(reading)
+                if reading[3] == ("vanished", None):
+                    self.confirm_gone(reading)
+            for reading in dying:
+                was = reading[3]
+                row, transition, state = self.read_row(reading[0])
+                if state == was:
+                    changed.append(reading)
+                elif state == ("ended", was[1]) or state == ("gone", None):
+                    reading[1:] = row, transition, state
+                elif state == ("vanished", None):
+                    self.confirm_gone(reading)
             pending = changed
-        self.denied = {pid: row for pid, row, transition in readings if transition}
+        self.denied = {pid: row for pid, row, transition, _ in readings if transition}
+        self.tool_starts = {pid: self.tool_starts[pid] for pid, _, _, state in readings if state == ("tool", None) and pid in self.tool_starts}
 
     def list_pids(self):
         # The pid list can grow between sizing and reading it, so leave headroom.
@@ -381,7 +532,7 @@ class Sampler:
     def scan(self):
         readings = [[pid, *self.read_row(pid)] for pid in self.list_pids()]
         self.settle(readings)
-        return [row for _, row, _ in readings]
+        return [row for _, row, _, _ in readings]
 
     def describe(self, pid):
         """One line of facts about <pid> for a report; see the protocol above."""

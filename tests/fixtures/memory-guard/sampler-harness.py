@@ -11,6 +11,15 @@ test decides what that should have been.
   ended             a real ordinary child and a real set-uid ps, alive, ended
                     and not collected, and collected
   scan              two scans with a real ps that is new, then already seen
+  table-decoding    the longer process record, as sysctl could hand it back
+  table             what the process table says of a real child, alive and
+                    ended, and of a real set-uid ps once it has ended by itself
+                    and is not collected
+  exit-window [n]   a probe, run by hand and by no test: n real set-uid ps (150
+                    by default) in each of three ways of ending, read in a tight
+                    loop. What it catches depends on timing, so it decides
+                    nothing; it reports how often the dying state was seen, how
+                    long it lasted, and whether each sighting kept the contract
 
 Whatever it starts ends by itself within seconds and is collected here.
 """
@@ -24,6 +33,7 @@ import os
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 spec = importlib.util.spec_from_file_location("sampler", sys.argv[1])
@@ -42,13 +52,18 @@ def scripted(scenario):
       "uid": the user the sampler runs as, "guard": the guard's pid,
       "scans": [[pid, ...], ...]         the pids each scan lists
       "known": {pid: row}                what the scan before the first reported, if anything
+      "tools": {pid: [seconds, microseconds]}   the live tools remembered from before the first scan
+      "learn": {pid: record}             what the process table says when a live tool's start time is
+                                         looked up: null, "absent" or a record as in "record" below
+      "framed": true                     each scan goes through the sampler's answer to a scan request
       "script": {pid: [step, ...]}       the answers for that pid, in the order they are asked for
     }
     A step is ["info", errno, [ppid, pgid, uid, ruid, status]], ["usage", errno,
     [start, resident, footprint] or [start, resident, footprint, exit time]],
-    ["path", text] or ["record", null or
-    [ppid, pgid, uid, ruid, status]]. A read the script did not expect next is
-    an error, and so is a step that is never asked for.
+    ["path", text] or ["record", null, "absent" (the table answers and has no
+    such record) or [ppid, pgid, uid, ruid, status] with, optionally,
+    [seconds, microseconds] and flags]. A read the script did not expect next
+    is an error, and so is a step that is never asked for.
     """
     sampler = module.Sampler()
     sampler.uid = scenario["uid"]
@@ -90,21 +105,45 @@ def scripted(scenario):
         answer = step(pid, "path")
         return answer[1] if answer else "-"
 
+    def table_answer(facts):
+        if not facts:
+            return None
+        if facts == "absent":
+            return module.NO_RECORD
+        facts = list(facts) + [[0, 0], 0][len(facts) - 5:]
+        return (*facts[:5], tuple(facts[5]), facts[6])
+
+    def read_table(pid):
+        answer = step(pid, "record")
+        return table_answer(answer[1]) if answer else None
+
+    learned = []
+
+    def read_tool_record(pid):
+        learned.append(pid)
+        return table_answer(scenario.get("learn", {}).get(str(pid)))
+
+    # A sampler without read_table (the one this change started from) asks for the five facts.
     def read_record(pid):
         answer = step(pid, "record")
-        return tuple(answer[1]) if answer and answer[1] else None
+        return tuple(answer[1][:5]) if answer and answer[1] and answer[1] != "absent" else None
 
     sampler.read_info, sampler.read_usage, sampler.read_path, sampler.read_record = read_info, read_usage, read_path, read_record
+    sampler.read_table, sampler.read_tool_record = read_table, read_tool_record
+    sampler.tool_starts = {int(pid): tuple(start) for pid, start in scenario.get("tools", {}).items()}
     sampler.pause = pauses.append
     scans = []
-    for pids in scenario["scans"]:
+    for number, pids in enumerate(scenario["scans"], 1):
         sampler.list_pids = lambda pids=pids: list(pids)
         before = len(pauses)
-        rows = sampler.scan()
-        scans.append({"rows": rows, "pauses": pauses[before:], "remembered": {str(pid): row for pid, row in sampler.denied.items()}})
+        framed = module.answer(sampler, ["scan", str(number)]) if scenario.get("framed") else None
+        rows = framed.splitlines()[1:-1] if framed else sampler.scan()
+        scans.append({"rows": rows, "pauses": pauses[before:], "remembered": {str(pid): row for pid, row in sampler.denied.items()},
+                      "tools": {str(pid): list(start) for pid, start in getattr(sampler, "tool_starts", {}).items()}, "framed": framed})
     return {
         "scans": scans,
         "calls": calls,
+        "learned": learned,
         "errors": errors,
         "unused": {str(pid): [item[0] for item in steps] for pid, steps in script.items() if steps},
     }
@@ -227,7 +266,7 @@ def observe(sampler, pid):
     info_errno = sampler.read_info(pid)
     usage_errno = sampler.read_usage(pid)
     megabytes = None if usage_errno else [round(sampler.usage.ri_resident_size / 1048576), round(sampler.usage.ri_phys_footprint / 1048576)]
-    row, transition = sampler.read_row(pid)
+    row, transition, *_ = sampler.read_row(pid)
     return {"info": info_errno, "usage": usage_errno, "megabytes": megabytes, "record": sampler.read_record(pid), "row": row, "transition": transition}
 
 
@@ -275,7 +314,131 @@ def scan():
     return {"first": first, "second": second, "reads": [after_first, len(reads) - after_first], "running": running, "remembered": sampler.denied.get(child.pid)}
 
 
-checks = {"decoding": decoding, "records": records, "ended": ended, "scan": scan}
+def table_decoding():
+    sampler = module.Sampler()
+    size = module.KINFO_PROC_SIZE
+    raw = bytearray(record_of(4242, 100, 101, 0, 501, 2))
+    struct.pack_into("q", raw, module.KINFO_START_SECONDS, 1763440000)
+    struct.pack_into("i", raw, module.KINFO_START_MICROSECONDS, 123456)
+    struct.pack_into("i", raw, module.KINFO_FLAGS, module.P_WEXIT)
+    whole = bytes(raw)
+
+    def read(outcome):
+        sampler.libc = ScriptedSysctl([outcome])
+        answer = sampler.read_table(4242)
+        return "no record" if answer == module.NO_RECORD else answer
+
+    return {
+        "whole": read(("ok", whole, size)),
+        "none": read(("ok", b"", 0)),
+        "short": read(("ok", whole[:100], 100)),
+        "longer": read(("ok", whole, size + 8)),
+        "another pid": read(("ok", record_of(4243, 100, 101, 0, 501, 2), size)),
+        "fails": read(("fails", errno.ESRCH, 0)),
+        "wexit": module.P_WEXIT,
+    }
+
+
+def wait_until(condition):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        value = condition()
+        if value:
+            return value
+        time.sleep(0.002)
+    raise SystemExit("timed out")
+
+
+def table():
+    """Nothing here depends on catching a moment: the sleeping child lives until
+    it is killed, the ps ends by itself, and an ended process stays as it is
+    until it is collected."""
+    sampler = module.Sampler()
+    before = int(time.time())
+    ordinary = subprocess.Popen(["/bin/sleep", "30"])
+    ps = subprocess.Popen(["/bin/ps", "-axo", "pid="], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    result = {"before": before, "after": None, "self": os.getuid(), "wexit": module.P_WEXIT}
+
+    def ended(child):
+        def read():
+            record = sampler.read_table(child.pid)
+            return record if record not in (None, module.NO_RECORD) and record[4] == module.ENDED else None
+        return wait_until(read)
+
+    def observed(child, alive=None):
+        record = ended(child)
+        row, transition, state = sampler.read_row(child.pid)
+        return {"pid": child.pid, "alive": alive, "ended": record, "row": row, "transition": transition, "state": state}
+
+    try:
+        wait_until(lambda: sampler.read_path(ordinary.pid).endswith("/sleep"))
+        alive = sampler.read_table(ordinary.pid)
+        result["after"] = int(time.time())
+        ordinary.kill()
+        result["ordinary"] = observed(ordinary, alive)
+        result["ps"] = observed(ps)
+        result["after"] = int(time.time())
+    finally:
+        for child in (ordinary, ps):
+            child.kill()
+            child.wait()
+    return result
+
+
+def exit_window():
+    count = int(sys.argv[3]) if len(sys.argv) > 3 else 150
+    sampler = module.Sampler()
+    wide = ["/bin/ps", "-axwwo", ",".join(["command="] * 16)]
+    report = {}
+    for way in ("killed", "killed and collected at once", "ended by itself"):
+        spans, same, other = [], 0, 0
+        for _ in range(count):
+            itself = way == "ended by itself"
+            child = subprocess.Popen(["/bin/ps", "-axo", "pid="] if itself else wide, stdout=subprocess.DEVNULL if itself else subprocess.PIPE, stderr=subprocess.DEVNULL)
+            # The start time is set when the process is created and stays through exec.
+            started = sampler.read_table(child.pid)
+            started = None if started in (None, module.NO_RECORD) else started[5]
+            if not itself:
+                time.sleep(0.03)
+            collector = None
+            if way == "killed and collected at once":
+                collector = threading.Thread(target=child.wait)
+                collector.start()
+            if not itself:
+                child.kill()
+            first = last = None
+            until = time.monotonic() + 3
+            while time.monotonic() < until:
+                info_errno = sampler.read_info(child.pid)
+                usage_errno = sampler.read_usage(child.pid)
+                record = sampler.read_table(child.pid)
+                now = time.monotonic()
+                whole = record not in (None, module.NO_RECORD)
+                if info_errno == errno.ESRCH and usage_errno == errno.EPERM and whole and record[4] != module.ENDED and record[6] & module.P_WEXIT:
+                    first, last = first or now, now
+                    same += record[5] == started
+                    other += record[5] != started
+                elif (whole and record[4] == module.ENDED) or usage_errno == errno.ESRCH:
+                    break
+            if first:
+                spans.append((last - first) * 1000000)
+            if collector:
+                collector.join()
+            else:
+                child.kill()
+                child.wait()
+            if child.stdout:
+                child.stdout.close()
+        spans.sort()
+        report[way] = {
+            "runs": count, "runs in which it was seen dying": len(spans), "readings with the start time it was created with": same, "readings with another": other,
+            "microseconds": None if not spans else {"median": round(spans[len(spans) // 2]), "p99": round(spans[min(len(spans) - 1, len(spans) * 99 // 100)]), "longest": round(spans[-1])},
+        }
+    report["note"] = "zero sightings would prove nothing: this probe decides no test"
+    return report
+
+
+checks = {"decoding": decoding, "records": records, "ended": ended, "scan": scan, "table-decoding": table_decoding, "table": table, "exit-window": exit_window}
 if sys.argv[2] == "scripted":
     print(json.dumps(scripted(json.loads(sys.argv[3]))))
 else:
