@@ -14,7 +14,6 @@ mkdir -p "$OUT_DIR"
   -parse-as-library \
   -target arm64-apple-macosx14.0 \
   -lz \
-  -framework AppKit \
   -framework Foundation \
   -framework CryptoKit \
   "$SRC_DIR/main.swift" \

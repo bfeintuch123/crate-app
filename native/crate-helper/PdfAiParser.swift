@@ -125,13 +125,15 @@ enum PdfAiParser {
                     && bytes[i + 8] == 0x2F
 
                 if isUsers || isVolumes {
-                    // Find end of valid path run (delimiters: control chars < 0x20, '"', '\'', '<', '>', '|', '*', '?', '(', ')')
+                    // Find end of valid path run (delimiters: control chars < 0x20, '"', '\'', DEL, '<', '>').
+                    // Do NOT stop on '(' or ')' so macOS filenames like `Logo (1).png` are preserved intact;
+                    // PDF literal strings like `(/Users/a.png)` still stop right after `.png`.
                     var end = i + (isUsers ? 7 : 9)
                     let limit = min(n, i + 4096)
                     var matchedEnd = -1
                     while end < limit {
                         let b = bytes[end]
-                        if b < 0x20 || b == 0x22 || b == 0x27 || b == 0x7F || b == 0x3C || b == 0x3E || b == 0x28 || b == 0x29 {
+                        if b < 0x20 || b == 0x22 || b == 0x27 || b == 0x7F || b == 0x3C || b == 0x3E {
                             break
                         }
                         if b == 0x2E { // '.'

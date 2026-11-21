@@ -1,7 +1,7 @@
 'use strict';
 
 const assert = require('./bounded-assert');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawn } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -125,11 +125,12 @@ test('Swift native helper: PDF/AI parser recovers FlateDecode compressed streams
   t.after(() => client.shutdown());
 
   const compressedLink = '/Users/synthetic/compressed-from-illustrator.png';
+  const parenLink = '/Users/synthetic/Logo (1).png';
   const xmpLink = '/Users/synthetic/xmp-manifest-photo.jpg';
   const rawLink = '/Users/synthetic/raw-uncompressed.svg';
 
   const compressedPayload = zlib.deflateSync(Buffer.from(
-    `BT (${compressedLink}) Tj ET\n<stRef:filePath>file://${xmpLink}</stRef:filePath>`
+    `BT (${compressedLink}) Tj ET\nBT (${parenLink}) Tj ET\n<stRef:filePath>file://${xmpLink}</stRef:filePath>`
   ));
   const aiBytes = Buffer.concat([
     Buffer.from('%PDF-1.6\n1 0 obj\n<< /Filter /FlateDecode /Length ' + compressedPayload.length + ' >>\nstream\n'),
@@ -142,16 +143,18 @@ test('Swift native helper: PDF/AI parser recovers FlateDecode compressed streams
 
   const parsed = await client.parsePdfAi(aiPath, { decompressStreams: true });
   assert.ok(parsed.compressedStreamsScanned >= 1);
-  assert.ok(parsed.compressedHits >= 2);
+  assert.ok(parsed.compressedHits >= 3);
   assert.ok(parsed.paths.includes(compressedLink), 'must recover FlateDecode-compressed link');
+  assert.ok(parsed.paths.includes(parenLink), 'must preserve parentheses in filenames like Logo (1).png');
   assert.ok(parsed.paths.includes(xmpLink), 'must recover XMP stRef:filePath inside compressed stream');
   assert.ok(parsed.paths.includes(rawLink), 'must retain raw uncompressed links');
 
-  // Verify AIParser integration discovers all three!
+  // Verify AIParser integration discovers all four!
   const parser = new AIParser();
   const assets = await parser.extractAssets(aiPath);
   const foundPaths = assets.map(a => a.path);
   assert.ok(foundPaths.includes(compressedLink));
+  assert.ok(foundPaths.includes(parenLink));
   assert.ok(foundPaths.includes(xmpLink));
   assert.ok(foundPaths.includes(rawLink));
 });
@@ -354,4 +357,151 @@ test('Phase 3B: cloneVerifiedFile enforces ancestry, source identity, mode 0o600
     /source_changed/
   );
   assert.equal(fs.existsSync(path.join(destDir, 'wrong-size.psd')), false);
+});
+
+test('WatchOps live kernel parity: sees processes launched after first poll and detects mmap-only files without open fds', { skip: !hasNativeBinary }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-swift-watch-live-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const client = new NativeHelperClient(DEFAULT_BINARY_PATH);
+  t.after(() => client.shutdown());
+
+  // 1. Prime persistent helper with an initial runningApps call (would freeze NSWorkspace cache!)
+  const beforeApps = await client.runningApps(['python']);
+  assert.ok(Array.isArray(beforeApps.apps));
+
+  // 2. Launch a brand-new process AFTER the first call that mmaps a .ttf file and closes its fd immediately
+  const mappedFont = path.join(fs.realpathSync.native(dir), 'MappedFont (1).ttf');
+  fs.writeFileSync(mappedFont, Buffer.alloc(8192, 0x41));
+  const pyScript = [
+    'import mmap, os, sys, time',
+    'fd = os.open(sys.argv[1], os.O_RDONLY)',
+    'mm = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)',
+    'os.close(fd)',
+    'print("READY", flush=True)',
+    'time.sleep(30)',
+  ].join('\n');
+  const child = spawn('/usr/bin/python3', ['-c', pyScript, mappedFont], { stdio: ['ignore', 'pipe', 'ignore'] });
+  t.after(() => { try { child.kill('SIGKILL'); } catch (_) {} });
+
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('python mmap helper timed out')), 5000);
+    child.stdout.on('data', chunk => {
+      if (String(chunk).includes('READY')) {
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+    child.once('exit', () => { clearTimeout(timer); reject(new Error('python mmap helper exited early')); });
+  });
+
+  // Persistent helper MUST see the newly launched child PID immediately (no RunLoop cache!)
+  const afterApps = await client.runningApps(['python']);
+  assert.ok(
+    afterApps.apps.some(app => app.pid === child.pid),
+    `persistent helper must see newly launched PID ${child.pid} immediately`
+  );
+
+  // Persistent helper MUST see the mmap-only .ttf file even though its fd was closed!
+  const openRes = await client.openFiles([child.pid], ['.ttf']);
+  assert.ok(
+    openRes.files.some(entry => entry.pid === child.pid && entry.path === mappedFont),
+    'PROC_PIDREGIONPATHINFO must detect mmap-only regular files with closed fds'
+  );
+});
+
+test('NativeHelperClient process isolation: watcher and package helpers use distinct child processes', { skip: !hasNativeBinary }, async t => {
+  const { watcherNativeHelper, packageNativeHelper } = require('../parsers/native-helper');
+  t.after(async () => {
+    await watcherNativeHelper.shutdown();
+    await packageNativeHelper.shutdown();
+  });
+  assert.notEqual(watcherNativeHelper, packageNativeHelper);
+  const [wPong, pPong] = await Promise.all([watcherNativeHelper.ping(), packageNativeHelper.ping()]);
+  assert.notEqual(wPong.pid, pPong.pid, 'watcher and package helpers must run in isolated OS processes');
+});
+
+test('Phase 3B hardening: cloneVerifiedFile strips source xattrs and falls back safely on Finder-locked sources', { skip: !hasNativeBinary }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-swift-clone-hardening-'));
+  const lockedPath = path.join(dir, 'locked-asset.png');
+  t.after(() => {
+    try { execFileSync('/usr/bin/chflags', ['nouchg', lockedPath]); } catch (_) {}
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const client = new NativeHelperClient(DEFAULT_BINARY_PATH);
+  t.after(() => client.shutdown());
+
+  const destDir = path.join(dir, 'staged');
+  fs.mkdirSync(destDir, { mode: 0o700 });
+  const destStat = fs.lstatSync(destDir, { bigint: true });
+  const ancestry = [];
+  let cur = fs.realpathSync(destDir);
+  while (true) {
+    const st = fs.lstatSync(cur, { bigint: true });
+    ancestry.push({ dev: `${st.dev}`, ino: `${st.ino}` });
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+
+  // 1. Source with privacy-sensitive extended attributes (WhereFroms + quarantine)
+  const xattrSrc = path.join(dir, 'downloaded.png');
+  const payload = crypto.randomBytes(64 * 1024);
+  fs.writeFileSync(xattrSrc, payload);
+  execFileSync('/usr/bin/xattr', ['-w', 'com.apple.metadata:kMDItemWhereFroms', 'https://private.example/secret', xattrSrc]);
+  execFileSync('/usr/bin/xattr', ['-w', 'com.apple.quarantine', '0081;00000000;Safari;', xattrSrc]);
+  const xattrSrcStat = fs.lstatSync(xattrSrc, { bigint: true });
+
+  const cloneRes = await client.cloneVerifiedFile({
+    sourcePath: xattrSrc,
+    expectedSourceDev: `${xattrSrcStat.dev}`,
+    expectedSourceIno: `${xattrSrcStat.ino}`,
+    expectedSourceSize: `${xattrSrcStat.size}`,
+    destDir,
+    expectedDestDev: `${destStat.dev}`,
+    expectedDestIno: `${destStat.ino}`,
+    ancestries: [ancestry],
+    leafName: 'downloaded.png',
+    mode: 0o600,
+  });
+  assert.equal(cloneRes.cloned, true);
+  const clonedPath = path.join(destDir, 'downloaded.png');
+  assert.deepEqual(fs.readFileSync(clonedPath), payload);
+  const outXattrs = execFileSync('/usr/bin/xattr', [clonedPath], { encoding: 'utf8' })
+    .split('\n')
+    .map(line => line.trim())
+    .filter(name => name && name !== 'com.apple.provenance');
+  assert.deepEqual(outXattrs, [], 'cloned output must strip all non-kernel extended attributes including WhereFroms and quarantine');
+
+  // 2. Finder-locked source (UF_IMMUTABLE via chflags uchg) must NOT fail hard or leave an undeletable file
+  fs.writeFileSync(lockedPath, payload);
+  execFileSync('/usr/bin/chflags', ['uchg', lockedPath]);
+  const lockedStat = fs.lstatSync(lockedPath, { bigint: true });
+
+  const lockedRes = await client.cloneVerifiedFile({
+    sourcePath: lockedPath,
+    expectedSourceDev: `${lockedStat.dev}`,
+    expectedSourceIno: `${lockedStat.ino}`,
+    expectedSourceSize: `${lockedStat.size}`,
+    destDir,
+    expectedDestDev: `${destStat.dev}`,
+    expectedDestIno: `${destStat.ino}`,
+    ancestries: [ancestry],
+    leafName: 'locked-asset.png',
+    mode: 0o600,
+  });
+  assert.equal(lockedRes.cloned, false);
+  assert.equal(lockedRes.fallback, true);
+  assert.equal(lockedRes.reason, 'source_has_flags');
+  assert.equal(fs.existsSync(path.join(destDir, 'locked-asset.png')), false, 'locked fallback must leave no undeletable file in staging');
+
+  // 3. packageBatch must also fall back to streaming copy on a locked source
+  const batchDir = path.join(dir, 'batch-out');
+  fs.mkdirSync(batchDir, { mode: 0o700 });
+  const batchRes = await client.packageBatch(batchDir, [{ sourcePath: lockedPath, leafName: 'locked-copy.png' }], {
+    mode: 'clone_or_copy',
+    computeHash: true,
+  });
+  assert.equal(batchRes.files.length, 1);
+  assert.equal(batchRes.files[0].cloned, false);
+  assert.deepEqual(fs.readFileSync(path.join(batchDir, 'locked-copy.png')), payload);
 });

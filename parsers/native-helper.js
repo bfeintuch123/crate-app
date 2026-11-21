@@ -31,14 +31,17 @@ function resolveNativeHelperBinaryPath(explicitPath = null) {
   if (typeof explicitPath === 'string' && explicitPath.length > 0) {
     return explicitPath;
   }
-  const envOverride = process.env.CRATE_NATIVE_HELPER_PATH;
-  if (typeof envOverride === 'string' && isExecutableRegularFile(envOverride)) {
-    return envOverride;
-  }
   if (typeof process.resourcesPath === 'string' && process.resourcesPath.length > 0) {
     const packagedCandidate = path.join(process.resourcesPath, 'native', 'crate-helper');
     if (isExecutableRegularFile(packagedCandidate)) {
       return packagedCandidate;
+    }
+  }
+  // Never honor CRATE_NATIVE_HELPER_PATH inside Electron runtimes (packaged or dev Electron).
+  if (!(process.versions && process.versions.electron)) {
+    const envOverride = process.env.CRATE_NATIVE_HELPER_PATH;
+    if (typeof envOverride === 'string' && isExecutableRegularFile(envOverride)) {
+      return envOverride;
     }
   }
   return DEV_BINARY_PATH;
@@ -239,6 +242,8 @@ class NativeHelperClient {
 }
 
 const defaultClient = new NativeHelperClient();
+const watcherClient = new NativeHelperClient();
+const packageClient = new NativeHelperClient();
 
 module.exports = {
   DEFAULT_BINARY_PATH,
@@ -246,5 +251,7 @@ module.exports = {
   NativeHelperClient,
   isExecutableRegularFile,
   nativeHelper: defaultClient,
+  packageNativeHelper: packageClient,
   resolveNativeHelperBinaryPath,
+  watcherNativeHelper: watcherClient,
 };

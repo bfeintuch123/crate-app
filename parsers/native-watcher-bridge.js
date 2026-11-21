@@ -15,14 +15,23 @@
 const path = require('node:path');
 
 let nativeHelper = null;
+let watcherNativeHelper = null;
+let packageNativeHelper = null;
 try {
-  ({ nativeHelper } = require('./native-helper'));
+  ({
+    nativeHelper,
+    watcherNativeHelper,
+    packageNativeHelper,
+  } = require('./native-helper'));
 } catch (_) {
   nativeHelper = null;
+  watcherNativeHelper = null;
+  packageNativeHelper = null;
 }
 
 function canUseNativeProcessWatcher(execFn, execFileFn) {
-  if (!nativeHelper || !nativeHelper.isAvailable()) return false;
+  const client = watcherNativeHelper || nativeHelper;
+  if (!client || !client.isAvailable()) return false;
   try {
     const builtinCp = require('node:child_process');
     return execFn === builtinCp.exec && execFileFn === builtinCp.execFile;
@@ -32,13 +41,15 @@ function canUseNativeProcessWatcher(execFn, execFileFn) {
 }
 
 function canUseNativePackageClone() {
-  if (!nativeHelper || !nativeHelper.isAvailable()) return false;
+  const client = packageNativeHelper || nativeHelper;
+  if (!client || !client.isAvailable()) return false;
   return Boolean(process.versions && process.versions.electron) || process.env.CRATE_ENABLE_NATIVE_CLONE === '1';
 }
 
 async function readNativeLastUsedXattrs(filePaths, timeoutMs) {
-  if (!nativeHelper) return null;
-  const response = await nativeHelper.readLastUsedXattrs(filePaths, timeoutMs);
+  const client = watcherNativeHelper || nativeHelper;
+  if (!client) return null;
+  const response = await client.readLastUsedXattrs(filePaths, timeoutMs);
   const timestamps = response && response.timestamps;
   if (!timestamps || typeof timestamps !== 'object') return null;
 
@@ -54,8 +65,9 @@ async function readNativeLastUsedXattrs(filePaths, timeoutMs) {
 }
 
 async function getNativeRunningDesignApps(keywords, timeoutMs = 3000) {
-  if (!nativeHelper) return null;
-  const result = await nativeHelper.runningApps(keywords, timeoutMs);
+  const client = watcherNativeHelper || nativeHelper;
+  if (!client) return null;
+  const result = await client.runningApps(keywords, timeoutMs);
   const pids = [];
   const pidToCmd = new Map();
   for (const appInfo of (result && result.apps) || []) {
@@ -97,8 +109,9 @@ function formatNativeOpenFilesAsLsofF(validPids, files) {
 }
 
 async function pollNativeOpenFilesAsLsofF(validPids, timeoutMs = 12000) {
-  if (!nativeHelper) return null;
-  const response = await nativeHelper.openFiles(validPids, [], timeoutMs);
+  const client = watcherNativeHelper || nativeHelper;
+  if (!client) return null;
+  const response = await client.openFiles(validPids, [], timeoutMs);
   if (!response || !Array.isArray(response.files)) return null;
   return formatNativeOpenFilesAsLsofF(validPids, response.files);
 }
@@ -112,8 +125,9 @@ async function tryNativeVerifiedClone({
   PackageReviewChangedError,
   PackageTransactionInvariantError,
 }) {
+  const client = packageNativeHelper || nativeHelper;
   if (
-    !nativeHelper ||
+    !client ||
     !sourceMeta ||
     typeof sourceMeta.sourcePath !== 'string' ||
     typeof sourceMeta.dev !== 'bigint' ||
@@ -125,7 +139,7 @@ async function tryNativeVerifiedClone({
 
   let cloneResult = null;
   try {
-    cloneResult = await nativeHelper.cloneVerifiedFile({
+    cloneResult = await client.cloneVerifiedFile({
       sourcePath: sourceMeta.sourcePath,
       expectedSourceDev: `${sourceMeta.dev}`,
       expectedSourceIno: `${sourceMeta.ino}`,
@@ -165,9 +179,11 @@ async function tryNativeVerifiedClone({
 }
 
 function shutdownNativeHelper() {
-  try {
-    nativeHelper?.shutdown?.();
-  } catch (_) {}
+  for (const client of [watcherNativeHelper, packageNativeHelper, nativeHelper]) {
+    try {
+      client?.shutdown?.();
+    } catch (_) {}
+  }
 }
 
 module.exports = {

@@ -120,10 +120,79 @@ enum PackageOps {
         return ancestries.contains { verifyDirFdMatchesAncestry(dirFd: dirFd, ancestry: $0) }
     }
 
+    /// Strips all user/privacy extended attributes (including kMDItemWhereFroms,
+    /// quarantine, Finder tags, etc.) and rejects extended ACLs from a newly cloned
+    /// file descriptor so APFS-cloned outputs match byte-only copy privacy parity.
+    /// Note: macOS Sequoia/Sonoma kernel-enforces `com.apple.provenance` even on
+    /// freshly created files and silently retains it after fremovexattr returns 0.
+    private static func stripCloneMetadata(fd: Int32) -> Bool {
+        let kernelManagedXattrs: Set<String> = ["com.apple.provenance"]
+
+        func listXattrNames() -> [String]? {
+            for _ in 0..<4 {
+                let listSize = Darwin.flistxattr(fd, nil, 0, 0)
+                if listSize == 0 { return [] }
+                if listSize < 0 {
+                    if errno == ENOTSUP || errno == EOPNOTSUPP { return [] }
+                    return nil
+                }
+                var buf = [CChar](repeating: 0, count: listSize)
+                let actual = Darwin.flistxattr(fd, &buf, listSize, 0)
+                if actual == 0 { return [] }
+                if actual < 0 {
+                    if errno == ERANGE { continue }
+                    if errno == ENOTSUP || errno == EOPNOTSUPP { return [] }
+                    return nil
+                }
+                var names: [String] = []
+                var pos = 0
+                while pos < actual {
+                    var end = pos
+                    while end < actual && buf[end] != 0 { end += 1 }
+                    if end > pos {
+                        let name = buf.withUnsafeBufferPointer { ptr in
+                            String(cString: ptr.baseAddress!.advanced(by: pos))
+                        }
+                        names.append(name)
+                    }
+                    pos = end + 1
+                }
+                return names
+            }
+            return nil
+        }
+
+        // 1. Remove every non-kernel-managed extended attribute via fremovexattr
+        guard let initialNames = listXattrNames() else { return false }
+        for name in initialNames {
+            if kernelManagedXattrs.contains(name) { continue }
+            let removed = name.withCString { Darwin.fremovexattr(fd, $0, 0) }
+            if removed != 0 && errno != ENOATTR {
+                return false
+            }
+        }
+        guard let remainingNames = listXattrNames() else { return false }
+        if remainingNames.contains(where: { !kernelManagedXattrs.contains($0) }) {
+            return false
+        }
+
+        // 2. Reject/fallback if the cloned file carries any extended ACL entries so
+        //    the caller falls back to a fresh byte-only copy with zero ACLs.
+        if let existingAcl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED) {
+            defer { acl_free(UnsafeMutableRawPointer(existingAcl)) }
+            var entry: acl_entry_t? = nil
+            if acl_get_entry(existingAcl, Int32(ACL_FIRST_ENTRY.rawValue), &entry) == 0 {
+                return false
+            }
+        }
+
+        return true
+    }
+
     /// Descriptor-bound, ancestry-verified APFS copy-on-write clone matching
     /// Crate's package-transaction-worker security invariants (O_NOFOLLOW,
     /// full directory ancestry check, owner-only mode 0o600, source stability
-    /// check, atomic rollback on post-clone mismatch).
+    /// check, xattr/ACL stripping, atomic rollback on post-clone mismatch).
     static func cloneVerifiedFile(req: [String: Any]) throws -> [String: Any] {
         guard let sourcePath = req["sourcePath"] as? String,
               let destDir = req["destDir"] as? String,
@@ -182,6 +251,12 @@ enum PackageOps {
             return ["cloned": false, "fallback": true, "reason": "cross_device"]
         }
 
+        // Fall back to byte-copy if source has BSD file flags (e.g., Finder Locked UF_IMMUTABLE),
+        // because fclonefileat clones the flag and makes fchmod/unlinkat fail with EPERM.
+        if srcBefore.st_flags != 0 {
+            return ["cloned": false, "fallback": true, "reason": "source_has_flags"]
+        }
+
         let rc = leafName.withCString { cLeaf in
             fclonefileat(srcFd, dirFd, cLeaf, UInt32(CLONE_NOFOLLOW))
         }
@@ -210,6 +285,16 @@ enum PackageOps {
         if fchmod(outFd, targetMode) != 0 {
             rollbackClone()
             throw HelperError("fchmod_failed")
+        }
+
+        if !stripCloneMetadata(fd: outFd) {
+            rollbackClone()
+            return ["cloned": false, "fallback": true, "reason": "metadata_strip_failed"]
+        }
+
+        if Darwin.fsync(outFd) != 0 {
+            rollbackClone()
+            throw HelperError("dest_verify_failed")
         }
 
         var outStat = stat()
@@ -310,7 +395,7 @@ enum PackageOps {
                 }
 
                 let sameDevice = (srcBefore.st_dev == dirStat.st_dev)
-                let tryClone = sameDevice && (mode == "clone" || mode == "clone_or_copy")
+                let tryClone = sameDevice && srcBefore.st_flags == 0 && (mode == "clone" || mode == "clone_or_copy")
                 var cloned = false
                 var sha256Hex: String? = nil
                 var outDev: Int64 = 0
@@ -321,28 +406,34 @@ enum PackageOps {
                         fclonefileat(srcFd, dirFd, cLeaf, UInt32(CLONE_NOFOLLOW))
                     }
                     if rc == 0 {
-                        cloned = true
-                        createdLeaves.append(leafName)
-                        // Harden mode and verify cloned file identity via openat(O_NOFOLLOW)
+                        // Strip xattrs/ACLs, harden mode, and verify cloned file identity via openat(O_NOFOLLOW)
                         let outFd = leafName.withCString { cLeaf in
                             Darwin.openat(dirFd, cLeaf, O_RDONLY | O_NOFOLLOW)
                         }
-                        if outFd < 0 { throw HelperError("dest_verify_failed") }
-                        defer { Darwin.close(outFd) }
-                        _ = fchmod(outFd, ownerOnlyFileMode)
-                        var outStat = stat()
-                        if fstat(outFd, &outStat) != 0 || (outStat.st_mode & S_IFMT) != S_IFREG {
+                        if outFd < 0 {
+                            _ = leafName.withCString { Darwin.unlinkat(dirFd, $0, 0) }
                             throw HelperError("dest_verify_failed")
                         }
-                        outDev = Int64(outStat.st_dev)
-                        outIno = Int64(outStat.st_ino)
-                        if computeHash {
-                            sha256Hex = try computeSha256FromFd(fd: outFd, fileSize: Int64(outStat.st_size))
+                        defer { Darwin.close(outFd) }
+                        if fchmod(outFd, ownerOnlyFileMode) != 0 || !stripCloneMetadata(fd: outFd) {
+                            _ = leafName.withCString { Darwin.unlinkat(dirFd, $0, 0) }
+                        } else {
+                            cloned = true
+                            createdLeaves.append(leafName)
+                            var outStat = stat()
+                            if fstat(outFd, &outStat) != 0 || (outStat.st_mode & S_IFMT) != S_IFREG {
+                                throw HelperError("dest_verify_failed")
+                            }
+                            outDev = Int64(outStat.st_dev)
+                            outIno = Int64(outStat.st_ino)
+                            if computeHash {
+                                sha256Hex = try computeSha256FromFd(fd: outFd, fileSize: Int64(outStat.st_size))
+                            }
                         }
                     } else if errno == EEXIST {
                         throw HelperError("dest_already_exists")
                     }
-                    // For EXDEV / ENOTSUP / EINVAL, fall through to openat streaming copy!
+                    // For EXDEV / ENOTSUP / EINVAL / metadata_strip_failed, fall through to openat streaming copy!
                 }
 
                 if !cloned {

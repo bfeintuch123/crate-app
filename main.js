@@ -256,7 +256,13 @@ function initializeAccountSession() {
     const allowed = snapshot.canUseWorkspace;
     const identityChanged = accountWorkspaceId !== snapshot.identity?.id;
     const generationChanged = accountWorkspaceGeneration !== accountSession.generation;
-    if (!allowed || identityChanged || generationChanged) invalidateAllPackageReviews();
+    if (!allowed || identityChanged || generationChanged) {
+      invalidateAllPackageReviews();
+      if (!allowed || identityChanged) {
+        clearFileVisualProjectCache();
+        try { store?.clearStatCache?.(); } catch (_) {}
+      }
+    }
     // An identity change while access had already lapsed (a sign-out, then a
     // sign-in) skips the block below, but still ends every Assets need save episode.
     if (identityChanged && !accountWorkspaceAllowed) closeNeedsSaveNotifications(null, { forgetSeen: true });
@@ -6735,6 +6741,7 @@ function clearFileVisualProjectCache(projectId = null) {
   fileVisualProjectCacheGeneration += 1;
   fileVisualProjectCache.clear();
   if (typeof rasterThumbnailMemoryCache?.clear === 'function') rasterThumbnailMemoryCache.clear();
+  if (typeof embeddedPsdReviewCache?.clear === 'function') embeddedPsdReviewCache.clear();
 }
 
 function getCurrentFileVisualProjectCache(projectId, project) {
@@ -16910,13 +16917,17 @@ async function extractLinkedAssets(filePath, options = {}) {
           onOrdinaryScanFailure: options.onOrdinaryScanFailure,
           onOrdinaryScanLimit: options.onOrdinaryScanLimit,
           sourceBuffer: options.sourceBuffer,
+          sourceText: options.sourceText,
           addFilesAttempt: options.addFilesAttempt,
           validatedRegexResult: options.validatedRegexResult,
         });
       case '.psd':
         return await extractLinkedAssetsPhotoshop(filePath, { strict,
           onOrdinaryScanFailure: options.onOrdinaryScanFailure,
-          onOrdinaryScanLimit: options.onOrdinaryScanLimit });
+          onOrdinaryScanLimit: options.onOrdinaryScanLimit,
+          sourceBuffer: options.sourceBuffer,
+          sourceText: options.sourceText,
+          inScanPhotoshopPaths: options.inScanPhotoshopPaths });
       case '.indd':
       case '.idml':
         return await extractLinkedAssetsInDesign(filePath, { ...options, strict });
@@ -16981,6 +16992,9 @@ async function extractLinkedAssetsRegex(filePath, options = {}) {
       const workerResult = await runAddFilesRegexWorker(filePath, options.addFilesAttempt);
       return [...workerResult.paths];
     }
+    if (typeof options.sourceText === 'string') {
+      return extractLinkedAssetPaths(options.sourceText, filePath);
+    }
     const suppliedBuffer = Buffer.isBuffer(options.sourceBuffer) ? options.sourceBuffer : null;
     if (!suppliedBuffer) {
       // Guard: skip files larger than MAX_PARSE_FILE_SIZE to prevent OOM.
@@ -17016,6 +17030,16 @@ async function extractLinkedAssetsPhotoshop(filePath, options = {}) {
   // script reports links from every open document, so baseline discovery
   // delegates to the file-scoped ag-psd pass below instead.
   if (options.strict === true) return [];
+
+  if (Array.isArray(options.inScanPhotoshopPaths)) {
+    const results = [];
+    for (const p of options.inScanPhotoshopPaths) {
+      if (p === filePath) continue;
+      if (fs.existsSync(p)) results.push(p);
+    }
+    if (results.length > 0) return results;
+    return extractLinkedAssetsRegex(filePath, options);
+  }
 
   try {
     // Check if Photoshop is running
@@ -21959,6 +21983,59 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   }
   const operation = captureProjectOperation(projectId); if (!operation) return null;
   const operationCurrent = operation.current;
+  const preScanStartedAt = Date.now();
+  const inScanFileCache = new Map();
+  let inScanRunningAppsPromise = null;
+  let inScanPhotoshopPaths = null;
+  const getInScanRunningApps = async () => {
+    if (!inScanRunningAppsPromise) {
+      inScanRunningAppsPromise = (async () => {
+        if (canUseNativeProcessWatcher()) {
+          try {
+            const nativeApps = await nativeWatcherBridge.getNativeRunningDesignApps(
+              ['Figma', 'Adobe Photoshop', 'Adobe InDesign'],
+              3000
+            );
+            if (nativeApps && nativeApps.pidToCmd) {
+              return [...nativeApps.pidToCmd.entries()].map(([pid, cmd]) => ({ pid: String(pid), cmd }));
+            }
+          } catch (_) {}
+        }
+        try {
+          const { stdout: psOut } = await execAsync('/bin/ps ax -o pid= -o command= 2>/dev/null', {
+            timeout: 5000,
+            encoding: 'utf8',
+          });
+          const rows = [];
+          for (const line of psOut.trim().split('\n')) {
+            const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
+            if (m) rows.push({ pid: m[1], cmd: m[2] });
+          }
+          return rows;
+        } catch (_) {
+          return [];
+        }
+      })();
+    }
+    return inScanRunningAppsPromise;
+  };
+  const getInScanFileEntry = async (filePath) => {
+    const key = normalizeTrackedFilePath(filePath);
+    if (!key) return null;
+    try {
+      const st = await fs.promises.stat(filePath, { bigint: true });
+      if (!st.isFile() || st.size > BigInt(MAX_PARSE_FILE_SIZE)) return null;
+      const statKey = `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+      const cached = inScanFileCache.get(key);
+      if (cached && cached.statKey === statKey) return cached;
+      const buf = await fs.promises.readFile(filePath);
+      const entry = { statKey, buf, text: null };
+      inScanFileCache.set(key, entry);
+      return entry;
+    } catch (_) {
+      return null;
+    }
+  };
   const ordinaryPsdOutputBatches = [], ownerNotes = [], outputEvidenceRecords = new Set();
   // The Photoshop parse keeps its merged guard: only with a selection record,
   // and it goes on reading an individually excluded placed PSD.
@@ -21981,6 +22058,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   try {
   const watcherDrainStartedAt = Date.now();
   const watcherDrained = await pauseWatcherCoordinatorForPackage(projectId);
+  const watcherDrainElapsedMs = Math.max(0, Date.now() - watcherDrainStartedAt);
   if (!watcherDrained) {
     const drainDiagnostic = {
       failurePhase: 'background-watch-drain',
@@ -22036,18 +22114,27 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   // v1.3.29: Live lsof pass at package time — captures .fig files currently open in Figma,
   // bypassing Spotlight indexing delay. Runs once synchronously before the scan loops.
   try {
-    const figmaPids = [];
-    const { stdout: psOut } = await execAsync("/bin/ps ax -o pid= -o command= 2>/dev/null", { timeout: 5000, encoding: "utf8" });
+    const runningRows = await getInScanRunningApps();
     if (!operationCurrent()) return;
-    for (const line of psOut.trim().split("\n")) {
-      const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
-      if (m && m[2].includes("Figma")) figmaPids.push(m[1]);
-    }
+    const figmaPids = runningRows.filter(row => row.cmd.includes('Figma')).map(row => row.pid);
     if (figmaPids.length > 0) {
-      const { stdout: lsofOut } = await execAsync(
-        `/usr/sbin/lsof -F n -p ${figmaPids.join(",")} 2>/dev/null`,
-        { timeout: 10000, encoding: "utf8" }
-      );
+      let lsofOut = '';
+      if (canUseNativeProcessWatcher()) {
+        try {
+          const numericPids = figmaPids.map(p => parseInt(p, 10)).filter(p => Number.isInteger(p) && p > 0);
+          const nativeLsof = numericPids.length > 0
+            ? await nativeWatcherBridge.pollNativeOpenFilesAsLsofF(numericPids, 10000)
+            : null;
+          if (typeof nativeLsof === 'string') lsofOut = nativeLsof;
+        } catch (_) {}
+      }
+      if (!lsofOut) {
+        const res = await execAsync(
+          `/usr/sbin/lsof -F n -p ${figmaPids.join(",")} 2>/dev/null`,
+          { timeout: 10000, encoding: "utf8" }
+        );
+        lsofOut = res.stdout;
+      }
       if (!operationCurrent()) return;
       for (const line of lsofOut.trim().split("\n")) {
         if (!line.startsWith("n")) continue;
@@ -22348,13 +22435,11 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   // and regex fails because paths live in binary smart-object sections.
   // do javascript exposes embedded smart object paths via layer.smartObject.fileReference.
   try {
-    const { stdout: psPsCheck } = await execAsync(
-      "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe Photoshop' | grep -v grep",
-      { timeout: 3000, encoding: 'utf8' }
-    ).catch(() => ({ stdout: '' }));
+    const runningRows = await getInScanRunningApps();
     if (!operationCurrent()) return;
+    const psRunning = runningRows.some(row => row.cmd.toLowerCase().includes('adobe photoshop'));
 
-    if (psPsCheck.trim()) {
+    if (psRunning) {
       const { stdout: psPaths } = await runOsascriptInPrivateTemp(
         ({ resolveScriptPath }) => ({
           'crate-ps-scan.js': PS_DOJAVASCRIPT,
@@ -22365,8 +22450,9 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
       ).catch(() => ({ stdout: '' }));
       if (!operationCurrent()) return;
 
-      if (psPaths.trim()) {
-        for (const trimmed of psPaths.split('\n').filter(Boolean)) {
+      inScanPhotoshopPaths = psPaths.trim() ? psPaths.split('\n').filter(Boolean) : [];
+      if (inScanPhotoshopPaths.length > 0) {
+        for (const trimmed of inScanPhotoshopPaths) {
           if (isAutoCaptureExcludedPath(trimmed)) continue;
           const normalizedTrimmed = normalizeTrackedFilePath(trimmed);
           if (existingPaths.has(normalizedTrimmed) || pendingPaths.has(normalizedTrimmed)) continue;
@@ -22389,6 +22475,8 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
           newCount++;
         }
       }
+    } else {
+      inScanPhotoshopPaths = [];
     }
   } catch (e) {
     // do javascript failed or Photoshop not responding — fall through to regex
@@ -22402,7 +22490,10 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     for (const psdFile of psdFiles) {
       if (skipPsd(psdFile)) continue;
       if (!fs.existsSync(psdFile.path)) continue;
+      const cachedFile = await getInScanFileEntry(psdFile.path);
+      if (!operationCurrent()) return;
       const psdAssets = await extractPsdAssets(psdFile.path, projectId, operationCurrent, {
+        ...(cachedFile ? { sourceBuffer: cachedFile.buf } : {}),
         onOrdinaryPsdOutputs: outputs => ordinaryPsdOutputBatches.push(outputs),
         scanOwnsNewWorkingOutputs: true,
         onOutputEvidenceRecord: key => outputEvidenceRecords.add(key),
@@ -22435,13 +22526,11 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   // v2.2.7: AppleScript query to InDesign for linked files.
   // InDesign has excellent scripting support — query all links of each document.
   try {
-    const { stdout: inddPsCheck } = await execAsync(
-      "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe InDesign' | grep -v grep",
-      { timeout: 3000, encoding: 'utf8' }
-    ).catch(() => ({ stdout: '' }));
+    const runningRows = await getInScanRunningApps();
     if (!operationCurrent()) return;
+    const inddRunning = runningRows.some(row => row.cmd.toLowerCase().includes('adobe indesign'));
 
-    if (inddPsCheck.trim()) {
+    if (inddRunning) {
       const inddAppleScript = `tell application "Adobe InDesign"
   try
     set pathList to {}
@@ -22517,6 +22606,7 @@ end tell`;
   // v1.3.36: Extended from .ai-only to full Adobe suite + Affinity.
   // Pattern: if we parse the file format to extract links, those links are
   // always relevant — never filter by date.
+  const regexScanStartedAt = Date.now();
   const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig|heic|ttf|otf|woff2|woff|mp4|mov|avi|webm)/gi;
   const LINKABLE_EXTENSIONS = new Set(['.ai', '.indd', '.idml', '.psd', '.pdf', '.afdesign', '.afpub', '.afphoto']);
   const linkableFiles = project.files.filter(f => LINKABLE_EXTENSIONS.has(f.ext));
@@ -22528,9 +22618,17 @@ end tell`;
       try {
         if (skipLinkable(designFile)) continue;
         if (!fs.existsSync(designFile.path)) continue;
-        const buf = await fs.promises.readFile(designFile.path);
+        const cachedFile = await getInScanFileEntry(designFile.path);
         if (!operationCurrent()) return null;
-        const content = buf.toString('utf8');
+        let content;
+        if (cachedFile) {
+          if (cachedFile.text === null) cachedFile.text = cachedFile.buf.toString('utf8');
+          content = cachedFile.text;
+        } else {
+          const buf = await fs.promises.readFile(designFile.path);
+          if (!operationCurrent()) return null;
+          content = buf.toString('utf8');
+        }
         let match;
         LINKED_ASSET_REGEX.lastIndex = 0;
         while ((match = LINKED_ASSET_REGEX.exec(content)) !== null) {
@@ -22567,8 +22665,10 @@ end tell`;
     clearFileVisualProjectCache(projectId);
   }
 
+  const regexScanElapsedMs = Math.max(0, Date.now() - regexScanStartedAt);
   // v2.2.3: Pre-package double-check — re-extract linked assets from all scannable
   // design files in the project to catch anything missed during the session.
+  const doubleCheckStartedAt = Date.now();
   try {
     const existingPathsCheck = getNormalizedPathSet(project.files);
     let doubleCheckCount = 0;
@@ -22578,7 +22678,13 @@ end tell`;
       if (skipDoubleCheck(file)) continue;
       try {
         if (!fs.existsSync(file.path)) continue;
-        const linkedPaths = await extractLinkedAssets(file.path);
+        const cachedFile = await getInScanFileEntry(file.path);
+        if (!operationCurrent()) return null;
+        const linkedPaths = await extractLinkedAssets(file.path, {
+          ...(cachedFile ? { sourceBuffer: cachedFile.buf } : {}),
+          ...(cachedFile && typeof cachedFile.text === 'string' ? { sourceText: cachedFile.text } : {}),
+          ...(Array.isArray(inScanPhotoshopPaths) ? { inScanPhotoshopPaths } : {}),
+        });
         if (!operationCurrent()) return null;
         for (const lp of linkedPaths) {
           if (isAutoCaptureExcludedPath(lp)) continue;
@@ -22867,12 +22973,21 @@ end tell`;
     ...scanMetrics,
     phaseElapsedMs: discoveryElapsedMs + appScanElapsedMs,
   });
+  const doubleCheckElapsedMs = Math.max(0, Date.now() - doubleCheckStartedAt);
+  if ((process.versions && process.versions.electron) || process.env.CRATE_LOG_PACKAGE_TIMING === '1') {
+    console.log(
+      `[crate][package-timing] phase=pre-scan drainMs=${watcherDrainElapsedMs} discoveryMs=${discoveryElapsedMs} ` +
+      `appScanMs=${appScanElapsedMs} regexMs=${regexScanElapsedMs} doubleCheckMs=${doubleCheckElapsedMs} ` +
+      `totalMs=${Math.max(0, Date.now() - preScanStartedAt)} files=${project.files.length} new=${newCount}`
+    );
+  }
   return {
     files: getIllustratorScopedProjectView(finalProject).files,
     newCount,
     ...(figmaPackageError ? { error: figmaPackageError } : {}),
   };
   } finally {
+    inScanFileCache.clear();
     // A regenerated legacy locator may already be a member without adding a
     // row or running the merge. Retain it only while the same operation owns
     // this account/project view; never adopt another account's membership.
@@ -23551,12 +23666,13 @@ function readStablePackageReviewBuffer(sourcePath, expectedFingerprint) {
   } finally { fs.closeSync(fd); }
 }
 
-function readStablePsdForPackageReview(sourcePath, expectedFingerprint) {
+function readStablePsdForPackageReview(sourcePath, expectedFingerprint, { includeBuffer = false } = {}) {
   const beforeFingerprint = getPackageReviewSourceFingerprint(sourcePath);
   if (!packageReviewFingerprintsMatch(expectedFingerprint, beforeFingerprint)) {
     throw new PackageReviewChangedError();
   }
 
+  let buffer;
   let descriptor;
   let fd = null;
   try {
@@ -23569,7 +23685,7 @@ function readStablePsdForPackageReview(sourcePath, expectedFingerprint) {
     ) {
       throw new PackageReviewChangedError();
     }
-    const buffer = fs.readFileSync(fd);
+    buffer = fs.readFileSync(fd);
     const afterStat = fs.fstatSync(fd, { bigint: true });
     if (!packageReviewFingerprintsMatch(expectedFingerprint.source, serializePackageReviewStat(afterStat))) {
       throw new PackageReviewChangedError();
@@ -23582,7 +23698,7 @@ function readStablePsdForPackageReview(sourcePath, expectedFingerprint) {
   if (!packageReviewFingerprintsMatch(expectedFingerprint, getPackageReviewSourceFingerprint(sourcePath))) {
     throw new PackageReviewChangedError();
   }
-  return descriptor;
+  return includeBuffer ? { descriptor, buffer } : descriptor;
 }
 
 function getStablePackageReviewSourceContentFingerprint(sourcePath, expectedFingerprint, maxBytes = Infinity) {
@@ -23639,6 +23755,75 @@ function getEmbeddedPsdResourceFingerprint(match) {
   };
 }
 
+// In-memory LRU memo for embedded PSD resource metadata + exact byte slices.
+// Keyed by normalized path + full stat fingerprint (dev, ino, mode, nlink, size,
+// mtimeNs, ctimeNs). Never persisted to SQLite; write-time extraction still reads
+// from the held reviewed fd and verifies size + SHA-256 against the reviewed resource
+// fingerprint (falling back to a full ag-psd parse on any mismatch).
+const MAX_EMBEDDED_PSD_REVIEW_CACHE_ENTRIES = 64;
+const embeddedPsdReviewCache = new Map();
+
+function getEmbeddedPsdReviewCacheKey(sourceFingerprint) {
+  if (!sourceFingerprint || sourceFingerprint.state !== 'present') return null;
+  return JSON.stringify({
+    normalizedPath: sourceFingerprint.normalizedPath,
+    source: sourceFingerprint.source,
+  });
+}
+
+function buildEmbeddedPsdReviewSummary(sourcePath, expectedFingerprint) {
+  const { descriptor, buffer } = readStablePsdForPackageReview(sourcePath, expectedFingerprint, { includeBuffer: true });
+  const linkedFiles = Array.isArray(descriptor?.linkedFiles) ? descriptor.linkedFiles : [];
+  const entries = linkedFiles.map((lf, embeddedIndex) => {
+    if (!lf || lf.data === undefined || lf.data === null) {
+      return { name: lf?.name, data: null, resourceFingerprint: null, slice: null };
+    }
+    let slice = null;
+    if (
+      lf.data instanceof Uint8Array &&
+      lf.data.buffer === buffer.buffer &&
+      lf.data.byteOffset >= buffer.byteOffset &&
+      lf.data.byteOffset + lf.data.byteLength <= buffer.byteOffset + buffer.byteLength
+    ) {
+      slice = {
+        byteOffset: lf.data.byteOffset - buffer.byteOffset,
+        byteLength: lf.data.byteLength,
+      };
+    }
+    return {
+      name: lf.name,
+      // Lightweight non-null sentinel for findEmbeddedPsdLinkedFileMatch(hasData)
+      data: true,
+      resourceFingerprint: getEmbeddedPsdResourceFingerprint({ linkedFile: lf, embeddedIndex }),
+      slice,
+    };
+  });
+  return { linkedFiles: entries };
+}
+
+function getCachedEmbeddedPsdReviewSummary(sourcePath, expectedFingerprint) {
+  const cacheKey = getEmbeddedPsdReviewCacheKey(expectedFingerprint);
+  if (!cacheKey) return null;
+  if (embeddedPsdReviewCache.has(cacheKey)) {
+    // Re-verify live stat/path before trusting the in-memory memo.
+    const currentFingerprint = getPackageReviewSourceFingerprint(sourcePath);
+    if (!packageReviewFingerprintsMatch(expectedFingerprint, currentFingerprint)) {
+      embeddedPsdReviewCache.delete(cacheKey);
+      throw new PackageReviewChangedError();
+    }
+    const cached = embeddedPsdReviewCache.get(cacheKey);
+    embeddedPsdReviewCache.delete(cacheKey);
+    embeddedPsdReviewCache.set(cacheKey, cached);
+    return cached;
+  }
+  const summary = buildEmbeddedPsdReviewSummary(sourcePath, expectedFingerprint);
+  if (embeddedPsdReviewCache.size >= MAX_EMBEDDED_PSD_REVIEW_CACHE_ENTRIES) {
+    embeddedPsdReviewCache.delete(embeddedPsdReviewCache.keys().next().value);
+  }
+  embeddedPsdReviewCache.set(cacheKey, summary);
+  return summary;
+}
+
 function bindEmbeddedPsdPackageReviewResources(files, entries) {
   const parsedBySource = new Map();
   entries.forEach((entry, entryIndex) => {
@@ -23647,24 +23832,21 @@ function bindEmbeddedPsdPackageReviewResources(files, entries) {
     const sourcePath = file && (file.parentPsd || file.path);
     if (!sourcePath) return;
 
-    const cacheKey = JSON.stringify({
-      normalizedPath: entry.sourceFingerprint.normalizedPath,
-      source: entry.sourceFingerprint.source,
-    });
+    const cacheKey = getEmbeddedPsdReviewCacheKey(entry.sourceFingerprint);
     let parsed = parsedBySource.get(cacheKey);
     if (!parsed) {
       try {
-        parsed = { psd: readStablePsdForPackageReview(sourcePath, entry.sourceFingerprint) };
+        parsed = { summary: getCachedEmbeddedPsdReviewSummary(sourcePath, entry.sourceFingerprint) };
       } catch (_) {
-        parsed = { psd: null };
+        parsed = { summary: null };
       }
       parsedBySource.set(cacheKey, parsed);
     }
-    if (!parsed.psd) return;
+    if (!parsed.summary) return;
 
-    const match = findEmbeddedPsdLinkedFileMatch(file, parsed.psd.linkedFiles || []);
-    if (!match) return;
-    entry.embeddedResource = getEmbeddedPsdResourceFingerprint(match);
+    const match = findEmbeddedPsdLinkedFileMatch(file, parsed.summary.linkedFiles || []);
+    if (!match || !match.linkedFile.resourceFingerprint) return;
+    entry.embeddedResource = { ...match.linkedFile.resourceFingerprint };
   });
 }
 
@@ -25814,6 +25996,20 @@ async function readReviewedPackageSourceBuffer(sourceHandle, size) {
   return buffer;
 }
 
+async function readReviewedPackageSourceSlice(sourceHandle, startOffset, length) {
+  if (!Number.isSafeInteger(startOffset) || startOffset < 0 || !Number.isSafeInteger(length) || length < 0) {
+    throw new PackageReviewChangedError();
+  }
+  const buffer = Buffer.allocUnsafe(length);
+  let offset = 0;
+  while (offset < length) {
+    const { bytesRead } = await sourceHandle.read(buffer, offset, length - offset, startOffset + offset);
+    if (bytesRead === 0) throw new PackageReviewChangedError();
+    offset += bytesRead;
+  }
+  return buffer;
+}
+
 async function writeEmbeddedPsdAssetToPackage(
   file,
   reviewedSource,
@@ -25823,18 +26019,48 @@ async function writeEmbeddedPsdAssetToPackage(
   materializeBuffer = null,
   rememberDestination = null
 ) {
-  const buf = await withStableReviewedPackageSource(reviewedSource, async (sourceHandle, stat) => {
-    if (stat.size > BigInt(MAX_PARSE_FILE_SIZE)) throw new PackageReviewChangedError();
-    return readReviewedPackageSourceBuffer(sourceHandle, stat.size);
-  });
-  const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true, totalMemoryLimit: -Infinity });
-  const match = findEmbeddedPsdLinkedFileMatch(file, psd.linkedFiles || []);
-  if (!match || !packageReviewFingerprintsMatch(expectedResource, getEmbeddedPsdResourceFingerprint(match))) {
-    throw new PackageReviewChangedError();
+  let data = null;
+  const cacheKey = getEmbeddedPsdReviewCacheKey(reviewedSource?.expectedFingerprint);
+  const cachedSummary = cacheKey ? embeddedPsdReviewCache.get(cacheKey) : null;
+  const cachedEntry = cachedSummary && Number.isInteger(expectedResource?.embeddedIndex)
+    ? cachedSummary.linkedFiles?.[expectedResource.embeddedIndex]
+    : null;
+  if (
+    cachedEntry?.slice &&
+    cachedEntry.slice.byteLength === expectedResource?.size &&
+    cachedEntry.resourceFingerprint &&
+    packageReviewFingerprintsMatch(expectedResource, cachedEntry.resourceFingerprint)
+  ) {
+    const { byteOffset, byteLength } = cachedEntry.slice;
+    const candidate = await withStableReviewedPackageSource(reviewedSource, async (sourceHandle, stat) => {
+      if (stat.size > BigInt(MAX_PARSE_FILE_SIZE)) throw new PackageReviewChangedError();
+      if (BigInt(byteOffset + byteLength) > stat.size) return null;
+      return readReviewedPackageSourceSlice(sourceHandle, byteOffset, byteLength);
+    });
+    if (
+      candidate &&
+      candidate.length === expectedResource.size &&
+      crypto.createHash('sha256').update(candidate).digest('hex') === expectedResource.sha256 &&
+      getPackageContentFingerprint(candidate) === expectedResource.contentFingerprint
+    ) {
+      data = candidate;
+    }
+  }
+
+  if (!data) {
+    const buf = await withStableReviewedPackageSource(reviewedSource, async (sourceHandle, stat) => {
+      if (stat.size > BigInt(MAX_PARSE_FILE_SIZE)) throw new PackageReviewChangedError();
+      return readReviewedPackageSourceBuffer(sourceHandle, stat.size);
+    });
+    const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true, totalMemoryLimit: -Infinity });
+    const match = findEmbeddedPsdLinkedFileMatch(file, psd.linkedFiles || []);
+    if (!match || !packageReviewFingerprintsMatch(expectedResource, getEmbeddedPsdResourceFingerprint(match))) {
+      throw new PackageReviewChangedError();
+    }
+    data = Buffer.from(match.linkedFile.data);
   }
 
   verifyWrite(finalPath);
-  const data = Buffer.from(match.linkedFile.data);
   if (typeof materializeBuffer === 'function') {
     await materializeBuffer(finalPath, data, OWNER_ONLY_FILE_MODE);
   } else {
@@ -27218,7 +27444,10 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
   const limitResult = getPackageLimitResult();
   if (limitResult) return limitResult;
 
+  const packageStartedAt = Date.now();
+  const manifest1StartedAt = Date.now();
   const manifest = await buildCanonicalPackageReviewManifest(id);
+  const manifest1ElapsedMs = Math.max(0, Date.now() - manifest1StartedAt);
   if (manifest.error) return { error: manifest.error };
   if (!manifest.materializable) {
     return { error: 'package_review_changed', review: await createUnavailablePackageReview(id, manifest) };
@@ -27244,6 +27473,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
   }
   const project = manifest.project;
   const packageFiles = manifest.files;
+  const openSourcesStartedAt = Date.now();
   try {
     reviewedPackageSources = await openReviewedPackageSources(packageFiles, manifest.entries);
   } catch (error) {
@@ -27253,6 +27483,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
     }
     throw error;
   }
+  const openSourcesElapsedMs = Math.max(0, Date.now() - openSourcesStartedAt);
   if (!isPackageActivationCurrent()) throw new PackageReviewChangedError();
 
   const currentDestination = inspectPrivatePackageDestination(
@@ -27322,6 +27553,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
         })),
     ].sort((left, right) => left.entryIndex - right.entryIndex);
 
+    const materializeStartedAt = Date.now();
     for (const plannedOutput of plannedDesignOutputs) {
       const file = packageFiles[plannedOutput.entryIndex];
       const manifestEntry = manifest.entries[plannedOutput.entryIndex];
@@ -27553,8 +27785,13 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
           : packageWrites.materializeDirectBuffer(diagnosticPath, data, OWNER_ONLY_FILE_MODE);
       });
     }
+    const materializeElapsedMs = Math.max(0, Date.now() - materializeStartedAt);
+    const captureTreeStartedAt = Date.now();
     const stagedTreeSnapshot = packageWrites.captureTree();
+    const captureTreeElapsedMs = Math.max(0, Date.now() - captureTreeStartedAt);
+    const manifest2StartedAt = Date.now();
     const finalManifest = await buildCanonicalPackageReviewManifest(id);
+    const manifest2ElapsedMs = Math.max(0, Date.now() - manifest2StartedAt);
     if (
       finalManifest.error ||
       !finalManifest.materializable ||
@@ -27566,8 +27803,18 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
     if (!isPackageActivationCurrent()) throw new PackageReviewChangedError();
     reviewedPackageSources.assertCurrent();
     packageWrites.assertRoot();
+    const publishStartedAt = Date.now();
     publishPrivatePackageDestination(packageDestination, stagedTreeSnapshot);
+    const publishElapsedMs = Math.max(0, Date.now() - publishStartedAt);
     packageWrites.adoptPublishedRoot(packageDestination.destFolder);
+    if ((process.versions && process.versions.electron) || process.env.CRATE_LOG_PACKAGE_TIMING === '1') {
+      console.log(
+        `[crate][package-timing] phase=package manifest1Ms=${manifest1ElapsedMs} openSourcesMs=${openSourcesElapsedMs} ` +
+        `materializeMs=${materializeElapsedMs} captureTreeMs=${captureTreeElapsedMs} manifest2Ms=${manifest2ElapsedMs} ` +
+        `publishMs=${publishElapsedMs} totalMs=${Math.max(0, Date.now() - packageStartedAt)} ` +
+        `copied=${copiedCount} embedded=${embeddedCount}`
+      );
+    }
 
     persistPackageCompletion(id, {
       destFolder,
@@ -27717,6 +27964,8 @@ registerTrustedIpcHandler('projects:delete', (event, id) => {
     return projects;
   });
   if (removed) {
+    clearFileVisualProjectCache();
+    try { store?.clearStatCache?.('raster-thumb'); } catch (_) {}
     scheduleProjectCacheCleanup({
       projectIds: [id],
       removeOrphans: false,
@@ -27785,6 +28034,7 @@ registerTrustedIpcHandler('projects:delete-all', () => {
   assetBaselineScans.clear();
 
   clearFileVisualProjectCache();
+  try { store?.clearStatCache?.(); } catch (_) {}
   store.set('projects', []);
   if (projectCacheIds !== null) {
     scheduleProjectCacheCleanup({
