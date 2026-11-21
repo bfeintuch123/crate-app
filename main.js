@@ -86,6 +86,7 @@ const {
 const { runBoundedAddFilesScan } = require('./parsers/add-files-operation');
 const { REGEX_SOURCE_EXTENSIONS } = require('./parsers/add-files-regex-worker');
 const { extractLinkedAssetPaths } = require('./parsers/linked-asset-matcher');
+const { createEmbeddedDocumentClassifier, inspectPsdLinkFraming, isProvenEmbeddedDocumentBytes } = require('./parsers/add-files-psd-worker');
 const { decodeXMLPath, fileUriToPath } = require('./parsers/xml-path');
 startupPhaseJournal.mark('dependencies-loaded');
 
@@ -14333,7 +14334,7 @@ function isIllustratorScopedFileAllowed(project, fileEntry, observation = {}) { 
 function getScopedRecordAppFamily(value) { const normalized = normalizeLiveCaptureReason(value, ''); if (!normalized) return null; if (CAPTURE_SOURCE_APP_FAMILY.has(normalized)) return CAPTURE_SOURCE_APP_FAMILY.get(normalized); if (normalized === 'illustrator' || normalized.startsWith('ai-') || normalized.includes('illustrator')) return 'illustrator'; if (normalized === 'photoshop' || normalized.startsWith('psd-') || normalized.startsWith('ps-') || normalized.includes('photoshop')) return 'photoshop'; if (normalized === 'indesign' || normalized.startsWith('indd-') || normalized.includes('indesign')) return 'indesign'; if (normalized === 'figma' || normalized.startsWith('fig-') || normalized.includes('figma')) return 'figma'; if (normalized.includes('powerpoint') || normalized.includes('keynote') || normalized.includes('presentation')) return 'presentation'; if (normalized === 'generic' || normalized.startsWith('lastused-') || normalized === 'manual-browse' || normalized === 'lsof') return 'generic'; return null; } function getScopedRecordFamilies(record) { const values = [record?.appFamily, record?.source, record?.explicitUserAuthority?.source, record?.captureEvidence?.appFamily, record?.captureEvidence?.source, record?.captureEvidence?.observerMethod, record?.latest?.appFamily, record?.latest?.source, record?.latest?.observerMethod, record?.observer?.appFamily, record?.observer?.method, record?.payload?.appFamily, record?.payload?.source, record?.payload?.authoritySource, record?.payload?.observer?.method]; return new Set(values.map(getScopedRecordAppFamily).filter(Boolean)); }
 const SCOPED_PRIMARY_PATH_FIELDS = ['path', 'filePath', 'localPath', 'normalizedPath']; function isScopedRecord(value) { return isRecord(value) && ['id', 'fileId', 'evidenceKey', 'path', 'source', 'appFamily', 'captureEvidence', 'latest', 'observer', 'relationType', 'subjectNodeId', 'objectNodeId', 'type'].some(key => Object.prototype.hasOwnProperty.call(value, key)); } function scopedRecordIdentities(entry) { const item = entry.item, ids = [item.id, item.fileId, item.evidenceKey]; if (!Array.isArray(entry.parent) && typeof entry.key === 'string' && !['captureEvidence', 'latest', 'observer', 'payload', 'metadata'].includes(entry.key)) ids.push(entry.key); return ids.filter(value => typeof value === 'string'); } function scopedRecordPrimaryPath(record, key, nodePaths, ledgerPaths) { const values = [...SCOPED_PRIMARY_PATH_FIELDS.map(field => record?.[field]), ...SCOPED_PRIMARY_PATH_FIELDS.map(field => record?.latest?.[field]), ...SCOPED_PRIMARY_PATH_FIELDS.map(field => record?.payload?.[field])]; for (const value of values) { const normalized = typeof value === 'string' && (path.isAbsolute(value) || /normalizedPath/.test(key || '')) ? normalizeTrackedFilePath(value) : null; if (normalized) return normalized; } return ledgerPaths.get(key) || nodePaths.get(record?.objectNodeId) || (typeof key === 'string' && path.isAbsolute(key) ? normalizeTrackedFilePath(key) : null); }
 function scopedRecordReferencesHidden(value, info, hiddenPaths, hiddenIds, nodePaths) { const ancestors = new Set(); let visited = 0; const visit = (item, key = '') => { if (++visited > 50000) return true; if (typeof item === 'string') { if (hiddenIds.has(item)) return true; const nodePath = /NodeId$/i.test(key) ? nodePaths.get(item) : null, normalized = (path.isAbsolute(item) || /paths?$/i.test(key)) ? normalizeTrackedFilePath(item) : null, deniedPath = nodePath || (normalized && hiddenPaths.has(normalized) ? normalized : null); return !!deniedPath && !(info.authorized && info.primaryPath === deniedPath); } if (!Array.isArray(item) && !isRecord(item)) return false; if (ancestors.has(item)) return true; ancestors.add(item); try { for (const childKey of Object.keys(item)) if (visit(item[childKey], childKey)) return true; return false; } catch (_) { return true; } finally { ancestors.delete(item); } }; return visit(value); }
-function getIllustratorScopedProjectView(project) { if (!project) return project; const scope = getIllustratorActivationScope(project.id), hiddenPaths = new Set(scope ? [...scope.baselineDocumentPaths, ...scope.excludedLinkedPaths] : []), hiddenPendingPaths = new Set(), stalePendingFiles = new Set(), scopeAllowedPaths = new Set(); for (const file of [...(project.files || []), ...(project.pendingFiles || [])]) { const filePath = normalizeTrackedFilePath(file?.path); if ((project.pendingFiles || []).includes(file) && !isCurrentWatchSessionPendingFile(project, file)) { hiddenPaths.add(filePath); hiddenPendingPaths.add(filePath); stalePendingFiles.add(file); } else if (!isIllustratorScopedFileAllowed(project, file)) hiddenPaths.add(filePath); else if (hiddenPaths.has(filePath) && !hiddenPendingPaths.has(filePath) && getScopedFileAppFamily(project, file) === 'illustrator') scopeAllowedPaths.add(filePath); } hiddenPaths.delete(null); if (!hiddenPaths.size) return project;
+function getIllustratorScopedProjectView(project) { if (!project) return project; if (project.retiredEmbeddedDocuments !== undefined) { const { retiredEmbeddedDocuments: _retired, ...visible } = project; return getIllustratorScopedProjectView(visible); } const scope = getIllustratorActivationScope(project.id), hiddenPaths = new Set(scope ? [...scope.baselineDocumentPaths, ...scope.excludedLinkedPaths] : []), hiddenPendingPaths = new Set(), stalePendingFiles = new Set(), scopeAllowedPaths = new Set(); for (const file of [...(project.files || []), ...(project.pendingFiles || [])]) { const filePath = normalizeTrackedFilePath(file?.path); if ((project.pendingFiles || []).includes(file) && !isCurrentWatchSessionPendingFile(project, file)) { hiddenPaths.add(filePath); hiddenPendingPaths.add(filePath); stalePendingFiles.add(file); } else if (!isIllustratorScopedFileAllowed(project, file)) hiddenPaths.add(filePath); else if (hiddenPaths.has(filePath) && !hiddenPendingPaths.has(filePath) && getScopedFileAppFamily(project, file) === 'illustrator') scopeAllowedPaths.add(filePath); } hiddenPaths.delete(null); if (!hiddenPaths.size) return project;
   const nodePaths = new Map(), ledgerPaths = new Map(); for (const hiddenPath of hiddenPaths) { nodePaths.set(createNodeId(NODE_TYPES.FILE, { normalizedPath: hiddenPath }), hiddenPath); const ledgerId = getLiveEvidenceKeyHash(hiddenPath); if (ledgerId) ledgerPaths.set(ledgerId, hiddenPath); } for (const [id, node] of Object.entries(project.provenance?.nodes || {})) { const nodePath = normalizeTrackedFilePath(node?.path || node?.normalizedPath); if (hiddenPaths.has(nodePath)) { nodePaths.set(id, nodePath); if (typeof node?.id === 'string') nodePaths.set(node.id, nodePath); } }
   const hiddenEntries = new WeakMap(), records = [], infos = [], infoByObject = new WeakMap(), markHidden = (parent, key) => { if (!parent) return false; let keys = hiddenEntries.get(parent); if (!keys) hiddenEntries.set(parent, keys = new Set()); const fresh = !keys.has(key); keys.add(key); return fresh; }, isHidden = (parent, key) => !!hiddenEntries.get(parent)?.has(key); let collected = 0; const collect = (value, parent, key, ancestors) => { if (!Array.isArray(value) && !isRecord(value)) return; if (++collected > 50000 || ancestors.has(value)) { markHidden(parent, key); return; } if (isScopedRecord(value)) records.push({ item: value, parent, key }); ancestors.add(value); try { for (const [childKey, child] of Object.entries(value)) { if (path.isAbsolute(childKey) && hiddenPaths.has(normalizeTrackedFilePath(childKey))) markHidden(value, childKey); else collect(child, value, childKey, ancestors); } } catch (_) { markHidden(parent, key); } finally { ancestors.delete(value); } }; for (const [key, value] of Object.entries(project)) collect(value, project, key, new Set());
   for (const entry of records) { const families = getScopedRecordFamilies(entry.item); if ((project.files || []).includes(entry.item) || (project.pendingFiles || []).includes(entry.item)) { const family = getScopedFileAppFamily(project, entry.item); if (family) families.add(family); } const info = { families, primaryPath: scopedRecordPrimaryPath(entry.item, entry.key, nodePaths, ledgerPaths), authorized: false, entry }; infos.push(info); infoByObject.set(entry.item, info); } const allowedPaths = new Set(scopeAllowedPaths); for (const info of infos) if (!stalePendingFiles.has(info.entry.item) && hiddenPaths.has(info.primaryPath) && !info.families.has('illustrator') && (info.families.size || isExplicitUserCapturedFile(info.entry.item))) allowedPaths.add(info.primaryPath); for (const info of infos) info.authorized = !stalePendingFiles.has(info.entry.item) && allowedPaths.has(info.primaryPath) && ((scopeAllowedPaths.has(info.primaryPath) && info.families.size === 1 && info.families.has('illustrator')) || (!info.families.has('illustrator') && info.families.size > 0) || isExplicitUserCapturedFile(info.entry.item) || (info.entry.item.type === NODE_TYPES.FILE && info.families.size === 0));
@@ -15835,7 +15836,8 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
           || !item.layerPath.every(validInteger) || !layerPaths.has(item.layerPath.join('/'))))
         || typeof item.dataPresent !== 'boolean' || !validInteger(item.byteLength)
         || item.byteLength > MAX_PARSE_FILE_SIZE
-        || (item.dataPresent ? item.embeddedIndex !== metadataEmbeddedCount : (item.embeddedIndex !== null || item.byteLength !== 0))) invalid();
+        || (item.dataPresent ? item.embeddedIndex !== metadataEmbeddedCount : (item.embeddedIndex !== null || item.byteLength !== 0))
+        || (item.selfContained !== undefined && (item.selfContained !== true || !item.dataPresent))) invalid();
       linkedFileCount++;
       if (item.dataPresent) metadataEmbeddedCount++;
     } else if (item.origin === 'media-reference') {
@@ -16116,7 +16118,21 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
       pendingIO = consume(message);
       return pendingIO;
     },
-    promote(reservation = null) {
+    // This read's embedded objects with what is now known about their bytes.
+    describeEmbeddedRecords() {
+      const embeddedRecords = linkedMetadata.filter(item => item.origin === 'linked-file' && item.dataPresent);
+      return stages.map((stage, ordinal) => {
+        const item = embeddedRecords[ordinal];
+        return { stage, proven: item.selfContained === true, layerPath: item.layerPath,
+          linkedIndex: linkedMetadata.filter(candidate => candidate.origin === 'linked-file' && candidate.index < item.index &&
+            JSON.stringify(candidate.layerPath) === JSON.stringify(item.layerPath)).length,
+          originalName: stage.embeddedOriginalName, producerId: typeof item.metadata.id === 'string' ? item.metadata.id : null,
+          outputDigest: stage.outputDigest, byteLength: stage.byteLength };
+      });
+    },
+    // `omitted` stages stay temporary: they keep their ordinal and reserved name
+    // so no other output changes, and finish() removes them.
+    promote(reservation = null, omitted = null) {
       check();
       // Another file's output name is never taken by this file, whether or not
       // its cached file exists. A missing output of this file whose row carries
@@ -16131,6 +16147,7 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
         const available = new Map([...(chosenMissing || [])].filter(([name]) => !otherFileNames?.has(name)));
         for (const name of reserved) usedNames.add(name);
         for (const stage of stages) {
+          if (omitted?.has(stage)) continue;
           let target = null;
           for (const [name, chosen] of available) {
             if (chosen.outputDigest !== stage.outputDigest || chosen.originalName !== stage.embeddedOriginalName) continue;
@@ -16143,6 +16160,7 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
         }
       }
       for (const stage of stages) {
+        if (omitted?.has(stage)) { stage.omitted = true; continue; }
         promoteEmbeddedPsdStage(stage, extractDir, usedNames, () => {
           check();
           ownedPath(stage, stage.stagedPath);
@@ -16153,23 +16171,24 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
         if (ownedPath(stage, stage.extractPath).size !== stage.byteLength) invalid();
       }
       const embeddedRecords = linkedMetadata.filter(item => item.origin === 'linked-file' && item.dataPresent);
-      return stages.map((stage, ordinal) => {
+      return stages.flatMap((stage, ordinal) => {
+        if (stage.omitted) return [];
         const item = embeddedRecords[ordinal];
         // Transfer ordinal, concatenated record index and per-layer locator are
         // separate domains. Only metadata already bound to this output is used.
         const localIndex = linkedMetadata.filter(candidate => candidate.origin === 'linked-file' &&
           candidate.index < item.index && JSON.stringify(candidate.layerPath) === JSON.stringify(item.layerPath)).length;
-        return { filePath: stage.extractPath, source: 'psd-embedded',
+        return [{ filePath: stage.extractPath, source: 'psd-embedded',
           embeddedOriginalName: stage.embeddedOriginalName, embeddedIndex: stage.embeddedIndex,
           sourceDigest, outputDigest: stage.outputDigest,
           psdResource: { version: 1, producerId: typeof item.metadata.id === 'string' && item.metadata.id.length <= 512
             ? item.metadata.id : null, layerPath: item.layerPath, linkedIndex: localIndex,
-            originalName: stage.embeddedOriginalName, sourceDigest, outputDigest: stage.outputDigest } };
+            originalName: stage.embeddedOriginalName, sourceDigest, outputDigest: stage.outputDigest } }];
       });
     },
     assertReady() {
       check();
-      for (const stage of stages) if (ownedPath(stage, stage.extractPath).size !== stage.byteLength) invalid();
+      for (const stage of stages) if (!stage.omitted && ownedPath(stage, stage.extractPath).size !== stage.byteLength) invalid();
     },
     accept(project) {
       // Deduplication can discard a new row. Keep only files actually retained
@@ -16619,6 +16638,214 @@ async function extractLinkedAssetsPhotoshop(filePath, options = {}) {
  * Complements the AppleScript/do-javascript approach — works even when
  * Photoshop is not running.
  */
+// A proven self-contained embedded Photoshop document is part of its PSD, not a
+// separate asset. One scan object follows one validated read of one PSD: it says
+// which objects get no output or row, and which existing rows leave membership.
+// A retired row is kept verbatim on the project, inside the same write that
+// publishes the scan, and nothing on disk is removed.
+const EMBEDDED_DOCUMENT_RETIREMENT_REASON = 'proven-self-contained-embedded-document';
+
+function getRetiredEmbeddedDocumentEntries(project) {
+  const record = project?.retiredEmbeddedDocuments;
+  if (record === undefined) return [];
+  return record && record.version === 1 && Array.isArray(record.entries) ? record.entries : null;
+}
+
+// What this row itself records, read as packaging reads it. 'excluded' means
+// packaging leaves this row out; 'kept' is any other recorded decision, including
+// an exclusion record packaging does not act on; null is no decision. One row's
+// choice is never lent to another.
+function getEmbeddedRowOwnerChoice(project, row, context) {
+  const logical = isScanOnSaveEmbeddedPsdFile(row);
+  const decided = ['individualContentInclude', 'keptAfterSourceExclusion', 'individualChoiceReview', 'explicitUserAuthority',
+    'existingIncludeEpisode', 'presentationChoiceSuperseded'].some(field => row[field] !== undefined);
+  if (decided || row.acceptedPending === true || isExplicitUserCapturedFile(row) ||
+      row.captureEvidence?.explicitUserAdd || row.captureEvidence?.acceptedPending) return 'kept';
+  context.records ||= getOwnerAcceptanceRecords(project);
+  const node = createNodeId(NODE_TYPES.FILE, { normalizedPath: normalizeTrackedFilePath(logical ? row.parentPsd || row.path : row.path) });
+  if (logical ? context.records.logicalChildAccepted.has(node) : context.records.accepted.has(node) || context.records.bulk.has(node)) return 'kept';
+  context.ownerState ??= JSON.stringify([project.workingSourceSelections, project.workingFileChoices, project.workingSourceRecovery,
+    project.workingSourceRecoveryGuards, project.workingSourceContinuations]) || '';
+  const routeKey = getAssetBaselineSourceRecoveryRouteKey(project, row);
+  if ((routeKey && context.ownerState.includes(routeKey)) || (!logical && context.ownerState.includes(JSON.stringify(row.path)))) return 'kept';
+  if (isAssetReviewFileExcluded(project, row)) {
+    context.membership ||= getWorkingSourceMembership(project);
+    return context.membership.facts.get(getTrackedFileDedupKey(row))?.includedAsDependency ? 'kept' : 'excluded';
+  }
+  context.excludedKeys ||= new Set(project.excludedAssetKeys || []);
+  context.excludedPaths ||= new Set([...context.excludedKeys].filter(value => typeof value === 'string' && path.isAbsolute(value))
+    .map(normalizeTrackedFilePath));
+  context.pendingExclusions ||= new Set(readExcludedPendingRecords(project).records.map(getTrackedFileDedupKey));
+  return row.individualContentExclusion !== undefined || context.pendingExclusions.has(getTrackedFileDedupKey(row)) ||
+    (!logical && (context.excludedKeys.has(row.path) || context.excludedPaths.has(normalizeTrackedFilePath(row.path)))) ? 'kept' : null;
+}
+
+function createEmbeddedDocumentScan(projectId, psdFilePath, isCurrent) {
+  const parentKey = normalizeTrackedFilePath(psdFilePath);
+  // A record its producer no longer claims still names this PSD: such a row counts
+  // for its object, and can never retire.
+  const isOwnReceipt = receipt => receipt?.version === 1 &&
+    typeof receipt.parentPath === 'string' && normalizeTrackedFilePath(receipt.parentPath) === parentKey;
+  const isLogicalChild = row => isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.parentPsd || row.path) === parentKey;
+  const samePlace = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+  const fingerprintOf = record => `${record.byteLength}:${record.outputDigest}`;
+  const effectiveChoice = (project, row, collection, context) =>
+    getEmbeddedRowOwnerChoice(project, row, context) || (collection === 'pendingFiles' ? 'kept' : null);
+
+  // The objects of this read a row of this PSD can stand for: a cache output and
+  // a logical save row of one object are the same object. An exact match decides
+  // alone; otherwise every object sharing its place, bytes or producer counts, and
+  // more than one is ambiguous. Null means the row is not of this PSD.
+  function objectsOfRow(row, records) {
+    const isOutput = row.source === 'psd-embedded';
+    const receipt = isOutput ? row.psdExtractionReceipt || row.psdResource : null;
+    if (isOutput ? !isOwnReceipt(receipt) : !isLogicalChild(row)) return null;
+    const named = records.filter(record => record.originalName === (isOutput ? receipt.originalName : row.embeddedOriginalName));
+    const isAtPlace = record => (isOutput
+      ? record.linkedIndex === receipt.linkedIndex && samePlace(record.layerPath, receipt.layerPath)
+      : record.layerPath === null && record.linkedIndex === row.embeddedIndex);
+    const hasBytes = record => (isOutput ? record.outputDigest === receipt.outputDigest
+      : [row.embeddedContentFingerprint, row.individualContentExclusion, row.individualContentInclude].includes(fingerprintOf(record)));
+    const exact = named.filter(record => isAtPlace(record) && hasBytes(record));
+    if (exact.length === 1) return exact;
+    const producerId = isOutput && receipt.producerId;
+    const isProducer = record => !!producerId && record.producerId === producerId &&
+      records.filter(item => item.producerId === producerId).length === 1;
+    return named.filter(record => isAtPlace(record) || hasBytes(record) || isProducer(record));
+  }
+
+  async function isProvenCachedRow(row, receipt, provenDigests, directory) {
+    const found = fs.lstatSync(row.path);
+    if (found.size > MAX_PARSE_FILE_SIZE) return null;
+    const snapshot = await readPsdBaselineSnapshot(row.path, isCurrent, directory);
+    if (snapshot.digest !== receipt.outputDigest) return null;
+    if (!provenDigests.has(snapshot.digest)) {
+      const bytes = await fs.promises.readFile(row.path);
+      if (!isCurrent() || crypto.createHash('sha256').update(bytes).digest('hex') !== snapshot.digest ||
+          !isProvenEmbeddedDocumentBytes(bytes)) return null;
+    }
+    assertPsdBaselineSnapshot(snapshot);
+    return snapshot;
+  }
+
+  const scan = {
+    plan: null,
+    classify(psd, buffer) {
+      return createEmbeddedDocumentClassifier(psd, () => inspectPsdLinkFraming(buffer));
+    },
+    // `records` are this read's embedded objects. Each proven object is decided
+    // once, from all of its rows of either kind.
+    async prepare(records) {
+      const project = getProjects().find(item => item.id === projectId);
+      const plan = { retire: [], retiringKeys: new Set(), ignoredRowKeys: new Set(), omitted: new Set(), records };
+      scan.plan = plan;
+      if (!project) return plan;
+      const context = {}, members = [];
+      for (const collection of ['files', 'pendingFiles']) for (const row of project[collection] || []) members.push({ row, collection });
+      const pathCounts = new Map();
+      for (const { row } of members) { const key = normalizeTrackedFilePath(row.path); pathCounts.set(key, (pathCounts.get(key) || 0) + 1); }
+      const canRetire = getRetiredEmbeddedDocumentEntries(project) !== null;
+      const provenDigests = new Set(records.filter(record => record.proven).map(record => record.outputDigest));
+      const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + projectId);
+      let directory = null;
+      try { directory = captureCacheDirectoryIdentity(extractDir, 'psd-extract-directory'); } catch (_) {}
+      const parentRow = (project.files || []).find(row => !isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.path) === parentKey);
+      const parentRecordKey = parentRow ? getAssetBaselineSourceRecoveryRouteKey(project, parentRow) : null;
+      const isNamedElsewhere = row => Object.entries(project.workingSourceVerification || {}).some(([key, record]) => key !== parentRecordKey &&
+        [...(record?.requiredEmbeddedOutputs || []), ...(record?.requiredReferences || [])]
+          .some(ref => normalizeTrackedFilePath(ref?.path) === normalizeTrackedFilePath(row.path)));
+      const choices = new Map(), objectsByRow = new Map(), retirable = new Map();
+      const rowsByObject = new Map(records.map(record => [record, []]));
+      for (const member of members) {
+        const { row, collection } = member, objects = objectsOfRow(row, records);
+        if (!objects) continue;
+        objectsByRow.set(row, objects);
+        for (const record of objects) rowsByObject.get(record).push(row);
+        // A row still waiting in review has no decision yet: it stays, and so does
+        // its object's handling.
+        const choice = effectiveChoice(project, row, collection, context);
+        choices.set(row, choice);
+        if (choice || !canRetire || objects.length > 1 || objects.some(record => !record.proven)) continue;
+        if (row.source !== 'psd-embedded') {
+          if (objects.length === 1 && row.embeddedContentFingerprint === fingerprintOf(objects[0])) retirable.set(row, { collection, snapshot: null, receipt: null });
+          continue;
+        }
+        const receipt = row.psdExtractionReceipt || row.psdResource, evidence = row.captureEvidence || {};
+        if (receipt.current === false) continue;
+        const relationship = [row.assetBaselineSourcePath, evidence.relationshipSourcePath, evidence.sourceDocumentPath, ...(row.dependencyOwners || [])];
+        if (!directory || !isDirectCacheChild(extractDir, row.path) || pathCounts.get(normalizeTrackedFilePath(row.path)) !== 1 ||
+            !/^[a-f0-9]{64}$/.test(receipt.outputDigest || '') || typeof receipt.originalName !== 'string' ||
+            relationship.some(value => value !== undefined && value !== null && normalizeTrackedFilePath(value) !== parentKey) ||
+            isNamedElsewhere(row)) continue;
+        try {
+          await new Promise(resolve => setImmediate(resolve));
+          if (!isCurrent()) return plan;
+          const snapshot = await isProvenCachedRow(row, receipt, provenDigests, directory);
+          if (snapshot) retirable.set(row, { collection, snapshot, receipt });
+        } catch (_) { if (!isCurrent()) return plan; }
+      }
+      const retire = (row, record) => {
+        const { collection, snapshot, receipt } = retirable.get(row);
+        plan.retire.push({ collection, json: JSON.stringify(row), snapshot, receipt, record, key: getTrackedFileDedupKey(row),
+          reason: EMBEDDED_DOCUMENT_RETIREMENT_REASON });
+        plan.retiringKeys.add(getTrackedFileDedupKey(row));
+      };
+      for (const record of records.filter(item => item.proven)) {
+        const rows = rowsByObject.get(record);
+        // Anything but an exclusion or a retirable row keeps the object's complete
+        // handling, so a kept row never loses its bytes.
+        if (rows.some(row => objectsByRow.get(row).length > 1 || choices.get(row) === 'kept' ||
+            (!choices.get(row) && !retirable.has(row)))) continue;
+        plan.omitted.add(record);
+        for (const row of rows) {
+          if (choices.get(row) === 'excluded') plan.ignoredRowKeys.add(getTrackedFileDedupKey(row));
+          else retire(row, record);
+        }
+      }
+      // An output of an object this PSD no longer holds is judged by its own bytes.
+      for (const row of retirable.keys()) if (!objectsByRow.get(row).length) retire(row, null);
+      for (const key of plan.retiringKeys) plan.ignoredRowKeys.add(key);
+      return plan;
+    },
+    hasRetirements() { return !!scan.plan?.retire.length; },
+    isIgnoredRow(row) { return !!scan.plan?.ignoredRowKeys.has(getTrackedFileDedupKey(row)); },
+    // Runs inside the writer that publishes the scan. Each row is checked again
+    // against this canonical read; one that changed simply stays.
+    apply(project) {
+      const plan = scan.plan, entries = getRetiredEmbeddedDocumentEntries(project);
+      if (!plan?.retire.length || !entries) return 0;
+      const context = {}, retired = [], byJson = new Map(), keptObjects = new Set();
+      for (const collection of ['files', 'pendingFiles']) for (const row of project[collection] || []) {
+        byJson.set(collection + '\0' + JSON.stringify(row), row);
+        const objects = objectsOfRow(row, plan.records);
+        if (objects?.length && effectiveChoice(project, row, collection, context) === 'kept') for (const record of objects) keptObjects.add(record);
+      }
+      for (const item of plan.retire) {
+        const row = byJson.get(item.collection + '\0' + item.json);
+        if (!row || keptObjects.has(item.record) || getEmbeddedRowOwnerChoice(project, row, context)) continue;
+        try { if (item.snapshot) assertPsdBaselineSnapshot(item.snapshot); } catch (_) { continue; }
+        project[item.collection].splice(project[item.collection].indexOf(row), 1);
+        retired.push({ row, parentPath: psdFilePath, reason: item.reason, retiredAt: Date.now() });
+      }
+      if (!retired.length) return 0;
+      const known = new Set(entries.map(entry => JSON.stringify([entry?.row, entry?.parentPath])));
+      project.retiredEmbeddedDocuments = { version: 1, entries: [...entries,
+        ...retired.filter(entry => !known.has(JSON.stringify([entry.row, entry.parentPath])))] };
+      // The same write stops this PSD's stored record naming what just left.
+      const paths = new Set(retired.map(entry => normalizeTrackedFilePath(entry.row.path)));
+      const parentRow = (project.files || []).find(row => !isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.path) === parentKey);
+      const recordKey = parentRow && getAssetBaselineSourceRecoveryRouteKey(project, parentRow);
+      const record = recordKey && project.workingSourceVerification?.[recordKey];
+      if (Array.isArray(record?.requiredEmbeddedOutputs)) {
+        project.workingSourceVerification[recordKey] = { ...record,
+          requiredEmbeddedOutputs: record.requiredEmbeddedOutputs.filter(output => !paths.has(normalizeTrackedFilePath(output?.path))) };
+      }
+      return retired.length;
+    },
+  };
+  return scan;
+}
+
 // A concurrent reader must not clear a hold for an output whose repair owner
 // can still discard it before caller acceptance. This set grants no authority.
 const pendingPsdRepairs = new Set();
@@ -16636,6 +16863,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
     }
     let psd = null;
     let sourceDigest = null;
+    let isProvenEmbeddedRecord = null;
     let workerResult = options.validatedPsdResult || null;
     if (workerResult) {
       const expectedIdentity = options.validatedPsdSourceIdentity || workerResult.sourceIdentity;
@@ -16651,6 +16879,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       if (!isCurrent()) return [];
       psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true, totalMemoryLimit: -Infinity });
       sourceDigest = crypto.createHash('sha256').update(buf).digest('hex');
+      isProvenEmbeddedRecord = options.embeddedDocuments?.classify(psd, buf) || null;
     }
     const discoveredPaths = [];
 
@@ -16696,7 +16925,14 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         return getChosenMissingPsdOutputs(getProjects().find(project => project.id === projectId), psdFilePath, extractDir,
           name => (listing ??= listNames()).has(name));
       };
-      const promoted = workerResult.transaction.promote(reservation);
+      let omittedStages = null;
+      if (options.embeddedDocuments) {
+        const records = workerResult.transaction.describeEmbeddedRecords();
+        const plan = await options.embeddedDocuments.prepare(records);
+        if (!isCurrent()) return [];
+        omittedStages = new Set(records.filter(record => plan.omitted.has(record)).map(record => record.stage));
+      }
+      const promoted = workerResult.transaction.promote(reservation, omittedStages);
       for (const output of promoted) if (output.source === 'psd-embedded' && typeof output.outputDigest === 'string') {
         notePsdOutputWritten(output.filePath, psdFilePath, output.outputDigest);
       }
@@ -16755,7 +16991,19 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           if (chosen.outputDigest !== outputDigest || chosen.originalName !== (lf.name || '')) continue;
           chosenMissing.delete(name); chosenName = chosen.name; break;
         }
-        embeddedRecords.push({ lf, embeddedIndex, outputDigest, matches, chosenName, byteLength: data.length });
+        embeddedRecords.push({ lf, embeddedIndex, outputDigest, matches, chosenName, byteLength: data.length,
+          proven: isProvenEmbeddedRecord?.(lf) === true, linkedIndex: embeddedIndex, layerPath: null,
+          originalName: lf.name || '', producerId: typeof lf.id === 'string' ? lf.id : null });
+      }
+      if (options.embeddedDocuments) {
+        const plan = await options.embeddedDocuments.prepare(embeddedRecords);
+        if (!isCurrent()) return [];
+        const isRetiring = row => plan.retiringKeys.has(normalizeTrackedFilePath(row.path));
+        for (let index = priorEmbeddedRows.length - 1; index >= 0; index--) if (isRetiring(priorEmbeddedRows[index])) priorEmbeddedRows.splice(index, 1);
+        for (const record of embeddedRecords) {
+          record.omit = plan.omitted.has(record);
+          if (!record.omit) record.matches = record.matches.filter(row => !isRetiring(row));
+        }
       }
       // Rows of this file without an individual choice whose cached file holds
       // one of this file's current objects (same original name) while their
@@ -16777,7 +17025,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           if (rerecorded.has(row) || !receipt || row.psdResource || receipt.version !== 1 || receipt.current === false ||
               receipt.layerPath !== null || !isDirectCacheChild(extractDir, row.path) ||
               (onlyPaths && !onlyPaths.has(normalizeTrackedFilePath(row.path)))) continue;
-          const candidates = embeddedRecords.filter(record => !record.repairOnly &&
+          const candidates = embeddedRecords.filter(record => !record.repairOnly && !record.omit &&
             (record.lf.name || '') === receipt.originalName && record.outputDigest !== receipt.outputDigest);
           if (!candidates.length ||
               normalizeTrackedFilePath(receipt.parentPath) !== (psdKey ??= normalizeTrackedFilePath(psdFilePath)) ||
@@ -16818,7 +17066,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       if (!options.onOwnedPsdOutputs && priorEmbeddedRows.length) {
         const examined = new Set(embeddedRecords.flatMap(record => record.matches));
         let psdKey = null;
-        for (const record of [...embeddedRecords]) for (const row of priorEmbeddedRows) {
+        for (const record of embeddedRecords.filter(item => !item.omit)) for (const row of priorEmbeddedRows) {
           const receipt = row.psdExtractionReceipt || row.psdResource;
           if (examined.has(row) || receipt?.version !== 1 || receipt.current === false || receipt.layerPath !== null ||
               receipt.outputDigest !== record.outputDigest || receipt.originalName !== (record.lf.name || '') ||
@@ -16968,8 +17216,17 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         } catch (_) { return null; }
       };
       let baselineEmbeddedOrdinal = 0;
-      for (const { lf, embeddedIndex, outputDigest, matches, chosenName, repairOnly } of embeddedRecords) {
+      for (const { lf, embeddedIndex, outputDigest, matches, chosenName, repairOnly, omit } of embeddedRecords) {
         if (!isCurrent()) return [];
+        if (omit) {
+          // No output, but the name and ordinal are used as they always were,
+          // so every other object keeps its own.
+          if (!matches.length && !chosenName && !verificationOwnsNewRows()) {
+            reserveUniqueName(lf.name, usedEmbeddedNames);
+            if (options.onOwnedPsdOutputs) baselineEmbeddedOrdinal++;
+          }
+          continue;
+        }
         const data = Buffer.from(lf.data);
         const psdExtractionReceipt = { version: 1, parentPath: psdFilePath, sourceDigest,
           layerPath: null, linkedIndex: embeddedIndex, originalName: lf.name || '', outputDigest };
@@ -17141,6 +17398,8 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         if (refilled.size && priorEmbeddedRows.some(row => refilled.has(normalizeTrackedFilePath(row.path))) &&
             !await rerecordRefilledRows(refilled)) return [];
       }
+    } else if (options.embeddedDocuments) {
+      await options.embeddedDocuments.prepare([]);
     }
 
     if (!isCurrent()) return []; keepInvocationFiles = true; return discoveredPaths;
@@ -17867,7 +18126,7 @@ function getRestagedEmbeddedPsdChoices(project, isStaleEntry) {
   }
   return { choices, unchosen, unproven, size: choices.size + (unproven ? 1 : 0) };
 }
-function carryRestagedEmbeddedPsdChoices(project, restaged, entries, linkedFiles) {
+function carryRestagedEmbeddedPsdChoices(project, restaged, entries, linkedFiles, neverHeldEntries = null) {
   const staged = new Map(entries.filter(isScanOnSaveEmbeddedPsdFile).map(entry => [entry.fileId, entry]));
   const excluded = new Set(project.excludedAssetKeys || []), carried = new Set(), uncarried = [];
   let changed = false;
@@ -17882,7 +18141,7 @@ function carryRestagedEmbeddedPsdChoices(project, restaged, entries, linkedFiles
       row.individualContentExclusion = fingerprint; delete row.individualContentInclude; carried.add(fingerprint); changed = true;
     } else if (choice === 'include') {
       row.individualContentInclude = fingerprint; carried.add(fingerprint); changed = true;
-    } else if (!(fingerprint && restaged.unchosen.has(fingerprint)) && accepted.has(row)) uncarried.push(row);
+    } else if (!(fingerprint && restaged.unchosen.has(fingerprint)) && accepted.has(row) && !neverHeldEntries?.has(entry)) uncarried.push(row);
   }
   if (changed) project.excludedAssetKeys = [...excluded];
   // Any choice without a proven successor holds every restaged row it could
@@ -17900,7 +18159,7 @@ function reconcilePsdEmbeddedMembership(project, isStaleEntry) {
   return project.files.length !== filesBefore || project.pendingFiles.length !== pendingBefore;
 }
 
-async function prepareWorkingPsdReconciliation(projectId, filePath, assets, linkedInventory, isCurrent) {
+async function prepareWorkingPsdReconciliation(projectId, filePath, assets, linkedInventory, isCurrent, embeddedDocuments = null) {
   const project = getProjects().find(item => item.id === projectId);
   const parent = normalizeTrackedFilePath(filePath);
   const before = JSON.stringify([project.files, project.pendingFiles || []]);
@@ -17929,9 +18188,11 @@ async function prepareWorkingPsdReconciliation(projectId, filePath, assets, link
       rowReceipts.set(row, { collection, index, row: JSON.stringify(row) });
     }
   }
+  // Rows of proven embedded documents that are leaving or stay untouched take
+  // no part: they have no output here and are no missing object.
   const associated = [...project.files, ...(project.pendingFiles || [])].filter(row =>
     row.source === 'psd-embedded' && row.psdResource?.version === 1 && row.psdResource.current !== false &&
-    normalizeTrackedFilePath(row.psdResource.parentPath) === parent);
+    normalizeTrackedFilePath(row.psdResource.parentPath) === parent && !embeddedDocuments?.isIgnoredRow(row));
   const priorByKey = new Map();
   const holds = [];
   for (const row of associated) {
@@ -17943,10 +18204,10 @@ async function prepareWorkingPsdReconciliation(projectId, filePath, assets, link
   }
   // No generic old-row migration: hold only concrete source-associated rows
   // whose object correspondence is unavailable in this reconciliation.
-  const legacyAssociations = [...project.files, ...(project.pendingFiles || [])].filter(row =>
+  const legacyAssociations = [...project.files, ...(project.pendingFiles || [])].filter(row => !embeddedDocuments?.isIgnoredRow(row) && (
     (row.source === 'psd-embedded' && !row.psdResource &&
       normalizeTrackedFilePath(row.assetBaselineSourcePath) === parent) ||
-    (isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.parentPsd || row.path) === parent));
+    (isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.parentPsd || row.path) === parent)));
   const priorMembership = getWorkingSourceMembership(project);
   const includedLegacyAssociation = legacyAssociations.some(row =>
     priorMembership.facts.get(getTrackedFileDedupKey(row))?.included ||
@@ -18599,7 +18860,9 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     }
     if (!isCurrent()) return;
     psdParseDebounce.set(filePath, Date.now()); // set BEFORE parse to prevent concurrent duplicates
+    const embeddedDocuments = createEmbeddedDocumentScan(projectId, filePath, isCurrent);
     const psdAssets = await extractPsdAssets(filePath, projectId, isCurrent, {
+      embeddedDocuments,
       strict: strictScan,
       onOrdinaryScanFailure,
       onOrdinaryScanLimit,
@@ -18616,8 +18879,8 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     if (psdTransaction && !await recheckValidatedSource()) throw new Error('asset_baseline_source_changed');
     const reconcileWorkingPsd = verificationScan && !!psdTransaction;
     const workingReconciliation = reconcileWorkingPsd
-      ? await prepareWorkingPsdReconciliation(projectId, filePath, psdAssets, inventory, isCurrent) : null;
-    if (psdAssets.length > 0 || workingReconciliation || (workingScan && psdTransaction)) {
+      ? await prepareWorkingPsdReconciliation(projectId, filePath, psdAssets, inventory, isCurrent, embeddedDocuments) : null;
+    if (psdAssets.length > 0 || workingReconciliation || (workingScan && psdTransaction) || embeddedDocuments.hasRetirements()) {
       // Complete saved-byte proof before comparing baseline receipt ownership.
       // No async continuation may invalidate that final comparison before write.
       const psdSourceReceipt = (strictScan || psdTransaction) ? await prepareScanPublicationSource() : null;
@@ -18649,7 +18912,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         scanEvidence.requiredEmbeddedOutputs = bounded.requiredReferences.map(ref => outputByPath.get(normalizeTrackedFilePath(ref.path)));
         scanEvidence.limited ||= bounded.limited || bounded.unresolved.length > 0;
       }
-      let psdRowsAccepted = false;
+      let psdRowsAccepted = false, embeddedDocumentsRetired = false;
       const psdResult = mutateProject(projectId, (proj) => {
         if (
           (proj.status !== 'watching' && !((baselineScan?.allowPaused || options.allowPausedBaseline) && proj.status === 'paused')) ||
@@ -18669,6 +18932,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         workingReconciliation?.apply(proj);
         const acceptedFiles = [], ownerIntentMemo = {};
         let changed = !!workingReconciliation;
+        if (embeddedDocuments.apply(proj)) { changed = true; embeddedDocumentsRetired = true; }
         for (const asset of psdAssets) {
           const reconciled = workingReconciliation?.items.find(item => item.asset === asset);
           if ((reconciled && workingReconciliation.blocked) || reconciled?.retained ||
@@ -18757,6 +19021,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         retainReferencedPsdOutputs(baselinePsdOutputs, acceptedProject);
         acceptance?.remember(acceptedProject);
       }
+      if (embeddedDocumentsRetired) invalidatePackageReviewForProject(projectId);
       if (psdResult && isCurrent()) {
         lastFileActivity.set(projectId, Date.now());
         inactivityNotified.delete(projectId);
@@ -18896,6 +19161,9 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null, ope
     const buf = await fs.promises.readFile(psdFilePath);
     if (!isCurrent()) return;
     const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true, totalMemoryLimit: -Infinity });
+    const embeddedDocuments = createEmbeddedDocumentScan(projectId, psdFilePath, isCurrent);
+    const isProvenEmbeddedRecord = embeddedDocuments.classify(psd, buf);
+    const embeddedRecords = [];
 
     const newEntries = [];
 
@@ -18926,7 +19194,8 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null, ope
       for (const [embeddedIndex, lf] of psd.linkedFiles.entries()) {
         if (!lf.data) continue;
         const safeName = reserveUniqueName(lf.name, usedEmbeddedNames);
-        newEntries.push({
+        const embeddedContentFingerprint = getPackageContentFingerprint(lf.data);
+        const entry = {
           path: psdFilePath, // parent PSD — physical extraction happens at package time
           name: safeName,
           ext: path.extname(safeName).toLowerCase(),
@@ -18938,15 +19207,26 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null, ope
           embeddedIndex,
           fileId: crypto.randomUUID(), // C2: unique key so embedded entries can be individually removed
           // The object's bytes at this save: proves identity across a later rename or reorder.
-          embeddedContentFingerprint: getPackageContentFingerprint(lf.data),
-        });
+          embeddedContentFingerprint,
+        };
+        newEntries.push(entry);
+        await new Promise(resolve => setImmediate(resolve));
+        if (!isCurrent()) return;
+        embeddedRecords.push({ entry, proven: isProvenEmbeddedRecord(lf), linkedIndex: embeddedIndex, layerPath: null,
+          originalName: lf.name || '', producerId: typeof lf.id === 'string' ? lf.id : null, fingerprint: embeddedContentFingerprint,
+          outputDigest: embeddedContentFingerprint.slice(embeddedContentFingerprint.indexOf(':') + 1), byteLength: lf.data.length });
       }
     }
 
     if (!isCurrent()) return;
+    const embeddedPlan = await embeddedDocuments.prepare(embeddedRecords);
+    if (!isCurrent()) return;
+    const provenEntries = new Set(embeddedRecords.filter(record => record.proven).map(record => record.entry));
+    const omittedEntries = new Set(embeddedRecords.filter(record => embeddedPlan.omitted.has(record)).map(record => record.entry));
 
     const result = mutateProject(projectId, (proj) => {
       if (!isCurrent()) return null;
+      const retiredEmbeddedRows = embeddedDocuments.apply(proj);
       const currentEmbeddedKeys = new Set(
         newEntries
           .filter(entry => entry.source === 'scan-on-save-embedded')
@@ -18955,19 +19235,20 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null, ope
       const isStaleEmbeddedEntry = entry => (
         isScanOnSaveEmbeddedPsdFile(entry) &&
         normalizeTrackedFilePath(entry.parentPsd || entry.path) === normalizeTrackedFilePath(psdFilePath) &&
-        !currentEmbeddedKeys.has(getEmbeddedPsdDedupKey(entry))
+        !currentEmbeddedKeys.has(getEmbeddedPsdDedupKey(entry)) && !embeddedDocuments.isIgnoredRow(entry)
       );
       const restagedChoices = getRestagedEmbeddedPsdChoices(proj, isStaleEmbeddedEntry);
-      let changed = reconcilePsdEmbeddedMembership(proj, isStaleEmbeddedEntry);
+      const entriesToStage = newEntries.filter(entry => !omittedEntries.has(entry));
+      let changed = reconcilePsdEmbeddedMembership(proj, isStaleEmbeddedEntry) || retiredEmbeddedRows > 0;
       // Rows that keep their identity record their current bytes once.
-      for (const entry of newEntries) {
+      for (const entry of entriesToStage) {
         if (entry.source !== 'scan-on-save-embedded') continue;
         const key = getEmbeddedPsdDedupKey(entry);
         for (const row of proj.files) if (isScanOnSaveEmbeddedPsdFile(row) && row.embeddedContentFingerprint === undefined &&
           getEmbeddedPsdDedupKey(row) === key) { row.embeddedContentFingerprint = entry.embeddedContentFingerprint; changed = true; }
       }
 
-      for (const entry of newEntries) {
+      for (const entry of entriesToStage) {
         const staged = stageLiveObservedFile(proj, entry, {
           relationshipSourcePath: psdFilePath, appFamily: 'photoshop',
           reason: 'scan-on-save-psd',
@@ -18978,7 +19259,8 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null, ope
         }
         changed = true;
       }
-      if (restagedChoices.size) carryRestagedEmbeddedPsdChoices(proj, restagedChoices, newEntries, psd.linkedFiles);
+      if (restagedChoices.size) carryRestagedEmbeddedPsdChoices(proj, restagedChoices, entriesToStage, psd.linkedFiles, provenEntries);
+      if (retiredEmbeddedRows) invalidatePackageReviewForProject(projectId);
 
       if (changed) {
         proj.files = deduplicateFiles(proj.files);
@@ -21514,7 +21796,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   }
   const operation = captureProjectOperation(projectId); if (!operation) return null;
   const operationCurrent = operation.current;
-  const ordinaryPsdOutputBatches = [], ownerNotes = [], outputEvidenceRecords = new Set();
+  const ordinaryPsdOutputBatches = [], ownerNotes = [], outputEvidenceRecords = new Set(), embeddedDocumentScans = [];
   // The Photoshop parse keeps its merged guard: only with a selection record,
   // and it goes on reading an individually excluded placed PSD.
   const scanSkipper = (scanProject, { photoshopParse = false } = {}) => {
@@ -21957,7 +22239,10 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     for (const psdFile of psdFiles) {
       if (skipPsd(psdFile)) continue;
       if (!fs.existsSync(psdFile.path)) continue;
+      const embeddedDocuments = createEmbeddedDocumentScan(projectId, psdFile.path, operationCurrent);
+      embeddedDocumentScans.push(embeddedDocuments);
       const psdAssets = await extractPsdAssets(psdFile.path, projectId, operationCurrent, {
+        embeddedDocuments,
         onOrdinaryPsdOutputs: outputs => ordinaryPsdOutputBatches.push(outputs),
         scanOwnsNewWorkingOutputs: true,
         onOutputEvidenceRecord: key => outputEvidenceRecords.add(key),
@@ -22174,6 +22459,7 @@ end tell`;
     // double-check pass failed — non-fatal
   }
 
+  let embeddedDocumentsRetired = false;
   // Atomic merge: write scan results to store without overwriting concurrent poller changes.
   // The stale `projects` array was read at the start of this handler — pollers may have
   // added files via mutateProject during the scan. Using mutateProject here re-reads the
@@ -22184,6 +22470,7 @@ end tell`;
     const scanPending = project.pendingFiles || [];
     const merged = mutateProject(projectId, (proj) => {
       if (!operationCurrent()) return null;
+      for (const scan of embeddedDocumentScans) if (scan.apply(proj)) embeddedDocumentsRetired = true;
       const existingKeys = getTrackedFileKeySet(proj.files);
       const recoveredFilesForProvenance = [];
       for (const f of scanFiles) {
@@ -22233,6 +22520,15 @@ end tell`;
       clearFileVisualProjectCache(projectId);
     }
   }
+
+  if (newCount === 0 && operationCurrent() && embeddedDocumentScans.some(scan => scan.hasRetirements())) {
+    mutateProject(projectId, proj => {
+      if (!operationCurrent()) return null;
+      for (const scan of embeddedDocumentScans) if (scan.apply(proj)) embeddedDocumentsRetired = true;
+      return { changed: embeddedDocumentsRetired };
+    }, { persistIfChanged: true, trustResultChanged: true });
+  }
+  if (embeddedDocumentsRetired) { clearFileVisualProjectCache(projectId); invalidatePackageReviewForProject(projectId); }
 
   if (newCount === 0 && ownerNotes.length > 0 && operationCurrent()) {
     const noted = mutateProject(projectId, proj => {

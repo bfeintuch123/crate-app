@@ -7,6 +7,8 @@ const { createReader } = require('ag-psd/dist/psdReader');
 const { readVersionAndDescriptor } = require('ag-psd/dist/descriptor');
 
 const MAX_PARSE_FILE_SIZE = 300 * 1024 * 1024;
+// Additional-info keys with 8-byte lengths in large documents, as ag-psd reads them.
+const LARGE_ADDITIONAL_INFO_KEYS = new Set(['LMsk', 'Lr16', 'Lr32', 'Layr', 'Mt16', 'Mt32', 'Mtrn', 'Alph', 'FMsk', 'lnk2', 'FEid', 'FXid', 'PxSD', 'cinf']);
 
 function getParentPort() {
   if (process.parentPort) return process.parentPort;
@@ -32,6 +34,17 @@ function getSourceIdentity(stat) {
   };
 }
 
+// Metadata-only read. No bitmap budget (-Infinity, not 0: a negative pattern
+// size would otherwise raise a finite budget) keeps ag-psd from decoding
+// document patterns, which it would otherwise allocate here.
+function readPsdMetadata(bytes) {
+  return readPsd(bytes, {
+    skipLayerImageData: true,
+    skipCompositeImageData: true,
+    totalMemoryLimit: -Infinity,
+  });
+}
+
 function parsePsd(filePath) {
   const stat = fs.statSync(filePath);
   if (!stat.isFile()) throw new Error('asset_baseline_source_not_file');
@@ -39,14 +52,7 @@ function parsePsd(filePath) {
 
   const sourceBuffer = fs.readFileSync(filePath);
   const sourceDigest = crypto.createHash('sha256').update(sourceBuffer).digest('hex');
-  // Metadata-only read. No bitmap budget (-Infinity, not 0: a negative pattern
-  // size would otherwise raise a finite budget) keeps ag-psd from decoding
-  // document patterns, which it would otherwise allocate here.
-  const psd = readPsd(sourceBuffer, {
-    skipLayerImageData: true,
-    skipCompositeImageData: true,
-    totalMemoryLimit: -Infinity,
-  });
+  const psd = readPsdMetadata(sourceBuffer);
   return { psd, sourceIdentity: getSourceIdentity(stat), sourceDigest,
     framing: inspectPsdLinkFraming(sourceBuffer) };
 }
@@ -54,7 +60,10 @@ function parsePsd(filePath) {
 // A bounded section walk, not a second PSD/descriptor parser. This supplies
 // wire facts absent from ag-psd's parsed objects. It cannot establish that this
 // named smart-object domain contains every reference required by a PSD.
-function inspectPsdLinkFraming(buffer) {
+// `allowLarge` also walks large-format documents; only the embedded-document
+// proof asks for it, so every other caller's facts stay as they are.
+function inspectPsdLinkFraming(buffer, { allowLarge = false } = {}) {
+  let large = false;
   const facts = { domain: 'psd-v1-link-and-media-descriptors', version: 3,
     status: 'incomplete', records: [], mediaCarriers: [], keys: [], resourceIds: [], issues: [], notes: [] };
   let offset = 0;
@@ -81,6 +90,8 @@ function inspectPsdLinkFraming(buffer) {
     if (u32(end) !== 0) throw new Error('unsupported-large-length');
     return u32(end);
   }
+  function section64(end) { const size = length64(end); need(size, end); return offset + size; }
+  const documentSection = end => (large ? section64(end) : section(end));
   function unicode(end) {
     const units = u32(end);
     if (units > 16384) throw new Error('coverage-limit');
@@ -208,7 +219,7 @@ function inspectPsdLinkFraming(buffer) {
       if (!['8BIM', '8B64'].includes(sig)) throw new Error('unsupported-additional-signature');
       const key = signature(end);
       if (facts.keys.length < 128 && !facts.keys.includes(key)) facts.keys.push(key);
-      const blockSize = sig === '8B64' ? length64(end) : u32(end);
+      const blockSize = sig === '8B64' || (large && LARGE_ADDITIONAL_INFO_KEYS.has(key)) ? length64(end) : u32(end);
       need(blockSize, end);
       const blockEnd = offset + blockSize;
       const size = blockEnd - offset;
@@ -246,7 +257,7 @@ function inspectPsdLinkFraming(buffer) {
       skip(16, layerEnd);
       const channelCount = u16(layerEnd);
       if (channelCount > 56) throw new Error('unsupported-layer-channels');
-      for (let c = 0; c < channelCount; c++) { skip(2, layerEnd); channelBytes += u32(layerEnd); }
+      for (let c = 0; c < channelCount; c++) { skip(2, layerEnd); channelBytes += large ? length64(layerEnd) : u32(layerEnd); }
       if (signature(layerEnd) !== '8BIM') throw new Error('invalid-layer-signature');
       skip(8, layerEnd); // blend mode, opacity, clipping, flags, filler
       const extraEnd = section(layerEnd);
@@ -268,7 +279,9 @@ function inspectPsdLinkFraming(buffer) {
   }
   try {
     const end = buffer.length;
-    if (signature(end) !== '8BPS' || u16(end) !== 1) throw new Error('unsupported-psd-version');
+    const isPhotoshop = signature(end) === '8BPS', version = u16(end);
+    if (!isPhotoshop || !(version === 1 || (allowLarge && version === 2))) throw new Error('unsupported-psd-version');
+    large = version === 2;
     skip(6, end);
     const channels = u16(end);
     skip(8, end); // dimensions; semantic decoding belongs to ag-psd
@@ -290,9 +303,9 @@ function inspectPsdLinkFraming(buffer) {
       offset = resourceEnd;
       skip(size % 2, resourcesEnd);
     }
-    const maskEnd = section(end);
+    const maskEnd = documentSection(end);
     if (offset < maskEnd) {
-      const layerEnd = section(maskEnd);
+      const layerEnd = documentSection(maskEnd);
       const layerStart = offset;
       if (offset < layerEnd) {
         layerInfo(layerEnd);
@@ -306,6 +319,167 @@ function inspectPsdLinkFraming(buffer) {
     if (facts.issues.length < 128) facts.issues.push(error.message === 'coverage-limit' ? 'coverage-limit' : 'unsupported-or-malformed-framing');
   }
   return facts;
+}
+
+// A proven self-contained embedded Photoshop document: its bytes alone carry
+// everything it needs. Name, extension and file type are never evidence. Any
+// parse error, limit or unexplained field leaves the object not proven, and
+// callers then treat it as every other embedded file.
+const EMBEDDED_DOCUMENT_LIMITS = Object.freeze({
+  depth: 4, records: 1024, layers: 8192, layerNesting: 64, parsedBytes: MAX_PARSE_FILE_SIZE,
+});
+
+function asBuffer(data) {
+  return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+}
+
+function hasPhotoshopSignature(data) {
+  return data instanceof Uint8Array && data.byteLength >= 4 &&
+    data[0] === 0x38 && data[1] === 0x42 && data[2] === 0x50 && data[3] === 0x53;
+}
+
+// The metadata-only read stops before the composite image, so a cut-off file
+// can still parse. Every declared section and the composite must be present.
+function hasCompletePhotoshopSections(bytes) {
+  if (bytes.length < 26) return false;
+  const version = bytes.readUInt16BE(4);
+  if (version !== 1 && version !== 2) return false;
+  const channels = bytes.readUInt16BE(12), height = bytes.readUInt32BE(14), width = bytes.readUInt32BE(18);
+  const depth = bytes.readUInt16BE(22);
+  let offset = 26;
+  const skipSection = wide => {
+    if (offset + (wide ? 8 : 4) > bytes.length) return false;
+    let size;
+    if (wide) {
+      const high = bytes.readUInt32BE(offset);
+      if (high > 0x1fffff) return false;
+      size = high * 2 ** 32 + bytes.readUInt32BE(offset + 4);
+      offset += 8;
+    } else { size = bytes.readUInt32BE(offset); offset += 4; }
+    if (size > bytes.length - offset) return false;
+    offset += size;
+    return true;
+  };
+  if (!skipSection(false) || !skipSection(false) || !skipSection(version === 2)) return false;
+  if (bytes.length - offset < 2) return false;
+  const compression = bytes.readUInt16BE(offset);
+  offset += 2;
+  const remaining = bytes.length - offset;
+  if (compression === 0) return remaining === channels * height * Math.ceil(width * depth / 8);
+  // A compressed composite cannot be shown complete without inflating it.
+  if (compression !== 1) return false;
+  const rows = channels * height, entryBytes = version === 2 ? 4 : 2;
+  if (rows * entryBytes > remaining) return false;
+  let total = 0;
+  for (let row = 0; row < rows; row++, offset += entryBytes) {
+    total += version === 2 ? bytes.readUInt32BE(offset) : bytes.readUInt16BE(offset);
+  }
+  return total === bytes.length - offset;
+}
+
+function collectDocumentLinkRecords(psd, budget, limits) {
+  const records = [...(Array.isArray(psd.linkedFiles) ? psd.linkedFiles : [])];
+  if (psd.linkedFiles !== undefined && !Array.isArray(psd.linkedFiles)) return null;
+  const placedIds = [];
+  const walk = (layers, nesting) => {
+    if (layers === undefined) return true;
+    if (!Array.isArray(layers) || nesting > limits.layerNesting) return false;
+    for (const layer of layers) {
+      if (!layer || typeof layer !== 'object' || ++budget.layers > limits.layers) return false;
+      if (layer.linkedFile !== undefined || layer.pixelSource?.frameReader?.link !== undefined) return false;
+      if (layer.linkedFiles !== undefined) {
+        if (!Array.isArray(layer.linkedFiles)) return false;
+        records.push(...layer.linkedFiles);
+      }
+      if (layer.placedLayer !== undefined) {
+        if (typeof layer.placedLayer?.id !== 'string' || !layer.placedLayer.id) return false;
+        placedIds.push(layer.placedLayer.id);
+      }
+      if (!walk(layer.children, nesting + 1)) return false;
+    }
+    return true;
+  };
+  if (!walk(psd.children, 0)) return null;
+  const groups = psd.imageResources?.timelineInformation?.audioClipGroups;
+  if (groups !== undefined) {
+    if (!Array.isArray(groups)) return null;
+    for (const group of groups) {
+      if (!Array.isArray(group?.audioClips)) return null;
+      if (group.audioClips.some(clip => clip?.frameReader?.link !== undefined)) return null;
+    }
+  }
+  return { records, placedIds };
+}
+
+function isProvenEmbeddedDocument(data, budget, limits, depth = 1) {
+  if (!hasPhotoshopSignature(data) || depth > limits.depth) return false;
+  budget.parsedBytes += data.byteLength;
+  if (budget.parsedBytes > limits.parsedBytes) return false;
+  const bytes = asBuffer(data);
+  // External and alias records carry these literal type codes. A chance match
+  // in other data only leaves the document not proven.
+  if (!hasCompletePhotoshopSections(bytes) || bytes.includes('liFE', 0, 'latin1') || bytes.includes('liFA', 0, 'latin1')) return false;
+  let psd;
+  try {
+    psd = readPsdMetadata(bytes);
+  } catch (_) { return false; }
+  if (!psd || typeof psd !== 'object') return false;
+  const links = collectDocumentLinkRecords(psd, budget, limits);
+  if (!links) return false;
+  // What ag-psd leaves out of its parsed result still shows in the raw walk: any
+  // doubt there, or any media carrier at all, leaves the document not proven.
+  const framing = inspectPsdLinkFraming(bytes, { allowLarge: true });
+  if (framing.status !== 'framed' || framing.issues.length || framing.notes.length || framing.mediaCarriers.length) return false;
+  const wireIds = framing.records.map(item => item.id).sort();
+  if (framing.records.some(item => item.type !== 'liFD' || item.carrier === 'lnkE' || item.tailBytes !== 0) ||
+      JSON.stringify(wireIds) !== JSON.stringify(links.records.map(record => record?.id).sort())) return false;
+  const ids = new Set();
+  for (const record of links.records) {
+    if (!record || typeof record !== 'object' || ++budget.records > limits.records) return false;
+    if (record.linkedFile !== undefined || !(record.data instanceof Uint8Array) || !record.data.byteLength) return false;
+    if (typeof record.id !== 'string' || !record.id || ids.has(record.id)) return false;
+    ids.add(record.id);
+    if (hasPhotoshopSignature(record.data) && !isProvenEmbeddedDocument(record.data, budget, limits, depth + 1)) return false;
+  }
+  return links.placedIds.every(id => ids.has(id));
+}
+
+function isProvenEmbeddedDocumentBytes(data, limits = EMBEDDED_DOCUMENT_LIMITS) {
+  return isProvenEmbeddedDocument(data, { parsedBytes: 0, records: 0, layers: 0 }, limits);
+}
+
+// Decides each linked-file record of one parsed parent. `getFraming` supplies
+// the parent's wire facts: parsed fields alone cannot show that a record is
+// stored as embedded data, because a record of another form can parse the same.
+function createEmbeddedDocumentClassifier(psd, getFraming) {
+  const idCounts = new Map();
+  const count = records => {
+    for (const record of Array.isArray(records) ? records : []) {
+      if (typeof record?.id === 'string') idCounts.set(record.id, (idCounts.get(record.id) || 0) + 1);
+    }
+  };
+  count(psd?.linkedFiles);
+  const walk = layers => {
+    for (const layer of Array.isArray(layers) ? layers : []) { count(layer?.linkedFiles); walk(layer?.children); }
+  };
+  walk(psd?.children);
+  let framing;
+  const decisions = new Map();
+  return record => {
+    if (decisions.has(record)) return decisions.get(record);
+    let proven = false;
+    try {
+      if (record && record.linkedFile === undefined && hasPhotoshopSignature(record.data) &&
+          typeof record.id === 'string' && record.id && idCounts.get(record.id) === 1) {
+        if (framing === undefined) framing = getFraming() || null;
+        const wire = (framing?.records || []).filter(item => item.id === record.id);
+        proven = wire.length === 1 && wire[0].type === 'liFD' && wire[0].carrier !== 'lnkE' &&
+          wire[0].tailBytes === 0 && isProvenEmbeddedDocumentBytes(record.data);
+      }
+    } catch (_) { proven = false; }
+    decisions.set(record, proven);
+    return proven;
+  };
 }
 
 const CHUNK_BYTES = 1024 * 1024;
@@ -357,6 +531,8 @@ async function sendPsdRecords(parsed, send) {
     }
   }
   collectLinkedFiles(psd.linkedFiles, null);
+  // Add Files scans only: Quick Package reads links and never embedded records.
+  const isSelfContained = parsed.sourceIdentity ? createEmbeddedDocumentClassifier(psd, () => parsed.framing) : () => false;
   async function record(kind, text, data, index) {
     await send({ type: 'record', kind, index, textUnits: text.length, byteLength: data ? data.byteLength : 0 });
     for (let offset = 0; offset < text.length; offset += TEXT_UNITS) {
@@ -421,7 +597,8 @@ async function sendPsdRecords(parsed, send) {
     }
     const { data, ...fields } = file;
     await metadata({ origin: 'linked-file', index, layerPath, metadata: fields, dataPresent: !!data,
-      byteLength: data ? data.byteLength : 0, embeddedIndex: data ? embeddedIndex++ : null });
+      byteLength: data ? data.byteLength : 0, embeddedIndex: data ? embeddedIndex++ : null,
+      ...(data && isSelfContained(file) ? { selfContained: true } : {}) });
   }
   for (const [index, fields] of mediaSources.entries()) await metadata({ origin: 'media-reference', index, ...fields });
   async function walkLayerPaths(layers) {
@@ -513,4 +690,7 @@ module.exports = {
   TEXT_UNITS,
   sendPsdRecords,
   startAddFilesPsdWorker,
+  EMBEDDED_DOCUMENT_LIMITS,
+  createEmbeddedDocumentClassifier,
+  isProvenEmbeddedDocumentBytes,
 };
