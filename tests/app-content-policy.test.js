@@ -99,7 +99,9 @@ test('electron-builder uses the explicit Crate runtime allowlist', () => {
   assert.deepEqual(packageJson.build.files, EXPECTED_BUILD_FILES);
   assert.equal(packageJson.build.files.some(pattern => pattern === '**/*'), false);
   assert.equal(packageJson.build.extraFiles, undefined);
-  assert.equal(packageJson.build.extraResources, undefined);
+  assert.deepEqual(packageJson.build.extraResources, [
+    { from: 'native/bin/crate-helper', to: 'native/crate-helper' }
+  ]);
   assert.equal(packageJson.build.mac.extraFiles, undefined);
   assert.equal(packageJson.build.mac.extraResources, undefined);
 });

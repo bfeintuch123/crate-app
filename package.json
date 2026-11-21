@@ -73,6 +73,12 @@
       "parsers/*.js",
       "assets/tray-icon.png"
     ],
+    "extraResources": [
+      {
+        "from": "native/bin/crate-helper",
+        "to": "native/crate-helper"
+      }
+    ],
     "afterPack": "scripts/patch-helper-info-plists.js",
     "afterSign": "scripts/notarize.js",
     "mac": {

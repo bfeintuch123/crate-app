@@ -28145,6 +28145,12 @@ registerTrustedIpcHandler('inactivity:pause', (event, projectId) => {
 
 app.whenReady().then(async () => {
   startupPhaseJournal.mark('ready-handler-entered');
+  if (process.versions && process.versions.electron) {
+    const storeKind = typeof store?.getProjectById === 'function' ? 'sqlite-wal' : 'electron-store';
+    const helperReady = canUseNativeProcessWatcher() ? 'arm64-ready' : 'fallback';
+    const cloneReady = canUseNativePackageClone() ? 'enabled' : 'fallback';
+    console.log(`[crate][fast-engine] store=${storeKind} nativeHelper=${helperReady} apfsClone=${cloneReady} deltaIpc=${projectIpcDeltaBridge.coalesceMs}ms`);
+  }
   if (localStoreStartupError) {
     startupPhaseJournal.mark('startup-error');
     dialog.showErrorBox(
