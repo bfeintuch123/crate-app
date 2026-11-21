@@ -1044,7 +1044,7 @@
         <div class="modal-header-area">
           <div class="modal-title" id="package-review-title">Package Review</div>
         </div>
-        <div class="modal-body">
+        <div class="modal-body" id="package-review-body">
           <div class="package-review-ready" id="package-review-ready">Ready to package</div>
           <div class="modal-info-row package-review-project">
             <div class="modal-row-label">Project</div>
@@ -1053,6 +1053,10 @@
           <div id="modal-figma-warning" role="status" aria-live="polite" aria-atomic="true" style="font-size:12px;color:#f59e0b;margin-bottom:8px;"></div>
           <section id="source-continuation-choices" class="source-continuation-choices hidden" aria-label="Working file choices"></section>
           <div class="modal-review-message hidden" id="modal-package-review-message" role="status" aria-live="polite" aria-atomic="true" tabindex="-1"></div>
+          <div class="package-review-verification hidden" id="package-review-verification" role="group" aria-label="Verification">
+            <button type="button" class="working-source-action working-file-choice-retry" id="btn-retry-package-verification" aria-describedby="modal-package-review-message">Retry verification</button>
+            <button type="button" class="working-source-action hidden" id="btn-review-files-manually" aria-describedby="modal-package-review-message">Review files manually</button>
+          </div>
           <div class="modal-reminder is-thin hidden" id="modal-needs-save-reminder"></div>
           <div class="modal-reminder hidden" id="modal-presentation-reminder">
             <div class="modal-reminder-title">Save before packaging</div>
@@ -1132,6 +1136,41 @@
             <button class="modal-btn-primary" id="btn-confirm-package">Package Project</button>
           </div>
         </div>
+        <div class="modal-body package-manual-body hidden" id="package-manual-body">
+          <div class="modal-reminder package-manual-warning" id="package-manual-warning">
+            <div class="modal-reminder-title">Linked assets unverified</div>
+            <div class="modal-reminder-copy">This manual package includes only the files marked Included.</div>
+          </div>
+          <div class="modal-review-message is-empty" id="package-manual-message" role="status" aria-live="polite" aria-atomic="true" tabindex="-1"></div>
+          <div class="package-review-layout">
+            <section class="package-review-assets" aria-labelledby="package-manual-assets-heading">
+              <div class="package-manual-assets-header">
+                <div class="modal-row-label" id="package-manual-assets-heading">What Will Be Packaged</div>
+                <button type="button" class="package-review-font-action" id="btn-manual-choose-files">Choose Files…</button>
+              </div>
+              <div class="package-review-total" id="package-manual-total" aria-live="polite">No files Included</div>
+              <div class="package-manual-contents" id="package-manual-contents">
+                <ul class="package-manual-file-list" id="package-manual-file-list" aria-labelledby="package-manual-assets-heading"></ul>
+              </div>
+            </section>
+            <aside class="package-review-summary" aria-labelledby="package-manual-summary-heading">
+              <div class="modal-row-label" id="package-manual-summary-heading">Package Summary</div>
+              <div class="modal-folder-row">
+                <div class="modal-naming-label" id="package-manual-destination-label">Save package to</div>
+                <span class="modal-folder-path" id="package-manual-dest-path" role="status" aria-live="polite">Choose a folder before packaging</span>
+                <button type="button" class="modal-folder-change" id="btn-manual-change-dest" aria-describedby="package-manual-destination-label package-manual-dest-path">Choose Folder</button>
+              </div>
+              <div class="modal-naming-box">
+                <div class="modal-naming-label">Output Folder Name</div>
+                <div class="modal-naming-preview" id="package-manual-folder-name"></div>
+              </div>
+            </aside>
+          </div>
+          <div class="modal-actions">
+            <button class="modal-btn-secondary" id="btn-manual-back">Back to Package Review</button>
+            <button class="modal-btn-primary" id="btn-manual-package" disabled>Package these files</button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -1141,6 +1180,7 @@
         <div class="success-icon-wrap">&#x2705;</div>
         <div class="success-title" id="success-title">Package Complete</div>
         <div class="success-desc" id="success-message">14 files gathered.</div>
+        <div class="success-desc success-manual-note hidden" id="success-manual-note">Linked assets weren’t verified. Only the files you marked Included were copied.</div>
         <div class="success-path" id="success-path"></div>
         <details class="package-details hidden" id="package-details">
           <summary id="package-details-summary">Package Details</summary>

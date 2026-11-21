@@ -25,7 +25,7 @@ function productionPage(rendererDir, bootstrapSource) {
   const index = fs.readFileSync(path.join(rendererDir, 'index.html'), 'utf8');
   const html = index
     .replace(/<meta http-equiv="Content-Security-Policy"[^>]+>/u, '')
-    .replace(/<link[^>]+https:\/\/fonts\.googleapis\.com[^>]+>/u, '')
+    .replace(/<link[^>]+https:\/\/fonts\.(?:googleapis|gstatic)\.com[^>]+>/gu, '')
     .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gu, '')
     .replace('<head>', `<head><base href="${new URL(`file://${rendererDir}/`).href}">`);
   const cut = html.lastIndexOf('</body>');
@@ -172,6 +172,7 @@ async function launch({ browser, rendererDir, bootstrapSource, width = 1100, hei
       Tab: { key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 },
       Enter: { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' },
       Space: { key: ' ', code: 'Space', windowsVirtualKeyCode: 32, text: ' ' },
+      Escape: { key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 },
     };
     async function press(name, modifiers = 0) {
       const key = keys[name];

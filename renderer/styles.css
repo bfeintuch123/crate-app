@@ -3978,3 +3978,60 @@ body {
   white-space: normal;
   overflow-wrap: anywhere;
 }
+
+/* Package Review: manual packaging fallback (Retry verification, Review files manually). */
+.package-review-verification {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: -4px 0 14px;
+}
+.package-review-verification .working-file-choice-retry { margin-top: 0; }
+.package-manual-warning { margin-bottom: 12px; }
+.package-manual-assets-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.package-manual-contents { max-height: 310px; overflow-y: auto; border-radius: 4px; }
+.package-manual-file-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.package-manual-file {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--gray-200);
+  font-size: 12px;
+  color: var(--gray-700);
+}
+.package-manual-file-copy { flex: 1 1 auto; min-width: 0; }
+.package-manual-file-name {
+  font-weight: 650;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.package-manual-file-detail {
+  margin-top: 2px;
+  color: var(--gray-500);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.package-manual-file.is-excluded .package-manual-file-name { color: var(--gray-500); font-weight: 600; }
+.package-manual-file.is-changed .package-manual-file-detail { color: #9a3412; }
+.package-manual-empty {
+  padding: 12px 0;
+  color: var(--gray-500);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.success-manual-note { margin-top: -4px; }

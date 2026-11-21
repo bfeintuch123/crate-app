@@ -43,3 +43,9 @@ _Avoid_: Skipped, left out
 **Exclude**:
 The designer's action that makes an asset or working file Excluded. The same word is used everywhere, including under Needs Review and for applying it to many at once.
 _Avoid_: Skip, Skip All
+
+### Packages
+
+**Manual package**:
+A package made in Review files manually after a working file's verification couldn't finish. It holds only the files the designer marks Included there, copied as they are. Crate doesn't verify or add their linked assets, and the project and its decisions stay as they were.
+_Avoid_: Unverified package, forced package
