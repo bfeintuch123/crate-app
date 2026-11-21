@@ -174,6 +174,7 @@ const REVIEWED_SOURCE_BOUND_ENTRIES = Object.freeze([
   'parsers/powerpoint.js',
   'parsers/premiere.js',
   'parsers/psd.js',
+  'parsers/sqlite-store.js',
   'parsers/working-source-recovery-core.js',
   'parsers/working-source-witness.js',
   'parsers/zip-reader.js',

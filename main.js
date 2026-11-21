@@ -87,6 +87,12 @@ const { runBoundedAddFilesScan } = require('./parsers/add-files-operation');
 const { REGEX_SOURCE_EXTENSIONS } = require('./parsers/add-files-regex-worker');
 const { extractLinkedAssetPaths } = require('./parsers/linked-asset-matcher');
 const { decodeXMLPath, fileUriToPath } = require('./parsers/xml-path');
+let CrateSqliteStore = null;
+try {
+  ({ CrateSqliteStore } = require('./parsers/sqlite-store'));
+} catch (_) {
+  CrateSqliteStore = null;
+}
 startupPhaseJournal.mark('dependencies-loaded');
 
 const PROVENANCE_MANIFEST_FILENAME = 'crate-provenance.json';
@@ -7359,6 +7365,25 @@ function runSerializedFileVisualRasterWork(task) {
   });
 }
 
+const MAX_RASTER_THUMBNAIL_MEMORY_CACHE_ENTRIES = 256;
+const rasterThumbnailMemoryCache = new Map();
+
+function getRasterThumbnailMemoryCacheKey(filePath, stat) {
+  if (typeof filePath !== 'string' || !stat) return null;
+  return `${filePath}\0${stat.dev}\0${stat.ino}\0${stat.size}\0${stat.mtimeNs}\0${stat.ctimeNs}`;
+}
+
+function rememberRasterThumbnail(cacheKey, dataUrl) {
+  if (!cacheKey || typeof dataUrl !== 'string') return;
+  rasterThumbnailMemoryCache.delete(cacheKey);
+  while (rasterThumbnailMemoryCache.size >= MAX_RASTER_THUMBNAIL_MEMORY_CACHE_ENTRIES) {
+    const oldest = rasterThumbnailMemoryCache.keys().next().value;
+    if (oldest === undefined) break;
+    rasterThumbnailMemoryCache.delete(oldest);
+  }
+  rasterThumbnailMemoryCache.set(cacheKey, dataUrl);
+}
+
 function getBoundedRasterThumbnail(projectId, file, visualRevision) {
   return runSerializedFileVisualRasterWork(async () => {
     const source = await openPreflightedRasterSource(file.path);
@@ -7368,6 +7393,19 @@ function getBoundedRasterThumbnail(projectId, file, visualRevision) {
       if (createProjectFileVisualRevisionFromStat(projectId, file, source.sourceStat) !== visualRevision) {
         return { stale: true };
       }
+      const memoryKey = getRasterThumbnailMemoryCacheKey(file.path, source.sourceStat);
+      const cachedMemory = memoryKey ? rasterThumbnailMemoryCache.get(memoryKey) : null;
+      const cachedPersisted = cachedMemory
+        ? null
+        : store?.getStatCache?.('raster-thumbnail', file.path, source.sourceStat);
+      const cachedDataUrl = cachedMemory || (cachedPersisted && typeof cachedPersisted.dataUrl === 'string' ? cachedPersisted.dataUrl : null);
+      if (cachedDataUrl) {
+        const descriptorStat = await source.handle.stat({ bigint: true });
+        if (!sameOpenFileStat(source.sourceStat, descriptorStat)) return null;
+        if (!cachedMemory && memoryKey) rememberRasterThumbnail(memoryKey, cachedDataUrl);
+        return cachedDataUrl;
+      }
+
       const ext = (file.ext || path.extname(file.path || '')).toLowerCase();
       snapshot = await createPrivateFileVisualSnapshot(source, ext);
       if (!snapshot) return null;
@@ -7385,7 +7423,12 @@ function getBoundedRasterThumbnail(projectId, file, visualRevision) {
         !sameOpenFileStat(snapshot.stat, snapshotStat) ||
         !sameOpenFileStat(snapshotStat, snapshotPathStat)
       ) return null;
-      return encodeBoundedFileVisual(thumbnail);
+      const encoded = encodeBoundedFileVisual(thumbnail);
+      if (encoded) {
+        if (memoryKey) rememberRasterThumbnail(memoryKey, encoded);
+        store?.setStatCache?.('raster-thumbnail', file.path, source.sourceStat, { dataUrl: encoded });
+      }
+      return encoded;
     } catch (_) {
       return null;
     } finally {
@@ -7403,17 +7446,34 @@ function getProjectOwnedFileVisualRequestError({
   requestProject,
   requestFile,
 }) {
-  const storedProjects = typeof projectId === 'string' ? store.get('projects', []) : [];
-  const currentProject = Array.isArray(storedProjects)
-    ? storedProjects.find(item => item && item.id === projectId)
-    : null;
+  const usesPerProjectStore = typeof store?.getProjectById === 'function';
+  let currentProject = null;
+  if (typeof projectId === 'string') {
+    if (usesPerProjectStore) {
+      currentProject = store.getProjectById(projectId);
+    } else {
+      const storedProjects = store.get('projects', []);
+      currentProject = Array.isArray(storedProjects)
+        ? storedProjects.find(item => item && item.id === projectId)
+        : null;
+    }
+  }
   if (!currentProject) return { error: 'not_found' };
   const currentFile = resolveProjectOwnedFileVisualRecord(projectId, visualIdentity, currentProject);
   if (!currentFile) return { error: 'not_found' };
+  const identityChanged = usesPerProjectStore
+    ? (
+      currentProject.id !== requestProject?.id ||
+      currentFile.name !== requestFile?.name ||
+      currentFile.path !== requestFile?.path ||
+      currentFile.addedAt !== requestFile?.addedAt ||
+      currentFile.assetOrigin !== requestFile?.assetOrigin ||
+      currentFile.projectRole !== requestFile?.projectRole
+    )
+    : (currentProject !== requestProject || currentFile !== requestFile);
   if (
     getFileVisualProjectCacheEpoch(projectId) !== requestEpoch ||
-    currentProject !== requestProject ||
-    currentFile !== requestFile ||
+    identityChanged ||
     createProjectFileVisualIdentity(projectId, currentFile) !== visualIdentity
   ) return { error: 'stale_visual' };
 
@@ -8846,7 +8906,36 @@ try {
   startupPhaseJournal.mark('store-path-security-complete');
   validateLocalStoreShape(candidateStore);
   startupPhaseJournal.mark('store-shape-validation-complete');
-  store = candidateStore;
+  const isRealElectronStore = (
+    typeof candidateStore.openInEditor === 'function' &&
+    typeof candidateStore.onDidChange === 'function'
+  );
+  if (isRealElectronStore && CrateSqliteStore) {
+    const sqliteStore = new CrateSqliteStore({
+      userDataRealPath: localStorePaths.userDataRealPath,
+      defaults: {
+        projects: [],
+        settings: {
+          namingTemplate: DEFAULT_NAMING_TEMPLATE,
+          notifications: true,
+          existingAssetsNotifications: true,
+          needsSaveNotifications: true,
+          includeDiagnosticReport: false,
+          showPackageDetails: true,
+          packageOutputLayoutMode: PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
+        },
+        usage: {
+          packagesThisMonth: 0,
+          resetDate: getNextMonthReset()
+        }
+      }
+    });
+    sqliteStore.migrateFromLegacyStore(candidateStore);
+    validateLocalStoreShape(sqliteStore);
+    store = sqliteStore;
+  } else {
+    store = candidateStore;
+  }
   migrateSettings();
   startupPhaseJournal.mark('store-migrations-complete');
   startupPhaseJournal.mark('store-preflight-complete');
@@ -10500,9 +10589,30 @@ function isDiagnosticManifestDestinationSafe(destFolder, relativePath = path.joi
 
 // FIX 1 (C1): Atomic store helper — prevents read-mutate-write race conditions
 function mutateProject(projectId, fn, { persistIfChanged = false, trustResultChanged = false, packageStageContext = false } = {}) {
-  const projects = getProjects();
-  const project = projects.find(p => p.id === projectId);
-  if (!project) return null;
+  const canUseSingleProjectPath = (
+    typeof store?.getProjectById === 'function' &&
+    typeof store?.upsertProject === 'function' &&
+    typeof fn === 'function' &&
+    fn.length <= 1
+  );
+  let projects = null;
+  let project = null;
+  if (canUseSingleProjectPath) {
+    project = store.getProjectById(projectId);
+    if (!project) return null;
+    let readNormalized = false;
+    if (migrateProjectFigmaLinkPrivacy(project)) readNormalized = true;
+    if (clearPersistedCurrentSessionFilesystemEvidence(project)) readNormalized = true;
+    if (normalizeProjectAssetReviewState(project)) readNormalized = true;
+    if (readNormalized) {
+      clearFileVisualProjectCache(projectId);
+      store.upsertProject(project);
+    }
+  } else {
+    projects = getProjects();
+    project = projects.find(p => p.id === projectId);
+    if (!project) return null;
+  }
   const heldPsdMembers = capturePsdReceiptHeldMembers(project);
   if (typeof clearFileVisualProjectCache === 'function') clearFileVisualProjectCache(projectId);
   // Background observers can legitimately return changed:false after running
@@ -10515,7 +10625,7 @@ function mutateProject(projectId, fn, { persistIfChanged = false, trustResultCha
   if (persistIfChanged && !trustResultChanged) {
     try { before = JSON.stringify(project); } catch (_) { before = null; }
   }
-  const result = fn(project, projects);
+  const result = canUseSingleProjectPath ? fn(project) : fn(project, projects);
   const resultChanged = !!(result && result.changed === true);
   if (!persistIfChanged || !trustResultChanged || resultChanged) {
     normalizeAutoCaptureProjectState(project, packageStageContext ? createLiveObservedFileStageContext(project) : null);
@@ -10530,7 +10640,11 @@ function mutateProject(projectId, fn, { persistIfChanged = false, trustResultCha
     try { shouldPersist = before === null || JSON.stringify(project) !== before; } catch (_) { shouldPersist = true; }
   }
   if (shouldPersist) {
-    store.set('projects', projects);
+    if (canUseSingleProjectPath) {
+      store.upsertProject(project);
+    } else {
+      store.set('projects', projects);
+    }
     scheduleNeedsSaveNotificationSync(projectId);
   }
   return result;
@@ -23649,6 +23763,12 @@ function inspectFontFile(sourcePath) {
   const cacheKey = JSON.stringify(fingerprint);
   const cached = fontFactsCache.get(cacheKey);
   if (cached) return { ...result, ...cached };
+  const persistedKey = fingerprint.normalizedPath || sourcePath;
+  const persistedCached = store?.getStatCache?.('font-inspect', persistedKey, fingerprint.source);
+  if (persistedCached && typeof persistedCached.sha256 === 'string') {
+    rememberFontFacts(cacheKey, persistedCached);
+    return { ...result, ...persistedCached };
+  }
   let buffer;
   try {
     buffer = readStablePackageReviewBuffer(sourcePath, fingerprint);
@@ -23657,6 +23777,7 @@ function inspectFontFile(sourcePath) {
   }
   const facts = getFontFactsFromBuffer(buffer);
   rememberFontFacts(cacheKey, facts);
+  store?.setStatCache?.('font-inspect', persistedKey, fingerprint.source, facts);
   return { ...result, ...facts };
 }
 
@@ -28047,6 +28168,7 @@ app.on('before-quit', () => {
     clearInterval(inactivityCheckerInterval);
     inactivityCheckerInterval = null;
   }
+  try { store?.close?.(); } catch (_) {}
   activeNativeNotifications.clear();
   // v2.5.0: Clean up scan-on-save timers
   for (const [, pending] of scanOnSaveTimers) {

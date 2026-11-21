@@ -301,7 +301,7 @@ const mainUnderTestPath = process.env.CRATE_MAIN_UNDER_TEST
 const originalMainLoader = Module._extensions['.js'];
 Module._extensions['.js'] = function loadMainForOrdinaryPsdCoverage(module, filename) {
   if (filename !== mainUnderTestPath) return originalMainLoader(module, filename);
-  return module._compile(fs.readFileSync(filename, 'utf8') + '\nmodule.exports.__psdSafetyHooks = { runScanOnOpen, mutateProject, getAccountSession() { return accountSession; }, getCrypto() { return crypto; }, getPsdScanState() { return { operations: workingSourceScanOperations.size, leases: workingSourceScanLeases.size, pendingRepairs: typeof pendingPsdRepairs === "undefined" ? 0 : pendingPsdRepairs.size }; }, getPsdScanLease() { return [...workingSourceScanLeases.values()][0]; }, getPrePackageScanState(projectId) { return { inFlight: scanInFlight.has(projectId), settlement: packageScanSettlements.has(projectId) }; }, getPrePackageAppTimeout() { return PRE_PACKAGE_APP_SCAN_TIMEOUT_MS; }, interceptExtraction(wrapper) { const before = extractPsdAssets; extractPsdAssets = wrapper(before); return () => { extractPsdAssets = before; }; } };\n', filename);
+  return module._compile(fs.readFileSync(filename, 'utf8') + '\nmodule.exports.__psdSafetyHooks = { runScanOnOpen, mutateProject, disposeAddFilesWorkerPool, getAccountSession() { return accountSession; }, getCrypto() { return crypto; }, getPsdScanState() { return { operations: workingSourceScanOperations.size, leases: workingSourceScanLeases.size, pendingRepairs: typeof pendingPsdRepairs === "undefined" ? 0 : pendingPsdRepairs.size }; }, getPsdScanLease() { return [...workingSourceScanLeases.values()][0]; }, getPrePackageScanState(projectId) { return { inFlight: scanInFlight.has(projectId), settlement: packageScanSettlements.has(projectId) }; }, getPrePackageAppTimeout() { return PRE_PACKAGE_APP_SCAN_TIMEOUT_MS; }, interceptExtraction(wrapper) { const before = extractPsdAssets; extractPsdAssets = wrapper(before); return () => { extractPsdAssets = before; }; } };\n', filename);
 };
 let psdSafetyHooks;
 try { psdSafetyHooks = require(mainUnderTestPath).__psdSafetyHooks; }
@@ -1707,6 +1707,8 @@ test('real worker admission followed by ordinary pre-package IPC retains root an
     assert.deepEqual(f.rows().map(row => row.path), initialPaths, 'worker-root cache loss preserves admitted identity and locator');
     assert.deepEqual(fs.readdirSync(f.extractDir).sort(), initialNames);
     assert.deepEqual(initialPaths.map(file => fs.readFileSync(file, 'utf8')).sort(), ['layer embedded bytes', 'root embedded bytes']);
+    assert.equal(psdWorkerChildren.size, 1);
+    await psdSafetyHooks.disposeAddFilesWorkerPool();
     assert.equal(psdWorkerChildren.size, 0);
   });
 });
