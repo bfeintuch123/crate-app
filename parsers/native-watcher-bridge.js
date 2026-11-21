@@ -1,0 +1,182 @@
+'use strict';
+
+/**
+ * Phase 4B — Native Watcher & APFS Package Adapter
+ *
+ * Isolates all native Swift helper (`parsers/native-helper.js`) watcher and
+ * packaging bridge logic cleanly out of `main.js`:
+ *   - Availability & test-mock detection guards (`canUseNativeProcessWatcher`, `canUseNativePackageClone`)
+ *   - Native `getxattr(2)` batch last-used timestamp adapter
+ *   - Native `NSWorkspace` running design-app PID adapter
+ *   - Native `libproc` open-files -> `lsof -F ptn` adapter (preserving exact scan-on-close semantics)
+ *   - Native descriptor-bound, ancestry-verified APFS `fclonefileat` adapter
+ */
+
+const path = require('node:path');
+
+let nativeHelper = null;
+try {
+  ({ nativeHelper } = require('./native-helper'));
+} catch (_) {
+  nativeHelper = null;
+}
+
+function canUseNativeProcessWatcher(execFn, execFileFn) {
+  if (!nativeHelper || !nativeHelper.isAvailable()) return false;
+  try {
+    const builtinCp = require('node:child_process');
+    return execFn === builtinCp.exec && execFileFn === builtinCp.execFile;
+  } catch (_) {
+    return false;
+  }
+}
+
+function canUseNativePackageClone() {
+  if (!nativeHelper || !nativeHelper.isAvailable()) return false;
+  return Boolean(process.versions && process.versions.electron) || process.env.CRATE_ENABLE_NATIVE_CLONE === '1';
+}
+
+async function readNativeLastUsedXattrs(filePaths, timeoutMs) {
+  if (!nativeHelper) return null;
+  const response = await nativeHelper.readLastUsedXattrs(filePaths, timeoutMs);
+  const timestamps = response && response.timestamps;
+  if (!timestamps || typeof timestamps !== 'object') return null;
+
+  const values = new Map();
+  for (const filePath of filePaths) {
+    if (!Object.prototype.hasOwnProperty.call(timestamps, filePath)) {
+      throw new Error('incomplete native xattr result');
+    }
+    const raw = timestamps[filePath];
+    values.set(filePath, typeof raw === 'number' && Number.isFinite(raw) ? raw : null);
+  }
+  return values;
+}
+
+async function getNativeRunningDesignApps(keywords, timeoutMs = 3000) {
+  if (!nativeHelper) return null;
+  const result = await nativeHelper.runningApps(keywords, timeoutMs);
+  const pids = [];
+  const pidToCmd = new Map();
+  for (const appInfo of (result && result.apps) || []) {
+    if (!Number.isInteger(appInfo.pid) || appInfo.pid <= 0) continue;
+    pids.push(appInfo.pid);
+    pidToCmd.set(appInfo.pid, appInfo.command || appInfo.name || '');
+  }
+  return { pids, pidToCmd };
+}
+
+/**
+ * Formats native `libproc` open-file results into exact `lsof -F ptn` output,
+ * always emitting `p<pid>` headers for every valid PID so scan-on-close triggers
+ * identically when a running app closes its last file.
+ */
+function formatNativeOpenFilesAsLsofF(validPids, files) {
+  const byPid = new Map();
+  for (const entry of files) {
+    if (!entry || !Number.isInteger(entry.pid) || typeof entry.path !== 'string') continue;
+    if (!entry.path || entry.path.includes('\n') || entry.path.includes('\r')) continue;
+    let list = byPid.get(entry.pid);
+    if (!list) {
+      list = [];
+      byPid.set(entry.pid, list);
+    }
+    list.push(entry.path);
+  }
+  const lines = [];
+  for (const pid of validPids) {
+    lines.push(`p${pid}`);
+    const paths = byPid.get(pid);
+    if (!paths) continue;
+    for (const filePath of paths) {
+      lines.push('tREG');
+      lines.push(`n${filePath}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+async function pollNativeOpenFilesAsLsofF(validPids, timeoutMs = 12000) {
+  if (!nativeHelper) return null;
+  const response = await nativeHelper.openFiles(validPids, [], timeoutMs);
+  if (!response || !Array.isArray(response.files)) return null;
+  return formatNativeOpenFilesAsLsofF(validPids, response.files);
+}
+
+async function tryNativeVerifiedClone({
+  sourceMeta,
+  group,
+  filePath,
+  ancestries,
+  mode,
+  PackageReviewChangedError,
+  PackageTransactionInvariantError,
+}) {
+  if (
+    !nativeHelper ||
+    !sourceMeta ||
+    typeof sourceMeta.sourcePath !== 'string' ||
+    typeof sourceMeta.dev !== 'bigint' ||
+    typeof sourceMeta.ino !== 'bigint' ||
+    typeof sourceMeta.size !== 'bigint'
+  ) {
+    return null;
+  }
+
+  let cloneResult = null;
+  try {
+    cloneResult = await nativeHelper.cloneVerifiedFile({
+      sourcePath: sourceMeta.sourcePath,
+      expectedSourceDev: `${sourceMeta.dev}`,
+      expectedSourceIno: `${sourceMeta.ino}`,
+      expectedSourceSize: `${sourceMeta.size}`,
+      destDir: group.path,
+      expectedDestDev: `${group.identity.dev}`,
+      expectedDestIno: `${group.identity.ino}`,
+      ancestries,
+      leafName: path.basename(filePath),
+      mode,
+    });
+  } catch (error) {
+    if (error && error.code === 'source_changed' && typeof PackageReviewChangedError === 'function') {
+      throw new PackageReviewChangedError();
+    }
+    if (
+      error &&
+      typeof PackageTransactionInvariantError === 'function' &&
+      (error.code === 'dest_dir_changed' ||
+        error.code === 'dest_already_exists' ||
+        error.code === 'fchmod_failed' ||
+        error.code === 'dest_verify_failed')
+    ) {
+      throw new PackageTransactionInvariantError();
+    }
+    return null;
+  }
+
+  if (cloneResult && cloneResult.cloned === true && cloneResult.outputIdentity) {
+    return {
+      dev: BigInt(cloneResult.outputIdentity.dev),
+      ino: BigInt(cloneResult.outputIdentity.ino),
+      bytesWritten: cloneResult.bytesWritten,
+    };
+  }
+  return null;
+}
+
+function shutdownNativeHelper() {
+  try {
+    nativeHelper?.shutdown?.();
+  } catch (_) {}
+}
+
+module.exports = {
+  canUseNativePackageClone,
+  canUseNativeProcessWatcher,
+  formatNativeOpenFilesAsLsofF,
+  getNativeRunningDesignApps,
+  pollNativeOpenFilesAsLsofF,
+  readNativeLastUsedXattrs,
+  shutdownNativeHelper,
+  tryNativeVerifiedClone,
+};

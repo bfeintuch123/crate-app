@@ -93,25 +93,28 @@ try {
 } catch (_) {
   CrateSqliteStore = null;
 }
-let nativeHelper = null;
+let nativeWatcherBridge = null;
 try {
-  ({ nativeHelper } = require('./parsers/native-helper'));
+  nativeWatcherBridge = require('./parsers/native-watcher-bridge');
 } catch (_) {
-  nativeHelper = null;
+  nativeWatcherBridge = null;
 }
-const canUseNativeProcessWatcher = () => {
-  if (!nativeHelper || !nativeHelper.isAvailable()) return false;
-  try {
-    const builtinCp = require('node:child_process');
-    return exec === builtinCp.exec && execFile === builtinCp.execFile;
-  } catch (_) {
-    return false;
-  }
-};
-const canUseNativePackageClone = () => {
-  if (!nativeHelper || !nativeHelper.isAvailable()) return false;
-  return Boolean(process.versions && process.versions.electron) || process.env.CRATE_ENABLE_NATIVE_CLONE === '1';
-};
+const { ProjectIpcDeltaBridge } = require('./parsers/ipc-delta-bridge');
+const {
+  PROJECT_LIFECYCLE_EVENTS,
+  ProjectLifecycleController,
+  enforceSingleWatchingInvariant,
+} = require('./parsers/project-state-machine');
+const projectIpcDeltaBridge = new ProjectIpcDeltaBridge({
+  coalesceMs: (process.versions && process.versions.electron) ? 16 : 0,
+});
+const projectLifecycleController = new ProjectLifecycleController();
+const canUseNativeProcessWatcher = () => Boolean(
+  nativeWatcherBridge && nativeWatcherBridge.canUseNativeProcessWatcher(exec, execFile)
+);
+const canUseNativePackageClone = () => Boolean(
+  nativeWatcherBridge && nativeWatcherBridge.canUseNativePackageClone()
+);
 startupPhaseJournal.mark('dependencies-loaded');
 
 const PROVENANCE_MANIFEST_FILENAME = 'crate-provenance.json';
@@ -712,19 +715,8 @@ function parseMissingXattrPaths(stderr, filePaths) {
 async function getBulkXattrLastUsedMs(filePaths) {
   if (canUseNativeProcessWatcher()) {
     try {
-      const response = await nativeHelper.readLastUsedXattrs(filePaths, LAST_USED_XATTR_TIMEOUT_MS);
-      const timestamps = response && response.timestamps;
-      if (timestamps && typeof timestamps === 'object') {
-        const values = new Map();
-        for (const filePath of filePaths) {
-          if (!Object.prototype.hasOwnProperty.call(timestamps, filePath)) {
-            throw new Error('incomplete native xattr result');
-          }
-          const raw = timestamps[filePath];
-          values.set(filePath, typeof raw === 'number' && Number.isFinite(raw) ? raw : null);
-        }
-        return values;
-      }
+      const nativeValues = await nativeWatcherBridge.readNativeLastUsedXattrs(filePaths, LAST_USED_XATTR_TIMEOUT_MS);
+      if (nativeValues) return nativeValues;
     } catch (_) {
       // Fall back to /usr/bin/xattr on any native helper failure.
     }
@@ -6903,7 +6895,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   const workspaceAccountGeneration = accountSession?.generation;
   await refreshWorkingSourceLocators(projectId);
   await refreshWorkingSourceVerification(projectId);
-  const project = getProjects().find(item => item && item.id === projectId);
+  const project = getProjectByIdFast(projectId);
   const scopedProject = project && getIllustratorScopedProjectView(project);
   if (!project || !scopedProject) return null;
   const projectFiles = project.files;
@@ -6919,7 +6911,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
 
   // Filtering can await source-session evidence. Revalidate the exact state
   // captured above before using its result or building presentation data.
-  const currentProjectAfterSelection = getProjects().find(item => item && item.id === projectId);
+  const currentProjectAfterSelection = getProjectByIdFast(projectId);
   const selectionProjectionIsFresh = (
     accountSession?.generation === workspaceAccountGeneration && accountSession?.canUseWorkspace() &&
     getActiveWatchingActivationToken(projectId) === workspaceActivationToken &&
@@ -6988,7 +6980,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   // in-flight workspace build from publishing or returning stale records
   // after a concurrent project update. Retry once so the renderer receives a
   // current snapshot; repeated churn fails closed instead of returning stale data.
-  const currentProject = getProjects().find(item => item.id === projectId);
+  const currentProject = getProjectByIdFast(projectId);
   const workspaceIsFresh = (
     accountSession?.generation === workspaceAccountGeneration && accountSession?.canUseWorkspace() &&
     getActiveWatchingActivationToken(projectId) === workspaceActivationToken &&
@@ -11494,7 +11486,56 @@ function isPackageAutoForegroundSuppressed() {
 
 function sendToRenderer(channel, data) { if (trayWindow && !trayWindow.isDestroyed()) trayWindow.webContents.send(channel, data); }
 
-function sendProjectFileStateToRenderer(projectId, activationToken = null) { const current = () => isBoundWatchingActivationCurrent(projectId, activationToken), project = current() && getProjects().find(item => item && item.id === projectId); if (!project || !current()) return; syncAcceptedSourceWatchSubscriptions(projectId); const { files = [], pendingFiles = [] } = getIllustratorScopedProjectView(project); sendToRenderer('files:updated', { projectId, files }); if (current()) sendToRenderer('files:pending', { projectId, pendingFiles }); }
+function getProjectByIdFast(projectId) {
+  if (typeof projectId !== 'string' || !projectId) return null;
+  if (typeof store?.getProjectById === 'function' && typeof store?.upsertProject === 'function') {
+    const project = store.getProjectById(projectId);
+    if (!project) return null;
+    let changed = false;
+    if (migrateProjectFigmaLinkPrivacy(project)) changed = true;
+    if (clearPersistedCurrentSessionFilesystemEvidence(project)) changed = true;
+    if (normalizeProjectAssetReviewState(project)) changed = true;
+    if (changed) {
+      if (typeof clearFileVisualProjectCache === 'function') clearFileVisualProjectCache(projectId);
+      store.upsertProject(project);
+    }
+    return project;
+  }
+  return getProjects().find(item => item && item.id === projectId) || null;
+}
+
+function sendProjectFileStateToRenderer(projectId, activationToken = null) {
+  const emitNow = () => {
+    const current = () => isBoundWatchingActivationCurrent(projectId, activationToken);
+    const project = current() && getProjectByIdFast(projectId);
+    if (!project || !current()) return;
+    syncAcceptedSourceWatchSubscriptions(projectId);
+    const { files = [], pendingFiles = [] } = getIllustratorScopedProjectView(project);
+    const update = projectIpcDeltaBridge.computeProjectUpdate(projectId, files, pendingFiles);
+    if (!update) return;
+    const isElectronRuntime = Boolean(process.versions && process.versions.electron);
+    const includeFullArrays = !isElectronRuntime;
+    if (update.filesChanged || update.revision === 1) {
+      sendToRenderer('files:updated', {
+        projectId,
+        revision: update.revision,
+        delta: update.filesDelta,
+        counts: update.counts,
+        ...(includeFullArrays ? { files } : {}),
+      });
+    }
+    if (current() && (update.pendingChanged || update.revision === 1)) {
+      sendToRenderer('files:pending', {
+        projectId,
+        revision: update.revision,
+        delta: update.pendingDelta,
+        counts: update.counts,
+        ...(includeFullArrays ? { pendingFiles } : {}),
+      });
+    }
+  };
+  projectIpcDeltaBridge.schedule(projectId, emitNow);
+}
 
 function projectWatchActivityTime(project) {
   for (const value of [project && project.watchStartedAt, project && project.createdAt]) {
@@ -11634,14 +11675,19 @@ function activateSingleWatchingProject(projectId, settings, { preserveWatchStart
   const project = projects.find(item => item.id === projectId);
   if (!project) return null;
 
-  const pausedProjectIds = [];
-  for (const otherProject of projects) {
-    if (otherProject.id === projectId || otherProject.status !== 'watching') continue;
-    otherProject.status = 'paused';
-    pausedProjectIds.push(otherProject.id);
+  const { pausedProjectIds } = enforceSingleWatchingInvariant(projects, projectId);
+  for (const pausedProjectId of pausedProjectIds) {
+    const pausedProj = projects.find(item => item && item.id === pausedProjectId);
+    if (pausedProj) {
+      try { projectLifecycleController.transition(pausedProj, PROJECT_LIFECYCLE_EVENTS.PAUSE, { reason: 'displaced-by-activation' }); } catch (_) {}
+    }
   }
 
-  project.status = 'watching';
+  try {
+    projectLifecycleController.transition(project, PROJECT_LIFECYCLE_EVENTS.START_WATCHING, { reason: 'activate-watching' });
+  } catch (_) {
+    project.status = 'watching';
+  }
   if (!preserveWatchStartedAt || !project.watchStartedAt) {
     project.watchStartedAt = Date.now();
   }
@@ -11956,54 +12002,34 @@ const LAST_USED_POLL_MS = 10000;      // 10 seconds
 // Get PIDs of all running supported design apps so one project can span apps.
 // Uses `ps ax -o pid= -o command=` which gives full app paths (not truncated like lsof COMMAND).
 function getRunningDesignAppPids(callback) {
-  if (canUseNativeProcessWatcher()) {
-    nativeHelper.runningApps(DESIGN_APP_PROCESS_KEYWORDS, 3000)
-      .then(result => {
-        const pids = [];
-        const pidToCmd = new Map();
-        for (const appInfo of (result && result.apps) || []) {
-          if (!Number.isInteger(appInfo.pid) || appInfo.pid <= 0) continue;
-          pids.push(appInfo.pid);
-          pidToCmd.set(appInfo.pid, appInfo.command || appInfo.name || '');
+  const runLegacyPs = () => {
+    exec('/bin/ps ax -o pid= -o command= 2>/dev/null', { timeout: 5000 }, (err, stdout) => {
+      if (err && !stdout) { callback([], new Map()); return; }
+      const pids = [];
+      const pidToCmd = new Map(); // v2.5.3: PID → command string for lsof image filtering
+      for (const line of stdout.trim().split('\n')) {
+        const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
+        if (!m) continue;
+        const pid = parseInt(m[1]);
+        const cmd = m[2];
+        if (DESIGN_APP_PROCESS_KEYWORDS.some(kw => cmd.includes(kw))) {
+          pids.push(pid);
+          pidToCmd.set(pid, cmd);
         }
-        callback(pids, pidToCmd);
+      }
+      callback(pids, pidToCmd);
+    });
+  };
+  if (canUseNativeProcessWatcher()) {
+    nativeWatcherBridge.getNativeRunningDesignApps(DESIGN_APP_PROCESS_KEYWORDS, 3000)
+      .then(result => {
+        if (result) callback(result.pids, result.pidToCmd);
+        else runLegacyPs();
       })
-      .catch(() => {
-        exec('/bin/ps ax -o pid= -o command= 2>/dev/null', { timeout: 5000 }, (err, stdout) => {
-          if (err && !stdout) { callback([], new Map()); return; }
-          const pids = [];
-          const pidToCmd = new Map();
-          for (const line of stdout.trim().split('\n')) {
-            const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
-            if (!m) continue;
-            const pid = parseInt(m[1]);
-            const cmd = m[2];
-            if (DESIGN_APP_PROCESS_KEYWORDS.some(kw => cmd.includes(kw))) {
-              pids.push(pid);
-              pidToCmd.set(pid, cmd);
-            }
-          }
-          callback(pids, pidToCmd);
-        });
-      });
+      .catch(runLegacyPs);
     return;
   }
-  exec('/bin/ps ax -o pid= -o command= 2>/dev/null', { timeout: 5000 }, (err, stdout) => {
-    if (err && !stdout) { callback([], new Map()); return; }
-    const pids = [];
-    const pidToCmd = new Map(); // v2.5.3: PID → command string for lsof image filtering
-    for (const line of stdout.trim().split('\n')) {
-      const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
-      if (!m) continue;
-      const pid = parseInt(m[1]);
-      const cmd = m[2];
-      if (DESIGN_APP_PROCESS_KEYWORDS.some(kw => cmd.includes(kw))) {
-        pids.push(pid);
-        pidToCmd.set(pid, cmd);
-      }
-    }
-    callback(pids, pidToCmd);
-  });
+  runLegacyPs();
 }
 
 // Poll lsof for a single watching project. Runs every LSOF_POLL_MS.
@@ -12332,29 +12358,9 @@ function pollLsofForProjectCore(projectId, activationToken = null, onComplete = 
     };
 
     if (canUseNativeProcessWatcher()) {
-      nativeHelper.openFiles(validPids, [], 12000)
-        .then((response) => {
-          if (response && Array.isArray(response.files)) {
-            const byPid = new Map();
-            for (const entry of response.files) {
-              if (!entry || !Number.isInteger(entry.pid) || typeof entry.path !== 'string') continue;
-              if (!entry.path || entry.path.includes('\n') || entry.path.includes('\r')) continue;
-              let list = byPid.get(entry.pid);
-              if (!list) { list = []; byPid.set(entry.pid, list); }
-              list.push(entry.path);
-            }
-            const lines = [];
-            for (const pid of validPids) {
-              lines.push(`p${pid}`);
-              const paths = byPid.get(pid);
-              if (!paths) continue;
-              for (const filePath of paths) {
-                lines.push('tREG');
-                lines.push(`n${filePath}`);
-              }
-            }
-            return handleLsofOutput(null, lines.join('\n'));
-          }
+      nativeWatcherBridge.pollNativeOpenFilesAsLsofF(validPids, 12000)
+        .then(lsofText => {
+          if (typeof lsofText === 'string') return handleLsofOutput(null, lsofText);
           exec(cmd, { timeout: 12000 }, handleLsofOutput);
         })
         .catch(() => {
@@ -21464,18 +21470,22 @@ registerTrustedIpcHandler('projects:start-watching', async (event, id) => {
 
 registerTrustedIpcHandler('projects:pause', (event, id) => {
   const project = mutateProject(id, (proj) => {
-    proj.status = 'paused';
+    try {
+      projectLifecycleController.transition(proj, PROJECT_LIFECYCLE_EVENTS.PAUSE, { reason: 'user-pause' });
+    } catch (_) {
+      proj.status = 'paused';
+    }
     return proj;
   });
   if (project) {
     stopWatching(id);
   }
-  return getIllustratorScopedProjectView(getProjects().find(item => item.id === id) || null);
+  const latest = getProjectByIdFast(id);
+  return latest ? getIllustratorScopedProjectView(latest) : null;
 });
 
 registerTrustedIpcHandler('projects:get-files', (event, id) => {
-  const projects = getProjects();
-  const project = projects.find(p => p.id === id);
+  const project = getProjectByIdFast(id);
   return project ? getIllustratorScopedProjectView(project).files : [];
 });
 
@@ -27039,50 +27049,23 @@ function createPackageWriteTransaction(destFolder) {
     async materializeSource(filePath, sourceFd, sourceSize, mode, sourceMeta = null) {
       const group = getDescriptorBoundGroup(filePath);
       if (!group) throw new PackageTransactionInvariantError();
-      if (
-        canUseNativePackageClone() &&
-        sourceMeta &&
-        typeof sourceMeta.sourcePath === 'string' &&
-        typeof sourceMeta.dev === 'bigint' &&
-        typeof sourceMeta.ino === 'bigint' &&
-        typeof sourceMeta.size === 'bigint'
-      ) {
+      if (canUseNativePackageClone() && sourceMeta) {
         const ancestries = Array.isArray(group.ancestries) && group.ancestries.length > 0
           ? group.ancestries
           : [capturePackageTransactionAncestry(group.path, group.identity)];
-        let cloneResult = null;
-        try {
-          cloneResult = await nativeHelper.cloneVerifiedFile({
-            sourcePath: sourceMeta.sourcePath,
-            expectedSourceDev: `${sourceMeta.dev}`,
-            expectedSourceIno: `${sourceMeta.ino}`,
-            expectedSourceSize: `${sourceMeta.size}`,
-            destDir: group.path,
-            expectedDestDev: `${group.identity.dev}`,
-            expectedDestIno: `${group.identity.ino}`,
-            ancestries,
-            leafName: path.basename(filePath),
-            mode: OWNER_ONLY_FILE_MODE,
-          });
-        } catch (error) {
-          if (error && error.code === 'source_changed') {
-            throw new PackageReviewChangedError();
-          }
-          if (
-            error &&
-            (error.code === 'dest_dir_changed' ||
-              error.code === 'dest_already_exists' ||
-              error.code === 'fchmod_failed' ||
-              error.code === 'dest_verify_failed')
-          ) {
-            throw new PackageTransactionInvariantError();
-          }
-          cloneResult = { cloned: false, fallback: true };
-        }
-        if (cloneResult && cloneResult.cloned === true && cloneResult.outputIdentity) {
+        const clonedIdentity = await nativeWatcherBridge.tryNativeVerifiedClone({
+          sourceMeta,
+          group,
+          filePath,
+          ancestries,
+          mode: OWNER_ONLY_FILE_MODE,
+          PackageReviewChangedError,
+          PackageTransactionInvariantError,
+        });
+        if (clonedIdentity) {
           group.ownedOutputs.set(path.basename(filePath), {
-            dev: BigInt(cloneResult.outputIdentity.dev),
-            ino: BigInt(cloneResult.outputIdentity.ino),
+            dev: clonedIdentity.dev,
+            ino: clonedIdentity.ino,
           });
           assertPhysicalDestination(filePath);
           return;
@@ -27714,6 +27697,7 @@ registerTrustedIpcHandler('projects:select-output', async (event) => {
 });
 
 registerTrustedIpcHandler('projects:delete', (event, id) => {
+  projectIpcDeltaBridge.clearProject(id);
   invalidatePackageReviewForProject(id);
   incompletePackageScans.delete(id);
   packageScanDiagnosticState.delete(id);
@@ -27797,6 +27781,7 @@ registerTrustedIpcHandler('projects:delete-all', () => {
   scannedDesignFiles.clear();
   designFilePids.clear();
   disposeAddFilesWorkerPool();
+  projectIpcDeltaBridge.clearAll();
   assetBaselineScans.clear();
 
   clearFileVisualProjectCache();
@@ -28323,13 +28308,14 @@ app.on('before-quit', () => {
   scannedDesignFiles.clear();
   designFilePids.clear();
   disposeAddFilesWorkerPool();
+  projectIpcDeltaBridge.clearAll();
   // C4: Clean up inactivity checker
   if (inactivityCheckerInterval) {
     clearInterval(inactivityCheckerInterval);
     inactivityCheckerInterval = null;
   }
   try { store?.close?.(); } catch (_) {}
-  try { nativeHelper?.shutdown?.(); } catch (_) {}
+  try { nativeWatcherBridge?.shutdownNativeHelper?.(); } catch (_) {}
   activeNativeNotifications.clear();
   // v2.5.0: Clean up scan-on-save timers
   for (const [, pending] of scanOnSaveTimers) {

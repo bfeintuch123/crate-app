@@ -8,12 +8,48 @@ const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const DEFAULT_BINARY_PATH = path.resolve(__dirname, '..', 'native', 'bin', 'crate-helper');
+const DEV_BINARY_PATH = path.resolve(__dirname, '..', 'native', 'bin', 'crate-helper');
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 
+function isExecutableRegularFile(candidatePath) {
+  if (typeof candidatePath !== 'string' || !path.isAbsolute(candidatePath)) return false;
+  try {
+    const stat = fs.lstatSync(candidatePath);
+    return stat.isFile() && !stat.isSymbolicLink() && (stat.mode & 0o111) !== 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * Resolve the native Apple Silicon Swift helper binary across both:
+ *   1. Packaged Electron `.app` builds (`Contents/Resources/native/crate-helper`,
+ *      outside `app.asar` because Mach-O binaries cannot be spawned from ASAR),
+ *   2. Dev/worktree checkouts (`native/bin/crate-helper`).
+ */
+function resolveNativeHelperBinaryPath(explicitPath = null) {
+  if (typeof explicitPath === 'string' && explicitPath.length > 0) {
+    return explicitPath;
+  }
+  const envOverride = process.env.CRATE_NATIVE_HELPER_PATH;
+  if (typeof envOverride === 'string' && isExecutableRegularFile(envOverride)) {
+    return envOverride;
+  }
+  if (typeof process.resourcesPath === 'string' && process.resourcesPath.length > 0) {
+    const packagedCandidate = path.join(process.resourcesPath, 'native', 'crate-helper');
+    if (isExecutableRegularFile(packagedCandidate)) {
+      return packagedCandidate;
+    }
+  }
+  return DEV_BINARY_PATH;
+}
+
+const DEFAULT_BINARY_PATH = resolveNativeHelperBinaryPath();
+
 class NativeHelperClient {
-  constructor(binaryPath = DEFAULT_BINARY_PATH) {
-    this.binaryPath = binaryPath;
+  constructor(binaryPath = null) {
+    this.explicitBinaryPath = binaryPath;
+    this.binaryPath = resolveNativeHelperBinaryPath(binaryPath);
     this.child = null;
     this.buffer = '';
     this.nextId = 1;
@@ -24,12 +60,10 @@ class NativeHelperClient {
   isAvailable() {
     if (process.platform !== 'darwin') return false;
     if (process.env.CRATE_DISABLE_NATIVE_HELPER === '1') return false;
-    try {
-      const stat = fs.lstatSync(this.binaryPath);
-      return stat.isFile() && !stat.isSymbolicLink() && (stat.mode & 0o111) !== 0;
-    } catch (_) {
-      return false;
+    if (!this.explicitBinaryPath) {
+      this.binaryPath = resolveNativeHelperBinaryPath(null);
     }
+    return isExecutableRegularFile(this.binaryPath);
   }
 
   _ensureRunning() {
@@ -208,6 +242,9 @@ const defaultClient = new NativeHelperClient();
 
 module.exports = {
   DEFAULT_BINARY_PATH,
+  DEV_BINARY_PATH,
   NativeHelperClient,
+  isExecutableRegularFile,
   nativeHelper: defaultClient,
+  resolveNativeHelperBinaryPath,
 };
