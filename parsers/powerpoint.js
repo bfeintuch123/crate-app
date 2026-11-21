@@ -49,6 +49,10 @@ const {
   sanitizePackageFileName,
   writeFileIntoPackage,
 } = require('./package-safety');
+const {
+  isUnsupportedZipEntryError,
+  openZipArchive,
+} = require('./zip-reader');
 
 const execFileAsync = promisify(execFile);
 const PRESENTATION_ADMISSION_MESSAGE = 'This presentation contains too much embedded media for Crate to inspect safely.';
@@ -150,7 +154,55 @@ function getUniqueKeynoteWildcardFallback(zipPath, assets) {
   };
 }
 
-async function extractArchiveEntryData(archivePath, zipPath, ext, assets) {
+async function extractArchiveEntryData(archivePath, zipPath, ext, assets, archive = null) {
+  if (archive) {
+    const exactEntry = archive.findEntry(zipPath);
+    if (exactEntry) {
+      try {
+        const data = assertBufferWithinBudget(
+          archive.readEntry(exactEntry, {
+            maxOutputBytes: ADMISSION_LIMITS.presentationMediaEntryBytes,
+            message: PRESENTATION_ADMISSION_MESSAGE,
+          }),
+          ADMISSION_LIMITS.presentationMediaEntryBytes,
+          PRESENTATION_ADMISSION_MESSAGE
+        );
+        return { data, outputTail: ext === '.key' ? getKeynoteArchiveEntryOutputTail(zipPath) : null };
+      } catch (entryError) {
+        if (!isUnsupportedZipEntryError(entryError)) throw entryError;
+        // Fall through to /usr/bin/unzip only for unsupported ZIP compression methods.
+      }
+    } else if (ext === '.key') {
+      const fallback = getUniqueKeynoteWildcardFallback(zipPath, assets);
+      if (!fallback) {
+        throw Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
+      }
+      const archiveMatches = archive.entries.filter(entry => (
+        entry.path.startsWith('Data/')
+        && hasEmbeddedMediaExtension(entry.path)
+        && path.basename(entry.path).trim().endsWith(fallback.tail)
+      ));
+      if (archiveMatches.length !== 1) {
+        throw Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
+      }
+      try {
+        const data = assertBufferWithinBudget(
+          archive.readEntry(archiveMatches[0], {
+            maxOutputBytes: ADMISSION_LIMITS.presentationMediaEntryBytes,
+            message: PRESENTATION_ADMISSION_MESSAGE,
+          }),
+          ADMISSION_LIMITS.presentationMediaEntryBytes,
+          PRESENTATION_ADMISSION_MESSAGE
+        );
+        return { data, outputTail: getKeynoteArchiveEntryOutputTail(zipPath, fallback.tail) || fallback.tail };
+      } catch (entryError) {
+        if (!isUnsupportedZipEntryError(entryError)) throw entryError;
+      }
+    } else {
+      throw Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
+    }
+  }
+
   try {
     const data = await readArchiveEntryData(archivePath, zipPath);
     return { data, outputTail: ext === '.key' ? getKeynoteArchiveEntryOutputTail(zipPath) : null };
@@ -209,13 +261,27 @@ class PowerPointParser extends BaseParser {
       PRESENTATION_ADMISSION_MESSAGE
     );
 
+    let archive = null;
     try {
-      // List the ZIP contents
-      const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', filePath], {
-        timeout: 10000,
-        maxBuffer: ADMISSION_LIMITS.archiveListingBufferBytes,
-        encoding: 'utf8'
+      archive = openZipArchive(filePath, {
+        maxFileBytes: ADMISSION_LIMITS.archiveFileBytes,
+        maxEntries: ADMISSION_LIMITS.archiveEntries,
+        maxTotalBytes: ADMISSION_LIMITS.archiveUncompressedBytes,
+        message: PRESENTATION_ADMISSION_MESSAGE,
       });
+
+      let entries;
+      if (archive) {
+        entries = archive.entries;
+      } else {
+        // Fallback for non-standard/legacy fixtures: list ZIP contents via /usr/bin/unzip
+        const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', filePath], {
+          timeout: 10000,
+          maxBuffer: ADMISSION_LIMITS.archiveListingBufferBytes,
+          encoding: 'utf8'
+        });
+        entries = parseArchiveListing(listing, { message: PRESENTATION_ADMISSION_MESSAGE });
+      }
 
       if (ext === '.pptx') {
         const source = readFileWithinBudget(filePath, ADMISSION_LIMITS.localParserFileBytes, PRESENTATION_ADMISSION_MESSAGE);
@@ -227,7 +293,6 @@ class PowerPointParser extends BaseParser {
           this.appendAsset(assets, { path: linkedPath, source: 'pptx-linked', exists }, PRESENTATION_ADMISSION_MESSAGE);
         }
       }
-      const entries = parseArchiveListing(listing, { message: PRESENTATION_ADMISSION_MESSAGE });
       for (const entry of entries) {
         const fileSize = entry.size;
         const zipPath = entry.path;
@@ -293,6 +358,8 @@ class PowerPointParser extends BaseParser {
           console.warn('[PowerPointParser] Embedded inspection error callback skipped');
         }
       }
+    } finally {
+      if (archive) archive.close();
     }
 
     return this.deduplicateAssets(assets);
@@ -332,13 +399,21 @@ class PowerPointParser extends BaseParser {
     });
 
     const outputRoot = ensureSafePackageDirectory(destDir);
+    let archive = null;
 
     try {
+      archive = openZipArchive(archivePath, {
+        maxFileBytes: ADMISSION_LIMITS.archiveFileBytes,
+        maxEntries: ADMISSION_LIMITS.archiveEntries,
+        maxTotalBytes: ADMISSION_LIMITS.archiveUncompressedBytes,
+        message: PRESENTATION_ADMISSION_MESSAGE,
+      });
+
       for (const asset of assets) {
         if (!asset.zipPath) continue;
 
         try {
-          const { data, outputTail } = await extractArchiveEntryData(archivePath, asset.zipPath, ext, assets);
+          const { data, outputTail } = await extractArchiveEntryData(archivePath, asset.zipPath, ext, assets, archive);
           extractedBytes += data.length;
           if (extractedBytes > ADMISSION_LIMITS.presentationMediaBytes) {
             throw admissionError(PRESENTATION_ADMISSION_MESSAGE);
@@ -391,6 +466,8 @@ class PowerPointParser extends BaseParser {
         removeCreatedPackageFiles(outputRoot, extracted.map(item => item.extractedPath));
       }
       throw error;
+    } finally {
+      if (archive) archive.close();
     }
 
     return extracted;

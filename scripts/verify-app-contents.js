@@ -28,7 +28,8 @@ const RUNTIME_PARSER_FILES = Object.freeze([
   'premiere.js',
   'psd.js',
   'working-source-recovery-core.js',
-  'working-source-witness.js'
+  'working-source-witness.js',
+  'zip-reader.js'
 ]);
 
 const REQUIRED_ASAR_ENTRIES = Object.freeze([

@@ -16205,16 +16205,33 @@ function runAddFilesWorker(workerPath, filePath, scanLease, options = {}) {
   if (!utilityProcess || typeof utilityProcess.fork !== 'function') {
     return Promise.reject(new Error(options.unavailableError || 'asset_baseline_worker_unavailable'));
   }
+  const pool = getAddFilesWorkerPool();
+  const requestId = ++pool.nextRequestId;
   return new Promise((resolve, reject) => {
     let child = null;
+    let reused = false;
     let settled = false;
+    let awaitingIdle = false;
     let terminationRequested = false;
     let removeCancelListener = () => {};
     let busy = false;
     let expectedSeq = 0;
     let exited;
+    let sessionDoneResolved = false;
+    const resolveSessionDone = () => {
+      if (sessionDoneResolved) return;
+      sessionDoneResolved = true;
+      exited();
+    };
     const exitPromise = new Promise(resolveExit => { exited = resolveExit; });
     options.consumer?.setWorkerExit(exitPromise);
+    const detachJobListeners = () => {
+      if (!child) return;
+      child.removeListener('message', onMessage);
+      child.removeListener('error', onError);
+      child.removeListener('exit', onExit);
+      child.removeListener('spawn', onSpawn);
+    };
     const stopChild = () => {
       terminationRequested = true;
       try { child?.kill(); } catch (_) {}
@@ -16223,50 +16240,79 @@ function runAddFilesWorker(workerPath, filePath, scanLease, options = {}) {
       if (settled) return;
       settled = true;
       removeCancelListener();
-      child?.removeAllListeners('message');
       if (error) {
+        awaitingIdle = false;
+        child?.removeListener('message', onMessage);
         stopChild();
         reject(error);
       } else {
+        if (!awaitingIdle) child?.removeListener('message', onMessage);
         resolve(value);
       }
     };
-    try {
-      child = utilityProcess.fork(workerPath, [], {
-        cwd: path.dirname(filePath),
-        env: {},
-        execArgv: [],
-        stdio: 'ignore',
-        serviceName: options.serviceName || 'Crate Add Files Parser',
-        allowLoadingUnsignedLibraries: false,
-        disclaim: false,
-      });
-    } catch (error) {
-      exited();
+    const onError = error => {
+      if (awaitingIdle) {
+        awaitingIdle = false;
+        detachJobListeners();
+        stopChild();
+        resolveSessionDone();
+        return;
+      }
       finish(error);
-      return;
-    }
-    child.on('error', error => finish(error));
-    child.once('exit', () => {
-      exited();
+    };
+    const onExit = () => {
+      awaitingIdle = false;
+      detachJobListeners();
+      resolveSessionDone();
       if (!settled && !options.consumer?.finalReceived) finish(new Error(options.exitedError || 'asset_baseline_worker_exited'));
-      child.removeAllListeners('error');
-      child.on('error', () => {}); // Observe late errors without retaining the scan.
-    });
-    child.once('spawn', () => {
+      if (child) {
+        child.removeAllListeners('error');
+        child.on('error', () => {}); // Observe late errors without retaining the scan.
+      }
+    };
+    const dispatchParse = () => {
       // A pre-spawn kill can return false because the child has no PID yet.
       if (terminationRequested) {
         stopChild();
         return;
       }
       if (!settled) {
-        try { child.postMessage({ type: 'parse', filePath, ...(options.consumer ? { sessionId: options.consumer.sessionId } : {}) }); }
-        catch (error) { finish(error); }
+        try {
+          child.postMessage({
+            type: 'parse',
+            filePath,
+            pooled: true,
+            requestId,
+            ...(options.consumer ? { sessionId: options.consumer.sessionId } : {}),
+          });
+        } catch (error) {
+          finish(error);
+        }
       }
-    });
-    child.on('message', message => {
-      if (settled || !message || typeof message !== 'object') return;
-      if (options.consumer && message.sessionId !== options.consumer.sessionId) return;
+    };
+    const onSpawn = () => dispatchParse();
+    const onMessage = message => {
+      if (!message || typeof message !== 'object') return;
+      if (awaitingIdle) {
+        if (options.consumer && message.type === 'session-idle' && message.sessionId === options.consumer.sessionId) {
+          awaitingIdle = false;
+          detachJobListeners();
+          releasePooledAddFilesWorker(workerPath, child);
+          resolveSessionDone();
+          return;
+        }
+        awaitingIdle = false;
+        detachJobListeners();
+        stopChild();
+        resolveSessionDone();
+        return;
+      }
+      if (settled) return;
+      if (options.consumer) {
+        if (message.sessionId !== options.consumer.sessionId) return;
+      } else if (message.requestId !== undefined && message.requestId !== requestId) {
+        return;
+      }
       if (message.type === 'error') {
         finish(new Error(typeof message.error === 'string'
           ? message.error
@@ -16290,7 +16336,10 @@ function runAddFilesWorker(workerPath, filePath, scanLease, options = {}) {
               options.consumer.check();
               busy = false;
               child.postMessage({ type: 'ack', sessionId: options.consumer.sessionId, seq });
-              if (value) finish(null, value);
+              if (value) {
+                awaitingIdle = true;
+                finish(null, value);
+              }
             } catch (error) { finish(error); }
           });
         }, error => { message = null; finish(error); });
@@ -16300,8 +16349,40 @@ function runAddFilesWorker(workerPath, filePath, scanLease, options = {}) {
         finish(new Error(options.invalidResultError || 'asset_baseline_worker_invalid_result'));
         return;
       }
+      if (message.keepAlive === true && !terminationRequested) {
+        detachJobListeners();
+        releasePooledAddFilesWorker(workerPath, child);
+        resolveSessionDone();
+      }
       finish(null, message.result);
-    });
+    };
+
+    const pooledChild = acquirePooledAddFilesWorker(workerPath);
+    if (pooledChild) {
+      child = pooledChild;
+      reused = true;
+    } else {
+      try {
+        child = utilityProcess.fork(workerPath, [], {
+          cwd: path.dirname(filePath),
+          env: {},
+          execArgv: [],
+          stdio: 'ignore',
+          serviceName: options.serviceName || 'Crate Add Files Parser',
+          allowLoadingUnsignedLibraries: false,
+          disclaim: false,
+        });
+      } catch (error) {
+        resolveSessionDone();
+        finish(error);
+        return;
+      }
+    }
+    child.on('error', onError);
+    child.once('exit', onExit);
+    child.on('message', onMessage);
+    if (!reused) child.once('spawn', onSpawn);
+
     if (scanLease && typeof scanLease.onCancel === 'function') {
       const unsubscribe = scanLease.onCancel(() => {
         finish(new Error('add_files_parser_cancelled'));
@@ -16309,7 +16390,141 @@ function runAddFilesWorker(workerPath, filePath, scanLease, options = {}) {
       if (settled) unsubscribe();
       else removeCancelListener = unsubscribe;
     }
+    if (reused && !settled) {
+      dispatchParse();
+    }
   });
+}
+
+function getAddFilesWorkerPool() {
+  if (!runAddFilesWorker._pool) {
+    runAddFilesWorker._pool = {
+      byPath: new Map(),
+      nextRequestId: 0,
+      maxIdlePerKind: 2,
+      idleTtlMs: 15_000,
+    };
+  }
+  return runAddFilesWorker._pool;
+}
+
+function detachPooledWorkerEntry(entry) {
+  if (entry.idleTimer !== null && typeof clearTimeout === 'function') {
+    clearTimeout(entry.idleTimer);
+    entry.idleTimer = null;
+  }
+  entry.child.removeListener('exit', entry.onIdleExit);
+  entry.child.removeListener('error', entry.onIdleError);
+  entry.child.removeListener('message', entry.onIdleMessage);
+}
+
+function shutdownIdleAddFilesWorker(child) {
+  if (!child) return Promise.resolve();
+  if (child.exitCode !== null && child.exitCode !== undefined) return Promise.resolve();
+  if (child.signalCode !== null && child.signalCode !== undefined) return Promise.resolve();
+  return new Promise(resolve => {
+    let done = false;
+    let timer = null;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      if (timer !== null && typeof clearTimeout === 'function') {
+        clearTimeout(timer);
+        timer = null;
+      }
+      resolve();
+    };
+    child.once('exit', finish);
+    child.removeAllListeners('error');
+    child.on('error', () => {});
+    try {
+      child.postMessage({ type: 'shutdown' });
+    } catch (_) {
+      let killed = false;
+      try { killed = child.kill() !== false; } catch (_) {}
+      if (!killed) finish();
+      return;
+    }
+    if (typeof setTimeout === 'function') {
+      timer = setTimeout(() => {
+        timer = null;
+        if (!done) {
+          let killed = false;
+          try { killed = child.kill() !== false; } catch (_) {}
+          if (!killed) finish();
+        }
+      }, 250);
+      if (typeof timer.unref === 'function') timer.unref();
+    }
+  });
+}
+
+function acquirePooledAddFilesWorker(workerPath) {
+  const pool = getAddFilesWorkerPool();
+  const list = pool.byPath.get(workerPath);
+  if (!list || list.length === 0) return null;
+  const entry = list.pop();
+  if (list.length === 0) pool.byPath.delete(workerPath);
+  detachPooledWorkerEntry(entry);
+  return entry.child;
+}
+
+function releasePooledAddFilesWorker(workerPath, child) {
+  if (!child) return false;
+  const pool = getAddFilesWorkerPool();
+  let list = pool.byPath.get(workerPath);
+  if (list && list.length >= pool.maxIdlePerKind) {
+    shutdownIdleAddFilesWorker(child);
+    return false;
+  }
+  if (!list) {
+    list = [];
+    pool.byPath.set(workerPath, list);
+  }
+  const evict = ({ kill = false } = {}) => {
+    const currentList = pool.byPath.get(workerPath);
+    if (currentList) {
+      const idx = currentList.indexOf(entry);
+      if (idx >= 0) currentList.splice(idx, 1);
+      if (currentList.length === 0) pool.byPath.delete(workerPath);
+    }
+    detachPooledWorkerEntry(entry);
+    if (kill) {
+      try { child.kill(); } catch (_) {}
+    }
+  };
+  const entry = {
+    child,
+    idleTimer: null,
+    onIdleExit: () => evict({ kill: false }),
+    onIdleError: () => evict({ kill: true }),
+    onIdleMessage: () => evict({ kill: true }),
+  };
+  child.once('exit', entry.onIdleExit);
+  child.on('error', entry.onIdleError);
+  child.on('message', entry.onIdleMessage);
+  if (typeof setTimeout === 'function') {
+    entry.idleTimer = setTimeout(() => {
+      evict({ kill: false });
+      shutdownIdleAddFilesWorker(child);
+    }, pool.idleTtlMs);
+    if (typeof entry.idleTimer.unref === 'function') entry.idleTimer.unref();
+  }
+  list.push(entry);
+  return true;
+}
+
+async function disposeAddFilesWorkerPool() {
+  const pool = getAddFilesWorkerPool();
+  const closing = [];
+  for (const [, list] of [...pool.byPath.entries()]) {
+    for (const entry of list) {
+      detachPooledWorkerEntry(entry);
+      closing.push(shutdownIdleAddFilesWorker(entry.child));
+    }
+  }
+  pool.byPath.clear();
+  await Promise.allSettled(closing);
 }
 
 function runAddFilesPsdWorker(filePath, scanLease, transaction) {
@@ -27300,6 +27515,7 @@ registerTrustedIpcHandler('projects:delete-all', () => {
   // v2.2.2: Clean up scan-on-open state
   scannedDesignFiles.clear();
   designFilePids.clear();
+  disposeAddFilesWorkerPool();
   assetBaselineScans.clear();
 
   clearFileVisualProjectCache();
@@ -27825,6 +28041,7 @@ app.on('before-quit', () => {
   // v2.2.2: Clean up scan-on-open state
   scannedDesignFiles.clear();
   designFilePids.clear();
+  disposeAddFilesWorkerPool();
   // C4: Clean up inactivity checker
   if (inactivityCheckerInterval) {
     clearInterval(inactivityCheckerInterval);

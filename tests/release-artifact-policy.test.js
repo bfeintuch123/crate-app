@@ -176,6 +176,7 @@ const REVIEWED_SOURCE_BOUND_ENTRIES = Object.freeze([
   'parsers/psd.js',
   'parsers/working-source-recovery-core.js',
   'parsers/working-source-witness.js',
+  'parsers/zip-reader.js',
 ]);
 const REVIEWED_EXTERNAL_SOURCE_BOUND_ENTRIES = Object.freeze([
   Object.freeze({
