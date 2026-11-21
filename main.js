@@ -1248,6 +1248,20 @@ function getKnownPackageOutputPaths(projects = getProjects()) {
   return Array.from(new Set(paths.map(outputPath => path.resolve(outputPath))));
 }
 
+// One path check per file would read the whole store twice per file. This shares
+// one read of the output folders, taken when the first path needs it, even if that
+// path is decided without them. Use it only within one synchronous stretch: never
+// across an await, a callback turn, a store write or a publication, and call
+// refresh() after anything that can write the store. A view must not outlive a
+// catch that swallows a throw from such a call. Inside such a stretch every result
+// is what isAutoCaptureExcludedPath(filePath) alone would have returned.
+function createSynchronousOutputExclusion() {
+  let outputPaths = null;
+  const isExcluded = filePath => isAutoCaptureExcludedPath(filePath, [], outputPaths ||= getKnownPackageOutputPaths());
+  isExcluded.refresh = () => { outputPaths = null; };
+  return isExcluded;
+}
+
 function rememberGeneratedPackageOutputPath(outputPath) {
   if (typeof outputPath !== 'string' || !outputPath.trim()) return;
   try {
@@ -3019,9 +3033,10 @@ function pruneExcludedAutoCapturedFiles(project) {
   if (!project || !Array.isArray(project.files)) return false;
 
   const before = project.files.length;
+  const isOutputExcluded = createSynchronousOutputExclusion();
   project.files = project.files.filter(file => {
     if (!file || file.source === 'manual-browse' || file.source === 'manual') return true;
-    return !isAutoCaptureExcludedPath(file.path);
+    return !isOutputExcluded(file.path);
   });
   return project.files.length !== before;
 }
@@ -8580,7 +8595,7 @@ function getPackageSourceMasterStat(file) {
   }
 }
 
-function getPackageSourceMasterDedupePriority(project, file) {
+function getPackageSourceMasterDedupePriority(project, file, isOutputExcluded = isAutoCaptureExcludedPath) {
   let priority = 0;
   const source = getFileCaptureSource(file);
   const evidence = file && file.captureEvidence;
@@ -8593,7 +8608,7 @@ function getPackageSourceMasterDedupePriority(project, file) {
   }
   if (source === 'lsof') priority += 20;
   if (isWeakBroadObserverFile(file)) priority -= 25;
-  if (file && typeof file.path === 'string' && isAutoCaptureExcludedPath(file.path)) priority -= 100;
+  if (file && typeof file.path === 'string' && isOutputExcluded(file.path)) priority -= 100;
 
   return priority;
 }
@@ -8608,6 +8623,7 @@ function comparePackageSourceMasterDedupeCandidates(left, right) {
 
 function deduplicatePackageSourceMastersForOutput(project, packageFiles) {
   const byOutputName = new Map();
+  const isOutputExcluded = createSynchronousOutputExclusion();
 
   packageFiles.forEach((file, index) => {
     const key = getPackageSourceMasterCollisionKey(file);
@@ -8632,7 +8648,7 @@ function deduplicatePackageSourceMastersForOutput(project, packageFiles) {
         ...entry,
         stat: getPackageSourceMasterStat(entry.file),
         addedAt: typeof entry.file.addedAt === 'number' ? entry.file.addedAt : 0,
-        priority: getPackageSourceMasterDedupePriority(project, entry.file),
+        priority: getPackageSourceMasterDedupePriority(project, entry.file, isOutputExcluded),
       })).sort(comparePackageSourceMasterDedupeCandidates);
       keepIndexes.add(bestEntry.index);
     }
@@ -15558,6 +15574,7 @@ async function pollLastUsedForProjectCore(projectId, activationToken = null, wat
       `kMDItemLastUsedDate >= ${mdfindTimestamp}`
     ], { timeout: 15000, encoding: 'utf8' });
 
+    const isOutputExcluded = createSynchronousOutputExclusion();
     for (const line of mdfindOut.split('\n')) {
       const fullPath = line.trim();
       if (!fullPath) continue;
@@ -15580,7 +15597,7 @@ async function pollLastUsedForProjectCore(projectId, activationToken = null, wat
       // but must still be excluded — their content is extracted via scan-on-save, not polling.
       const PRESENTATION_SOURCE_EXTS_LU = new Set(['.pptx', '.pptm', '.ppt', '.key', '.keynote']);
       if (PRESENTATION_SOURCE_EXTS_LU.has(ext)) continue;
-      if (isAutoCaptureExcludedPath(fullPath)) continue;
+      if (isOutputExcluded(fullPath)) continue;
       const normalizedFullPath = normalizeTrackedFilePath(fullPath);
       if (existingPaths.has(normalizedFullPath) || pendingPaths.has(normalizedFullPath)) continue;
       newFiles.push({ path: fullPath, name, ext, addedAt: Date.now(), source: 'lastused-poll' });
@@ -21604,6 +21621,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
         { timeout: 10000, encoding: "utf8" }
       );
       if (!operationCurrent()) return;
+      const isOutputExcluded = createSynchronousOutputExclusion();
       for (const line of lsofOut.trim().split("\n")) {
         if (!line.startsWith("n")) continue;
         const filePath = line.slice(1);
@@ -21611,7 +21629,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
         // Only capture .fig files within known scan dirs — prevents false positives
         // if Figma has unrelated project files open simultaneously.
         if (!scanDirs.some(dir => filePath.startsWith(dir + "/"))) continue;
-        if (isAutoCaptureExcludedPath(filePath)) continue;
+        if (isOutputExcluded(filePath)) continue;
         const normalizedFilePath = normalizeTrackedFilePath(filePath);
         if (existingPaths.has(normalizedFilePath) || pendingPaths.has(normalizedFilePath)) continue;
         if (!fs.existsSync(filePath)) continue;
@@ -21623,6 +21641,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
           appFamily: 'figma',
           reason: 'pre-package-lsof-scan',
         });
+        isOutputExcluded.refresh();
         if (!staged || !staged.changed) continue;
         if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
           existingPaths.add(normalizedFilePath);
@@ -21639,6 +21658,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   for (const dir of scanDirs) {
     try {
       if (!fs.existsSync(dir)) continue;
+      const isFigScanOutputExcluded = createSynchronousOutputExclusion();
       // Scan at depth 0 (direct children) and depth 1 (one subfolder deep)
       const scanFolder = (folder, depth) => {
         let entries;
@@ -21656,7 +21676,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
 
           if (!entry.isFile()) continue;
           if (path.extname(entry.name).toLowerCase() !== '.fig') continue;
-          if (isAutoCaptureExcludedPath(fullPath)) continue;
+          if (isFigScanOutputExcluded(fullPath)) continue;
           const normalizedFullPath = normalizeTrackedFilePath(fullPath);
           if (existingPaths.has(normalizedFullPath) || pendingPaths.has(normalizedFullPath)) continue;
 
@@ -21682,6 +21702,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
             appFamily: 'figma',
             reason: 'pre-package-fig-scan',
           });
+          isFigScanOutputExcluded.refresh();
           if (!staged || !staged.changed) continue;
           if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
             existingPaths.add(normalizedFullPath);
@@ -21921,8 +21942,9 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
       if (!operationCurrent()) return;
 
       if (psPaths.trim()) {
+        const isOutputExcluded = createSynchronousOutputExclusion();
         for (const trimmed of psPaths.split('\n').filter(Boolean)) {
-          if (isAutoCaptureExcludedPath(trimmed)) continue;
+          if (isOutputExcluded(trimmed)) continue;
           const normalizedTrimmed = normalizeTrackedFilePath(trimmed);
           if (existingPaths.has(normalizedTrimmed) || pendingPaths.has(normalizedTrimmed)) continue;
           if (!fs.existsSync(trimmed)) continue;
@@ -21935,6 +21957,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
             appFamily: 'photoshop',
             reason: 'pre-package-app-script-broad-observer',
           });
+          isOutputExcluded.refresh();
           if (!staged || !staged.changed) continue;
           if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
             existingPaths.add(normalizedTrimmed);
@@ -22023,10 +22046,11 @@ end tell`;
       if (!operationCurrent()) return;
 
       if (inddPaths.trim()) {
+        const isOutputExcluded = createSynchronousOutputExclusion();
         for (const linkedPath of inddPaths.trim().split('\n')) {
           const trimmed = linkedPath.trim();
           if (!trimmed) continue;
-          if (isAutoCaptureExcludedPath(trimmed)) continue;
+          if (isOutputExcluded(trimmed)) continue;
           const normalizedTrimmed = normalizeTrackedFilePath(trimmed);
           if (existingPaths.has(normalizedTrimmed) || pendingPaths.has(normalizedTrimmed)) continue;
           if (!fs.existsSync(trimmed)) continue;
@@ -22039,6 +22063,7 @@ end tell`;
             appFamily: 'indesign',
             reason: 'pre-package-app-script-broad-observer',
           });
+          isOutputExcluded.refresh();
           if (!staged || !staged.changed) continue;
           if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
             existingPaths.add(normalizedTrimmed);
@@ -22088,9 +22113,10 @@ end tell`;
         const content = buf.toString('utf8');
         let match;
         LINKED_ASSET_REGEX.lastIndex = 0;
+        const isOutputExcluded = createSynchronousOutputExclusion();
         while ((match = LINKED_ASSET_REGEX.exec(content)) !== null) {
           const linkedPath = match[0];
-          if (isAutoCaptureExcludedPath(linkedPath)) continue;
+          if (isOutputExcluded(linkedPath)) continue;
           const normalizedLinkedPath = normalizeTrackedFilePath(linkedPath);
           if (linkExisting.has(normalizedLinkedPath) || pendingPaths.has(normalizedLinkedPath)) { ownerNotes.push([linkedPath, designFile.path]); continue; }
           if (!fs.existsSync(linkedPath)) continue;
@@ -22102,6 +22128,7 @@ end tell`;
             appFamily: getExplicitCaptureAppFamily(designFile) || 'generic',
             reason: 'pre-package-linked-regex',
           });
+          isOutputExcluded.refresh();
           if (!staged || !staged.changed) { ownerNotes.push([linkedPath, designFile.path]); continue; }
           if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
             linkExisting.add(normalizedLinkedPath);
@@ -22135,8 +22162,9 @@ end tell`;
         if (!fs.existsSync(file.path)) continue;
         const linkedPaths = await extractLinkedAssets(file.path);
         if (!operationCurrent()) return null;
+        const isOutputExcluded = createSynchronousOutputExclusion();
         for (const lp of linkedPaths) {
-          if (isAutoCaptureExcludedPath(lp)) continue;
+          if (isOutputExcluded(lp)) continue;
           const normalizedLinkedPath = normalizeTrackedFilePath(lp);
           if (existingPathsCheck.has(normalizedLinkedPath) || pendingPaths.has(normalizedLinkedPath)) { ownerNotes.push([lp, file.path]); continue; }
           if (!lp.startsWith('/Users/')) continue;
@@ -22152,6 +22180,7 @@ end tell`;
             appFamily: getExplicitCaptureAppFamily(file) || 'generic',
             reason: 'pre-package-doublecheck',
           });
+          isOutputExcluded.refresh();
           if (!staged || !staged.changed) continue;
           if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
             existingPathsCheck.add(normalizedLinkedPath);
