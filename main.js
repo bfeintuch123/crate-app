@@ -16552,7 +16552,7 @@ async function extractLinkedAssetsRegex(filePath, options = {}) {
       }
     }
     const buf = suppliedBuffer || await fs.promises.readFile(filePath);
-    const content = buf.toString('utf8');
+    const content = extractLinkedAssetPaths.searchText(buf);
     return extractLinkedAssetPaths(content, filePath);
   } catch (e) {
     if (strict) throw e;
@@ -20335,7 +20335,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
               try {
                 if (!fs.existsSync(designFile.path)) continue;
                 const buf = fs.readFileSync(designFile.path);
-                const content = buf.toString('utf8');
+                const content = extractLinkedAssetPaths.searchText(buf);
                 let match;
                 LINKED_ASSET_REGEX_SNAPSHOT.lastIndex = 0;
                 while ((match = LINKED_ASSET_REGEX_SNAPSHOT.exec(content)) !== null) {
@@ -22085,7 +22085,7 @@ end tell`;
         if (!fs.existsSync(designFile.path)) continue;
         const buf = await fs.promises.readFile(designFile.path);
         if (!operationCurrent()) return null;
-        const content = buf.toString('utf8');
+        const content = extractLinkedAssetPaths.searchText(buf);
         let match;
         LINKED_ASSET_REGEX.lastIndex = 0;
         while ((match = LINKED_ASSET_REGEX.exec(content)) !== null) {
