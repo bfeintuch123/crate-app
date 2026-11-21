@@ -21,13 +21,8 @@
 'use strict';
 
 const { BaseParser } = require('./base');
+const { extractLinkedAssetPaths } = require('./linked-asset-matcher');
 const { nativeHelper } = require('./native-helper');
-
-// Regex to find macOS absolute paths to image/design/font/media files in binary data.
-// Matches /Users/... and /Volumes/... lazily so adjacent paths on the same line
-// stay distinct. Used as fallback when the native Swift PDF/XMP/FlateDecode
-// extractor is unavailable.
-const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27\x7f<>|*?\n\r]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|psb|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig|heic|ttf|otf|woff2|woff|mp4|mov|avi|webm)/gi;
 
 class AIParser extends BaseParser {
   /**
@@ -73,13 +68,7 @@ class AIParser extends BaseParser {
     const buffer = this.readFileBuffer(filePath);
     const content = buffer.toString('utf8');
 
-    // Reset regex lastIndex for fresh search
-    LINKED_ASSET_REGEX.lastIndex = 0;
-
-    let match;
-    while ((match = LINKED_ASSET_REGEX.exec(content)) !== null) {
-      const linkedPath = match[0];
-
+    for (const linkedPath of extractLinkedAssetPaths(content, filePath)) {
       // Skip system paths (unlikely to be user assets)
       if (!this.isUserPath(linkedPath)) continue;
 

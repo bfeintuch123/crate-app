@@ -75,6 +75,178 @@ enum PackageOps {
         return true
     }
 
+    private static func parseDecimalInt64(_ val: Any?) -> Int64? {
+        if let s = val as? String { return Int64(s) }
+        if let n = val as? NSNumber { return n.int64Value }
+        return nil
+    }
+
+    private static func parseDecimalUInt64(_ val: Any?) -> UInt64? {
+        if let s = val as? String { return UInt64(s) }
+        if let n = val as? NSNumber, n.int64Value >= 0 { return n.uint64Value }
+        return nil
+    }
+
+    private static func verifyDirFdMatchesAncestry(dirFd: Int32, ancestry: [[String: Any]]) -> Bool {
+        guard !ancestry.isEmpty, ancestry.count <= 256 else { return false }
+        var curFd = Darwin.dup(dirFd)
+        if curFd < 0 { return false }
+        defer { if curFd >= 0 { Darwin.close(curFd) } }
+
+        for (idx, expected) in ancestry.enumerated() {
+            guard let expDev = parseDecimalInt64(expected["dev"]),
+                  let expIno = parseDecimalUInt64(expected["ino"]) else {
+                return false
+            }
+            var st = stat()
+            if fstat(curFd, &st) != 0 || (st.st_mode & S_IFMT) != S_IFDIR {
+                return false
+            }
+            if Int64(st.st_dev) != expDev || UInt64(st.st_ino) != expIno {
+                return false
+            }
+            if idx + 1 < ancestry.count {
+                let parentFd = Darwin.openat(curFd, "..", O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+                if parentFd < 0 { return false }
+                Darwin.close(curFd)
+                curFd = parentFd
+            }
+        }
+        return true
+    }
+
+    private static func verifyDirFdMatchesAnyAncestry(dirFd: Int32, ancestries: [[[String: Any]]]) -> Bool {
+        guard !ancestries.isEmpty, ancestries.count <= 8 else { return false }
+        return ancestries.contains { verifyDirFdMatchesAncestry(dirFd: dirFd, ancestry: $0) }
+    }
+
+    /// Descriptor-bound, ancestry-verified APFS copy-on-write clone matching
+    /// Crate's package-transaction-worker security invariants (O_NOFOLLOW,
+    /// full directory ancestry check, owner-only mode 0o600, source stability
+    /// check, atomic rollback on post-clone mismatch).
+    static func cloneVerifiedFile(req: [String: Any]) throws -> [String: Any] {
+        guard let sourcePath = req["sourcePath"] as? String,
+              let destDir = req["destDir"] as? String,
+              let leafName = req["leafName"] as? String,
+              isSafeLeafName(leafName),
+              let expSrcDev = parseDecimalInt64(req["expectedSourceDev"]),
+              let expSrcIno = parseDecimalUInt64(req["expectedSourceIno"]),
+              let expSrcSize = parseDecimalInt64(req["expectedSourceSize"]),
+              expSrcSize >= 0,
+              let expDestDev = parseDecimalInt64(req["expectedDestDev"]),
+              let expDestIno = parseDecimalUInt64(req["expectedDestIno"]),
+              let ancestries = req["ancestries"] as? [[[String: Any]]] else {
+            throw HelperError("invalid_clone_request")
+        }
+
+        let targetMode: mode_t
+        if let rawMode = req["mode"] as? NSNumber {
+            let masked = rawMode.uint16Value & 0o777
+            targetMode = masked == 0 ? ownerOnlyFileMode : mode_t(masked)
+        } else {
+            targetMode = ownerOnlyFileMode
+        }
+
+        let dirFd = Darwin.open(destDir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        if dirFd < 0 {
+            throw HelperError("dest_dir_changed")
+        }
+        defer { Darwin.close(dirFd) }
+
+        var dirStat = stat()
+        if fstat(dirFd, &dirStat) != 0
+            || (dirStat.st_mode & S_IFMT) != S_IFDIR
+            || Int64(dirStat.st_dev) != expDestDev
+            || UInt64(dirStat.st_ino) != expDestIno
+            || !verifyDirFdMatchesAnyAncestry(dirFd: dirFd, ancestries: ancestries) {
+            throw HelperError("dest_dir_changed")
+        }
+
+        let srcFd = Darwin.open(sourcePath, O_RDONLY | O_NOFOLLOW)
+        if srcFd < 0 {
+            if errno == ELOOP { throw HelperError("source_changed") }
+            throw HelperError("source_changed")
+        }
+        defer { Darwin.close(srcFd) }
+
+        var srcBefore = stat()
+        if fstat(srcFd, &srcBefore) != 0
+            || (srcBefore.st_mode & S_IFMT) != S_IFREG
+            || Int64(srcBefore.st_dev) != expSrcDev
+            || UInt64(srcBefore.st_ino) != expSrcIno
+            || Int64(srcBefore.st_size) != expSrcSize {
+            throw HelperError("source_changed")
+        }
+
+        if srcBefore.st_dev != dirStat.st_dev {
+            return ["cloned": false, "fallback": true, "reason": "cross_device"]
+        }
+
+        let rc = leafName.withCString { cLeaf in
+            fclonefileat(srcFd, dirFd, cLeaf, UInt32(CLONE_NOFOLLOW))
+        }
+        if rc != 0 {
+            let err = errno
+            if err == EEXIST { throw HelperError("dest_already_exists") }
+            if err == EXDEV || err == ENOTSUP || err == EOPNOTSUPP || err == EINVAL {
+                return ["cloned": false, "fallback": true, "reason": "clone_unsupported"]
+            }
+            throw HelperError("clone_failed")
+        }
+
+        func rollbackClone() {
+            _ = leafName.withCString { Darwin.unlinkat(dirFd, $0, 0) }
+        }
+
+        let outFd = leafName.withCString { cLeaf in
+            Darwin.openat(dirFd, cLeaf, O_RDONLY | O_NOFOLLOW)
+        }
+        if outFd < 0 {
+            rollbackClone()
+            throw HelperError("dest_verify_failed")
+        }
+        defer { Darwin.close(outFd) }
+
+        if fchmod(outFd, targetMode) != 0 {
+            rollbackClone()
+            throw HelperError("fchmod_failed")
+        }
+
+        var outStat = stat()
+        if fstat(outFd, &outStat) != 0
+            || (outStat.st_mode & S_IFMT) != S_IFREG
+            || (outStat.st_mode & 0o777) != targetMode
+            || Int64(outStat.st_size) != expSrcSize {
+            rollbackClone()
+            throw HelperError("dest_verify_failed")
+        }
+
+        var srcAfter = stat()
+        if fstat(srcFd, &srcAfter) != 0
+            || srcBefore.st_dev != srcAfter.st_dev
+            || srcBefore.st_ino != srcAfter.st_ino
+            || srcBefore.st_size != srcAfter.st_size
+            || srcBefore.st_mtimespec.tv_sec != srcAfter.st_mtimespec.tv_sec
+            || srcBefore.st_mtimespec.tv_nsec != srcAfter.st_mtimespec.tv_nsec {
+            rollbackClone()
+            throw HelperError("source_changed")
+        }
+
+        if !verifyDirFdMatchesAnyAncestry(dirFd: dirFd, ancestries: ancestries) {
+            rollbackClone()
+            throw HelperError("dest_dir_changed")
+        }
+
+        return [
+            "cloned": true,
+            "bytesWritten": String(expSrcSize),
+            "outputIdentity": [
+                "dev": String(outStat.st_dev),
+                "ino": String(outStat.st_ino),
+            ],
+        ]
+    }
+
     static func packageBatch(
         destDir: String,
         items: [[String: Any]],

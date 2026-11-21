@@ -254,3 +254,104 @@ test('Swift native helper: NSWorkspace runningApps, libproc openFiles, and getxa
   assert.equal(xRes.timestamps[xattrPath], 1760000000 * 1000 + 500);
   assert.equal(xRes.timestamps[plainPath], null);
 });
+
+test('Phase 3B: cloneVerifiedFile enforces ancestry, source identity, mode 0o600, and EEXIST', { skip: !hasNativeBinary }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-swift-clone-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const client = new NativeHelperClient(DEFAULT_BINARY_PATH);
+  t.after(() => client.shutdown());
+
+  const srcPath = path.join(dir, 'design-master.psd');
+  const destDir = path.join(dir, 'staged-package');
+  fs.mkdirSync(destDir, { mode: 0o700 });
+  const payload = crypto.randomBytes(512 * 1024);
+  fs.writeFileSync(srcPath, payload, { mode: 0o644 });
+
+  const srcStat = fs.lstatSync(srcPath, { bigint: true });
+  const destStat = fs.lstatSync(destDir, { bigint: true });
+  const ancestry = [];
+  let cur = fs.realpathSync(destDir);
+  while (true) {
+    const st = fs.lstatSync(cur, { bigint: true });
+    ancestry.push({ dev: `${st.dev}`, ino: `${st.ino}` });
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+
+  // Happy path: verified APFS clone with 0o600 hardening
+  const res = await client.cloneVerifiedFile({
+    sourcePath: srcPath,
+    expectedSourceDev: `${srcStat.dev}`,
+    expectedSourceIno: `${srcStat.ino}`,
+    expectedSourceSize: `${srcStat.size}`,
+    destDir,
+    expectedDestDev: `${destStat.dev}`,
+    expectedDestIno: `${destStat.ino}`,
+    ancestries: [ancestry],
+    leafName: 'design-master.psd',
+    mode: 0o600,
+  });
+  assert.equal(res.cloned, true);
+  assert.equal(res.bytesWritten, `${payload.length}`);
+  const outPath = path.join(destDir, 'design-master.psd');
+  const outStat = fs.lstatSync(outPath, { bigint: true });
+  assert.equal(Number(outStat.mode & 0o777n), 0o600);
+  assert.equal(res.outputIdentity.dev, `${outStat.dev}`);
+  assert.equal(res.outputIdentity.ino, `${outStat.ino}`);
+  assert.deepEqual(fs.readFileSync(outPath), payload);
+
+  // Rejects EEXIST (atomic non-overwrite)
+  await assert.rejects(
+    client.cloneVerifiedFile({
+      sourcePath: srcPath,
+      expectedSourceDev: `${srcStat.dev}`,
+      expectedSourceIno: `${srcStat.ino}`,
+      expectedSourceSize: `${srcStat.size}`,
+      destDir,
+      expectedDestDev: `${destStat.dev}`,
+      expectedDestIno: `${destStat.ino}`,
+      ancestries: [ancestry],
+      leafName: 'design-master.psd',
+      mode: 0o600,
+    }),
+    /dest_already_exists/
+  );
+
+  // Rejects forged directory ancestry
+  const badAncestry = ancestry.map((item, idx) => (idx === 1 ? { ...item, ino: '999999999999' } : item));
+  await assert.rejects(
+    client.cloneVerifiedFile({
+      sourcePath: srcPath,
+      expectedSourceDev: `${srcStat.dev}`,
+      expectedSourceIno: `${srcStat.ino}`,
+      expectedSourceSize: `${srcStat.size}`,
+      destDir,
+      expectedDestDev: `${destStat.dev}`,
+      expectedDestIno: `${destStat.ino}`,
+      ancestries: [badAncestry],
+      leafName: 'should-not-exist.psd',
+      mode: 0o600,
+    }),
+    /dest_dir_changed/
+  );
+  assert.equal(fs.existsSync(path.join(destDir, 'should-not-exist.psd')), false);
+
+  // Rejects source identity mismatch
+  await assert.rejects(
+    client.cloneVerifiedFile({
+      sourcePath: srcPath,
+      expectedSourceDev: `${srcStat.dev}`,
+      expectedSourceIno: `${srcStat.ino}`,
+      expectedSourceSize: `${srcStat.size + 1n}`,
+      destDir,
+      expectedDestDev: `${destStat.dev}`,
+      expectedDestIno: `${destStat.ino}`,
+      ancestries: [ancestry],
+      leafName: 'wrong-size.psd',
+      mode: 0o600,
+    }),
+    /source_changed/
+  );
+  assert.equal(fs.existsSync(path.join(destDir, 'wrong-size.psd')), false);
+});

@@ -158,6 +158,10 @@ class NativeHelperClient {
     return this.call('package_batch', { destDir, items, mode, computeHash }, timeoutMs);
   }
 
+  cloneVerifiedFile(params, timeoutMs = 30_000) {
+    return this.call('clone_verified_file', params, timeoutMs);
+  }
+
   runningApps(keywords = [], timeoutMs = 3000) {
     return this.call('running_apps', { keywords }, timeoutMs);
   }
@@ -175,6 +179,7 @@ class NativeHelperClient {
     if (!child) return;
     this.disposing = true;
     this.child = null;
+    if (typeof child.ref === 'function') child.ref();
     await new Promise(resolve => {
       let done = false;
       const finish = () => {

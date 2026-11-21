@@ -108,6 +108,10 @@ const canUseNativeProcessWatcher = () => {
     return false;
   }
 };
+const canUseNativePackageClone = () => {
+  if (!nativeHelper || !nativeHelper.isAvailable()) return false;
+  return Boolean(process.versions && process.versions.electron) || process.env.CRATE_ENABLE_NATIVE_CLONE === '1';
+};
 startupPhaseJournal.mark('dependencies-loaded');
 
 const PROVENANCE_MANIFEST_FILENAME = 'crate-provenance.json';
@@ -6738,6 +6742,7 @@ function clearFileVisualProjectCache(projectId = null) {
   }
   fileVisualProjectCacheGeneration += 1;
   fileVisualProjectCache.clear();
+  if (typeof rasterThumbnailMemoryCache?.clear === 'function') rasterThumbnailMemoryCache.clear();
 }
 
 function getCurrentFileVisualProjectCache(projectId, project) {
@@ -7427,11 +7432,12 @@ function getBoundedRasterThumbnail(projectId, file, visualRevision) {
       if (createProjectFileVisualRevisionFromStat(projectId, file, source.sourceStat) !== visualRevision) {
         return { stale: true };
       }
-      const memoryKey = getRasterThumbnailMemoryCacheKey(file.path, source.sourceStat);
+      const hasStatCacheStore = typeof store?.getStatCache === 'function';
+      const memoryKey = hasStatCacheStore ? getRasterThumbnailMemoryCacheKey(file.path, source.sourceStat) : null;
       const cachedMemory = memoryKey ? rasterThumbnailMemoryCache.get(memoryKey) : null;
-      const cachedPersisted = cachedMemory
+      const cachedPersisted = (cachedMemory || !hasStatCacheStore)
         ? null
-        : store?.getStatCache?.('raster-thumbnail', file.path, source.sourceStat);
+        : store.getStatCache('raster-thumbnail', file.path, source.sourceStat);
       const cachedDataUrl = cachedMemory || (cachedPersisted && typeof cachedPersisted.dataUrl === 'string' ? cachedPersisted.dataUrl : null);
       if (cachedDataUrl) {
         const descriptorStat = await source.handle.stat({ bigint: true });
@@ -12326,20 +12332,25 @@ function pollLsofForProjectCore(projectId, activationToken = null, onComplete = 
     };
 
     if (canUseNativeProcessWatcher()) {
-      nativeHelper.openFiles(validPids, 12000)
+      nativeHelper.openFiles(validPids, [], 12000)
         .then((response) => {
-          if (response && response.ok && response.filesByPid && typeof response.filesByPid === 'object') {
+          if (response && Array.isArray(response.files)) {
+            const byPid = new Map();
+            for (const entry of response.files) {
+              if (!entry || !Number.isInteger(entry.pid) || typeof entry.path !== 'string') continue;
+              if (!entry.path || entry.path.includes('\n') || entry.path.includes('\r')) continue;
+              let list = byPid.get(entry.pid);
+              if (!list) { list = []; byPid.set(entry.pid, list); }
+              list.push(entry.path);
+            }
             const lines = [];
             for (const pid of validPids) {
-              const pidKey = String(pid);
-              lines.push(`p${pidKey}`);
-              const paths = response.filesByPid[pidKey];
-              if (!Array.isArray(paths)) continue;
+              lines.push(`p${pid}`);
+              const paths = byPid.get(pid);
+              if (!paths) continue;
               for (const filePath of paths) {
-                if (typeof filePath === 'string' && filePath.length > 0 && !filePath.includes('\n') && !filePath.includes('\r')) {
-                  lines.push('tREG');
-                  lines.push(`n${filePath}`);
-                }
+                lines.push('tREG');
+                lines.push(`n${filePath}`);
               }
             }
             return handleLsofOutput(null, lines.join('\n'));
@@ -25747,7 +25758,12 @@ async function copyReviewedPackageSource(
     verifyWrite(finalPath);
     const destinationMode = Number(sourceStat.mode & 0o777n) || OWNER_ONLY_FILE_MODE;
     if (typeof materializeSource === 'function') {
-      await materializeSource(finalPath, sourceHandle.fd, sourceStat.size, destinationMode);
+      await materializeSource(finalPath, sourceHandle.fd, sourceStat.size, destinationMode, {
+        sourcePath: reviewedSource.sourcePath,
+        dev: sourceStat.dev,
+        ino: sourceStat.ino,
+        size: sourceStat.size,
+      });
       verifyWrite(finalPath);
       return;
     }
@@ -27020,9 +27036,58 @@ function createPackageWriteTransaction(destFolder) {
     isDescriptorBound(filePath) {
       return !!getDescriptorBoundGroup(filePath);
     },
-    async materializeSource(filePath, sourceFd, sourceSize, mode) {
+    async materializeSource(filePath, sourceFd, sourceSize, mode, sourceMeta = null) {
       const group = getDescriptorBoundGroup(filePath);
       if (!group) throw new PackageTransactionInvariantError();
+      if (
+        canUseNativePackageClone() &&
+        sourceMeta &&
+        typeof sourceMeta.sourcePath === 'string' &&
+        typeof sourceMeta.dev === 'bigint' &&
+        typeof sourceMeta.ino === 'bigint' &&
+        typeof sourceMeta.size === 'bigint'
+      ) {
+        const ancestries = Array.isArray(group.ancestries) && group.ancestries.length > 0
+          ? group.ancestries
+          : [capturePackageTransactionAncestry(group.path, group.identity)];
+        let cloneResult = null;
+        try {
+          cloneResult = await nativeHelper.cloneVerifiedFile({
+            sourcePath: sourceMeta.sourcePath,
+            expectedSourceDev: `${sourceMeta.dev}`,
+            expectedSourceIno: `${sourceMeta.ino}`,
+            expectedSourceSize: `${sourceMeta.size}`,
+            destDir: group.path,
+            expectedDestDev: `${group.identity.dev}`,
+            expectedDestIno: `${group.identity.ino}`,
+            ancestries,
+            leafName: path.basename(filePath),
+            mode: OWNER_ONLY_FILE_MODE,
+          });
+        } catch (error) {
+          if (error && error.code === 'source_changed') {
+            throw new PackageReviewChangedError();
+          }
+          if (
+            error &&
+            (error.code === 'dest_dir_changed' ||
+              error.code === 'dest_already_exists' ||
+              error.code === 'fchmod_failed' ||
+              error.code === 'dest_verify_failed')
+          ) {
+            throw new PackageTransactionInvariantError();
+          }
+          cloneResult = { cloned: false, fallback: true };
+        }
+        if (cloneResult && cloneResult.cloned === true && cloneResult.outputIdentity) {
+          group.ownedOutputs.set(path.basename(filePath), {
+            dev: BigInt(cloneResult.outputIdentity.dev),
+            ino: BigInt(cloneResult.outputIdentity.ino),
+          });
+          assertPhysicalDestination(filePath);
+          return;
+        }
+      }
       const result = await runDescriptorBoundPackageWriter(group, filePath, { fd: sourceFd, size: sourceSize, mode });
       group.ownedOutputs.set(path.basename(filePath), {
         dev: BigInt(result.outputIdentity.dev),

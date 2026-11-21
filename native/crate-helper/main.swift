@@ -109,6 +109,16 @@ struct CrateHelperMain {
                 return ["id": reqId, "ok": false, "error": "package_batch_failed"]
             }
 
+        case "clone_verified_file":
+            do {
+                let result = try PackageOps.cloneVerifiedFile(req: req)
+                return ["id": reqId, "ok": true, "result": result]
+            } catch let err as HelperError {
+                return ["id": reqId, "ok": false, "error": err.code]
+            } catch {
+                return ["id": reqId, "ok": false, "error": "clone_failed"]
+            }
+
         case "running_apps":
             let keywords = (req["keywords"] as? [String]) ?? []
             let apps = WatchOps.runningApps(keywords: keywords)

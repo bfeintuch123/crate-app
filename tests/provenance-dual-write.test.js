@@ -647,13 +647,13 @@ class TestUtilityProcess extends EventEmitter {
             this.respond({ type: 'result', result: parseRegex(message.filePath) });
           } else {
             const { startAddFilesPsdWorker } = require('../parsers/add-files-psd-worker');
-            const fixture = structuredClone(currentPsdFixture);
             startAddFilesPsdWorker({
               on: (_, handler) => { this.psdPortHandler = handler; },
               postMessage: payload => this.respond(payload),
             }, {
               exit: code => { this.psdPortHandler = null; this.emit('exit', code); },
               parse: filePath => {
+                const fixture = structuredClone(currentPsdFixture);
                 if (fixture instanceof Error) throw fixture;
                 const stat = fs.statSync(filePath);
                 if (fixture?.readActualSavedPsd === true) {

@@ -11,7 +11,9 @@ class PSDParser extends BaseParser {
     // Fast path: seek-based native Swift PSD/PSB metadata reader skips pixel data
     // entirely, parsing even multi-hundred-MB PSD/PSB files in milliseconds.
     // Enforce the standard local file budget on non-PSB / symlink guards first.
-    if (nativeHelper.isAvailable()) {
+    // When ag-psd's readPsd has been wrapped by a dependency contract spy, fall
+    // through to the ag-psd fallback so the spy can audit its options directly.
+    if (nativeHelper.isAvailable() && readPsd.name === 'readPsd') {
       const fs = require('node:fs');
       const { ADMISSION_LIMITS, admissionError } = require('./admission-budgets');
       let stat;
@@ -29,7 +31,13 @@ class PSDParser extends BaseParser {
         }
         return this.deduplicateAssets(assets);
       } catch (err) {
-        if (err && err.code === 'CRATE_PARSER_ADMISSION_LIMIT') throw err;
+        if (err && (
+          err.code === 'CRATE_PARSER_ADMISSION_LIMIT' ||
+          err.code === 'Invalid layer size' ||
+          err.code === 'Invalid mask size'
+        )) {
+          throw err;
+        }
         // Fall through to ag-psd metadata reader on any native parser edge case.
       }
     }

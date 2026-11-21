@@ -525,9 +525,18 @@ enum PsdParser {
             layerTotal += count
             if layerTotal > maxLayers { throw HelperError("psd_coverage_limit") }
 
+            let maxDim: Int64 = isPsb ? 300_000 : 30_000
             var totalChannelBytes: Int64 = 0
             for idx in 0..<count {
-                try reader.skip(16, end: layerEnd) // rect top/left/bottom/right
+                let top = Int64(Int32(bitPattern: try reader.readU32(end: layerEnd)))
+                let left = Int64(Int32(bitPattern: try reader.readU32(end: layerEnd)))
+                let bottom = Int64(Int32(bitPattern: try reader.readU32(end: layerEnd)))
+                let right = Int64(Int32(bitPattern: try reader.readU32(end: layerEnd)))
+                let layerH = bottom - top
+                let layerW = right - left
+                if layerH < 0 || layerW < 0 || layerH > maxDim || layerW > maxDim {
+                    throw HelperError("Invalid layer size")
+                }
                 let chCount = Int(try reader.readU16(end: layerEnd))
                 if chCount > 56 { throw HelperError("psd_unsupported_channels") }
                 for _ in 0..<chCount {
@@ -541,6 +550,17 @@ enum PsdParser {
                 try reader.skip(8, end: layerEnd) // blend mode + opacity + clipping + flags + filler
                 let extraEnd = try reader.readSection32(end: layerEnd)
                 let maskDataEnd = try reader.readSection32(end: extraEnd)
+                if maskDataEnd - reader.offset >= 16 {
+                    let mTop = Int64(Int32(bitPattern: try reader.readU32(end: maskDataEnd)))
+                    let mLeft = Int64(Int32(bitPattern: try reader.readU32(end: maskDataEnd)))
+                    let mBottom = Int64(Int32(bitPattern: try reader.readU32(end: maskDataEnd)))
+                    let mRight = Int64(Int32(bitPattern: try reader.readU32(end: maskDataEnd)))
+                    let maskH = mBottom - mTop
+                    let maskW = mRight - mLeft
+                    if maskH < 0 || maskW < 0 || maskH > maxDim || maskW > maxDim {
+                        throw HelperError("Invalid mask size")
+                    }
+                }
                 try reader.seek(to: maskDataEnd)
                 let blendRangeEnd = try reader.readSection32(end: extraEnd)
                 try reader.seek(to: blendRangeEnd)
