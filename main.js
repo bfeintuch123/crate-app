@@ -2598,6 +2598,11 @@ function shouldUpdatePendingCandidate(existingFile, classification) {
   if (!existingFile || !classification) return false;
   const existingState = normalizeLiveCaptureState(existingFile.captureState, LIVE_CAPTURE_STATES.PENDING);
   const nextState = normalizeLiveCaptureState(classification.captureState, LIVE_CAPTURE_STATES.PENDING);
+  // A row the designer can decide is never replaced by a live claim that would
+  // take the decision away, from any observer. The claim only re-observes it;
+  // saved evidence and the designer's own Include or Exclude still decide it.
+  if (existingState === LIVE_CAPTURE_STATES.PENDING &&
+      (nextState === LIVE_CAPTURE_STATES.OBSERVED || nextState === LIVE_CAPTURE_STATES.NEEDS_SAVE)) return false;
   if (getLiveCaptureStateRank(nextState) > getLiveCaptureStateRank(existingState)) return true;
   const existingMethod = existingFile.captureEvidence && existingFile.captureEvidence.observerMethod;
   const nextMethod = classification.evidenceSummary && classification.evidenceSummary.observerMethod;
@@ -2650,6 +2655,7 @@ function stripLiveCaptureMetadata(fileEntry) {
     captureState,
     captureReason,
     captureEvidence,
+    illustratorLinkReview,
     ...cleanFileEntry
   } = fileEntry;
   return cleanFileEntry;
@@ -2908,8 +2914,14 @@ function classifyLiveObservedFile(project, fileEntry, observation = {}, stageInd
       };
     }
     const pendingFile = (project.pendingFiles || []).find(file => getTrackedFileDedupKey(file) === candidateKey);
+    // A link row holding a remembered row stays until a trusted reading withdraws
+    // it; another app's same-rank claim would lose the remembered row.
+    const keepsRememberedRow = evidence.observerMethod !== LIVE_APP_OBSERVER_METHODS.ILLUSTRATOR_ACTIVE_SESSION &&
+      isCurrentIllustratorLiveLinkRow(project, pendingFile) && !!getRememberedIllustratorLinkRow(pendingFile) &&
+      getLiveCaptureStateRank(normalizeLiveCaptureState(captureState, LIVE_CAPTURE_STATES.PENDING)) ===
+        getLiveCaptureStateRank(normalizeLiveCaptureState(pendingFile.captureState, LIVE_CAPTURE_STATES.PENDING));
     return {
-      decision: shouldUpdatePendingCandidate(pendingFile, { captureState, evidenceSummary })
+      decision: !keepsRememberedRow && shouldUpdatePendingCandidate(pendingFile, { captureState, evidenceSummary })
         ? LIVE_CAPTURE_DECISIONS.UPDATE_PENDING
         : LIVE_CAPTURE_DECISIONS.KEEP_EXISTING,
       reason: 'already-pending',
@@ -2971,12 +2983,12 @@ function stageLiveObservedFile(project, fileEntry, observation = {}, stageIndex 
       normalizeTrackedFilePath(file && file.path) === normalizedPath
     ));
     if (idx === -1) return { ...classification, changed: false, evidenceChanged, file: fileEntry };
-    const nextFile = decorateLiveObservedFile({
+    const nextFile = carryIllustratorLinkReview(project, project.pendingFiles[idx], decorateLiveObservedFile({
       ...project.pendingFiles[idx],
       source: fileEntry.source || project.pendingFiles[idx].source,
       ext: fileEntry.ext || project.pendingFiles[idx].ext,
       name: fileEntry.name || project.pendingFiles[idx].name,
-    }, classification, observation);
+    }, classification, observation));
     project.pendingFiles[idx] = nextFile;
     return { ...classification, changed: true, evidenceChanged, file: nextFile };
   }
@@ -2996,11 +3008,11 @@ function stageLiveObservedFile(project, fileEntry, observation = {}, stageIndex 
       existingFile.captureSessionId !== observation.captureSessionId ||
       existingFile.captureSessionObserved === false
     )) {
-      project.pendingFiles[idx] = {
+      project.pendingFiles[idx] = carryIllustratorLinkReview(project, existingFile, {
         ...existingFile,
         captureSessionId: observation.captureSessionId,
         captureSessionObserved: observation.captureSessionObserved !== false,
-      };
+      });
       return { ...classification, changed: true, evidenceChanged, file: project.pendingFiles[idx] };
     }
   }
@@ -3013,6 +3025,175 @@ function stageLiveObservedFile(project, fileEntry, observation = {}, stageIndex 
   }
 
   return { ...classification, changed: false, evidenceChanged, file: fileEntry };
+}
+
+// --- Illustrator link rows: re-checked against every trusted reading ---
+// A Needs Save link row is a claim about the present ("this open document has
+// unsaved changes that link this file"). Each trusted Illustrator reading
+// re-derives the current watch session's link rows: a link no document links
+// any more is withdrawn (the row it overwrote comes back exactly, or the row
+// goes); a link seen twice in a row only in clean documents becomes
+// "Include or Exclude". Withdrawal is not a designer decision: it writes no
+// exclusion key, Excluded record or decision provenance. Saved-file evidence
+// stays the only route to an automatic Include.
+// Row state, stripped with the capture metadata so it never reaches a project
+// file or an Excluded record: { version: 1, prior?, cleanSeen? }. A decidable
+// row is never overwritten by a claim, so `prior` only ever holds a row the
+// designer could not decide.
+const ILLUSTRATOR_LINK_REVIEW_VERSION = 1;
+
+function isIllustratorLiveLinkRow(row) {
+  return !!row && row.source === 'ai-linked' &&
+    row.captureEvidence?.observerMethod === LIVE_APP_OBSERVER_METHODS.ILLUSTRATOR_ACTIVE_SESSION;
+}
+
+// Whether a reading with nothing to stage still has a link row to reconcile.
+function hasIllustratorLiveLinkRows(projectId, activationToken) {
+  return (getFreshActiveWatchingProject(projectId, activationToken)?.pendingFiles || []).some(isIllustratorLiveLinkRow);
+}
+
+// Only a row stamped with this exact watch session. Stored rows of an earlier
+// session (after a pause, refresh or restart) stay as they are, hidden or not.
+function isCurrentIllustratorLiveLinkRow(project, row) {
+  return isIllustratorLiveLinkRow(row) && typeof project?.watchSessionId === 'string' && !!project.watchSessionId &&
+    row.captureSessionId === project.watchSessionId && isCurrentWatchSessionPendingFile(project, row);
+}
+
+function getIllustratorLinkReview(project, row) {
+  const review = row?.illustratorLinkReview;
+  return isCurrentIllustratorLiveLinkRow(project, row) && review && typeof review === 'object' &&
+    !Array.isArray(review) && review.version === ILLUSTRATOR_LINK_REVIEW_VERSION ? review : null;
+}
+
+// The review row a link claim overwrote. It is never itself a link row, and it
+// keeps its own session stamp, so the session rule decides its visibility.
+function getRememberedIllustratorLinkRow(row) {
+  const review = row?.illustratorLinkReview;
+  const prior = review?.version === ILLUSTRATOR_LINK_REVIEW_VERSION ? review.prior : null;
+  return prior && typeof prior === 'object' && !Array.isArray(prior) && !isIllustratorLiveLinkRow(prior) &&
+    normalizeTrackedFilePath(prior.path) === normalizeTrackedFilePath(row.path) ? prior : null;
+}
+
+function withIllustratorLinkReview(row, review) {
+  const { illustratorLinkReview, ...plainRow } = row;
+  return review.prior || review.cleanSeen ? { ...plainRow, illustratorLinkReview: review } : plainRow;
+}
+
+// Keeps the review state of a row this session's readings own. A link claim
+// over a review row remembers that row (one level). A claim over an earlier
+// session's link row inherits only what that row remembered: its clean-reading
+// state belongs to its own session, and it is never remembered itself.
+function carryIllustratorLinkReview(project, previousRow, nextRow) {
+  const { illustratorLinkReview, ...row } = nextRow;
+  if (!isIllustratorLiveLinkRow(row)) return row;
+  if (isCurrentIllustratorLiveLinkRow(project, previousRow)) {
+    const review = getIllustratorLinkReview(project, previousRow);
+    return review ? { ...row, illustratorLinkReview: { ...review } } : row;
+  }
+  let prior;
+  if (isIllustratorLiveLinkRow(previousRow)) {
+    prior = getRememberedIllustratorLinkRow(previousRow);
+    if (!prior) return row;
+  } else {
+    const { illustratorLinkReview: ignoredReview, ...reviewRow } = previousRow;
+    prior = reviewRow;
+  }
+  return { ...row, illustratorLinkReview: { version: ILLUSTRATOR_LINK_REVIEW_VERSION, prior: structuredClone(prior) } };
+}
+
+// Pending only when every reporting document is an excluded working file that
+// nothing included retains.
+function areLiveLinkOwnersExcluded(project, liveMembership, owners) {
+  return !!liveMembership && owners.length > 0 && owners.every(owner => {
+    const ownerRow = project.files.find(row => !isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.path) === normalizeTrackedFilePath(owner));
+    return isWorkingSourceFile(ownerRow) && isUnretainedExcludedScanSource(liveMembership, ownerRow);
+  });
+}
+
+// A reading is trusted when it is current and complete, and Illustrator is
+// either definitively not running or this reading made the activation scope
+// ready. Its link set is the links of admitted documents (the records row
+// creation uses). "Not running" counts only when the full process listing
+// completed. Untrusted readings return null and change no row.
+function createIllustratorLinkReading(projectId, activationToken, queryResult, scopeResult, records) {
+  if (!queryResult || queryResult.stale || getIllustratorSnapshotFailureReason(queryResult)) return null;
+  const scope = getIllustratorActivationScope(projectId, activationToken);
+  if (!scope || !getFreshActiveWatchingProject(projectId, activationToken)) return null;
+  const notRunning = queryResult.running === false;
+  if (notRunning ? queryResult.notRunningConfirmed !== true : !(scopeResult?.ready === true && scopeResult.scope === scope)) return null;
+  const links = new Map();
+  if (!notRunning) {
+    for (const record of records || []) {
+      if (record?.source !== 'ai-linked' || record.observerMethod !== LIVE_APP_OBSERVER_METHODS.ILLUSTRATOR_ACTIVE_SESSION) continue;
+      const linkedPath = normalizeTrackedFilePath(record.filePath);
+      if (!linkedPath) continue;
+      const entry = links.get(linkedPath) || { modified: false, owners: [] };
+      // Unknown modification state is never treated as clean.
+      if (record.documentModified !== false) entry.modified = true;
+      if (typeof record.relationshipSourcePath === 'string') entry.owners.push(record.relationshipSourcePath);
+      links.set(linkedPath, entry);
+    }
+  }
+  return { projectId, scope, links };
+}
+
+// Runs inside the project mutation that staged the same reading, and only for
+// a reading applyLiveAppEvidenceRefresh found current before staging anything.
+function reconcileIllustratorLinkRows(project, reading, liveMembership) {
+  const outcome = { changed: 0 };
+  if (!reading || !project || project.id !== reading.projectId || !Array.isArray(project.pendingFiles)) return outcome;
+  const acceptedKeys = getTrackedFileKeySet(project.files);
+  const nextRows = [];
+  for (const row of project.pendingFiles) {
+    if (!isCurrentIllustratorLiveLinkRow(project, row)) { nextRows.push(row); continue; }
+    const review = getIllustratorLinkReview(project, row);
+    const link = reading.links.get(normalizeTrackedFilePath(row.path));
+    if (!link) {
+      // Withdraw: the link is in no admitted open document.
+      outcome.changed++;
+      const remembered = getRememberedIllustratorLinkRow(row);
+      if (remembered) nextRows.push(structuredClone(remembered));
+      continue;
+    }
+    const { cleanSeen, ...reviewWithoutClean } = review || { version: ILLUSTRATOR_LINK_REVIEW_VERSION };
+    if (link.modified) {
+      // Clean readings must be consecutive.
+      if (cleanSeen) { nextRows.push(withIllustratorLinkReview(row, reviewWithoutClean)); outcome.changed++; }
+      else nextRows.push(row);
+      continue;
+    }
+    if (row.captureState !== LIVE_CAPTURE_STATES.NEEDS_SAVE || acceptedKeys.has(getTrackedFileDedupKey(row)) ||
+        areLiveLinkOwnersExcluded(project, liveMembership, link.owners)) {
+      nextRows.push(row);
+      continue;
+    }
+    outcome.changed++;
+    if (!cleanSeen) {
+      // First clean reading: stays Needs Save, so a save scan can promote first.
+      nextRows.push({ ...row, illustratorLinkReview: { ...reviewWithoutClean, cleanSeen: true } });
+      continue;
+    }
+    // Second consecutive clean reading: Include or Exclude. No saved evidence.
+    const captureEvidence = row.captureEvidence || {};
+    nextRows.push(withIllustratorLinkReview({
+      ...row,
+      captureState: LIVE_CAPTURE_STATES.PENDING,
+      captureEvidence: {
+        ...captureEvidence,
+        state: LIVE_CAPTURE_STATES.PENDING,
+        needsSave: false,
+        captureRecommendation: LIVE_CAPTURE_STATES.PENDING,
+        designerReason: getDesignerReasonForLiveEvidence({
+          appFamily: captureEvidence.appFamily,
+          evidenceStrength: captureEvidence.evidenceStrength,
+          captureState: LIVE_CAPTURE_STATES.PENDING,
+        }),
+        documentModified: false,
+      },
+    }, reviewWithoutClean));
+  }
+  if (outcome.changed) project.pendingFiles = nextRows;
+  return outcome;
 }
 
 function pruneExcludedAutoCapturedFiles(project) {
@@ -5901,13 +6082,16 @@ async function readWorkingSourceDocumentIdentity(project, file, operation, timeo
   return documentIdentity;
 }
 
-async function refreshWorkingSourceLocators(projectId, observedPaths = null, parentCurrent = null) {
+// `beforePublish` is an extra condition that must hold until the locator state
+// is published; work that follows a published move is not bound by it.
+async function refreshWorkingSourceLocators(projectId, observedPaths = null, parentCurrent = null, beforePublish = null) {
   if (Array.isArray(observedPaths) && !observedPaths.some(locator => typeof locator === 'string' && LOCAL_ADOBE_CONTINUATION_EXTENSIONS.has(path.extname(locator).toLowerCase()))) return;
   const captured = captureProjectOperation(projectId);
   const operation = captured && { ...captured, current: () => captured.current() && (!parentCurrent || parentCurrent()) };
+  const publishable = () => operation.current() && (!beforePublish || beforePublish());
   try {
     const project = getProjects().find(item => item.id === projectId);
-    if (!project || !operation?.current()) return;
+    if (!project || !operation || !publishable()) return;
     const beforeSignature = getPackageSelectionInputSignature(project);
     const state = project.workingSourceLocators;
     if (getWorkingFileChoiceObligations(project).invalid) { project.workingFileChoiceLimit = true; return; }
@@ -5932,7 +6116,7 @@ async function refreshWorkingSourceLocators(projectId, observedPaths = null, par
       const remainingMs = identityDeadline - Date.now();
       if (remainingMs <= 0) continue;
       const documentIdentity = await readWorkingSourceDocumentIdentity(project, file, operation, remainingMs);
-      if (!operation.current()) return;
+      if (!publishable()) return;
       documentRecords.set(key, { version: 1, path: file.path, physicalIdentity: identity, documentIdentity });
     }
     const relocated = [], changedBytes = [], aliases = [...(state?.aliases || [])];
@@ -6012,7 +6196,7 @@ async function refreshWorkingSourceLocators(projectId, observedPaths = null, par
     const nextState = { version: 1, records, aliases: aliases.slice(-128) };
     if (JSON.stringify(state) === JSON.stringify(nextState) && !relocated.length && !changedBytes.length) return;
     const result = mutateProject(projectId, latest => {
-      if (!operation.current() || beforeSignature !== getPackageSelectionInputSignature(latest) ||
+      if (!publishable() || beforeSignature !== getPackageSelectionInputSignature(latest) ||
           [...documentRecords.values()].some(record => getWorkingSourceContinuationPhysicalIdentity(latest, { path: record.path, projectRole: 'source' }) !== record.physicalIdentity) ||
           relocated.some(item => fs.existsSync(project.files.find(file => getAssetBaselineSourceRecoveryRouteKey(project, file) === item.oldKey)?.path || '') ||
             getWorkingSourceContinuationPhysicalIdentity(latest, item.file) !== records[item.key].physicalIdentity)) return { changed: false };
@@ -11465,10 +11649,12 @@ function captureProjectOperation(projectId) {
     // pending receipt as a non-success, and to keep an "Assets need save" notice
     // clickable while its scope gains links; never to publish results.
     currentIgnoringScope: baseCurrent,
-    adoptScope(scope) {
+    // `allowAdvance` is for a caller that has just discarded its own older
+    // reading and rebuilds its state from the current project.
+    adoptScope(scope, { allowAdvance = false } = {}) {
       if (activationToken === null) return baseCurrent();
       if (!baseCurrent() || illustratorActivationScopes.get(projectId) !== scope ||
-          ![scopeRevision, scopeRevision + 1].includes(scope?.revision)) return false;
+          !(allowAdvance ? scope?.revision >= scopeRevision : [scopeRevision, scopeRevision + 1].includes(scope?.revision))) return false;
       scopeRevision = scope.revision;
       return true;
     },
@@ -11509,7 +11695,7 @@ function activateSingleWatchingProject(projectId, settings, { preserveWatchStart
   // initial snapshot. Existing interval handles are stopped below by
   // startWatching, while this gate makes their ticks harmless in the gap.
   cancelWatcherCoordinator(projectId);
-  illustratorActivationScopes.set(projectId, { activationToken, revision: 0, status: 'initializing', baselineDocumentPaths: new Set(), admittedDocumentPaths: new Set(), allowedLinkedPaths: new Set(), excludedLinkedPaths: new Set() });
+  illustratorActivationScopes.set(projectId, { activationToken, revision: 0, status: 'initializing', queryOrder: { started: 0, applied: 0 }, baselineDocumentPaths: new Set(), admittedDocumentPaths: new Set(), allowedLinkedPaths: new Set(), excludedLinkedPaths: new Set() });
 
   return {
     activationToken,
@@ -14332,10 +14518,21 @@ function isIllustratorScopedFileAllowed(project, fileEntry, observation = {}) { 
   if (isExplicitUserCapturedFile(fileEntry) || isAcceptedPendingCapturedFile(project, fileEntry) || projectFiles.some((file, index) => projectFilePathAt(index) === normalizedPath && isAcceptedIllustratorProjectFile(project, file))) return true; if (!scope || !normalizedPath) return false; if (scope.allowedLinkedPaths.has(normalizedPath) || scope.admittedDocumentPaths.has(normalizedPath)) return true; if (scope.status !== 'ready' || scope.excludedLinkedPaths.has(normalizedPath) || scope.baselineDocumentPaths.has(normalizedPath)) return false; const sourcePath = getIllustratorRelationshipSourcePath(fileEntry, observation); return sourcePath ? scope.admittedDocumentPaths.has(sourcePath) : (!isWeakBroadObserverFile(fileEntry) && ILLUSTRATOR_SOURCE_EXTENSIONS.has(path.extname(fileEntry.path || '').toLowerCase())); }
 function getScopedRecordAppFamily(value) { const normalized = normalizeLiveCaptureReason(value, ''); if (!normalized) return null; if (CAPTURE_SOURCE_APP_FAMILY.has(normalized)) return CAPTURE_SOURCE_APP_FAMILY.get(normalized); if (normalized === 'illustrator' || normalized.startsWith('ai-') || normalized.includes('illustrator')) return 'illustrator'; if (normalized === 'photoshop' || normalized.startsWith('psd-') || normalized.startsWith('ps-') || normalized.includes('photoshop')) return 'photoshop'; if (normalized === 'indesign' || normalized.startsWith('indd-') || normalized.includes('indesign')) return 'indesign'; if (normalized === 'figma' || normalized.startsWith('fig-') || normalized.includes('figma')) return 'figma'; if (normalized.includes('powerpoint') || normalized.includes('keynote') || normalized.includes('presentation')) return 'presentation'; if (normalized === 'generic' || normalized.startsWith('lastused-') || normalized === 'manual-browse' || normalized === 'lsof') return 'generic'; return null; } function getScopedRecordFamilies(record) { const values = [record?.appFamily, record?.source, record?.explicitUserAuthority?.source, record?.captureEvidence?.appFamily, record?.captureEvidence?.source, record?.captureEvidence?.observerMethod, record?.latest?.appFamily, record?.latest?.source, record?.latest?.observerMethod, record?.observer?.appFamily, record?.observer?.method, record?.payload?.appFamily, record?.payload?.source, record?.payload?.authoritySource, record?.payload?.observer?.method]; return new Set(values.map(getScopedRecordAppFamily).filter(Boolean)); }
 const SCOPED_PRIMARY_PATH_FIELDS = ['path', 'filePath', 'localPath', 'normalizedPath']; function isScopedRecord(value) { return isRecord(value) && ['id', 'fileId', 'evidenceKey', 'path', 'source', 'appFamily', 'captureEvidence', 'latest', 'observer', 'relationType', 'subjectNodeId', 'objectNodeId', 'type'].some(key => Object.prototype.hasOwnProperty.call(value, key)); } function scopedRecordIdentities(entry) { const item = entry.item, ids = [item.id, item.fileId, item.evidenceKey]; if (!Array.isArray(entry.parent) && typeof entry.key === 'string' && !['captureEvidence', 'latest', 'observer', 'payload', 'metadata'].includes(entry.key)) ids.push(entry.key); return ids.filter(value => typeof value === 'string'); } function scopedRecordPrimaryPath(record, key, nodePaths, ledgerPaths) { const values = [...SCOPED_PRIMARY_PATH_FIELDS.map(field => record?.[field]), ...SCOPED_PRIMARY_PATH_FIELDS.map(field => record?.latest?.[field]), ...SCOPED_PRIMARY_PATH_FIELDS.map(field => record?.payload?.[field])]; for (const value of values) { const normalized = typeof value === 'string' && (path.isAbsolute(value) || /normalizedPath/.test(key || '')) ? normalizeTrackedFilePath(value) : null; if (normalized) return normalized; } return ledgerPaths.get(key) || nodePaths.get(record?.objectNodeId) || (typeof key === 'string' && path.isAbsolute(key) ? normalizeTrackedFilePath(key) : null); }
-function scopedRecordReferencesHidden(value, info, hiddenPaths, hiddenIds, nodePaths) { const ancestors = new Set(); let visited = 0; const visit = (item, key = '') => { if (++visited > 50000) return true; if (typeof item === 'string') { if (hiddenIds.has(item)) return true; const nodePath = /NodeId$/i.test(key) ? nodePaths.get(item) : null, normalized = (path.isAbsolute(item) || /paths?$/i.test(key)) ? normalizeTrackedFilePath(item) : null, deniedPath = nodePath || (normalized && hiddenPaths.has(normalized) ? normalized : null); return !!deniedPath && !(info.authorized && info.primaryPath === deniedPath); } if (!Array.isArray(item) && !isRecord(item)) return false; if (ancestors.has(item)) return true; ancestors.add(item); try { for (const childKey of Object.keys(item)) if (visit(item[childKey], childKey)) return true; return false; } catch (_) { return true; } finally { ancestors.delete(item); } }; return visit(value); }
-function getIllustratorScopedProjectView(project) { if (!project) return project; const scope = getIllustratorActivationScope(project.id), hiddenPaths = new Set(scope ? [...scope.baselineDocumentPaths, ...scope.excludedLinkedPaths] : []), hiddenPendingPaths = new Set(), stalePendingFiles = new Set(), scopeAllowedPaths = new Set(); for (const file of [...(project.files || []), ...(project.pendingFiles || [])]) { const filePath = normalizeTrackedFilePath(file?.path); if ((project.pendingFiles || []).includes(file) && !isCurrentWatchSessionPendingFile(project, file)) { hiddenPaths.add(filePath); hiddenPendingPaths.add(filePath); stalePendingFiles.add(file); } else if (!isIllustratorScopedFileAllowed(project, file)) hiddenPaths.add(filePath); else if (hiddenPaths.has(filePath) && !hiddenPendingPaths.has(filePath) && getScopedFileAppFamily(project, file) === 'illustrator') scopeAllowedPaths.add(filePath); } hiddenPaths.delete(null); if (!hiddenPaths.size) return project;
+function scopedRecordReferencesHidden(value, info, hiddenPaths, hiddenIds, nodePaths) { const ancestors = new Set(); let visited = 0; const visit = (item, key = '') => { if (++visited > 50000) return true; if (typeof item === 'string') { if (hiddenIds.has(item)) return true; const nodePath = /NodeId$/i.test(key) ? nodePaths.get(item) : null, normalized = (path.isAbsolute(item) || /paths?$/i.test(key)) ? normalizeTrackedFilePath(item) : null, deniedPath = nodePath || (normalized && hiddenPaths.has(normalized) ? normalized : null); return !!deniedPath && !(info.authorized && info.primaryPath === deniedPath); } if (!Array.isArray(item) && !isRecord(item)) return false; if (ancestors.has(item)) return true; ancestors.add(item); try { for (const childKey of Object.keys(item)) if (childKey !== 'illustratorLinkReview' && visit(item[childKey], childKey)) return true; return false; } catch (_) { return true; } finally { ancestors.delete(item); } }; return visit(value); }
+// Illustrator link review state (it can hold a copy of an overwritten row) is
+// private bookkeeping: it never authorizes or hides a path, and is left out.
+function withoutIllustratorLinkReview(project) {
+  const rows = project.pendingFiles, hasReview = row => !!row && Object.hasOwn(row, 'illustratorLinkReview');
+  if (!Array.isArray(rows) || !rows.some(hasReview)) return project;
+  return { ...project, pendingFiles: rows.map(row => {
+    if (!hasReview(row)) return row;
+    const { illustratorLinkReview, ...visibleRow } = row;
+    return visibleRow;
+  }) };
+}
+function getIllustratorScopedProjectView(project) { if (!project) return project; const scope = getIllustratorActivationScope(project.id), hiddenPaths = new Set(scope ? [...scope.baselineDocumentPaths, ...scope.excludedLinkedPaths] : []), hiddenPendingPaths = new Set(), stalePendingFiles = new Set(), scopeAllowedPaths = new Set(); for (const file of [...(project.files || []), ...(project.pendingFiles || [])]) { const filePath = normalizeTrackedFilePath(file?.path); if ((project.pendingFiles || []).includes(file) && !isCurrentWatchSessionPendingFile(project, file)) { hiddenPaths.add(filePath); hiddenPendingPaths.add(filePath); stalePendingFiles.add(file); } else if (!isIllustratorScopedFileAllowed(project, file)) hiddenPaths.add(filePath); else if (hiddenPaths.has(filePath) && !hiddenPendingPaths.has(filePath) && getScopedFileAppFamily(project, file) === 'illustrator') scopeAllowedPaths.add(filePath); } hiddenPaths.delete(null); if (!hiddenPaths.size) return withoutIllustratorLinkReview(project);
   const nodePaths = new Map(), ledgerPaths = new Map(); for (const hiddenPath of hiddenPaths) { nodePaths.set(createNodeId(NODE_TYPES.FILE, { normalizedPath: hiddenPath }), hiddenPath); const ledgerId = getLiveEvidenceKeyHash(hiddenPath); if (ledgerId) ledgerPaths.set(ledgerId, hiddenPath); } for (const [id, node] of Object.entries(project.provenance?.nodes || {})) { const nodePath = normalizeTrackedFilePath(node?.path || node?.normalizedPath); if (hiddenPaths.has(nodePath)) { nodePaths.set(id, nodePath); if (typeof node?.id === 'string') nodePaths.set(node.id, nodePath); } }
-  const hiddenEntries = new WeakMap(), records = [], infos = [], infoByObject = new WeakMap(), markHidden = (parent, key) => { if (!parent) return false; let keys = hiddenEntries.get(parent); if (!keys) hiddenEntries.set(parent, keys = new Set()); const fresh = !keys.has(key); keys.add(key); return fresh; }, isHidden = (parent, key) => !!hiddenEntries.get(parent)?.has(key); let collected = 0; const collect = (value, parent, key, ancestors) => { if (!Array.isArray(value) && !isRecord(value)) return; if (++collected > 50000 || ancestors.has(value)) { markHidden(parent, key); return; } if (isScopedRecord(value)) records.push({ item: value, parent, key }); ancestors.add(value); try { for (const [childKey, child] of Object.entries(value)) { if (path.isAbsolute(childKey) && hiddenPaths.has(normalizeTrackedFilePath(childKey))) markHidden(value, childKey); else collect(child, value, childKey, ancestors); } } catch (_) { markHidden(parent, key); } finally { ancestors.delete(value); } }; for (const [key, value] of Object.entries(project)) collect(value, project, key, new Set());
+  const hiddenEntries = new WeakMap(), records = [], infos = [], infoByObject = new WeakMap(), markHidden = (parent, key) => { if (!parent) return false; let keys = hiddenEntries.get(parent); if (!keys) hiddenEntries.set(parent, keys = new Set()); const fresh = !keys.has(key); keys.add(key); return fresh; }, isHidden = (parent, key) => !!hiddenEntries.get(parent)?.has(key); let collected = 0; const collect = (value, parent, key, ancestors) => { if (!Array.isArray(value) && !isRecord(value)) return; if (++collected > 50000 || ancestors.has(value)) { markHidden(parent, key); return; } if (isScopedRecord(value)) records.push({ item: value, parent, key }); ancestors.add(value); try { for (const [childKey, child] of Object.entries(value)) { if ((path.isAbsolute(childKey) && hiddenPaths.has(normalizeTrackedFilePath(childKey))) || childKey === 'illustratorLinkReview') markHidden(value, childKey); else collect(child, value, childKey, ancestors); } } catch (_) { markHidden(parent, key); } finally { ancestors.delete(value); } }; for (const [key, value] of Object.entries(project)) collect(value, project, key, new Set());
   for (const entry of records) { const families = getScopedRecordFamilies(entry.item); if ((project.files || []).includes(entry.item) || (project.pendingFiles || []).includes(entry.item)) { const family = getScopedFileAppFamily(project, entry.item); if (family) families.add(family); } const info = { families, primaryPath: scopedRecordPrimaryPath(entry.item, entry.key, nodePaths, ledgerPaths), authorized: false, entry }; infos.push(info); infoByObject.set(entry.item, info); } const allowedPaths = new Set(scopeAllowedPaths); for (const info of infos) if (!stalePendingFiles.has(info.entry.item) && hiddenPaths.has(info.primaryPath) && !info.families.has('illustrator') && (info.families.size || isExplicitUserCapturedFile(info.entry.item))) allowedPaths.add(info.primaryPath); for (const info of infos) info.authorized = !stalePendingFiles.has(info.entry.item) && allowedPaths.has(info.primaryPath) && ((scopeAllowedPaths.has(info.primaryPath) && info.families.size === 1 && info.families.has('illustrator')) || (!info.families.has('illustrator') && info.families.size > 0) || isExplicitUserCapturedFile(info.entry.item) || (info.entry.item.type === NODE_TYPES.FILE && info.families.size === 0));
   const hiddenIds = new Set(); let changed = true; while (changed) { changed = false; for (const info of infos) { const { entry } = info; if (isHidden(entry.parent, entry.key)) continue; const identities = scopedRecordIdentities(entry), keyHidden = typeof entry.key === 'string' && (hiddenIds.has(entry.key) || (path.isAbsolute(entry.key) && hiddenPaths.has(normalizeTrackedFilePath(entry.key)))), deniedPrimary = hiddenPaths.has(info.primaryPath) && !info.authorized; if (!keyHidden && !deniedPrimary && !identities.some(id => hiddenIds.has(id)) && !scopedRecordReferencesHidden(entry.item, info, hiddenPaths, hiddenIds, nodePaths)) continue; changed = markHidden(entry.parent, entry.key) || changed; for (const id of [...identities, ...(entry.item.evidenceIds || [])]) if (typeof id === 'string' && !hiddenIds.has(id)) { hiddenIds.add(id); changed = true; } } }
   const OMIT = Symbol('scoped-omit'); let filteredCount = 0; const filter = (value, parent = null, key = '', ancestors = new Set(), owner = null) => { if (parent && (isHidden(parent, key) || hiddenIds.has(key) || (path.isAbsolute(key) && hiddenPaths.has(normalizeTrackedFilePath(key))))) return OMIT; if (typeof value === 'string') { if (hiddenIds.has(value)) return OMIT; const nodePath = /NodeId$/i.test(key) ? nodePaths.get(value) : null, normalized = (path.isAbsolute(value) || /paths?$/i.test(key)) ? normalizeTrackedFilePath(value) : null, deniedPath = nodePath || (normalized && hiddenPaths.has(normalized) ? normalized : null); return deniedPath && !(owner?.authorized && owner.primaryPath === deniedPath) ? OMIT : value; } if (!Array.isArray(value) && !isRecord(value)) return value; if (++filteredCount > 50000 || ancestors.has(value)) return OMIT; const nextOwner = infoByObject.get(value) || owner, output = Array.isArray(value) ? [] : {}; ancestors.add(value); try { for (const [childKey, child] of Object.entries(value)) { const filtered = filter(child, value, childKey, ancestors, nextOwner); if (filtered !== OMIT) Array.isArray(output) ? output.push(filtered) : output[childKey] = filtered; } return output; } catch (_) { return OMIT; } finally { ancestors.delete(value); } }; const view = filter(project); return view === OMIT ? null : view; }
@@ -14495,7 +14692,7 @@ async function isIllustratorRunningForLiveEvidence(projectId = null, activationT
   }).catch(() => ({ stdout: '', failed: true }));
   if (!stillCurrent()) return null;
   if (ps.failed && psCommand.failed) return 'failed';
-  return String(psCommand.stdout || '')
+  const foundInCommands = String(psCommand.stdout || '')
     .split('\n')
     .some(line => {
       const commandText = line.trim();
@@ -14503,21 +14700,52 @@ async function isIllustratorRunningForLiveEvidence(projectId = null, activationT
       if (/^Adobe Illustrator(?:\s|$)/i.test(commandText)) return true;
       return /\/(?:adobe )?illustrator(?: \d{4})?\.app\/contents\/macos\/(?:adobe )?illustrator(?:\s|$)/i.test(commandText);
     });
+  // Without the full listing Crate only failed to find Illustrator.
+  return foundInCommands || (psCommand.failed ? 'not-found-unconfirmed' : false);
 }
 
+// Readings can overlap (poll, Add Files, pre-package scan, activation). Their
+// order is fixed when each query starts, per activation; the counters live on
+// the activation scope and end with it. A result that started before one
+// already applied is older than what Crate knows and is discarded whole.
+function isIllustratorQuerySuperseded(projectId, activationToken, queryResult) {
+  const started = queryResult?.queryOrder;
+  if (!started) return false;
+  const order = getIllustratorActivationScope(projectId, activationToken)?.queryOrder;
+  return order !== started.tracker || started.position < order.applied;
+}
+function claimIllustratorQueryResult(projectId, activationToken, queryResult) {
+  if (isIllustratorQuerySuperseded(projectId, activationToken, queryResult)) return false;
+  const started = queryResult?.queryOrder;
+  if (started) started.tracker.applied = started.position;
+  return true;
+}
 async function queryIllustratorActiveState(projectId, activationToken) {
+  const tracker = getIllustratorActivationScope(projectId, activationToken)?.queryOrder;
+  const position = tracker ? ++tracker.started : null;
+  const result = await readIllustratorActiveState(projectId, activationToken);
+  return tracker ? { ...result, queryOrder: { tracker, position } } : result;
+}
+async function readIllustratorActiveState(projectId, activationToken) {
   const running = await isIllustratorRunningForLiveEvidence(projectId, activationToken); if (running === null || !getFreshActiveWatchingProject(projectId, activationToken)) return { stale: true };
   if (running === 'failed') return { running: true, errorCategory: 'illustrator-query-failed', activeState: parseIllustratorActiveSessionOutput('') };
-  if (!running) return { running: false, activeState: parseIllustratorActiveSessionOutput('STATUS\tno-documents\nCOMPLETE\t0\t0') };
+  if (!running || running === 'not-found-unconfirmed') return { running: false, notRunningConfirmed: running === false, activeState: parseIllustratorActiveSessionOutput('STATUS\tno-documents\nCOMPLETE\t0\t0') };
   try { const { stdout } = await runOsascriptInPrivateTemp(() => ({ 'crate-ai-active-session.applescript': AI_ACTIVE_SESSION_APPLESCRIPT }), 'crate-ai-active-session.applescript', { timeout: 10000, encoding: 'utf8' });
     if (!getFreshActiveWatchingProject(projectId, activationToken)) return { stale: true }; return { running: true, outputEmpty: !String(stdout || '').trim(), activeState: parseIllustratorActiveSessionOutput(stdout) }; }
   catch (error) { if (!getFreshActiveWatchingProject(projectId, activationToken)) return { stale: true }; logLiveAppEvidenceUnavailable('Illustrator', error); return { running: true, errorCategory: getSafeLiveAppUnavailableReason(error), activeState: parseIllustratorActiveSessionOutput('') }; }
 }
 async function initializeIllustratorActivationScope(projectId, activationToken) {
   const queryResult = await queryIllustratorActiveState(projectId, activationToken); if (queryResult.stale || !getFreshActiveWatchingProject(projectId, activationToken)) return null;
+  // The activation reading always defines the session's baseline, even if a
+  // later-started reading finished first; only its records can be superseded.
+  // A failed reading has no baseline to give, and a newer reading already
+  // decided the scope, so it does not close that scope.
+  const superseded = isIllustratorQuerySuperseded(projectId, activationToken, queryResult);
+  if (superseded && getIllustratorSnapshotFailureReason(queryResult)) return null;
+  if (!superseded) claimIllustratorQueryResult(projectId, activationToken, queryResult);
   const updated = updateIllustratorActivationScope(projectId, activationToken, queryResult, true); if (!updated || !updated.ready) return updated;
-  await applyLiveAppEvidenceRefresh(projectId, createIllustratorLiveEvidenceRecords(projectId, queryResult.activeState, updated.project), activationToken);
-  observeIllustratorWorkingSourceContinuation(projectId, activationToken, queryResult);
+  const refreshed = await applyLiveAppEvidenceRefresh(projectId, createIllustratorLiveEvidenceRecords(projectId, queryResult.activeState, updated.project), activationToken, null, { illustratorQuery: queryResult, illustratorScope: updated.scope });
+  if (!refreshed.illustratorSuperseded) observeIllustratorWorkingSourceContinuation(projectId, activationToken, queryResult);
   return updated;
 }
 function admitIllustratorSourcesForProject(projectId, filePaths) {
@@ -14615,23 +14843,44 @@ function getLiveAppEvidenceCandidates(liveEvidenceRecords = []) {
   return collectLiveAppEvidenceCandidates(liveEvidenceRecords).candidates;
 }
 
-async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], activationToken = null, parentOperation = null) {
+async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], activationToken = null, parentOperation = null, { illustratorQuery = null, illustratorReading = null, illustratorScope = illustratorReading?.scope || null } = {}) {
   if (!isBoundWatchingActivationCurrent(projectId, activationToken)) {
     return { changed: false, stagedCount: 0, skipped: {} };
   }
   const { candidates, skipped } = collectLiveAppEvidenceCandidates(liveEvidenceRecords);
+  const isIllustratorEvidence = evidence => evidence?.observerMethod === LIVE_APP_OBSERVER_METHODS.ILLUSTRATOR_ACTIVE_SESSION;
+  // A later-started reading was applied, or the activation scope was replaced,
+  // while this batch waited (other apps' checks, locator refresh).
+  const isIllustratorReadingStale = () => isIllustratorQuerySuperseded(projectId, activationToken, illustratorQuery) ||
+    (!!illustratorScope && getIllustratorActivationScope(projectId, activationToken) !== illustratorScope);
+  // A trusted Illustrator reading reconciles this session's link rows even when
+  // it stages nothing; skip the mutation when there is no such row at all.
+  const reconcileReading = illustratorReading && (candidates.length > 0 || hasIllustratorLiveLinkRows(projectId, activationToken))
+    ? illustratorReading : null;
   if (candidates.length) {
-    await refreshWorkingSourceLocators(projectId, candidates.map(item => item.evidence.filePath), parentOperation?.current);
+    // A stale reading's paths never reach the locator refresh.
+    const readingStale = isIllustratorReadingStale();
+    const locatorCandidates = readingStale ? candidates.filter(item => !isIllustratorEvidence(item.evidence)) : candidates;
+    await refreshWorkingSourceLocators(projectId, locatorCandidates.map(item => item.evidence.filePath), parentOperation?.current,
+      locatorCandidates.some(item => isIllustratorEvidence(item.evidence)) ? () => !isIllustratorReadingStale() : null);
     if (!isBoundWatchingActivationCurrent(projectId, activationToken) || (parentOperation && !parentOperation.current())) return { cancelled: true, changed: false, stagedCount: 0, skipped };
   }
   const skipSummary = formatLiveAppSkipCounts(skipped);
   if (skipSummary) {
     logLiveAppDiagnostic(projectId, 'candidate-skips', `candidate skip counts for project ${projectId}: ${skipSummary}`);
   }
-  if (candidates.length === 0) return { changed: false, stagedCount: 0, skipped };
+  if (candidates.length === 0 && !reconcileReading) return { changed: false, stagedCount: 0, skipped };
 
+  let illustratorSuperseded = false;
   const result = mutateProject(projectId, (proj) => {
     if (proj.status !== 'watching' || !isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
+    // Decided here, before staging. A stale reading's Illustrator records and
+    // reconciliation are dropped, and candidates are chosen as if those records
+    // were never in the batch, so another app's claim for the same path stages.
+    illustratorSuperseded = isIllustratorReadingStale();
+    const stagingCandidates = illustratorSuperseded
+      ? collectLiveAppEvidenceCandidates(liveEvidenceRecords.filter(evidence => !isIllustratorEvidence(evidence))).candidates
+      : candidates;
     let changed = false;
     let evidenceChanged = false;
     let stagedCount = 0;
@@ -14640,10 +14889,11 @@ async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], 
     const baselineSourcePaths = [];
     const newSavedSourcePaths = [];
     const previouslyAccepted = getNormalizedPathSet(proj.files);
-    const liveMembership = hasWorkingSourceSelectionState(proj) && candidates.some(({ evidence }) => evidence.relationshipSourcePath)
+    const liveMembership = hasWorkingSourceSelectionState(proj) &&
+      (stagingCandidates.some(({ evidence }) => evidence.relationshipSourcePath) || (reconcileReading && reconcileReading.links.size > 0))
       ? getWorkingSourceMembership(proj) : null;
 
-    for (const { evidence, ext, owners: batchOwners = [] } of candidates) {
+    for (const { evidence, ext, owners: batchOwners = [] } of stagingCandidates) {
       const fileEntry = buildAutoCaptureFileEntry(evidence.filePath, evidence.source, { ext });
       // A link reported for a document the owner excluded (and that no
       // included file retains) is never admitted directly; record which
@@ -14651,10 +14901,7 @@ async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], 
       const reportedOwners = [evidence.relationshipSourcePath, ...batchOwners].filter(owner => typeof owner === 'string');
       // Pending only when every reporting document is an excluded working file
       // that nothing included retains; any other reporter admits as usual.
-      const liveOwnerExcluded = !!liveMembership && reportedOwners.length > 0 && reportedOwners.every(owner => {
-        const ownerRow = proj.files.find(row => !isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.path) === normalizeTrackedFilePath(owner));
-        return isWorkingSourceFile(ownerRow) && isUnretainedExcludedScanSource(liveMembership, ownerRow);
-      });
+      const liveOwnerExcluded = areLiveLinkOwnersExcluded(proj, liveMembership, reportedOwners);
       for (const owner of reportedOwners) noteDependencyOwner(fileEntry, owner);
       const shouldForcePending = liveOwnerExcluded || evidence.forcePending === true || (
         evidence.forcePending !== false &&
@@ -14709,10 +14956,15 @@ async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], 
       }
     }
 
+    const reconciled = reconcileIllustratorLinkRows(proj, illustratorSuperseded ? null : reconcileReading, liveMembership);
+    if (reconciled.changed) changed = true;
+
     return {
       changed,
       evidenceChanged,
       stagedCount,
+      illustratorSuperseded,
+      reconciledCount: reconciled.changed,
       stagedStates: Array.from(stagedStates.entries()),
       stagedByApp: Array.from(stagedByApp.entries()),
       baselineSourcePaths,
@@ -14722,8 +14974,8 @@ async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], 
     };
   }, { persistIfChanged: true, trustResultChanged: true });
 
-  if (!result || (result.stagedCount === 0 && result.evidenceChanged !== true)) {
-    return { changed: false, stagedCount: 0, skipped };
+  if (!result || (result.stagedCount === 0 && result.evidenceChanged !== true && !result.reconciledCount)) {
+    return { changed: false, stagedCount: 0, skipped, illustratorSuperseded };
   }
 
   if (result.stagedCount > 0) {
@@ -14731,7 +14983,7 @@ async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], 
     inactivityNotified.delete(projectId);
   }
 
-  if (result.stagedCount > 0) sendProjectFileStateToRenderer(projectId, activationToken);
+  if (result.stagedCount > 0 || result.reconciledCount > 0) sendProjectFileStateToRenderer(projectId, activationToken);
 
   // Reserve the newly admitted cohort before yielding so review waits on it.
   // Existing/failed sources are not re-queued by later observer snapshots.
@@ -15152,18 +15404,24 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
   try {
     const liveEvidenceRecords = [];
     const polledApps = [];
+    let illustratorReading = null;
 
     // --- Illustrator ---
     const illustratorQuery = await queryIllustratorActiveState(projectId, activationToken);
     if (illustratorQuery.stale || !getFreshActiveWatchingProject(projectId, activationToken)) return;
-    if (!getIllustratorSnapshotFailureReason(illustratorQuery)) {
+    // A reading older than one already applied never moves working-file locators.
+    const illustratorInOrder = () => !isIllustratorQuerySuperseded(projectId, activationToken, illustratorQuery);
+    if (!getIllustratorSnapshotFailureReason(illustratorQuery) && illustratorInOrder()) {
       await refreshWorkingSourceLocators(projectId, (illustratorQuery.activeState?.documents || []).map(doc => doc.documentPath),
-        () => watcherGeneration === null || getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration));
+        () => watcherGeneration === null || getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration), illustratorInOrder);
       if (!getFreshActiveWatchingProject(projectId, activationToken)) return;
     }
+    // A reading older than one already applied adds nothing for Illustrator;
+    // the Photoshop and InDesign parts of this poll still run.
+    const illustratorCurrent = claimIllustratorQueryResult(projectId, activationToken, illustratorQuery);
     const illustratorRunning = illustratorQuery.running;
     logLiveAppDiagnostic(projectId, 'illustrator-running', `Illustrator running=${illustratorRunning ? 'true' : 'false'} for project ${projectId}`);
-    recordLiveAppStatusBreadcrumb(projectId, 'illustrator', {
+    if (illustratorCurrent) recordLiveAppStatusBreadcrumb(projectId, 'illustrator', {
       pollFired: true,
       projectWatching: true,
       appRunning: illustratorRunning,
@@ -15172,7 +15430,10 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
       stagedCount: 0,
       errorCategory: illustratorRunning ? 'script-not-attempted' : 'app-not-running',
     });
-    if (illustratorRunning) {
+    if (illustratorCurrent && illustratorQuery.running === false) {
+      illustratorReading = createIllustratorLinkReading(projectId, activationToken, illustratorQuery, null, []);
+    }
+    if (illustratorCurrent && illustratorRunning) {
       polledApps.push('illustrator');
       try {
         recordLiveAppStatusBreadcrumb(projectId, 'illustrator', {
@@ -15194,6 +15455,7 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
         const illustratorRecords = scopeResult && scopeResult.ready
           ? createIllustratorLiveEvidenceRecords(projectId, activeState, scopeResult.project, illustratorDiagnostics)
           : [];
+        illustratorReading = createIllustratorLinkReading(projectId, activationToken, illustratorQuery, scopeResult, illustratorRecords);
         const illustratorSkipSummary = formatLiveAppSkipCounts(illustratorDiagnostics.skipped);
         const statusSummary = [...(activeState.statuses || []), ...(activeState.errors || [])]
           .filter(Boolean)
@@ -15422,7 +15684,7 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
     }
 
     if (
-      liveEvidenceRecords.length === 0 ||
+      (liveEvidenceRecords.length === 0 && !(illustratorReading && hasIllustratorLiveLinkRows(projectId, activationToken))) ||
       !isActiveWatchingProject(projectId, activationToken) ||
       (watcherGeneration !== null && !getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration))
     ) return;
@@ -15438,10 +15700,14 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
       adoptScope: scope => coordinatorCurrent() && capturedOperation.adoptScope(scope) && coordinatorCurrent(),
     };
     if (!refreshOperation.current()) return;
-    const refreshResult = await applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords, activationToken, refreshOperation);
+    const refreshResult = await applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords, activationToken, refreshOperation, { illustratorQuery, illustratorReading });
     if (refreshResult.cancelled || !refreshOperation.current()) return;
-    observeIllustratorWorkingSourceContinuation(projectId, activationToken, illustratorQuery);
-    continuationObserved = true;
+    // A poll with no records keeps today's continuation handling (cleared below),
+    // and so does one whose Illustrator reading was discarded.
+    if (liveEvidenceRecords.length > 0 && illustratorCurrent && !refreshResult.illustratorSuperseded) {
+      observeIllustratorWorkingSourceContinuation(projectId, activationToken, illustratorQuery);
+      continuationObserved = true;
+    }
     for (const [appFamily, stagedCount] of refreshResult.stagedByApp || []) {
       recordLiveAppStatusBreadcrumb(projectId, appFamily, {
         pollFired: true,
@@ -20710,7 +20976,12 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
 function stopWatching(projectId, { invalidateActivation = true } = {}) {
   closeExistingAssetsNotifications(projectId);
   closeNeedsSaveNotifications(projectId, { forgetSeen: false });
-  if (invalidateActivation) watchingActivationTokens.delete(projectId);
+  if (invalidateActivation) {
+    watchingActivationTokens.delete(projectId);
+    // The paused view still reads the scope; its reading order has ended.
+    const scope = illustratorActivationScopes.get(projectId);
+    if (scope) scope.queryOrder = null;
+  }
   cancelWatcherCoordinator(projectId);
   acceptedSourceWatchSubscriptions.delete(projectId);
   const watcher = watchers.get(projectId);
@@ -21572,6 +21843,28 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   const preScanExistingKeys = getTrackedFileKeySet(project.files);
   const existingPaths = getNormalizedPathSet(project.files);
   const pendingPaths = getNormalizedPathSet(project.pendingFiles);
+  const pendingAtScanStart = new Set(pendingPaths);
+  // Other readings can change the project while this scan runs. Continue from
+  // the current project, keeping what this scan has staged on its working copy.
+  const adoptCurrentProjectForScan = current => {
+    if (current !== project) {
+      const currentFileKeys = getTrackedFileKeySet(current.files), currentPendingKeys = getTrackedFileKeySet(current.pendingFiles);
+      for (const file of project.files || []) {
+        const key = getTrackedFileDedupKey(file);
+        if (!preScanExistingKeys.has(key) && !currentFileKeys.has(key)) { current.files.push(file); currentFileKeys.add(key); }
+      }
+      for (const file of project.pendingFiles || []) {
+        const key = getTrackedFileDedupKey(file);
+        if (pendingAtScanStart.has(normalizeTrackedFilePath(file.path)) || currentPendingKeys.has(key) || currentFileKeys.has(key)) continue;
+        (current.pendingFiles ||= []).push(file);
+        currentPendingKeys.add(key);
+      }
+      project = current;
+    }
+    for (const file of project.files || []) existingPaths.add(normalizeTrackedFilePath(file.path));
+    pendingPaths.clear();
+    for (const pendingPath of getNormalizedPathSet(project.pendingFiles)) pendingPaths.add(pendingPath);
+  };
   const scanMetrics = {
     candidateCount: 0,
     xattrResolvedCount: 0,
@@ -21886,16 +22179,25 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   const appScanComplete = await runPackageScanPhase(operation, PRE_PACKAGE_APP_SCAN_TIMEOUT_MS, async () => {
   const illustratorActivationToken = getActiveWatchingActivationToken(projectId);
   if (illustratorActivationToken !== null) {
-    const illustratorQuery = await queryIllustratorActiveState(projectId, illustratorActivationToken); if (!operationCurrent()) return;
-    if (!illustratorQuery.stale && getFreshActiveWatchingProject(projectId, illustratorActivationToken)) {
+    const illustratorQuery = await queryIllustratorActiveState(projectId, illustratorActivationToken);
+    const illustratorSuperseded = isIllustratorQuerySuperseded(projectId, illustratorActivationToken, illustratorQuery);
+    if (illustratorSuperseded) {
+      // Discard this older reading and go on under the scope the newer one left.
+      const currentScope = getIllustratorActivationScope(projectId, illustratorActivationToken);
+      if (!currentScope || !operation.adoptScope(currentScope, { allowAdvance: true })) return;
+    }
+    if (!operationCurrent()) return;
+    if (!illustratorSuperseded && !illustratorQuery.stale && getFreshActiveWatchingProject(projectId, illustratorActivationToken)) {
+      claimIllustratorQueryResult(projectId, illustratorActivationToken, illustratorQuery);
       const scopeResult = updateIllustratorActivationScope(projectId, illustratorActivationToken, illustratorQuery, false); if (!scopeResult || !operation.adoptScope(scopeResult.scope) || !operationCurrent()) return;
-      if (scopeResult && scopeResult.ready) {
-        const records = createIllustratorLiveEvidenceRecords(projectId, illustratorQuery.activeState, scopeResult.project, { skipped: {} }), refreshed = await applyLiveAppEvidenceRefresh(projectId, records, illustratorActivationToken, operation); newCount += refreshed.stagedCount || 0;
-        project = getFreshActiveWatchingProject(projectId, illustratorActivationToken) || project;
-        for (const file of project.files || []) existingPaths.add(normalizeTrackedFilePath(file.path));
-        for (const file of project.pendingFiles || []) pendingPaths.add(normalizeTrackedFilePath(file.path));
+      const records = scopeResult.ready ? createIllustratorLiveEvidenceRecords(projectId, illustratorQuery.activeState, scopeResult.project, { skipped: {} }) : [];
+      const illustratorReading = createIllustratorLinkReading(projectId, illustratorActivationToken, illustratorQuery, scopeResult, records);
+      if (scopeResult.ready || illustratorReading) {
+        const refreshed = await applyLiveAppEvidenceRefresh(projectId, records, illustratorActivationToken, operation, { illustratorQuery, illustratorReading }); newCount += refreshed.stagedCount || 0;
       }
     }
+    const currentProject = getFreshActiveWatchingProject(projectId, illustratorActivationToken);
+    if (currentProject) adoptCurrentProjectForScan(currentProject);
   }
 
   // v2.3.4: do javascript query to Photoshop for smart object / placed item paths.
