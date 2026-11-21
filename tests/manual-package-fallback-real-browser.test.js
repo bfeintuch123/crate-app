@@ -15,7 +15,17 @@ assertAnchor(harness, testAnchor, 'harness test anchor');
 harness = harness.replace(testAnchor, "const browserTest = require('node:test'); const test = new Proxy(browserTest, { apply() {} });");
 const homeAnchor = "fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual-write-home-'))";
 assertAnchor(harness, homeAnchor, 'harness home anchor');
-harness = harness.replace(homeAnchor, "fs.mkdtempSync(path.join(path.dirname(MAIN_UNDER_TEST_ROOT), 'manual-package-browser-home-'))");
+harness = harness.replace(homeAnchor, "(() => { const parent = path.dirname(MAIN_UNDER_TEST_ROOT); const base = parent.split(path.sep).some(part => part.startsWith('.')) ? path.join(os.homedir(), 'Library', 'Caches') : parent; fs.mkdirSync(base, { recursive: true }); return fs.mkdtempSync(path.join(base, 'manual-package-browser-home-')); })()");
+const hookAnchor = '  captureProjectOperation,\n  runScanOnOpen';
+assertAnchor(harness, hookAnchor, 'harness hook anchor');
+harness = harness.replace(hookAnchor, '  interceptRegexWorker(handler) {\n' +
+  '    const original = runAddFilesRegexWorker;\n' +
+  '    runAddFilesRegexWorker = async (filePath, scanLease) => handler(filePath, scanLease, () => original(filePath, scanLease));\n' +
+  '    return () => { runAddFilesRegexWorker = original; };\n' +
+  '  },\n' + hookAnchor);
+const psdAnchor = '                  psd: fixture,';
+assertAnchor(harness, psdAnchor, 'harness PSD fixture anchor');
+harness = harness.replace(psdAnchor, '                  psd: fixture, framing: require("../parsers/add-files-psd-worker").inspectPsdLinkFraming(fs.readFileSync(filePath)),');
 const compiled = new Module(harnessPath, module);
 compiled.filename = harnessPath; compiled.paths = Module._nodeModulePaths(__dirname);
 compiled._compile(harness + '\n(' + cases.toString() + ')();', harnessPath);
@@ -168,7 +178,7 @@ function cases() {
 
   // The same synthetic route as the main-process tests: Keep both, then the
   // owner excludes and restores Flyer.ai, whose bytes no longer parse.
-  async function fixture({ breakSecond = true } = {}) {
+  async function fixture({ breakSecond = true, hold = null } = {}) {
     resetTestHomeWorkspace(); setPresentationUnzipFixture([]);
     const project = await createProject('Synthetic fallback');
     const id = project.id;
@@ -187,6 +197,7 @@ function cases() {
     };
     assert.equal((await select('exclude')).success, true);
     if (breakSecond) fs.writeFileSync(flyer, '%PDF-1.7\nmissing EOF');
+    if (hold) hold();
     assert.equal((await select('restore')).success, true);
     const out = path.join(TEST_HOME, 'Out-' + crypto.randomUUID().slice(0, 8));
     fs.mkdirSync(out, { recursive: true });
@@ -517,5 +528,123 @@ function cases() {
       assert.equal((await screen(page)).title, 'Package Review');
       assert.deepEqual(fs.readdirSync(f.out), []);
     });
+  });
+
+  browserTest('Package Review: Back -> Projects -> toggle Watch during an in-flight Retry settles without stranding pending', { skip, timeout: 90000 }, async () => {
+    const timer = global.setTimeout, pause = ms => new Promise(resolve => timer(resolve, ms));
+    let held = false, release = () => {}, gate = null, inflight = 0;
+    const hold = () => { if (held) return; held = true; gate = new Promise(resolve => { release = resolve; }); };
+    const unpause = metadataTestHooks.pausePsdExtraction(async () => { if (!held) return; inflight++; try { await gate; } finally { inflight--; } });
+    const drain = async () => { held = false; release(); while (inflight) await pause(5); await pause(50); };
+    const emptyPsdBytes = () => {
+      const bytes = Buffer.alloc(40); bytes.write('8BPS'); bytes.writeUInt16BE(1, 4);
+      bytes.writeUInt16BE(3, 12); bytes.writeUInt32BE(1, 14); bytes.writeUInt32BE(1, 18);
+      bytes.writeUInt16BE(8, 22); bytes.writeUInt16BE(3, 24); return bytes;
+    };
+    let id = null;
+    global.setTimeout = (callback, delay, ...args) => timer(callback, delay === 30000 ? 250 : delay, ...args);
+    try {
+      resetTestHomeWorkspace(); setPresentationUnzipFixture([]);
+      currentPsdFixture = { children: [], linkedFiles: [] };
+      const project = await createProject('Watch Interrupt UI');
+      id = project.id;
+      await callIpcRaw('projects:pause', id); clearTrackedTimers();
+      const workspace = () => callIpcRaw('projects:get-asset-workspace', id);
+      const logo = desktop('Logo.png'); fs.writeFileSync(logo, 'synthetic logo bytes');
+      const poster = desktop('Poster.ai'); writeSyntheticAiFile(poster, logo);
+      manualDialogFor([poster]); await callIpcRaw('projects:add-files', id);
+      await callIpcRaw('projects:set-existing-assets-decision', id, 'include');
+      const cover = desktop('Cover.psd'); fs.writeFileSync(cover, emptyPsdBytes());
+      manualDialogFor([cover]); await callIpcRaw('projects:add-files', id);
+      const card = (await workspace()).workingFileChoices.choices[0];
+      await callIpcRaw('projects:resolve-working-file-choice', id, { id: card.id, revision: card.revision, choice: 'keep-both', predecessorIdentity: null });
+      const select = async action => {
+        const row = (await workspace()).files.find(file => file.name === 'Cover.psd');
+        return callIpcRaw('projects:set-working-source-selection', id, row.visualIdentity, { action, expectedRevision: row.selectionRevision });
+      };
+      assert.equal((await select('exclude')).success, true);
+      hold();
+      assert.equal((await select('restore')).success, true);
+      await drain();
+      global.setTimeout = timer;
+
+      await withPage({}, async page => {
+        assert.equal(await page.evaluate(`window.__start(${json(id)})`), true);
+        assert.equal(await page.evaluate('showPackageModal({ runPreScan: false })'), true);
+        await page.idle();
+        assert.deepEqual((await screen(page)).retry, ['Retry verification', false]);
+
+        // Start Retry, then reach Watch toggle through Back to selection -> Projects tab -> Watch pill.
+        hold();
+        await page.click('#btn-retry-package-verification', { wait: false });
+        await page.sleep(80);
+        assert.deepEqual((await screen(page)).retry, ['Verifying…', true]);
+        await page.click('#btn-cancel-package', { wait: false });
+        await page.sleep(100);
+        await page.click('.app-tab[data-tab="projects"]', { wait: false });
+        await page.sleep(100);
+        await page.click(`.project-pill[data-id=${json(id)}]`, { wait: false });
+        await page.sleep(100);
+        await drain();
+        await page.idle();
+
+        await callIpcRaw('projects:pause', id);
+        await page.evaluate(`state.projects = ${json(storeInstance.data.projects)}; state.selectedProjectId = ${json(id)}; switchTab('current-project');`);
+        await page.evaluate('showPackageModal({ runPreScan: false })');
+        await page.idle();
+        const shown = await screen(page);
+        assert.equal(shown.pill, 'Review required');
+        assert.deepEqual(shown.retry, ['Retry verification', false], 'Retry remains available instead of stranding pending');
+        assert.equal(shown.manual, null, 'interrupted Retry never unlocks manual mode');
+        assert.deepEqual(shown.packageProject, ['Package Project', true]);
+      });
+    } finally { held = false; release(); unpause(); global.setTimeout = timer; if (id) await callIpcRaw('projects:pause', id).catch(() => {}); clearTrackedTimers(); await pause(50); }
+  });
+
+  browserTest('Package Review (valid working file seam): failed Retry -> manual package of exact subset -> later successful Retry restores normal Review', { skip, timeout: 90000 }, async () => {
+    let failFlyer = false;
+    const unintercept = metadataTestHooks.interceptRegexWorker((filePath, scanLease, runOriginal) => {
+      if (failFlyer && path.basename(filePath) === 'Flyer.ai') return Promise.reject(new Error('asset_baseline_regex_worker_failed'));
+      return runOriginal();
+    });
+    try {
+      const f = await fixture({ breakSecond: false, hold: () => { failFlyer = true; } });
+      const flyerSha = sha(f.flyer);
+      await withPage({}, async page => {
+        await page.evaluate(`window.__start(${json(f.id)})`);
+        await page.evaluate('showPackageModal({ runPreScan: false })');
+        await page.idle();
+        let shown = await screen(page);
+        assert.equal(shown.message, 'Verification couldn’t finish. Try again.');
+        assert.equal(shown.manual, null);
+
+        await page.click('#btn-retry-package-verification');
+        shown = await screen(page);
+        assert.deepEqual(shown.manual, ['Review files manually', false]);
+
+        await page.click('#btn-review-files-manually');
+        await page.click('.package-manual-toggle[aria-label="Exclude Logo.png"]');
+        manualDialogFor([f.out]);
+        await page.click('#btn-manual-change-dest');
+        await page.click('#btn-manual-package');
+        const [folder] = fs.readdirSync(f.out);
+        assert.deepEqual(fs.readdirSync(path.join(f.out, folder)).sort(), ['Flyer.ai', 'Poster.ai']);
+        assert.equal(sha(path.join(f.out, folder, 'Flyer.ai')), flyerSha);
+        assert.equal(sha(f.flyer), flyerSha);
+
+        // Close success modal, disarm seam without editing Flyer.ai, Retry restores normal Review.
+        failFlyer = false;
+        await page.click('#btn-success-done');
+        await page.evaluate(`state.selectedProjectId = ${json(f.id)}; switchTab('current-project'); showPackageModal({ runPreScan: false });`);
+        await page.idle();
+        await page.click('#btn-retry-package-verification');
+        shown = await screen(page);
+        assert.equal(shown.pill, 'Ready to package');
+        assert.equal(shown.retry, null);
+        assert.equal(shown.manual, null);
+        assert.deepEqual(shown.packageProject, ['Package Project', false]);
+        assert.equal(typeof shown.token, 'string');
+      });
+    } finally { unintercept(); }
   });
 }

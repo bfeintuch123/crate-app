@@ -6757,6 +6757,8 @@ async function retryPackageVerificationFromReview() {
   const message = result?.success ? '' : result?.error === 'package_verification_busy'
     ? 'Crate is already checking this file. Try again in a moment.'
     : result?.error === 'package_in_flight' ? 'Crate is already packaging. Try again in a moment.'
+    : result?.error === 'package_verification_retry_limit'
+      ? `Too many working files need verification at once (${result.count || 'too many'}; maximum ${result.limit || 64}). Exclude some working files, then try again.`
     : result?.error === 'package_verification_retry_unavailable' || result?.error === 'package_review_changed'
       ? PACKAGE_REVIEW_CHANGED_MESSAGE : 'Verification couldn’t finish. Try again.';
   await showPackageModal({ runPreScan: false, message });
@@ -6967,6 +6969,7 @@ function describeManualPackageRefusals(refused) {
   const reasons = new Set((Array.isArray(refused) ? refused : []).map(item => item?.reason));
   const parts = [];
   if (reasons.has('font')) parts.push('Fonts can’t be added to a manual package.');
+  if (reasons.has('extracted')) parts.push('Extracted media files can’t be added to a manual package.');
   if (reasons.has('hidden-or-invalid')) parts.push('Hidden files can’t be added.');
   if (reasons.has('unavailable')) parts.push('Some files couldn’t be read.');
   if (reasons.has('limit')) parts.push('This package has too many files; some weren’t added.');

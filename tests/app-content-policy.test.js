@@ -44,7 +44,7 @@ test('runtime UUID policy uses Node crypto without an external uuid dependency',
   assert.equal(Object.hasOwn(packageLock.packages[''].dependencies, 'uuid'), false);
   assert.equal(Object.hasOwn(packageLock.packages, 'node_modules/uuid'), false);
   assert.equal(mainSource.includes("require('uuid')"), false);
-  assert.equal((mainSource.match(/\bcrypto\.randomUUID\(\)/gu) || []).length, 22); // Explicit receipt recovery attempt plus admission, explicit-choice nonce, ledger recovery, verification retry IDs and InDesign observation epoch; Package Review Retry attempt, manual package item and session IDs.
+  assert.equal((mainSource.match(/\bcrypto\.randomUUID\(\)/gu) || []).length, 23); // Explicit receipt recovery attempt plus admission, explicit-choice nonce, ledger recovery, verification retry IDs and InDesign observation epoch; Package Review Retry attempt, manual package item, session and pending completion IDs.
 });
 
 function listJavaScriptFiles(rootDirectory, currentDirectory = rootDirectory) {

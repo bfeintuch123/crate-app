@@ -25,7 +25,7 @@ function productionPage(rendererDir, bootstrapSource) {
   const index = fs.readFileSync(path.join(rendererDir, 'index.html'), 'utf8');
   const html = index
     .replace(/<meta http-equiv="Content-Security-Policy"[^>]+>/u, '')
-    .replace(/<link[^>]+https:\/\/fonts\.googleapis\.com[^>]+>/u, '')
+    .replace(/<link[^>]+https:\/\/fonts\.(?:googleapis|gstatic)\.com[^>]+>/gu, '')
     .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gu, '')
     .replace('<head>', `<head><base href="${new URL(`file://${rendererDir}/`).href}">`);
   const cut = html.lastIndexOf('</body>');

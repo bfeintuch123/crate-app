@@ -5048,6 +5048,8 @@ async function verifyRestoredWorkingSource(projectId, file, attempt, operation, 
           requiredReferences: [], unresolved: [{ reason: 'connected-provider-interface-required' }], notes: ['required-reference-domain-unverified'] });
         return;
       }
+      let scanError = null;
+      let scanIdentity = null;
       const outcome = await runBoundedAddFilesScan(async lease => {
         const scanLifecycle = {};
         workingSourceScanOperations.add(scanLifecycle);
@@ -5055,19 +5057,33 @@ async function verifyRestoredWorkingSource(projectId, file, attempt, operation, 
         workingSourceScanLeases.set(leaseKey, lease);
         try {
           const identity = getWorkingSourceDiskIdentity(file);
+          scanIdentity = identity;
           const fingerprint = await getAddFilesCurrentSourceDigest(file.path, lease, identity);
           if (fingerprint !== await getAddFilesCurrentSourceDigest(file.path, lease, identity)) throw new Error('source-bytes-changed');
           if (!lease.current()) return;
           publishWorkingSourceScan(scan, { status: 'no-extractor', reason: 'ordinary-route-has-no-extractor', provider: 'none',
             coverage: 'ordinary-route', version: 1, requiredReferences: [], unresolved: [],
             notes: ['required-reference-domain-unverified'], sourceFingerprint: fingerprint, sourceIdentity: identity });
+        } catch (error) {
+          scanError = error;
+          throw error;
         } finally {
           if (workingSourceScanLeases.get(leaseKey) === lease) workingSourceScanLeases.delete(leaseKey);
           workingSourceScanOperations.delete(scanLifecycle);
         }
       }, { parentCurrent: current, timeoutMs: ADD_FILES_SCAN_TIMEOUT_MS }).catch(() => ({ failed: true }));
-      if (outcome.failed || outcome.timedOut || outcome.cancelled) publishWorkingSourceScan(scan, {
-        status: 'failed', reason: outcome.timedOut ? 'scan-timeout' : 'source-unavailable', unresolved: [{ reason: 'source-unavailable' }] });
+      if (outcome.failed && isVerificationSizeOrCoverageLimitError(scanError)) {
+        const limitReason = scanError?.message === 'asset_baseline_source_too_large'
+          ? 'ordinary-extractor-source-too-large' : 'coverage-limit';
+        publishWorkingSourceScan(scan, {
+          status: 'limited', reason: limitReason, sourceIdentity: scanIdentity, sourceFingerprint: null,
+          unresolved: [{ reason: 'coverage-limit' }],
+        });
+      } else if (outcome.failed || outcome.timedOut || outcome.cancelled) {
+        publishWorkingSourceScan(scan, {
+          status: 'failed', reason: outcome.timedOut ? 'scan-timeout' : 'source-unavailable', unresolved: [{ reason: 'source-unavailable' }],
+        });
+      }
       return;
     }
     const scanOperation = { ...operation, current, adoptScope: scope => operation.adoptScope(scope) && current() };
@@ -5089,12 +5105,29 @@ async function verifyRestoredWorkingSource(projectId, file, attempt, operation, 
     }
     if (!current()) return;
     const record = getProjects().find(item => item.id === projectId)?.workingSourceVerification?.[key];
+    const outcomeError = report.outcomes[0]?.error;
+    const isLimitOutcome = outcomeError === 'asset_baseline_source_too_large' || outcomeError === 'coverage_limit' ||
+      (record?.status === 'limited' && ['ordinary-extractor-source-too-large', 'coverage-limit'].includes(record.reason));
     if (report.cancelled || report.outcomes.some(item => !item.success)) {
       mutateProject(projectId, project => {
         if (!current() || isWorkingSourceReceiptWriteBlocked(project, file)) return false;
+        if (isLimitOutcome) {
+          const limitReason = outcomeError === 'asset_baseline_source_too_large' || record?.reason === 'ordinary-extractor-source-too-large'
+            ? 'ordinary-extractor-source-too-large' : 'coverage-limit';
+          project.workingSourceVerification[key] = {
+            ...record,
+            status: 'limited',
+            reason: limitReason,
+            sourceFingerprint: null,
+            unresolved: Array.isArray(record?.unresolved) && record.unresolved.some(item => item?.reason === 'coverage-limit')
+              ? record.unresolved
+              : [{ reason: 'coverage-limit' }],
+          };
+          return true;
+        }
         project.workingSourceVerification[key] = { ...record, status: 'failed',
           reason: path.extname(file.path || '').toLowerCase() === '.indd' && record?.status === 'failed'
-            ? record.reason : report.outcomes[0]?.error || 'scan-cancelled' };
+            ? record.reason : outcomeError || 'scan-cancelled' };
         return true;
       });
       invalidatePackageReviewForProject(projectId);
@@ -8866,6 +8899,7 @@ try {
   startupPhaseJournal.mark('store-shape-validation-complete');
   store = candidateStore;
   migrateSettings();
+  reconcilePendingManualPackageCompletions({ ignoreInFlight: true });
   startupPhaseJournal.mark('store-migrations-complete');
   startupPhaseJournal.mark('store-preflight-complete');
 } catch (_) {
@@ -9024,6 +9058,7 @@ function getPackageEntitlement() {
 }
 
 function getUsageSnapshot() {
+  reconcilePendingManualPackageCompletions();
   checkAndResetUsage();
   return {
     ...store.get('usage'),
@@ -18353,7 +18388,10 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     });
   }
   let dependableScanCompleted = false;
+  let scanFailureStatus = 'failed';
   let scanFailureReason = 'ordinary-scan-failed';
+  let scanFailureUnresolvedReason = null;
+  let scanFailureSourceIdentity = null;
   let psdTransaction = null;
   let baselinePsdOutputs = [];
   try {
@@ -18368,6 +18406,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   }
   console.log(`[crate] scan-on-open: scanning ${path.basename(filePath)}`);
   const sourceIdentity = getWorkingSourceDiskIdentity({ path: filePath });
+  scanFailureSourceIdentity = sourceIdentity;
   let sourceFingerprint = null;
   let sideLedgerFailure = false;
   let sideLedgerLimit = false;
@@ -18787,6 +18826,24 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   dependableScanCompleted = true;
   return { success: true };
   } catch (error) {
+    const isLimitError = isVerificationSizeOrCoverageLimitError(error);
+    if (isLimitError) {
+      scanFailureStatus = 'limited';
+      scanFailureReason = error?.message === 'asset_baseline_source_too_large'
+        ? 'ordinary-extractor-source-too-large' : 'coverage-limit';
+      scanFailureUnresolvedReason = 'coverage-limit';
+      publishWorkingSourceScan(workingScan, {
+        status: 'limited', reason: scanFailureReason,
+        sourceIdentity: scanFailureSourceIdentity, sourceFingerprint: null,
+        unresolved: [{ reason: 'coverage-limit' }],
+      });
+      console.error('[crate] scan-on-open: controlled limit:', baselineScan ? 'asset-baseline-scan-failed' : scanFailureReason);
+      return {
+        success: false,
+        error: baselineScan ? 'asset_baseline_scan_incomplete'
+          : (error?.message === 'asset_baseline_source_too_large' ? 'asset_baseline_source_too_large' : 'coverage_limit'),
+      };
+    }
     scanFailureReason = error?.message === 'asset_baseline_source_changed' ? 'source-bytes-changed'
       : ext === '.indd' && error?.message === 'indesign-access-denied' ? 'indesign-access-denied'
       : ext === '.indd' && (error?.message === 'indesign-query-failed' || error?.message?.startsWith('asset_baseline_indesign_')) ? 'indesign-query-failed'
@@ -18816,9 +18873,20 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
       const ownsLease = !!leaseKey && workingSourceScanLeases.get(leaseKey) === scanLease;
       workingSourceScanOperations.delete(scanLifecycle);
       if (ownsLease) workingSourceScanLeases.delete(leaseKey);
-      if (workingScan?.current() && !dependableScanCompleted) publishWorkingSourceScan(workingScan, {
-        status: 'failed', reason: ext === '.indd' ? scanFailureReason : 'ordinary-scan-failed',
-        unresolved: [{ reason: ext === '.indd' ? scanFailureReason : 'ordinary-scan-failed' }] });
+      if (workingScan?.current() && !dependableScanCompleted) {
+        if (scanFailureStatus === 'limited') {
+          publishWorkingSourceScan(workingScan, {
+            status: 'limited', reason: scanFailureReason,
+            sourceIdentity: scanFailureSourceIdentity, sourceFingerprint: null,
+            unresolved: [{ reason: scanFailureUnresolvedReason || 'coverage-limit' }],
+          });
+        } else {
+          publishWorkingSourceScan(workingScan, {
+            status: 'failed', reason: ext === '.indd' ? scanFailureReason : 'ordinary-scan-failed',
+            unresolved: [{ reason: ext === '.indd' ? scanFailureReason : 'ordinary-scan-failed' }],
+          });
+        }
+      }
       // Only the Illustrator scope moved: retire this scan's own pending receipt.
       // A timed-out or replaced lease, or any other changed guard, keeps it as is.
       else if (workingScan && ownsLease && retireInterruptedWorkingSourceScan(workingScan, () =>
@@ -24994,17 +25062,38 @@ const MANUAL_PACKAGE_COMPLETED_FAILURE_RECEIPT_REASONS = new Set([
 const MANUAL_PACKAGE_FONT_EXTENSIONS = new Set(['.ttf', '.otf', '.ttc', '.otc', '.woff', '.woff2', '.dfont']);
 const MANUAL_PACKAGE_SESSION_TTL_MS = 30 * 60 * 1000;
 const MANUAL_PACKAGE_MAX_FILES = 1000;
+const MANUAL_PACKAGE_RETRY_BATCH_LIMIT = 64;
 const MANUAL_PACKAGE_RETRY_ATTEMPT_LIMIT = 256;
-// Completed explicit Retry readings, per project: attempt -> the file revision
-// that Retry read. In memory only; an app restart or account change asks for
-// one new Retry.
+// Completed explicit Retry readings, per project: route key -> the latest
+// completed Retry attempt and file revision for that source. In memory only;
+// an app restart or account change asks for one new Retry.
 const packageVerificationRetryAttempts = new Map();
 const manualPackageSessions = new Map();
 
-function rememberPackageVerificationRetry(projectId, attempt, record) {
+function isVerificationSizeOrCoverageLimitError(error) {
+  return error?.message === 'asset_baseline_source_too_large' ||
+    error?.message === 'asset_baseline_psd_metadata_limit' ||
+    error?.message === 'coverage-limit' ||
+    error?.code === 'CRATE_PARSER_ADMISSION_LIMIT';
+}
+
+function rememberPackageVerificationRetry(projectId, key, record) {
   const attempts = packageVerificationRetryAttempts.get(projectId) || new Map();
-  attempts.set(attempt, record);
-  while (attempts.size > MANUAL_PACKAGE_RETRY_ATTEMPT_LIMIT) attempts.delete(attempts.keys().next().value);
+  attempts.delete(key);
+  attempts.set(key, record);
+  if (attempts.size > MANUAL_PACKAGE_RETRY_ATTEMPT_LIMIT) {
+    const project = getProjects().find(item => item && item.id === projectId);
+    if (project) {
+      const activeKeys = new Set((project.files || [])
+        .filter(row => !isScanOnSaveEmbeddedPsdFile(row))
+        .map(row => getAssetBaselineSourceRecoveryRouteKey(project, row))
+        .filter(Boolean));
+      for (const existingKey of [...attempts.keys()]) {
+        if (!activeKeys.has(existingKey)) attempts.delete(existingKey);
+      }
+    }
+    while (attempts.size > MANUAL_PACKAGE_RETRY_ATTEMPT_LIMIT) attempts.delete(attempts.keys().next().value);
+  }
   packageVerificationRetryAttempts.set(projectId, attempts);
 }
 
@@ -25077,11 +25166,12 @@ function getPackageVerificationFallback(project, files) {
       const revision = getManualPackageRevision(file.path);
       if (!revision) return null;
       // Manual mode needs a completed Retry of this exact file revision and selection.
-      const record = retried?.get(receipt.attempt);
-      const completedRetry = !!record && record.key === key && record.selectionRevision === receipt.selectionRevision &&
+      const record = retried?.get(key);
+      const matchedAttempt = !!record && record.attempt === receipt.attempt && record.selectionRevision === receipt.selectionRevision;
+      const completedRetry = matchedAttempt &&
         MANUAL_PACKAGE_COMPLETED_FAILURE_RECEIPT_REASONS.has(receipt.reason) && packageReviewFingerprintsMatch(record.revision, revision);
       // A failed Retry whose file was saved again since is a changed file: Retry again.
-      if (record && !packageReviewFingerprintsMatch(record.revision, revision)) reason = 'working-file-source-changed';
+      if (matchedAttempt && !packageReviewFingerprintsMatch(record.revision, revision)) reason = 'working-file-source-changed';
       failures.push({ key, attempt: receipt.attempt, reason, completedRetry, revision });
     }
     if (!failures.length || failures.length !== membership.counts.unresolvedVerification) return null;
@@ -25090,7 +25180,8 @@ function getPackageVerificationFallback(project, files) {
       failures,
       reason: failures.every(failure => failure.reason === 'working-file-verification-timed-out') ? 'timed-out'
         : failures.some(failure => failure.reason === 'working-file-source-changed') ? 'changed' : 'failed',
-      manualAvailable: failures.every(failure => MANUAL_PACKAGE_FALLBACK_REASONS.has(failure.reason) && failure.completedRetry),
+      manualAvailable: failures.length <= MANUAL_PACKAGE_RETRY_BATCH_LIMIT &&
+        failures.every(failure => MANUAL_PACKAGE_FALLBACK_REASONS.has(failure.reason) && failure.completedRetry),
       // Binds sessions to these attempts and to the exact bytes each Retry read.
       signature: crypto.createHash('sha256').update(JSON.stringify(failures)).digest('hex'),
     };
@@ -25113,6 +25204,47 @@ async function readPackageVerificationFallback(projectId, operation) {
   return { project: latest, files, inputSignature, fallback: getPackageVerificationFallback(latest, files) };
 }
 
+// Retire a pending receipt reserved by an explicit Package Review Retry when
+// the operation is invalidated (for example, Watch toggles during Retry) so the
+// working file is not stranded as pending. Guarded by the captured account
+// authorization, current project selection, and exact attempt ownership so a
+// newer receipt or another account is never overwritten.
+function retireAbandonedPackageVerificationRetry(projectId, key, attempt, selectionRevision, accountAuthorization) {
+  if (!isPackageReviewAuthorizationCurrent(accountAuthorization)) return false;
+  const reason = 'scan-interrupted';
+  let retired = false;
+  try {
+    retired = !!mutateProject(projectId, current => {
+      if (!isPackageReviewAuthorizationCurrent(accountAuthorization) || !hasWorkingSourceSelectionState(current)) return false;
+      const row = (current.files || []).find(item => !isScanOnSaveEmbeddedPsdFile(item) &&
+        getAssetBaselineSourceRecoveryRouteKey(current, item) === key);
+      if (!row || isWorkingSourceReceiptWriteBlocked(current, row)) return false;
+      const selection = getWorkingSourceSelection(current, row);
+      if (selection.state === 'invalid' || selection.revision !== selectionRevision) return false;
+      const record = current.workingSourceVerification?.[key];
+      if (!record || record.attempt !== attempt || record.status !== 'pending' ||
+          record.selectionRevision !== selectionRevision) return false;
+      const unresolved = Array.isArray(record.unresolved) ? record.unresolved : [];
+      const next = {
+        ...record,
+        status: 'failed',
+        reason,
+        unresolved: unresolved.length < 128 ? [...unresolved, { reason }] : unresolved,
+      };
+      delete next.pendingReviewFacts;
+      current.workingSourceVerification = { ...(current.workingSourceVerification || {}), [key]: next };
+      return true;
+    });
+  } catch (_) {
+    return false;
+  }
+  if (retired) {
+    invalidatePackageReviewForProject(projectId);
+    sendToRenderer('project:updated', { projectId });
+  }
+  return retired;
+}
+
 // Explicit Retry verification from Package Review. It reads each failed
 // working file again through the same route as Restore and the working-file
 // choice Retry. It never issues a review token and never packages. Only a
@@ -25121,6 +25253,7 @@ async function readPackageVerificationFallback(projectId, operation) {
 async function retryPackageVerification(projectId) {
   if (packageInFlight) return { success: false, error: 'package_in_flight' };
   if (workingFileChoiceOperations.has(projectId)) return { success: false, error: 'package_verification_busy' };
+  const accountAuthorization = capturePackageReviewAuthorization();
   const operation = captureProjectOperation(projectId);
   if (!operation) return { success: false, error: 'not_found' };
   workingFileChoiceOperations.add(projectId);
@@ -25128,6 +25261,14 @@ async function retryPackageVerification(projectId) {
     const read = await readPackageVerificationFallback(projectId, operation);
     if (read.error) return { success: false, error: read.error };
     if (!read.fallback) return { success: false, error: 'package_verification_retry_unavailable' };
+    if (read.fallback.failures.length > MANUAL_PACKAGE_RETRY_BATCH_LIMIT) {
+      return {
+        success: false,
+        error: 'package_verification_retry_limit',
+        limit: MANUAL_PACKAGE_RETRY_BATCH_LIMIT,
+        count: read.fallback.failures.length,
+      };
+    }
     for (const failure of read.fallback.failures) {
       if (!operation.current() || packageInFlight) return { success: false, error: 'package_review_changed' };
       const project = getProjects().find(item => item.id === projectId);
@@ -25159,7 +25300,15 @@ async function retryPackageVerification(projectId) {
       });
       if (!reserved) return { success: false, error: 'package_review_changed' };
       invalidatePackageReviewForProject(projectId);
-      await verifyRestoredWorkingSource(projectId, source, attempt, operation);
+      let scanSettled = false;
+      try {
+        await verifyRestoredWorkingSource(projectId, source, attempt, operation);
+        scanSettled = true;
+      } finally {
+        if (!scanSettled || !operation.current()) {
+          retireAbandonedPackageVerificationRetry(projectId, failure.key, attempt, selectionRevision, accountAuthorization);
+        }
+      }
       if (!operation.current()) return { success: false, error: 'package_review_changed' };
       const latest = getProjects().find(item => item.id === projectId);
       const latestSource = (latest?.files || []).find(row => !isScanOnSaveEmbeddedPsdFile(row) &&
@@ -25168,7 +25317,7 @@ async function retryPackageVerification(projectId) {
       if (receipt?.attempt === attempt && receipt.status === 'failed' && receipt.selectionRevision === selectionRevision &&
           MANUAL_PACKAGE_COMPLETED_FAILURE_RECEIPT_REASONS.has(receipt.reason) &&
           packageReviewFingerprintsMatch(revision, getManualPackageRevision(latestSource.path))) {
-        rememberPackageVerificationRetry(projectId, attempt, { key: failure.key, selectionRevision, revision });
+        rememberPackageVerificationRetry(projectId, failure.key, { attempt, selectionRevision, revision });
       }
     }
     if (!operation.current()) return { success: false, error: 'package_review_changed' };
@@ -25201,6 +25350,13 @@ function isManualPackageFontFile(filePath, name) {
     isGatedFontPath(filePath) || isGatedFontFile({ path: filePath, name });
 }
 
+function isManualPackageFontRow(file) {
+  if (!file || typeof file !== 'object') return false;
+  if (isGatedFontFile(file)) return true;
+  return getFontRelevantNames(file).some(value =>
+    MANUAL_PACKAGE_FONT_EXTENSIONS.has(path.extname(String(value || '')).toLowerCase()));
+}
+
 function createManualPackageItem(filePath, rawName, role, origin) {
   if (typeof filePath !== 'string' || !path.isAbsolute(filePath) || filePath.includes('\0') ||
       isHiddenManualPackagePath(filePath)) return { refused: 'hidden-or-invalid' };
@@ -25213,7 +25369,7 @@ function createManualPackageItem(filePath, rawName, role, origin) {
   let realPath;
   try { realPath = realpathSync(filePath); } catch (_) { return { refused: 'unavailable' }; }
   if (isHiddenManualPackagePath(realPath) || isCratePrivateManualPackagePath(realPath)) return { refused: 'hidden-or-invalid' };
-  return { item: { id: crypto.randomUUID(), path: filePath, name, ext: path.extname(name).toLowerCase(), role, origin, fingerprint } };
+  return { realPath, item: { id: crypto.randomUUID(), path: filePath, name, ext: path.extname(name).toLowerCase(), role, origin, fingerprint } };
 }
 
 function describeManualPackageItem(item) {
@@ -25236,6 +25392,42 @@ function isManualPackageExtractedRow(file) {
     !!getValidPsdExtractionReceiptParent(file);
 }
 
+// Known project rows whose metadata restricts them from manual packaging
+// (fonts by original/recorded name, or extracted Photoshop media), indexed by
+// exact path, resolved path and physical identity so Choose Files preserves
+// the same exclusions as preselection.
+function getManualPackageRestrictedProjectIndex(project) {
+  const byExactPath = new Map();
+  const byRealPath = new Map();
+  const byIdentity = new Map();
+  const record = (map, key, reason) => {
+    if (!key || map.get(key) === 'font') return;
+    map.set(key, reason);
+  };
+  for (const row of [...(project?.files || []), ...(project?.pendingFiles || [])]) {
+    if (!row || typeof row.path !== 'string' || row.virtual === true || isScanOnSaveEmbeddedPsdFile(row)) continue;
+    const reason = isManualPackageFontRow(row) ? 'font'
+      : isManualPackageExtractedRow(row) ? 'extracted'
+      : null;
+    if (!reason) continue;
+    record(byExactPath, row.path, reason);
+    try { record(byRealPath, realpathSync(row.path), reason); } catch (_) {}
+    const fp = getPackageReviewSourceFingerprint(row.path);
+    if (fp.state === 'present') record(byIdentity, `${fp.source.dev}:${fp.source.ino}`, reason);
+  }
+  return {
+    match(filePath, realPath, fingerprint) {
+      const reasons = [
+        byExactPath.get(filePath),
+        realPath ? byRealPath.get(realPath) : null,
+        fingerprint?.state === 'present' ? byIdentity.get(`${fingerprint.source.dev}:${fingerprint.source.ino}`) : null,
+      ].filter(Boolean);
+      if (reasons.includes('font')) return 'font';
+      return reasons[0] || null;
+    },
+  };
+}
+
 // Returns the listed items and how many Included files could not be listed
 // (missing, hidden or Crate-owned, fonts, online files or extracted media), so
 // none is left out silently.
@@ -25249,7 +25441,7 @@ function getManualPackagePreselection(project, files) {
     const source = isWorkingSourceFile(file);
     if (source ? fact.sourceSelection !== 'selected' : isAssetReviewFileExcluded(project, file)) continue;
     if (items.length >= MANUAL_PACKAGE_MAX_FILES || file.virtual === true || isScanOnSaveEmbeddedPsdFile(file) ||
-        isManualPackageExtractedRow(file) || isGatedFontFile(file)) { omitted++; continue; }
+        isManualPackageExtractedRow(file) || isManualPackageFontRow(file)) { omitted++; continue; }
     const origin = source ? null : ['existing', 'added'].includes(file.assetOrigin) ? file.assetOrigin : null;
     const created = createManualPackageItem(file.path, getPackageFileDisplayName(file), source ? 'source' : 'asset', origin);
     if (!created.item) { omitted++; continue; }
@@ -25323,6 +25515,12 @@ async function chooseManualPackageFiles(projectId, sessionId) {
         return { error: 'manual_package_stale' };
       }
     } finally { operation?.close(); }
+    const currentProject = getProjects().find(item => item && item.id === projectId);
+    if (!currentProject) {
+      manualPackageSessions.delete(session.id);
+      return { error: 'manual_package_stale' };
+    }
+    const restrictedIndex = getManualPackageRestrictedProjectIndex(currentProject);
     const addedIds = [], matchedIds = [], refused = [];
     const paths = !result || result.canceled || !Array.isArray(result.filePaths) ? [] : result.filePaths;
     for (let index = 0; index < paths.length; index++) {
@@ -25331,6 +25529,8 @@ async function chooseManualPackageFiles(projectId, sessionId) {
       if (index >= MANUAL_PACKAGE_MAX_FILES) { refused.push({ name: displayName, reason: 'limit' }); continue; }
       const created = createManualPackageItem(filePath, null, 'chosen', null);
       if (!created.item) { refused.push({ name: displayName, reason: created.refused }); continue; }
+      const knownRestriction = restrictedIndex.match(filePath, created.realPath, created.item.fingerprint);
+      if (knownRestriction) { refused.push({ name: displayName, reason: knownRestriction }); continue; }
       const existing = findManualPackageItem(session, filePath, created.item.fingerprint);
       if (existing) {
         // The owner chose this file again: list it with its current bytes and
@@ -25384,20 +25584,120 @@ async function hashManualPackageHandle(handle, size) {
   return hash.digest('hex');
 }
 
-// Usage and the watcher exclusion for this folder, written in one store write
-// before publication; undone if publication does not happen.
-function reserveManualPackageCompletion(destFolder) {
+function isValidPendingManualPackageCompletion(record) {
+  return !!record && typeof record === 'object' && !Array.isArray(record) &&
+    record.version === 1 &&
+    typeof record.id === 'string' && record.id.length > 0 && record.id.length <= 64 &&
+    typeof record.destFolder === 'string' && path.isAbsolute(record.destFolder) && !record.destFolder.includes('\0') &&
+    typeof record.stagingFolder === 'string' && path.isAbsolute(record.stagingFolder) && !record.stagingFolder.includes('\0') &&
+    typeof record.stagingDev === 'string' && /^\d+$/.test(record.stagingDev) &&
+    typeof record.stagingIno === 'string' && /^\d+$/.test(record.stagingIno) &&
+    typeof record.resetDate === 'string' &&
+    typeof record.addedOutputPath === 'boolean';
+}
+
+function manualPackageDirMatchesStat(dirPath, stagingDev, stagingIno) {
+  const stat = lstatPackagePath(dirPath);
+  return !!stat && !stat.isSymbolicLink() && stat.isDirectory() &&
+    String(stat.dev) === stagingDev && String(stat.ino) === stagingIno;
+}
+
+// Reconcile pending manual-package completion records against the published
+// folder identity (dev/ino of the renamed staging folder). Safe at startup
+// before packageInFlight is initialized when ignoreInFlight is true.
+function reconcilePendingManualPackageCompletions({ ignoreInFlight = false, onlyId = null } = {}) {
+  if (!store || typeof store.get !== 'function' || (!ignoreInFlight && packageInFlight)) return false;
+  const raw = store.get('pendingManualPackageCompletions', null);
+  if (!Array.isArray(raw) || raw.length === 0) return false;
+
+  const usage = store.get('usage');
+  const validUsage = !!usage && Number.isSafeInteger(usage.packagesThisMonth) &&
+    usage.packagesThisMonth >= 0 && typeof usage.resetDate === 'string';
+  const nextUsage = validUsage ? { ...usage } : null;
+  const currentOutputs = store.get('quickPackageOutputPaths', []);
+  let nextOutputs = Array.isArray(currentOutputs) ? currentOutputs.filter(value => typeof value === 'string') : [];
+  const remaining = [];
+  const keepOutputPaths = new Set();
+  const removeOutputPaths = new Set();
+
+  for (const record of raw) {
+    if (!isValidPendingManualPackageCompletion(record)) continue;
+    if (onlyId && record.id !== onlyId) {
+      remaining.push(record);
+      keepOutputPaths.add(path.resolve(record.destFolder));
+      continue;
+    }
+    const resolvedDest = path.resolve(record.destFolder);
+    if (manualPackageDirMatchesStat(resolvedDest, record.stagingDev, record.stagingIno)) {
+      keepOutputPaths.add(resolvedDest);
+      nextOutputs = [...nextOutputs.filter(value => path.resolve(value) !== resolvedDest), resolvedDest];
+      continue;
+    }
+    if (nextUsage && nextUsage.resetDate === record.resetDate && nextUsage.packagesThisMonth > 0) {
+      nextUsage.packagesThisMonth--;
+    }
+    if (record.addedOutputPath) removeOutputPaths.add(resolvedDest);
+    if (!onlyId && manualPackageDirMatchesStat(record.stagingFolder, record.stagingDev, record.stagingIno)) {
+      void removePrivateStagedPackageTree(record.stagingFolder, {
+        dev: BigInt(record.stagingDev), ino: BigInt(record.stagingIno),
+      }).catch(() => {});
+    }
+  }
+
+  for (const resolvedDest of removeOutputPaths) {
+    if (keepOutputPaths.has(resolvedDest)) continue;
+    nextOutputs = nextOutputs.filter(value => path.resolve(value) !== resolvedDest);
+  }
+
+  const update = {
+    quickPackageOutputPaths: nextOutputs.slice(-50),
+    pendingManualPackageCompletions: remaining,
+  };
+  if (nextUsage) update.usage = nextUsage;
+  store.set(update);
+  return true;
+}
+
+// Usage, watcher exclusion, and a recoverable completion record written in one
+// store write before publication; finalized on publish or reconciled on failure
+// or restart against the published folder's (dev, ino) identity.
+function reserveManualPackageCompletion(destination) {
   const previousUsage = store.get('usage');
   const previousOutputs = store.get('quickPackageOutputPaths', []);
+  const previousPending = store.get('pendingManualPackageCompletions', []);
   if (!previousUsage || !Number.isSafeInteger(previousUsage.packagesThisMonth) || previousUsage.packagesThisMonth < 0 ||
       typeof previousUsage.resetDate !== 'string') throw new Error('package_state_invalid');
   const nextUsage = getResetAwareUsageSnapshot(previousUsage);
   nextUsage.packagesThisMonth++;
-  const resolved = path.resolve(destFolder);
+  const resolved = path.resolve(destination.destFolder);
   const outputs = Array.isArray(previousOutputs) ? previousOutputs.filter(value => typeof value === 'string') : [];
-  const nextOutputs = outputs.some(value => path.resolve(value) === resolved) ? outputs : [...outputs, resolved];
-  store.set({ usage: nextUsage, quickPackageOutputPaths: nextOutputs.slice(-50) });
-  return () => store.set({ usage: previousUsage, quickPackageOutputPaths: previousOutputs });
+  const hadOutput = outputs.some(value => path.resolve(value) === resolved);
+  const nextOutputs = [...outputs.filter(value => path.resolve(value) !== resolved), resolved];
+  const validPending = Array.isArray(previousPending) ? previousPending.filter(isValidPendingManualPackageCompletion) : [];
+  const record = {
+    version: 1,
+    id: crypto.randomUUID(),
+    destFolder: resolved,
+    stagingFolder: path.resolve(destination.stagingFolder),
+    stagingDev: String(destination.stagingStat.dev),
+    stagingIno: String(destination.stagingStat.ino),
+    resetDate: nextUsage.resetDate,
+    addedOutputPath: !hadOutput,
+    createdAt: Date.now(),
+  };
+  store.set({
+    usage: nextUsage,
+    quickPackageOutputPaths: nextOutputs.slice(-50),
+    pendingManualPackageCompletions: [...validPending, record].slice(-16),
+  });
+  return record;
+}
+
+function finalizeManualPackageCompletion(completionId) {
+  const previousPending = store.get('pendingManualPackageCompletions', []);
+  if (!Array.isArray(previousPending) || previousPending.length === 0) return;
+  const remaining = previousPending.filter(record => isValidPendingManualPackageCompletion(record) && record.id !== completionId);
+  store.set('pendingManualPackageCompletions', remaining);
 }
 
 async function packageManualFiles(projectId, sessionId, request, outputPath) {
@@ -25419,7 +25719,7 @@ async function packageManualFiles(projectId, sessionId, request, outputPath) {
   packageInFlight = true;
   session.packaging = true;
   const operation = captureProjectOperation(projectId);
-  let destination = null, writes = null, sources = null, published = false, undoCompletion = null;
+  let destination = null, writes = null, sources = null, published = false, completionReservation = null;
   const cleanup = async () => {
     if (published) return true;
     if (writes) return await writes.cleanup();
@@ -25434,6 +25734,7 @@ async function packageManualFiles(projectId, sessionId, request, outputPath) {
     if (!operation) return { error: 'manual_package_stale' };
     const change = await getManualPackageSessionChange(session, operation);
     if (change) return { error: change };
+    try { reconcilePendingManualPackageCompletions({ ignoreInFlight: true }); } catch (_) {}
     const limitResult = getPackageLimitResult();
     if (limitResult) return limitResult;
     // Each row keeps its reviewed name. Names that collide are refused, never renamed.
@@ -25484,16 +25785,22 @@ async function packageManualFiles(projectId, sessionId, request, outputPath) {
       throw new ManualPackageStaleError('manual_package_copy_unverified');
     }
     if (!operation.current() || hasPackageVerificationTransferHold(projectId)) throw new ManualPackageStaleError();
-    try { undoCompletion = reserveManualPackageCompletion(destination.destFolder); } catch (_) { throw new ManualPackageStaleError('package_state_failed'); }
+    try { completionReservation = reserveManualPackageCompletion(destination); } catch (_) { throw new ManualPackageStaleError('package_state_failed'); }
     publishPrivatePackageDestination(destination, tree);
     published = true;
     manualPackageSessions.delete(session.id);
+    try { finalizeManualPackageCompletion(completionReservation.id); } catch (_) {
+      console.error('[crate] manual package: completion journal cleanup deferred to restart');
+    }
     try { writes.adoptPublishedRoot(destination.destFolder); } catch (_) {}
     try { writes.dispose(); } catch (_) {}
     writes = null;
     return { success: true, manual: true, copiedCount: items.length, folderPath: destination.destFolder, files: names };
   } catch (error) {
-    if (!published && undoCompletion) { try { undoCompletion(); } catch (_) { console.error('[crate] manual package: usage reservation could not be undone'); } }
+    if (!published && completionReservation) {
+      try { reconcilePendingManualPackageCompletions({ ignoreInFlight: true, onlyId: completionReservation.id }); }
+      catch (_) { console.error('[crate] manual package: usage reservation reconciliation deferred to restart'); }
+    }
     if (!published && !await cleanup()) return { error: 'package_cleanup_failed' };
     if (error instanceof ManualPackageStaleError) return { error: error.code };
     if (error instanceof PackageReviewChangedError) return { error: 'manual_package_files_changed', ids: changedIds() };

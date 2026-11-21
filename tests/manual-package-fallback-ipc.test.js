@@ -13,11 +13,17 @@ assertAnchor(harness, testAnchor, 'harness test anchor');
 harness = harness.replace(testAnchor, "const manualTest = require('node:test'); const test = new Proxy(manualTest, { apply() {} });");
 const homeAnchor = "fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual-write-home-'))";
 assertAnchor(harness, homeAnchor, 'harness home anchor');
-harness = harness.replace(homeAnchor, "fs.mkdtempSync(path.join(path.dirname(MAIN_UNDER_TEST_ROOT), 'manual-package-home-'))");
+harness = harness.replace(homeAnchor, "(() => { const parent = path.dirname(MAIN_UNDER_TEST_ROOT); const base = parent.split(path.sep).some(part => part.startsWith('.')) ? path.join(os.homedir(), 'Library', 'Caches') : parent; fs.mkdirSync(base, { recursive: true }); return fs.mkdtempSync(path.join(base, 'manual-package-home-')); })()");
 const hookAnchor = '  captureProjectOperation,\n  runScanOnOpen';
 assertAnchor(harness, hookAnchor, 'harness hook anchor');
 harness = harness.replace(hookAnchor, '  getAssetBaselineSourceRecoveryRouteKey, mutateProject, getWorkingSourceVerification,\n' +
-  '  isManualPackageInDesignFile, findManualPackageItem,\n' + hookAnchor);
+  '  isManualPackageInDesignFile, findManualPackageItem, isAutoCaptureExcludedPath,\n' +
+  '  reconcilePendingManualPackageCompletions,\n' +
+  '  interceptRegexWorker(handler) {\n' +
+  '    const original = runAddFilesRegexWorker;\n' +
+  '    runAddFilesRegexWorker = async (filePath, scanLease) => handler(filePath, scanLease, () => original(filePath, scanLease));\n' +
+  '    return () => { runAddFilesRegexWorker = original; };\n' +
+  '  },\n' + hookAnchor);
 // Photoshop link framing is read from the synthetic bytes, as the working-file choice tests do.
 const psdAnchor = '                  psd: fixture,';
 assertAnchor(harness, psdAnchor, 'harness PSD fixture anchor');
@@ -416,7 +422,7 @@ function cases() {
     assert.equal(f.stored().status, 'packaged', 'normal packaging keeps its own completion');
   });
 
-  manualTest('An interrupted Retry never unlocks manual mode', { timeout: 30000 }, async () => {
+  manualTest('An interrupted Retry settles safely without stranding pending or overwriting newer receipts, and never unlocks manual mode', { timeout: 30000 }, async () => {
     const timer = global.setTimeout, pause = ms => new Promise(resolve => timer(resolve, ms));
     let held = false, release = () => {}, gate = null, inflight = 0;
     const hold = () => { if (held) return; held = true; gate = new Promise(resolve => { release = resolve; }); };
@@ -427,29 +433,61 @@ function cases() {
       const f = await setup({ second: 'Cover.psd', breakSecond: false, hold });
       await drain();
       assert.equal((await f.review()).verificationFallback?.manual, false);
-      // Retry starts, then the project's operation is retired before the reading ends.
+      // Retry starts, then Watch changes before the reading ends.
       global.setTimeout = timer;
       hold();
       const pending = f.retry();
       await pause(30);
+      assert.equal(f.receipt('Cover.psd').status, 'pending');
       await callIpcRaw('projects:start-watching', f.id);
       await drain();
       assert.equal((await pending).error, 'package_review_changed');
+      // Without any manual store intervention, the abandoned Retry receipt is
+      // retired from pending to failed/scan-interrupted.
+      assert.equal(f.receipt('Cover.psd').status, 'failed');
+      assert.equal(f.receipt('Cover.psd').reason, 'scan-interrupted');
       await callIpcRaw('projects:pause', f.id); clearTrackedTimers();
-      // The receipt as retireInterruptedWorkingSourceScan leaves an interrupted
-      // reading: failed, reason scan-interrupted, the Retry's own attempt.
+      let review = await f.review();
+      assert.deepEqual(review.verificationFallback, { version: 1, reason: 'failed', retry: true, manual: false },
+        'Retry stays offered after Watch interruption without unlocking manual mode');
+      assert.equal((await f.begin()).error, 'manual_package_unavailable');
+
+      // If a newer receipt already replaced the abandoned attempt before it
+      // settles, retirement must preserve the newer receipt untouched.
+      hold();
+      const secondPending = f.retry();
+      await pause(30);
+      const abandonedAttempt = f.receipt('Cover.psd').attempt;
       const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.stored(), f.stored().files.find(file => file.path === desktop('Cover.psd')));
+      const newerAttempt = 'newer-attempt-' + crypto.randomUUID().slice(0, 8);
+      await callIpcRaw('projects:start-watching', f.id);
       metadataTestHooks.mutateProject(f.id, project => {
-        const record = project.workingSourceVerification[key];
-        project.workingSourceVerification[key] = { ...record, status: 'failed', reason: 'scan-interrupted',
-          unresolved: [...(record.unresolved || []), { reason: 'scan-interrupted' }] };
+        project.workingSourceVerification[key] = { ...project.workingSourceVerification[key], status: 'failed', reason: 'ordinary-scan-failed', attempt: newerAttempt };
         return true;
       });
-      const review = await f.review();
-      assert.ok(review.verificationFallback, 'Retry is still offered');
-      assert.equal(review.verificationFallback.manual, false, 'an interrupted Retry is not a failed reading');
-      assert.equal((await f.begin()).error, 'manual_package_unavailable');
-    } finally { held = false; release(); unpause(); global.setTimeout = timer; await pause(50); }
+      await drain();
+      assert.equal((await secondPending).error, 'package_review_changed');
+      assert.notEqual(abandonedAttempt, newerAttempt);
+      assert.equal(f.receipt('Cover.psd').attempt, newerAttempt, 'newer receipt is preserved');
+      assert.equal(f.receipt('Cover.psd').reason, 'ordinary-scan-failed');
+      await callIpcRaw('projects:pause', f.id); clearTrackedTimers();
+
+      // An account switch during Retry must not write to the store on unwind.
+      hold();
+      const thirdPending = f.retry().catch(error => ({ error: error?.message || String(error) }));
+      await pause(30);
+      const pendingAttemptBeforeLogout = f.receipt('Cover.psd').attempt;
+      await testAccountSession.logout();
+      await drain();
+      try {
+        const thirdResult = await thirdPending;
+        assert.ok(thirdResult?.error, 'logged-out Retry does not succeed');
+      } finally {
+        await testAccountSession.restore();
+      }
+      assert.equal(f.receipt('Cover.psd').attempt, pendingAttemptBeforeLogout);
+      assert.equal(f.receipt('Cover.psd').status, 'pending', 'logged-out unwind never mutates store');
+    } finally { held = false; release(); unpause(); global.setTimeout = timer; await testAccountSession.restore(); await pause(50); }
   });
 
   manualTest('Saving the failed working file after Retry asks for Retry again and retires an open manual review', async () => {
@@ -623,5 +661,282 @@ function cases() {
     begun = await f.begin();
     assert.deepEqual(await callIpcRaw('projects:end-manual-package', f.id, begun.sessionId), { success: true });
     assert.equal((await f.commit(begun.sessionId, begun.files.map(file => file.id), f.out)).error, 'manual_package_stale');
+  });
+
+  manualTest('Valid working file (test-only seam): failed Retry -> manual review -> exact included files -> later successful Retry restores normal Review', async () => {
+    let failFlyer = false;
+    const unintercept = metadataTestHooks.interceptRegexWorker((filePath, scanLease, runOriginal) => {
+      if (failFlyer && path.basename(filePath) === 'Flyer.ai') {
+        return Promise.reject(new Error('asset_baseline_regex_worker_failed'));
+      }
+      return runOriginal();
+    });
+    try {
+      // Flyer.ai stays valid and unmodified on disk throughout the entire flow.
+      const f = await setup({ breakSecond: false, hold: () => { failFlyer = true; } });
+      const flyerDigest = sha(f.flyer);
+      let review = await f.review();
+      assert.equal(review.materializable, false);
+      assert.deepEqual(review.verificationFallback, { version: 1, reason: 'failed', retry: true, manual: false });
+      assert.equal((await f.begin()).error, 'manual_package_unavailable');
+
+      // Explicit Retry fails while the test-only seam is armed.
+      assert.deepEqual(await f.retry(), { success: true });
+      review = await f.review();
+      assert.deepEqual(review.verificationFallback, { version: 1, reason: 'failed', retry: true, manual: true });
+
+      // Manual review copies only the explicitly Included files, byte-for-byte.
+      const storeBefore = JSON.stringify(storeInstance.data.projects);
+      const begun = await f.begin();
+      const brief = path.join(TEST_HOME, 'Documents', 'Notes.pdf');
+      fs.mkdirSync(path.dirname(brief), { recursive: true }); fs.writeFileSync(brief, 'valid manual note');
+      const chosen = await f.choose(begun.sessionId, [brief]);
+      const includedIds = chosen.files.filter(file => file.name !== 'Logo.png').map(file => file.id);
+      const result = await f.commit(begun.sessionId, includedIds, f.out);
+      assert.equal(result.success, true, JSON.stringify(result));
+      const folder = path.basename(result.folderPath);
+      assert.deepEqual(listOutput(f.out), [folder, `${folder}/Flyer.ai`, `${folder}/Notes.pdf`, `${folder}/Poster.ai`]);
+      assert.equal(sha(path.join(result.folderPath, 'Flyer.ai')), flyerDigest, 'valid working file copied byte-identically');
+      assert.equal(sha(f.flyer), flyerDigest, 'valid working file never modified');
+      assert.equal(JSON.stringify(storeInstance.data.projects), storeBefore);
+
+      // Disarm seam without editing Flyer.ai; Retry restores normal Review.
+      failFlyer = false;
+      assert.deepEqual(await f.retry(), { success: true });
+      review = await f.review();
+      assert.equal(review.materializable, true);
+      assert.equal(typeof review.token, 'string');
+      assert.equal(review.verificationFallback, undefined);
+      assert.equal((await f.begin()).error, 'manual_package_unavailable');
+    } finally { unintercept(); }
+  });
+
+  manualTest('Typed size and coverage limits stay limited and never unlock Retry or manual packaging', async () => {
+    const f = await setup({ breakSecond: false });
+    // Oversized sparse file (>300 MiB) on Restore.
+    const originalSize = fs.statSync(f.flyer).size;
+    assert.equal((await f.select('Flyer.ai', 'exclude')).success, true);
+    fs.truncateSync(f.flyer, 301 * 1024 * 1024);
+    try {
+      assert.equal((await f.select('Flyer.ai', 'restore')).success, true);
+      const receipt = f.receipt('Flyer.ai');
+      assert.equal(receipt.status, 'limited');
+      assert.equal(receipt.reason, 'ordinary-extractor-source-too-large');
+      assert.ok(receipt.unresolved.some(item => item.reason === 'coverage-limit'));
+      const review = await f.review();
+      assert.equal(review.materializable, false);
+      assert.equal(review.verificationFallback, undefined, 'size limit never enables Retry or manual mode');
+      assert.equal((await f.retry()).error, 'package_verification_retry_unavailable');
+      assert.equal((await f.begin()).error, 'manual_package_unavailable');
+    } finally { fs.truncateSync(f.flyer, originalSize); }
+
+    // Starting from an eligible failed receipt, growing >300 MiB before Retry must not unlock manual mode.
+    const f2 = await setup();
+    const size2 = fs.statSync(f2.flyer).size;
+    fs.truncateSync(f2.flyer, 301 * 1024 * 1024);
+    try {
+      assert.deepEqual(await f2.retry(), { success: true });
+      assert.equal(f2.receipt('Flyer.ai').status, 'limited');
+      assert.equal(f2.receipt('Flyer.ai').reason, 'ordinary-extractor-source-too-large');
+      assert.equal((await f2.review()).verificationFallback, undefined);
+      assert.equal((await f2.begin()).error, 'manual_package_unavailable');
+    } finally { fs.truncateSync(f2.flyer, size2); }
+
+    // Typed coverage/metadata limit from parser worker also stays limited.
+    const f3 = await setup();
+    const unintercept = metadataTestHooks.interceptRegexWorker((filePath, scanLease, runOriginal) => {
+      if (path.basename(filePath) === 'Flyer.ai') return Promise.reject(new Error('asset_baseline_psd_metadata_limit'));
+      return runOriginal();
+    });
+    try {
+      assert.deepEqual(await f3.retry(), { success: true });
+      assert.equal(f3.receipt('Flyer.ai').status, 'limited');
+      assert.equal(f3.receipt('Flyer.ai').reason, 'coverage-limit');
+      assert.equal((await f3.review()).verificationFallback, undefined);
+      assert.equal((await f3.begin()).error, 'manual_package_unavailable');
+    } finally { unintercept(); }
+  });
+
+  manualTest('Choose Files preserves known project-row restrictions (renamed restricted fonts and extracted media) by exact path and physical identity', async () => {
+    const f = await setup();
+    const visibleDir = path.join(TEST_HOME, 'Desktop', 'VisibleExtracted');
+    fs.mkdirSync(visibleDir, { recursive: true });
+    const parentPsd = path.join(visibleDir, 'Source.psd'); fs.writeFileSync(parentPsd, emptyPsdBytes());
+    const restrictedFont = path.join(visibleDir, 'Restricted.otf_1.'); fs.writeFileSync(restrictedFont, 'restricted font bytes');
+    const brandFont = path.join(visibleDir, 'Brand.otf_2'); fs.writeFileSync(brandFont, 'brand font bytes');
+    const extractedPng = path.join(visibleDir, 'Extracted.png'); fs.writeFileSync(extractedPng, 'extracted png bytes');
+    const pendingExtracted = path.join(visibleDir, 'PendingExtracted.png'); fs.writeFileSync(pendingExtracted, 'pending extracted bytes');
+    const ordinaryRenamed = path.join(visibleDir, 'Logo_1.png'); fs.writeFileSync(ordinaryRenamed, 'ordinary png bytes');
+    const receipt = (name, bytes) => ({ version: 1, parentPath: parentPsd, sourceDigest: sha(parentPsd), outputDigest: crypto.createHash('sha256').update(bytes).digest('hex'),
+      layerPath: null, linkedIndex: 0, originalName: name });
+    metadataTestHooks.mutateProject(f.id, project => {
+      project.files.push(
+        { path: restrictedFont, name: 'Restricted.otf_1.', ext: '', addedAt: Date.now(), source: 'psd-embedded', assetOrigin: 'added', projectRole: 'asset',
+          psdResource: { version: 1, ...receipt('Restricted.otf', 'restricted font bytes') } },
+        { path: brandFont, name: 'Brand.otf_2', ext: '.otf_2', addedAt: Date.now(), source: 'psd-embedded', assetOrigin: 'added', projectRole: 'asset',
+          psdExtractionReceipt: receipt('Brand.otf', 'brand font bytes') },
+        { path: extractedPng, name: 'Extracted.png', ext: '.png', addedAt: Date.now(), source: 'psd-embedded', assetOrigin: 'added', projectRole: 'asset' },
+        { path: ordinaryRenamed, name: 'Logo_1.png', ext: '.png', addedAt: Date.now(), source: 'manual-browse', assetOrigin: 'added', projectRole: 'asset' },
+      );
+      project.pendingFiles = [...(project.pendingFiles || []),
+        { path: pendingExtracted, name: 'PendingExtracted.png', ext: '.png', addedAt: Date.now(), source: 'psd-embedded', assetOrigin: 'added', projectRole: 'asset' }];
+      return true;
+    });
+    await f.retry();
+    const begun = await f.begin();
+    assert.deepEqual(begun.files.map(file => file.name).sort(), ['Flyer.ai', 'Logo.png', 'Logo_1.png', 'Poster.ai']);
+    assert.equal(begun.omittedCount, 3, 'all 3 restricted rows are omitted from preselection');
+    // Hard links to restricted files in another visible folder must also be refused by physical identity.
+    const aliasDir = path.join(TEST_HOME, 'Documents', 'Aliases');
+    fs.mkdirSync(aliasDir, { recursive: true });
+    const hardFontAlias = path.join(aliasDir, 'InnocentName.dat'); fs.linkSync(restrictedFont, hardFontAlias);
+    const hardExtractedAlias = path.join(aliasDir, 'InnocentImage.png'); fs.linkSync(extractedPng, hardExtractedAlias);
+    const chosen = await f.choose(begun.sessionId, [restrictedFont, brandFont, extractedPng, pendingExtracted, hardFontAlias, hardExtractedAlias]);
+    assert.deepEqual(chosen.addedIds, [], 'no restricted file receives an item ID');
+    assert.deepEqual(chosen.matchedIds, []);
+    assert.equal(chosen.refusedCount, 6);
+    assert.deepEqual(chosen.refused.map(item => item.reason).sort(), ['extracted', 'extracted', 'extracted', 'font', 'font', 'font']);
+  });
+
+  manualTest('Large Retry batches above the bound are rejected before starting and repeated Retries do not evict active evidence', async () => {
+    const f = await setup();
+    // Seed 64 more failed selected working files (65 total failing sources > 64 batch limit).
+    const extraDir = path.join(TEST_HOME, 'Desktop', 'Batch');
+    fs.mkdirSync(extraDir, { recursive: true });
+    const extraFiles = [];
+    for (let index = 0; index < 64; index++) {
+      const target = path.join(extraDir, `Broken-${index}.ai`);
+      fs.writeFileSync(target, '%PDF-1.7\nmissing EOF');
+      extraFiles.push(target);
+    }
+    metadataTestHooks.mutateProject(f.id, project => {
+      for (const target of extraFiles) {
+        const row = { path: target, name: path.basename(target), ext: '.ai', addedAt: Date.now(), source: 'manual-browse', assetOrigin: 'added', projectRole: 'source' };
+        project.files.push(row);
+        const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(project, row);
+        project.workingSourceSelections[key] = { version: 1, state: 'selected', revision: 1, reason: null };
+        project.workingSourceVerification[key] = {
+          version: 1, status: 'failed', reason: 'scan_on_open_failed', attempt: 'seed-' + key.slice(0, 12),
+          selectionRevision: 1, sourceIdentity: null, provider: 'ordinary-scan', coverage: 'ordinary-route',
+          sourceFingerprint: null, requiredReferences: [], unresolved: [{ reason: 'ordinary-scan-failed' }],
+        };
+      }
+      return true;
+    });
+    const beforeAttempts = new Map(Object.entries(f.stored().workingSourceVerification).map(([k, v]) => [k, v.attempt]));
+    const limited = await f.retry();
+    assert.deepEqual(limited, { success: false, error: 'package_verification_retry_limit', limit: 64, count: 65 });
+    const afterAttempts = new Map(Object.entries(f.stored().workingSourceVerification).map(([k, v]) => [k, v.attempt]));
+    assert.deepEqual([...afterAttempts.entries()], [...beforeAttempts.entries()], 'no receipt is reserved when over the batch limit');
+    assert.equal((await f.review()).verificationFallback?.manual, false);
+    assert.equal((await f.begin()).error, 'manual_package_unavailable');
+
+    // Within the bound, repeated Retries keep manual eligibility without self-eviction.
+    const f2 = await setup();
+    for (let round = 0; round < 3; round++) {
+      assert.deepEqual(await f2.retry(), { success: true });
+      assert.equal((await f2.review()).verificationFallback?.manual, true, `round ${round + 1}`);
+    }
+  });
+
+  manualTest('Completion journal reconciles usage and output exclusions across crashes and failed rollbacks', async () => {
+    const f = await setup();
+    await f.retry();
+    let begun = await f.begin();
+    const ids = () => begun.files.map(file => file.id);
+    const usage = () => storeInstance.data.usage.packagesThisMonth;
+    const before = usage();
+
+    // 1. Failed rename AND failed rollback write leaves a pending record that reconciles cleanly on next check.
+    const originalRename = fs.renameSync;
+    const originalSet = storeInstance.set;
+    let blockRollback = true;
+    fs.renameSync = function (from, to) {
+      if (String(from).includes('.crate-package-staging-')) throw Object.assign(new Error('synthetic rename failure'), { code: 'EIO' });
+      return originalRename.call(this, from, to);
+    };
+    storeInstance.set = function (key, ...rest) {
+      if (blockRollback && key && typeof key === 'object' && Object.hasOwn(key, 'pendingManualPackageCompletions') &&
+          Array.isArray(key.pendingManualPackageCompletions) && key.pendingManualPackageCompletions.length === 0) {
+        throw new Error('synthetic rollback store failure');
+      }
+      return originalSet.call(this, key, ...rest);
+    };
+    let result;
+    try { result = await f.commit(begun.sessionId, ids(), f.out); }
+    finally { fs.renameSync = originalRename; storeInstance.set = originalSet; blockRollback = false; }
+    assert.equal(result.success, undefined);
+    assert.equal((storeInstance.data.pendingManualPackageCompletions || []).length, 1, 'pending completion record survives rollback failure');
+    assert.equal(usage(), before + 1, 'unreconciled reservation is still recorded before restart/reconcile');
+    // Restart/usage read reconciles against disk: folder never appeared, so usage and exclusion are refunded.
+    const reconciledUsage = await callIpcRaw('usage:get');
+    assert.equal(reconciledUsage.packagesThisMonth, before);
+    assert.equal(usage(), before);
+    assert.deepEqual(storeInstance.data.pendingManualPackageCompletions, []);
+    assert.equal((storeInstance.data.quickPackageOutputPaths || []).some(entry => entry.startsWith(path.resolve(f.out))), false);
+
+    // 2. Crash before rename with orphaned staging directory on disk: startup reconciliation refunds and removes staging.
+    const orphanStaging = path.join(f.out, '.crate-package-staging-orphan-' + crypto.randomUUID().slice(0, 8));
+    fs.mkdirSync(orphanStaging, { mode: 0o700 });
+    const orphanStat = fs.lstatSync(orphanStaging, { bigint: true });
+    const missingDest = path.join(f.out, 'NeverPublished');
+    storeInstance.set({
+      usage: { ...storeInstance.data.usage, packagesThisMonth: before + 1 },
+      quickPackageOutputPaths: [...(storeInstance.data.quickPackageOutputPaths || []), path.resolve(missingDest)],
+      pendingManualPackageCompletions: [{
+        version: 1, id: 'crash-before-rename', destFolder: path.resolve(missingDest),
+        stagingFolder: path.resolve(orphanStaging), stagingDev: String(orphanStat.dev), stagingIno: String(orphanStat.ino),
+        resetDate: storeInstance.data.usage.resetDate, addedOutputPath: true, createdAt: Date.now(),
+      }],
+    });
+    assert.equal(metadataTestHooks.reconcilePendingManualPackageCompletions({ ignoreInFlight: true }), true);
+    assert.equal(usage(), before, 'crash-before-rename refunds usage');
+    assert.equal(storeInstance.data.quickPackageOutputPaths.includes(path.resolve(missingDest)), false);
+    assert.deepEqual(storeInstance.data.pendingManualPackageCompletions, []);
+
+    // 3. Crash after rename (published folder exists with matching dev/ino): reconciliation keeps usage and exclusion.
+    const publishedDest = path.join(f.out, 'PublishedBeforeCrash');
+    fs.mkdirSync(publishedDest, { mode: 0o700 });
+    const publishedStat = fs.lstatSync(publishedDest, { bigint: true });
+    storeInstance.set({
+      usage: { ...storeInstance.data.usage, packagesThisMonth: before + 1 },
+      quickPackageOutputPaths: [...(storeInstance.data.quickPackageOutputPaths || []), path.resolve(publishedDest)],
+      pendingManualPackageCompletions: [{
+        version: 1, id: 'crash-after-rename', destFolder: path.resolve(publishedDest),
+        stagingFolder: path.join(f.out, '.crate-package-staging-gone'), stagingDev: String(publishedStat.dev), stagingIno: String(publishedStat.ino),
+        resetDate: storeInstance.data.usage.resetDate, addedOutputPath: true, createdAt: Date.now(),
+      }],
+    });
+    assert.equal(metadataTestHooks.reconcilePendingManualPackageCompletions({ ignoreInFlight: true }), true);
+    assert.equal(usage(), before + 1, 'crash-after-rename preserves usage charge');
+    assert.equal(storeInstance.data.quickPackageOutputPaths.includes(path.resolve(publishedDest)), true);
+    assert.deepEqual(storeInstance.data.pendingManualPackageCompletions, []);
+  });
+
+  manualTest('Cross-project Watch and destination/selection isolation: custom-named manual output is excluded from watching projects without mutating either project', async () => {
+    const f = await setup();
+    await callIpcRaw('settings:update', 'namingTemplate', '{Project}-Manual');
+    await f.retry();
+    const other = await createProject('Other Watched Project');
+    const otherDoc = desktop('Other.ai'); writeSyntheticAiFile(otherDoc, f.logo);
+    manualDialogFor([otherDoc]);
+    await callIpcRaw('projects:add-files', other.id);
+    await callIpcRaw('projects:start-watching', other.id);
+    const otherBefore = JSON.stringify(storeInstance.data.projects.find(item => item.id === other.id));
+    const projectABefore = JSON.stringify(f.stored());
+    const begun = await f.begin();
+    assert.equal(begun.folderName, 'Manual fallback-Manual', 'custom non-dated folder name');
+    // Session from Project A cannot be used for Project B.
+    assert.equal((await callIpcRaw('projects:package-manual', other.id, begun.sessionId,
+      { includedIds: begun.files.map(file => file.id), expectedCount: begun.files.length }, f.out)).error, 'manual_package_stale');
+    const result = await f.commit(begun.sessionId, begun.files.map(file => file.id), f.out);
+    assert.equal(result.success, true, JSON.stringify(result));
+    for (const name of result.files) {
+      assert.equal(metadataTestHooks.isAutoCaptureExcludedPath(path.join(result.folderPath, name)), true,
+        `copied ${name} inside custom-named manual folder is excluded from auto-capture`);
+    }
+    assert.equal(JSON.stringify(storeInstance.data.projects.find(item => item.id === other.id)), otherBefore, 'watched project B untouched');
+    assert.equal(JSON.stringify(f.stored()), projectABefore, 'project A untouched');
+    await callIpcRaw('projects:pause', other.id); clearTrackedTimers();
   });
 }
