@@ -93,6 +93,21 @@ try {
 } catch (_) {
   CrateSqliteStore = null;
 }
+let nativeHelper = null;
+try {
+  ({ nativeHelper } = require('./parsers/native-helper'));
+} catch (_) {
+  nativeHelper = null;
+}
+const canUseNativeProcessWatcher = () => {
+  if (!nativeHelper || !nativeHelper.isAvailable()) return false;
+  try {
+    const builtinCp = require('node:child_process');
+    return exec === builtinCp.exec && execFile === builtinCp.execFile;
+  } catch (_) {
+    return false;
+  }
+};
 startupPhaseJournal.mark('dependencies-loaded');
 
 const PROVENANCE_MANIFEST_FILENAME = 'crate-provenance.json';
@@ -691,6 +706,25 @@ function parseMissingXattrPaths(stderr, filePaths) {
 }
 
 async function getBulkXattrLastUsedMs(filePaths) {
+  if (canUseNativeProcessWatcher()) {
+    try {
+      const response = await nativeHelper.readLastUsedXattrs(filePaths, LAST_USED_XATTR_TIMEOUT_MS);
+      const timestamps = response && response.timestamps;
+      if (timestamps && typeof timestamps === 'object') {
+        const values = new Map();
+        for (const filePath of filePaths) {
+          if (!Object.prototype.hasOwnProperty.call(timestamps, filePath)) {
+            throw new Error('incomplete native xattr result');
+          }
+          const raw = timestamps[filePath];
+          values.set(filePath, typeof raw === 'number' && Number.isFinite(raw) ? raw : null);
+        }
+        return values;
+      }
+    } catch (_) {
+      // Fall back to /usr/bin/xattr on any native helper failure.
+    }
+  }
   let stdout = '';
   let missingPaths = new Set();
   try {
@@ -11916,6 +11950,38 @@ const LAST_USED_POLL_MS = 10000;      // 10 seconds
 // Get PIDs of all running supported design apps so one project can span apps.
 // Uses `ps ax -o pid= -o command=` which gives full app paths (not truncated like lsof COMMAND).
 function getRunningDesignAppPids(callback) {
+  if (canUseNativeProcessWatcher()) {
+    nativeHelper.runningApps(DESIGN_APP_PROCESS_KEYWORDS, 3000)
+      .then(result => {
+        const pids = [];
+        const pidToCmd = new Map();
+        for (const appInfo of (result && result.apps) || []) {
+          if (!Number.isInteger(appInfo.pid) || appInfo.pid <= 0) continue;
+          pids.push(appInfo.pid);
+          pidToCmd.set(appInfo.pid, appInfo.command || appInfo.name || '');
+        }
+        callback(pids, pidToCmd);
+      })
+      .catch(() => {
+        exec('/bin/ps ax -o pid= -o command= 2>/dev/null', { timeout: 5000 }, (err, stdout) => {
+          if (err && !stdout) { callback([], new Map()); return; }
+          const pids = [];
+          const pidToCmd = new Map();
+          for (const line of stdout.trim().split('\n')) {
+            const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
+            if (!m) continue;
+            const pid = parseInt(m[1]);
+            const cmd = m[2];
+            if (DESIGN_APP_PROCESS_KEYWORDS.some(kw => cmd.includes(kw))) {
+              pids.push(pid);
+              pidToCmd.set(pid, cmd);
+            }
+          }
+          callback(pids, pidToCmd);
+        });
+      });
+    return;
+  }
   exec('/bin/ps ax -o pid= -o command= 2>/dev/null', { timeout: 5000 }, (err, stdout) => {
     if (err && !stdout) { callback([], new Map()); return; }
     const pids = [];
@@ -11975,7 +12041,7 @@ function pollLsofForProjectCore(projectId, activationToken = null, onComplete = 
     // v2.2.2: Include PID in lsof output for scan-on-open re-open detection.
     const cmd = `/usr/sbin/lsof -F ptn -p ${pidArg} 2>/dev/null`;
 
-    exec(cmd, { timeout: 12000 }, async (err, stdout) => {
+    const handleLsofOutput = async (err, stdout) => {
       const parserScans = [];
       try {
       const latestProject = getFreshActiveWatchingProject(projectId, activationToken);
@@ -12257,7 +12323,36 @@ function pollLsofForProjectCore(projectId, activationToken = null, onComplete = 
         if (parserScans.length > 0) await Promise.allSettled(parserScans);
         finishLsofPoll(projectId, onComplete);
       }
-    });
+    };
+
+    if (canUseNativeProcessWatcher()) {
+      nativeHelper.openFiles(validPids, 12000)
+        .then((response) => {
+          if (response && response.ok && response.filesByPid && typeof response.filesByPid === 'object') {
+            const lines = [];
+            for (const pid of validPids) {
+              const pidKey = String(pid);
+              lines.push(`p${pidKey}`);
+              const paths = response.filesByPid[pidKey];
+              if (!Array.isArray(paths)) continue;
+              for (const filePath of paths) {
+                if (typeof filePath === 'string' && filePath.length > 0 && !filePath.includes('\n') && !filePath.includes('\r')) {
+                  lines.push('tREG');
+                  lines.push(`n${filePath}`);
+                }
+              }
+            }
+            return handleLsofOutput(null, lines.join('\n'));
+          }
+          exec(cmd, { timeout: 12000 }, handleLsofOutput);
+        })
+        .catch(() => {
+          exec(cmd, { timeout: 12000 }, handleLsofOutput);
+        });
+      return;
+    }
+
+    exec(cmd, { timeout: 12000 }, handleLsofOutput);
   });
 }
 
@@ -28169,6 +28264,7 @@ app.on('before-quit', () => {
     inactivityCheckerInterval = null;
   }
   try { store?.close?.(); } catch (_) {}
+  try { nativeHelper?.shutdown?.(); } catch (_) {}
   activeNativeNotifications.clear();
   // v2.5.0: Clean up scan-on-save timers
   for (const [, pending] of scanOnSaveTimers) {

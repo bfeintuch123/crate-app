@@ -249,18 +249,9 @@ test('other shared formats agree on a simple single link inside both stacks\' po
 // Differences this PR deliberately leaves in place. Each row pins both stacks'
 // current output so a change to either one fails here and must be reviewed.
 const KNOWN_DIFFERENCES = [
-  { id: 'ai-greedy-vs-lazy', ext: '.ai', input: `${S}/a.png ${S}/b.png`,
-    watching: [`${S}/a.png`, `${S}/b.png`], quick: [`${S}/a.png ${S}/b.png`],
-    reason: 'greedy versus lazy matching: Quick Package runs one greedy match across the space' },
-  { id: 'ai-font-extension', ext: '.ai', input: `${S}/Brand.woff2`,
-    watching: [`${S}/Brand.woff2`], quick: [],
-    reason: 'different extension lists: Quick Package AI has no font or video extensions' },
   { id: 'ai-psb-extension', ext: '.ai', input: `${S}/Smart.psb`,
     watching: [], quick: [`${S}/Smart.psb`],
     reason: 'different extension lists: only Quick Package AI lists .psb' },
-  { id: 'ai-volumes-root', ext: '.ai', input: '/Volumes/crate-synthetic/linked.png',
-    watching: ['/Volumes/crate-synthetic/linked.png'], quick: [],
-    reason: 'different roots: Quick Package AI matches /Users/ only' },
   { id: 'indd-greedy-vs-lazy', ext: '.indd', input: `${S}/a.png ${S}/b.png`,
     watching: [`${S}/a.png`, `${S}/b.png`], quick: [`${S}/a.png ${S}/b.png`],
     reason: 'greedy versus lazy matching in the binary InDesign scan' },
