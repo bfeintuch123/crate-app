@@ -86,7 +86,7 @@ const {
 const { runBoundedAddFilesScan } = require('./parsers/add-files-operation');
 const { REGEX_SOURCE_EXTENSIONS } = require('./parsers/add-files-regex-worker');
 const { extractLinkedAssetPaths } = require('./parsers/linked-asset-matcher');
-const { decodeXMLPath, fileUriToPath } = require('./parsers/xml-path');
+const { decodeXMLPath, fileUriToPath, normalizePsdExternalPath } = require('./parsers/xml-path');
 let CrateSqliteStore = null;
 try {
   ({ CrateSqliteStore } = require('./parsers/sqlite-store'));
@@ -4913,8 +4913,12 @@ function collectWorkingSourceScanEvidence(paths, inventory = null) {
   for (const ref of inventory?.references || []) {
     const raw = ref.rawPaths;
     // Preserve obligations even if the ordinary admission filter rejects them.
-    if (raw?.fullPath) add(raw.fullPath);
-    else issue('unresolved-declared-reference');
+    if (raw?.fullPath) {
+      const normalized = typeof normalizePsdExternalPath === 'function' ? normalizePsdExternalPath(raw.fullPath) : '';
+      add(normalized || raw.fullPath);
+    } else {
+      issue('unresolved-declared-reference');
+    }
   }
   for (const item of inventory?.unresolved || []) issue(typeof item?.reason === 'string' ? item.reason : 'unsupported-dependency-form');
   if (limited) {
@@ -17118,16 +17122,27 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       sourceDigest = crypto.createHash('sha256').update(buf).digest('hex');
     }
     const discoveredPaths = [];
+    const seenDiscovered = new Set();
+    const normalizePsdPath = rawPath => (
+      typeof normalizePsdExternalPath === 'function'
+        ? (normalizePsdExternalPath(rawPath) || (typeof rawPath === 'string' ? rawPath : ''))
+        : (typeof rawPath === 'string' ? rawPath : '')
+    );
+    const recordDiscoveredPath = (rawPath) => {
+      const fp = normalizePsdPath(rawPath);
+      if (!fp || seenDiscovered.has(fp)) return;
+      if (fs.existsSync(fp)) {
+        seenDiscovered.add(fp);
+        discoveredPaths.push({ filePath: fp, source: 'psd-linked' });
+      }
+    };
 
-    // Walk layers for linkedFile.fullPath
+    // Walk layers and global lnkE linkedFiles for linkedFile.fullPath
     function walkLayers(layers) {
       if (!layers) return;
       for (const layer of layers) {
         if (layer.linkedFile && layer.linkedFile.fullPath) {
-          const fp = layer.linkedFile.fullPath;
-          if (fs.existsSync(fp)) {
-            discoveredPaths.push({ filePath: fp, source: 'psd-linked' });
-          }
+          recordDiscoveredPath(layer.linkedFile.fullPath);
         }
         if (layer.children) walkLayers(layer.children);
       }
@@ -17136,15 +17151,24 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       for (const entry of workerResult.entries || []) {
         if (!isCurrent()) return [];
         if (typeof entry.filePath === 'string') {
-          try {
-            await fs.promises.access(entry.filePath, fs.constants.F_OK);
-            discoveredPaths.push({ filePath: entry.filePath, source: 'psd-linked' });
-          } catch (_) {}
+          const fp = normalizePsdPath(entry.filePath);
+          if (!seenDiscovered.has(fp)) {
+            try {
+              await fs.promises.access(fp, fs.constants.F_OK);
+              seenDiscovered.add(fp);
+              discoveredPaths.push({ filePath: fp, source: 'psd-linked' });
+            } catch (_) {}
+          }
         }
         await new Promise(resolve => setImmediate(resolve));
       }
     } else {
       walkLayers(psd.children);
+      for (const lf of psd.linkedFiles || []) {
+        if (lf?.linkedFile?.fullPath) {
+          recordDiscoveredPath(lf.linkedFile.fullPath);
+        }
+      }
     }
 
     if (workerResult) {
@@ -22690,7 +22714,7 @@ end tell`;
           if (isAutoCaptureExcludedPath(lp)) continue;
           const normalizedLinkedPath = normalizeTrackedFilePath(lp);
           if (existingPathsCheck.has(normalizedLinkedPath) || pendingPaths.has(normalizedLinkedPath)) { ownerNotes.push([lp, file.path]); continue; }
-          if (!lp.startsWith('/Users/')) continue;
+          if (!lp.startsWith('/Users/') && !lp.startsWith('/Volumes/')) continue;
           const lpExt = path.extname(lp).toLowerCase();
           if (!DESIGN_FILE_EXTENSIONS.has(lpExt)) continue;
           if (!fs.existsSync(lp)) continue;

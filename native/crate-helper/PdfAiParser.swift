@@ -231,21 +231,20 @@ enum PdfAiParser {
     }
 
     private static func normalizeLocalPathOrFileUri(_ raw: String) -> String? {
-        var path = raw
+        var path = raw.replacingOccurrences(of: "\0", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if path.isEmpty || path.unicodeScalars.contains(where: { $0.value < 0x20 }) { return nil }
         if path.lowercased().hasPrefix("file:") {
-            guard let url = URL(string: path), url.isFileURL else {
-                // Handle file:/// or file:/ fallback
-                if path.hasPrefix("file:///") {
-                    path = String(path.dropFirst("file://".count))
-                } else if path.hasPrefix("file:/") {
-                    path = String(path.dropFirst("file:".count))
-                } else {
-                    return nil
-                }
-                if let decoded = path.removingPercentEncoding { path = decoded }
-                return (path.hasPrefix("/Users/") || path.hasPrefix("/Volumes/")) ? path : nil
+            var rest = String(path.dropFirst(5))
+            if rest.hasPrefix("//") {
+                let afterAuthorityStart = rest.index(rest.startIndex, offsetBy: 2)
+                guard let slashIdx = rest[afterAuthorityStart...].firstIndex(of: "/") else { return nil }
+                let host = String(rest[afterAuthorityStart..<slashIdx])
+                if !host.isEmpty && host.lowercased() != "localhost" { return nil }
+                rest = String(rest[slashIdx...])
             }
-            path = url.path
+            guard rest.hasPrefix("/") else { return nil }
+            let decoded = rest.removingPercentEncoding ?? rest
+            path = "/" + decoded.drop(while: { $0 == "/" })
         }
         return (path.hasPrefix("/Users/") || path.hasPrefix("/Volumes/")) ? path : nil
     }

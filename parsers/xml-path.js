@@ -36,4 +36,34 @@ function fileUriToPath(value) {
   return decoded;
 }
 
-module.exports = { decodeXMLPath, fileUriToPath };
+// Normalizes a Photoshop linked-file fullPath descriptor value into an absolute
+// POSIX path. Pure string handling: no filesystem access.
+//
+// Native Adobe Photoshop CC writes macOS external links (`lnkE` / `liFE`) with
+// NUL-terminated UTF-16BE strings like `file:////Users/name/My Folder/a.jpg`
+// (four slashes and literal spaces), and may also emit `file:///...`,
+// `file://localhost/...`, `file:/...`, or plain `/Users/...`.
+// Rejects remote host authorities (e.g. `file://server/share`) and control chars.
+function normalizePsdExternalPath(value) {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.replace(/\0+$/u, '').trim();
+  if (!trimmed || /[\x00-\x1f]/u.test(trimmed)) return '';
+  if (trimmed.slice(0, 5).toLowerCase() === 'file:') {
+    let rest = trimmed.slice(5);
+    if (rest.startsWith('//')) {
+      const pathStart = rest.indexOf('/', 2);
+      if (pathStart === -1) return '';
+      const host = rest.slice(2, pathStart);
+      if (host !== '' && host.toLowerCase() !== 'localhost') return '';
+      rest = rest.slice(pathStart);
+    }
+    if (!rest.startsWith('/')) return '';
+    let decoded = rest;
+    try { decoded = decodeURIComponent(rest); } catch (_) {}
+    const collapsed = '/' + decoded.replace(/^\/+/u, '');
+    return collapsed.length > 1 && !/[\x00-\x1f]/u.test(collapsed) ? collapsed : '';
+  }
+  return trimmed.startsWith('/') && trimmed.length > 1 ? trimmed : '';
+}
+
+module.exports = { decodeXMLPath, fileUriToPath, normalizePsdExternalPath };

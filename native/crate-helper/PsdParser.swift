@@ -349,6 +349,29 @@ enum PsdParser {
         var blockCount = 0
         var layerTotal = 0
 
+        func normalizeLocalPath(_ raw: String?) -> String? {
+            guard let raw = raw else { return nil }
+            let stripped = raw.replacingOccurrences(of: "\0", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if stripped.isEmpty { return nil }
+            if stripped.unicodeScalars.contains(where: { $0.value < 0x20 }) { return nil }
+            if stripped.lowercased().hasPrefix("file:") {
+                var rest = String(stripped.dropFirst(5))
+                if rest.hasPrefix("//") {
+                    let afterAuthorityStart = rest.index(rest.startIndex, offsetBy: 2)
+                    guard let slashIdx = rest[afterAuthorityStart...].firstIndex(of: "/") else { return nil }
+                    let host = String(rest[afterAuthorityStart..<slashIdx])
+                    if !host.isEmpty && host.lowercased() != "localhost" { return nil }
+                    rest = String(rest[slashIdx...])
+                }
+                guard rest.hasPrefix("/") else { return nil }
+                let decoded = rest.removingPercentEncoding ?? rest
+                let collapsed = "/" + decoded.drop(while: { $0 == "/" })
+                if collapsed.count <= 1 || collapsed.unicodeScalars.contains(where: { $0.value < 0x20 }) { return nil }
+                return collapsed
+            }
+            return stripped.hasPrefix("/") && stripped.count > 1 ? stripped : nil
+        }
+
         func extractPathsFromLinkDescriptor(_ desc: [String: Any]) -> (fullPath: String?, originalPath: String?, relPath: String?, name: String?) {
             let fp = desc["fullPath"] as? String
             let op = desc["originalPath"] as? String
@@ -360,7 +383,7 @@ enum PsdParser {
         func walkMediaDescriptor(desc: [String: Any], carrier: String) {
             if let frameReader = desc["frameReader"] as? [String: Any],
                let lnk = frameReader["Lnk "] as? [String: Any],
-               let fp = lnk["fullPath"] as? String, !fp.isEmpty {
+               let fp = normalizeLocalPath(lnk["fullPath"] as? String) {
                 mediaPaths.append(fp)
             }
             if carrier == "1075",
@@ -371,7 +394,7 @@ enum PsdParser {
                         for clip in clips {
                             if let fr = clip["frameReader"] as? [String: Any],
                                let lnk = fr["Lnk "] as? [String: Any],
-                               let fp = lnk["fullPath"] as? String, !fp.isEmpty {
+                               let fp = normalizeLocalPath(lnk["fullPath"] as? String) {
                                 mediaPaths.append(fp)
                             }
                         }
@@ -423,7 +446,8 @@ enum PsdParser {
                         do { try readDescriptorFromStream() } catch { issues.append("link-descriptor-error") }
                         if recVersion > 3 { try reader.skip(16, end: recordEnd) }
                         let extFileSize = try reader.readU64(end: recordEnd)
-                        if let fp = fullPath, !fp.isEmpty {
+                        let normalizedFullPath = normalizeLocalPath(fullPath)
+                        if let fp = normalizedFullPath {
                             linkedPaths.append(fp)
                         }
                         linkedRecords.append([
@@ -433,7 +457,7 @@ enum PsdParser {
                             "type": type,
                             "version": Int(recVersion),
                             "name": fileName,
-                            "fullPath": fullPath ?? "",
+                            "fullPath": normalizedFullPath ?? (fullPath ?? ""),
                             "originalPath": originalPath ?? "",
                             "relativePath": relPath ?? "",
                             "fileSize": extFileSize,

@@ -505,3 +505,87 @@ test('Phase 3B hardening: cloneVerifiedFile strips source xattrs and falls back 
   assert.equal(batchRes.files[0].cloned, false);
   assert.deepEqual(fs.readFileSync(path.join(batchDir, 'locked-copy.png')), payload);
 });
+
+test('Photoshop CC external links: file://// four-slash URIs with spaces and NULs resolve across Swift, worker, and Quick Package', { skip: !hasNativeBinary }, async t => {
+  const { normalizePsdExternalPath } = require('../parsers/xml-path');
+  const { parsePsd, sendPsdRecords } = require('../parsers/add-files-psd-worker');
+
+  // Unit cases for normalizePsdExternalPath
+  assert.equal(
+    normalizePsdExternalPath('file:////Users/synthetic/QA Folder/qa-asset-one.jpg\0'),
+    '/Users/synthetic/QA Folder/qa-asset-one.jpg'
+  );
+  assert.equal(
+    normalizePsdExternalPath('file:////Volumes/Studio Drive/My Shot (1).jpg'),
+    '/Volumes/Studio Drive/My Shot (1).jpg'
+  );
+  assert.equal(
+    normalizePsdExternalPath('file:///Users/synthetic/My%20Folder/hero.png'),
+    '/Users/synthetic/My Folder/hero.png'
+  );
+  assert.equal(
+    normalizePsdExternalPath('file://localhost/Users/synthetic/100% Sale.jpg'),
+    '/Users/synthetic/100% Sale.jpg'
+  );
+  assert.equal(normalizePsdExternalPath('file://evil-host/Users/synthetic/a.jpg'), '');
+  assert.equal(normalizePsdExternalPath(''), '');
+
+  // End-to-end PSD with Photoshop CC-style file://// fullPath + literal spaces + trailing NUL
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-psd-cc-uri-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const client = new NativeHelperClient(DEFAULT_BINARY_PATH);
+  t.after(() => client.shutdown());
+
+  const expectedPosix = '/Users/synthetic/QA Folder/source-copies/qa-asset-one.jpg';
+  const ccFileUri = `file:///${expectedPosix}`; // yields file:////Users/... (four slashes)
+  const psdBytes = agPsd.writePsdBuffer({
+    width: 4,
+    height: 4,
+    channels: 3,
+    bitsPerChannel: 8,
+    linkedFiles: [
+      {
+        id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        name: 'qa-asset-one.jpg',
+        childDocumentID: '',
+        linkedFile: {
+          fileSize: 20495,
+          name: 'qa-asset-one.jpg',
+          fullPath: `${ccFileUri}\0`,
+          originalPath: expectedPosix,
+          relativePath: 'qa-asset-one.jpg',
+        },
+      },
+    ],
+  });
+  const psdPath = path.join(dir, 'Photoshop_CC_Linked.psd');
+  fs.writeFileSync(psdPath, psdBytes);
+
+  // 1. Native Swift PsdParser
+  const swiftParsed = await client.parsePsd(psdPath);
+  assert.deepEqual(swiftParsed.linkedPaths, [expectedPosix]);
+
+  // 2. Quick Package PSDParser (Swift path)
+  const quickAssets = await new PSDParser().extractAssets(psdPath);
+  assert.deepEqual(quickAssets, [{ path: expectedPosix, source: 'psd-smartobject', exists: false }]);
+
+  // 3. Add Files PSD worker (ag-psd path)
+  const workerParsed = parsePsd(psdPath);
+  const emitted = [];
+  let current = null;
+  await sendPsdRecords(workerParsed, async rec => {
+    if (rec.type === 'record') current = rec.kind === 'linked-path' ? '' : null;
+    else if (rec.type === 'text' && current !== null) current += rec.text;
+    else if (rec.type === 'record-end' && current !== null) { emitted.push(current); current = null; }
+  });
+  assert.deepEqual(emitted, [expectedPosix]);
+
+  // 4. Native Swift PdfAiParser XMP four-slash URI with literal spaces
+  const aiPath = path.join(dir, 'Illustrator_CC_XMP.ai');
+  fs.writeFileSync(
+    aiPath,
+    `%PDF-1.6\n<stRef:filePath>file:////Users/synthetic/QA Folder/ai-asset.jpg</stRef:filePath>\n%%EOF\n`
+  );
+  const aiParsed = await client.parsePdfAi(aiPath, { decompressStreams: true });
+  assert.ok(aiParsed.paths.includes('/Users/synthetic/QA Folder/ai-asset.jpg'));
+});

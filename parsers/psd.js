@@ -4,6 +4,7 @@ const path = require('node:path');
 const { BaseParser } = require('./base');
 const { sendPsdRecords, inspectPsdLinkFraming } = require('./add-files-psd-worker');
 const { nativeHelper } = require('./native-helper');
+const { normalizePsdExternalPath } = require('./xml-path');
 const { readPsd } = require('ag-psd');
 
 class PSDParser extends BaseParser {
@@ -24,8 +25,9 @@ class PSDParser extends BaseParser {
       try {
         const parsed = await nativeHelper.parsePsd(filePath);
         const assets = [];
-        for (const candidate of [...(parsed.linkedPaths || []), ...(parsed.mediaPaths || [])]) {
-          if (typeof candidate === 'string' && path.isAbsolute(candidate) && this.isUserPath(candidate)) {
+        for (const rawCandidate of [...(parsed.linkedPaths || []), ...(parsed.mediaPaths || [])]) {
+          const candidate = normalizePsdExternalPath(rawCandidate);
+          if (candidate && path.isAbsolute(candidate) && this.isUserPath(candidate)) {
             this.appendAsset(assets, { path: candidate, source: 'psd-smartobject', exists: this.fileExists(candidate) });
           }
         }
@@ -54,8 +56,9 @@ class PSDParser extends BaseParser {
       else if (record.type === 'record') currentPath = null;
       if (record.type === 'text' && currentPath !== null) currentPath += record.text;
       if (record.type === 'record-end' && currentPath !== null) {
-        if (path.isAbsolute(currentPath) && this.isUserPath(currentPath)) {
-          this.appendAsset(assets, { path: currentPath, source: 'psd-smartobject', exists: this.fileExists(currentPath) });
+        const normalized = normalizePsdExternalPath(currentPath);
+        if (normalized && path.isAbsolute(normalized) && this.isUserPath(normalized)) {
+          this.appendAsset(assets, { path: normalized, source: 'psd-smartobject', exists: this.fileExists(normalized) });
         }
         currentPath = null;
       }
