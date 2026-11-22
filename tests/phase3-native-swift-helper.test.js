@@ -602,3 +602,81 @@ test('Photoshop CC external links: file://// four-slash URIs with spaces and NUL
   assert.ok(aiParsed.paths.includes('/Users/synthetic/R&D Team/logo.png'));
   assert.ok(!aiParsed.paths.some(p => p.includes('smuggled.jpg')));
 });
+
+test('Photoshop external link normalization preserves literal trailing spaces and U+200B in Swift helper and JS', { skip: !hasNativeBinary }, async t => {
+  const { normalizePsdExternalPath } = require('../parsers/xml-path');
+  const { packageMasterFile } = require('../parsers/index');
+  const { nativeHelper } = require('../parsers/native-helper');
+
+  // Verify the rebuilt native Swift helper is actually active for PSDParser
+  assert.equal(nativeHelper.isAvailable(), true);
+
+  // JS normalizePsdExternalPath preserves literal trailing spaces and U+200B,
+  // strips only trailing NUL padding, and still rejects embedded NULs.
+  assert.equal(normalizePsdExternalPath('/Users/synthetic/Brand Kit/Boundary.otf \0'), '/Users/synthetic/Brand Kit/Boundary.otf ');
+  assert.equal(normalizePsdExternalPath('/Users/synthetic/Brand Kit/Photo.png\u200B\0'), '/Users/synthetic/Brand Kit/Photo.png\u200B');
+  assert.equal(normalizePsdExternalPath('/Users/synthetic/Brand Kit/Hidden.otf\u200B'), '/Users/synthetic/Brand Kit/Hidden.otf\u200B');
+  assert.equal(normalizePsdExternalPath('/Users/synthetic/Brand\0Kit/bad.png'), '');
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-psd-literal-chars-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const brandDir = path.join(dir, 'Brand Kit');
+  const outDir = path.join(dir, 'out');
+  fs.mkdirSync(brandDir, { recursive: true });
+  fs.mkdirSync(outDir, { recursive: true });
+
+  const photoPath = path.join(brandDir, 'Photo.png\u200B');
+  const hiddenFontPath = path.join(brandDir, 'Hidden.otf\u200B');
+  const spacedFontPath = path.join(brandDir, 'Boundary.otf ');
+  const photoBytes = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4, 5, 6, 7, 8]);
+  fs.writeFileSync(photoPath, photoBytes);
+  fs.writeFileSync(hiddenFontPath, Buffer.from('OTTO-synthetic-hidden-font'));
+  fs.writeFileSync(spacedFontPath, Buffer.from('OTTO-synthetic-spaced-font'));
+
+  const psdPath = path.join(dir, 'Comp.psd');
+  const makeLink = (file, id) => ({
+    id,
+    name: path.basename(file),
+    childDocumentID: '',
+    linkedFile: { fileSize: fs.statSync(file).size, name: path.basename(file), fullPath: `${file}\0`, originalPath: file, relativePath: '' },
+  });
+  fs.writeFileSync(psdPath, agPsd.writePsdBuffer({
+    width: 2,
+    height: 2,
+    linkedFiles: [
+      makeLink(photoPath, '11111111-1111-4111-8111-111111111111'),
+      makeLink(hiddenFontPath, '22222222-2222-4222-8222-222222222222'),
+      makeLink(spacedFontPath, '33333333-3333-4333-8333-333333333333'),
+    ],
+  }));
+
+  // 1. Direct Swift helper call preserves exact paths
+  const client = new NativeHelperClient(DEFAULT_BINARY_PATH);
+  t.after(() => client.shutdown());
+  const swiftParsed = await client.parsePsd(psdPath);
+  assert.deepEqual(swiftParsed.linkedPaths, [photoPath, hiddenFontPath, spacedFontPath]);
+
+  // 2. PSDParser (using Swift helper) finds all three with exists: true
+  const extracted = await new PSDParser().extractAssets(psdPath);
+  assert.deepEqual(
+    extracted.map(a => ({ path: a.path, exists: a.exists })),
+    [
+      { path: photoPath, exists: true },
+      { path: hiddenFontPath, exists: true },
+      { path: spacedFontPath, exists: true },
+    ]
+  );
+
+  // 3. Quick Package copies Photo.png\u200B with exact name and identical bytes,
+  //    while excluding both fonts and listing them under fontsNotIncluded.
+  const pkg = await packageMasterFile(psdPath, outDir);
+  const copiedPhoto = path.join(outDir, 'Brand Kit', 'Photo.png\u200B');
+  assert.equal(fs.existsSync(copiedPhoto), true);
+  assert.deepEqual(fs.readFileSync(copiedPhoto), photoBytes);
+  assert.equal(fs.existsSync(path.join(outDir, 'Brand Kit', 'Hidden.otf\u200B')), false);
+  assert.equal(fs.existsSync(path.join(outDir, 'Brand Kit', 'Boundary.otf ')), false);
+  assert.deepEqual(
+    (pkg.fontsNotIncluded || []).map(item => item.name).sort(),
+    ['Boundary.otf ', 'Hidden.otf\u200B']
+  );
+});

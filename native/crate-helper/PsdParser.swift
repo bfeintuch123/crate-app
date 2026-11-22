@@ -351,7 +351,13 @@ enum PsdParser {
 
         func normalizeLocalPath(_ raw: String?) -> String? {
             guard let raw = raw else { return nil }
-            let stripped = raw.replacingOccurrences(of: "\0", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+            // Strip only trailing NUL padding from Photoshop UTF-16BE descriptors.
+            // Never trim whitespace or invisible characters (trailing spaces, U+200B)
+            // because they are valid literal macOS filename characters.
+            var stripped = raw
+            while stripped.unicodeScalars.last == UnicodeScalar(0) {
+                stripped.unicodeScalars.removeLast()
+            }
             if stripped.isEmpty { return nil }
             if stripped.unicodeScalars.contains(where: { $0.value < 0x20 }) { return nil }
             if stripped.lowercased().hasPrefix("file:") {

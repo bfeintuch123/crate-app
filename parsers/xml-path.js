@@ -46,7 +46,10 @@ function fileUriToPath(value) {
 // Rejects remote host authorities (e.g. `file://server/share`) and control chars.
 function normalizePsdExternalPath(value) {
   if (typeof value !== 'string') return '';
-  const trimmed = value.replace(/\0+$/u, '').trim();
+  // Strip only trailing NUL padding written by Photoshop's UTF-16BE descriptors.
+  // Never trim whitespace or invisible characters (e.g. trailing spaces or U+200B),
+  // which are valid literal macOS filename characters.
+  const trimmed = value.replace(/\0+$/u, '');
   if (!trimmed || /[\x00-\x1f]/u.test(trimmed)) return '';
   if (trimmed.slice(0, 5).toLowerCase() === 'file:') {
     let rest = trimmed.slice(5);
