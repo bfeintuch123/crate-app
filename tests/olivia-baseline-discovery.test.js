@@ -2346,8 +2346,9 @@ function baselineCases() {
       }
       assert.deepEqual(metadataTestHooks.getIllustratorActivationScopeSnapshot(f.project.id).allowedLinkedPaths.sort(), f.paths.map(p => p.link.toLowerCase()).sort());
       assert.equal(partial.assetBaseline.status, 'awaiting-first-scan', 'partial snapshot must remain immutable');
-      // One triggered baseline read plus the existing package-time raw-link
-      // and double-check reads; unchanged live polls must add no further reads.
+      // One triggered baseline read plus one deduplicated in-scan package-time read
+      // (getInScanFileEntry shares the stat-verified buffer across the raw-link and
+      // double-check passes); unchanged live polls must add no further reads.
 
       // Explicitly retain the independently admitted second source.
       {
@@ -2356,10 +2357,10 @@ function baselineCases() {
         assert.equal((await callIpcRaw('projects:resolve-working-file-choice', f.project.id,
           { id: entry.id, revision: entry.revision, choice: 'keep-both', predecessorIdentity: null })).success, true);
       }
-      await assertComplete(f, 3);
-      assert.equal(f.count(1), 3);
+      await assertComplete(f, 2);
+      assert.equal(f.count(1), 2);
       for (let i = 0; i < 3; i++) await f.live();
-      assert.equal(f.count(0), 3); assert.equal(f.count(1), 3);
+      assert.equal(f.count(0), 2); assert.equal(f.count(1), 2);
     } finally { gate.release(); if (scan) await scan; await f.cleanup(); }
   });
 
