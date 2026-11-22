@@ -356,20 +356,27 @@ enum PsdParser {
             if stripped.unicodeScalars.contains(where: { $0.value < 0x20 }) { return nil }
             if stripped.lowercased().hasPrefix("file:") {
                 var rest = String(stripped.dropFirst(5))
+                var hasEmptyAuthority = false
                 if rest.hasPrefix("//") {
                     let afterAuthorityStart = rest.index(rest.startIndex, offsetBy: 2)
                     guard let slashIdx = rest[afterAuthorityStart...].firstIndex(of: "/") else { return nil }
                     let host = String(rest[afterAuthorityStart..<slashIdx])
                     if !host.isEmpty && host.lowercased() != "localhost" { return nil }
+                    hasEmptyAuthority = host.isEmpty
                     rest = String(rest[slashIdx...])
                 }
                 guard rest.hasPrefix("/") else { return nil }
+                if hasEmptyAuthority && rest.hasPrefix("//") && !rest.hasPrefix("///") {
+                    rest = String(rest.dropFirst(1))
+                }
                 let decoded = rest.removingPercentEncoding ?? rest
-                let collapsed = "/" + decoded.drop(while: { $0 == "/" })
-                if collapsed.count <= 1 || collapsed.unicodeScalars.contains(where: { $0.value < 0x20 }) { return nil }
-                return collapsed
+                if decoded.count <= 1 || !decoded.hasPrefix("/") || decoded.hasPrefix("//") ||
+                    decoded.unicodeScalars.contains(where: { $0.value < 0x20 }) {
+                    return nil
+                }
+                return decoded
             }
-            return stripped.hasPrefix("/") && stripped.count > 1 ? stripped : nil
+            return stripped.hasPrefix("/") && !stripped.hasPrefix("//") && stripped.count > 1 ? stripped : nil
         }
 
         func extractPathsFromLinkDescriptor(_ desc: [String: Any]) -> (fullPath: String?, originalPath: String?, relPath: String?, name: String?) {

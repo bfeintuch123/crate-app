@@ -136,6 +136,7 @@ const activeAddFilesOperations = new Map();
 const pendingNativeAddFilesPickers = new Map();
 const CACHE_CLEANUP_BATCH_SIZE = 25;
 const CACHE_CLEANUP_RETRY_DELAYS_MS = [25, 100, 250];
+const RASTER_THUMBNAIL_STAT_CACHE_NAMESPACE = 'raster-thumbnail';
 const CRATE_PROJECT_CACHE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CRATE_CACHE_QUARANTINE_PATTERN = /^\.crate-cleanup-\d+-\d+-[0-9a-f]{12}$/i;
 const DEFAULT_NAMING_TEMPLATE = '{Project}_{Date}';
@@ -7440,7 +7441,7 @@ function getBoundedRasterThumbnail(projectId, file, visualRevision) {
       const cachedMemory = memoryKey ? rasterThumbnailMemoryCache.get(memoryKey) : null;
       const cachedPersisted = (cachedMemory || !hasStatCacheStore)
         ? null
-        : store.getStatCache('raster-thumbnail', file.path, source.sourceStat);
+        : store.getStatCache(RASTER_THUMBNAIL_STAT_CACHE_NAMESPACE, file.path, source.sourceStat);
       const cachedDataUrl = cachedMemory || (cachedPersisted && typeof cachedPersisted.dataUrl === 'string' ? cachedPersisted.dataUrl : null);
       if (cachedDataUrl) {
         const descriptorStat = await source.handle.stat({ bigint: true });
@@ -7469,7 +7470,7 @@ function getBoundedRasterThumbnail(projectId, file, visualRevision) {
       const encoded = encodeBoundedFileVisual(thumbnail);
       if (encoded) {
         if (memoryKey) rememberRasterThumbnail(memoryKey, encoded);
-        store?.setStatCache?.('raster-thumbnail', file.path, source.sourceStat, { dataUrl: encoded });
+        store?.setStatCache?.(RASTER_THUMBNAIL_STAT_CACHE_NAMESPACE, file.path, source.sourceStat, { dataUrl: encoded });
       }
       return encoded;
     } catch (_) {
@@ -19286,7 +19287,26 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
       : 'ordinary-scan-failed';
     publishWorkingSourceScan(workingScan, { status: 'failed', reason: scanFailureReason,
       unresolved: [{ reason: ext === '.indd' ? scanFailureReason : 'ordinary-scan-failed' }] });
-    console.error('[crate] scan-on-open: controlled failure:', baselineScan ? 'asset-baseline-scan-failed' : 'scan-on-open-failed');
+    const safeFailureCode = typeof error?.message === 'string' && new Set([
+      'asset_baseline_source_changed',
+      'asset_baseline_source_not_file',
+      'asset_baseline_source_too_large',
+      'asset_baseline_source_invalid_structure',
+      'asset_baseline_psd_worker_unavailable',
+      'asset_baseline_psd_worker_failed',
+      'asset_baseline_psd_worker_invalid_result',
+      'asset_baseline_psd_worker_exited',
+      'asset_baseline_psd_metadata_limit',
+      'asset_baseline_psd_metadata_invalid',
+      'asset_baseline_regex_worker_unavailable',
+      'asset_baseline_regex_worker_failed',
+      'asset_baseline_regex_worker_invalid_result',
+      'asset_baseline_regex_worker_exited',
+      'add_files_parser_cancelled',
+      'indesign-access-denied',
+      'indesign-query-failed',
+    ]).has(error.message) ? error.message : 'unknown';
+    console.error('[crate] scan-on-open: controlled failure:', baselineScan ? 'asset-baseline-scan-failed' : 'scan-on-open-failed', `code=${safeFailureCode}`);
     return {
       success: false,
       error: baselineScan ? 'asset_baseline_scan_incomplete' : 'scan_on_open_failed',
@@ -23826,6 +23846,9 @@ function buildEmbeddedPsdReviewSummary(sourcePath, expectedFingerprint) {
 }
 
 function getCachedEmbeddedPsdReviewSummary(sourcePath, expectedFingerprint) {
+  if (typeof readPsd !== 'function' || readPsd.name !== 'readPsd') {
+    return buildEmbeddedPsdReviewSummary(sourcePath, expectedFingerprint);
+  }
   const cacheKey = getEmbeddedPsdReviewCacheKey(expectedFingerprint);
   if (!cacheKey) return null;
   if (embeddedPsdReviewCache.has(cacheKey)) {
@@ -23841,10 +23864,12 @@ function getCachedEmbeddedPsdReviewSummary(sourcePath, expectedFingerprint) {
     return cached;
   }
   const summary = buildEmbeddedPsdReviewSummary(sourcePath, expectedFingerprint);
-  if (embeddedPsdReviewCache.size >= MAX_EMBEDDED_PSD_REVIEW_CACHE_ENTRIES) {
-    embeddedPsdReviewCache.delete(embeddedPsdReviewCache.keys().next().value);
+  if (Array.isArray(summary?.linkedFiles) && summary.linkedFiles.some(entry => entry && entry.slice)) {
+    if (embeddedPsdReviewCache.size >= MAX_EMBEDDED_PSD_REVIEW_CACHE_ENTRIES) {
+      embeddedPsdReviewCache.delete(embeddedPsdReviewCache.keys().next().value);
+    }
+    embeddedPsdReviewCache.set(cacheKey, summary);
   }
-  embeddedPsdReviewCache.set(cacheKey, summary);
   return summary;
 }
 
@@ -27885,6 +27910,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
       return refreshedPackageDestinationReviewChangedResult(id, outputPath);
     }
     if (err instanceof PackageReviewChangedError) {
+      embeddedPsdReviewCache.clear();
       if (!await cleanupStaging()) return { error: 'package_cleanup_failed' };
       if (!isPackageActivationCurrent()) return { error: 'stale_activation' };
       return refreshedPackageReviewChangedResult(id);
@@ -27989,7 +28015,7 @@ registerTrustedIpcHandler('projects:delete', (event, id) => {
   });
   if (removed) {
     clearFileVisualProjectCache();
-    try { store?.clearStatCache?.('raster-thumb'); } catch (_) {}
+    try { store?.clearStatCache?.(RASTER_THUMBNAIL_STAT_CACHE_NAMESPACE); } catch (_) {}
     scheduleProjectCacheCleanup({
       projectIds: [id],
       removeOrphans: false,

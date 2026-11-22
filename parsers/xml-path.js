@@ -50,20 +50,30 @@ function normalizePsdExternalPath(value) {
   if (!trimmed || /[\x00-\x1f]/u.test(trimmed)) return '';
   if (trimmed.slice(0, 5).toLowerCase() === 'file:') {
     let rest = trimmed.slice(5);
+    let hasEmptyAuthority = false;
     if (rest.startsWith('//')) {
       const pathStart = rest.indexOf('/', 2);
       if (pathStart === -1) return '';
       const host = rest.slice(2, pathStart);
       if (host !== '' && host.toLowerCase() !== 'localhost') return '';
+      hasEmptyAuthority = host === '';
       rest = rest.slice(pathStart);
     }
     if (!rest.startsWith('/')) return '';
+    // Native macOS Photoshop CC emits four-slash `file:////Users/...` (empty
+    // authority + double leading slash). Collapse only that exact form before
+    // percent-decoding so `file:/%2F...` and `file://///...` stay rejected.
+    if (hasEmptyAuthority && rest.startsWith('//') && !rest.startsWith('///')) {
+      rest = rest.slice(1);
+    }
     let decoded = rest;
     try { decoded = decodeURIComponent(rest); } catch (_) {}
-    const collapsed = '/' + decoded.replace(/^\/+/u, '');
-    return collapsed.length > 1 && !/[\x00-\x1f]/u.test(collapsed) ? collapsed : '';
+    if (decoded.length < 2 || decoded[0] !== '/' || decoded[1] === '/' || /[\x00-\x1f]/u.test(decoded)) {
+      return '';
+    }
+    return decoded;
   }
-  return trimmed.startsWith('/') && trimmed.length > 1 ? trimmed : '';
+  return trimmed.startsWith('/') && trimmed[1] !== '/' && trimmed.length > 1 ? trimmed : '';
 }
 
 module.exports = { decodeXMLPath, fileUriToPath, normalizePsdExternalPath };

@@ -528,6 +528,9 @@ test('Photoshop CC external links: file://// four-slash URIs with spaces and NUL
     '/Users/synthetic/100% Sale.jpg'
   );
   assert.equal(normalizePsdExternalPath('file://evil-host/Users/synthetic/a.jpg'), '');
+  assert.equal(normalizePsdExternalPath('file:/%2FUsers/synthetic/a.jpg'), '');
+  assert.equal(normalizePsdExternalPath('file://///Users/synthetic/a.jpg'), '');
+  assert.equal(normalizePsdExternalPath('//Users/synthetic/a.jpg'), '');
   assert.equal(normalizePsdExternalPath(''), '');
 
   // End-to-end PSD with Photoshop CC-style file://// fullPath + literal spaces + trailing NUL
@@ -569,7 +572,8 @@ test('Photoshop CC external links: file://// four-slash URIs with spaces and NUL
   const quickAssets = await new PSDParser().extractAssets(psdPath);
   assert.deepEqual(quickAssets, [{ path: expectedPosix, source: 'psd-smartobject', exists: false }]);
 
-  // 3. Add Files PSD worker (ag-psd path)
+  // 3. Add Files PSD worker emits raw declared fullPath (matching linked-metadata
+  // for createAddFilesPsdTransaction protocol verification); main normalizes downstream.
   const workerParsed = parsePsd(psdPath);
   const emitted = [];
   let current = null;
@@ -578,14 +582,23 @@ test('Photoshop CC external links: file://// four-slash URIs with spaces and NUL
     else if (rec.type === 'text' && current !== null) current += rec.text;
     else if (rec.type === 'record-end' && current !== null) { emitted.push(current); current = null; }
   });
-  assert.deepEqual(emitted, [expectedPosix]);
+  assert.deepEqual(emitted, [`${ccFileUri}\0`]);
+  assert.deepEqual(emitted.map(normalizePsdExternalPath), [expectedPosix]);
 
-  // 4. Native Swift PdfAiParser XMP four-slash URI with literal spaces
+  // 4. Native Swift PdfAiParser XMP four-slash URI + numeric XML entities + %2F guard
   const aiPath = path.join(dir, 'Illustrator_CC_XMP.ai');
   fs.writeFileSync(
     aiPath,
-    `%PDF-1.6\n<stRef:filePath>file:////Users/synthetic/QA Folder/ai-asset.jpg</stRef:filePath>\n%%EOF\n`
+    [
+      '%PDF-1.6',
+      '<stRef:filePath>file:////Users/synthetic/QA Folder/ai-asset.jpg</stRef:filePath>',
+      '<stRef:filePath>file:///Users/synthetic/R&#38;D&#x20;Team/logo.png</stRef:filePath>',
+      '<stRef:filePath>file:/%2FUsers/synthetic/smuggled.jpg</stRef:filePath>',
+      '%%EOF',
+    ].join('\n')
   );
   const aiParsed = await client.parsePdfAi(aiPath, { decompressStreams: true });
   assert.ok(aiParsed.paths.includes('/Users/synthetic/QA Folder/ai-asset.jpg'));
+  assert.ok(aiParsed.paths.includes('/Users/synthetic/R&D Team/logo.png'));
+  assert.ok(!aiParsed.paths.some(p => p.includes('smuggled.jpg')));
 });

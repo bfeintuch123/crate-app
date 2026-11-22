@@ -222,12 +222,50 @@ enum PdfAiParser {
 
     private static func decodeXmlEntities(_ s: String) -> String {
         if !s.contains("&") { return s }
-        return s
-            .replacingOccurrences(of: "&amp;", with: "&")
-            .replacingOccurrences(of: "&quot;", with: "\"")
-            .replacingOccurrences(of: "&apos;", with: "'")
-            .replacingOccurrences(of: "&lt;", with: "<")
-            .replacingOccurrences(of: "&gt;", with: ">")
+        var out = ""
+        out.reserveCapacity(s.count)
+        let chars = Array(s)
+        var i = 0
+        while i < chars.count {
+            if chars[i] == "&" {
+                var semi = i + 1
+                let limit = min(chars.count, i + 12)
+                while semi < limit && chars[semi] != ";" { semi += 1 }
+                if semi < limit && chars[semi] == ";" {
+                    let entity = String(chars[(i + 1)..<semi])
+                    var replacement: String? = nil
+                    switch entity.lowercased() {
+                    case "amp": replacement = "&"
+                    case "quot": replacement = "\""
+                    case "apos": replacement = "'"
+                    case "lt": replacement = "<"
+                    case "gt": replacement = ">"
+                    default:
+                        if entity.hasPrefix("#") {
+                            let body = entity.dropFirst(1)
+                            let scalarVal: UInt32?
+                            if body.hasPrefix("x") || body.hasPrefix("X") {
+                                scalarVal = UInt32(body.dropFirst(1), radix: 16)
+                            } else {
+                                scalarVal = UInt32(body, radix: 10)
+                            }
+                            if let v = scalarVal, v > 0, v <= 0x10FFFF, !(v >= 0xD800 && v <= 0xDFFF),
+                               let scalar = UnicodeScalar(v) {
+                                replacement = String(scalar)
+                            }
+                        }
+                    }
+                    if let r = replacement {
+                        out.append(r)
+                        i = semi + 1
+                        continue
+                    }
+                }
+            }
+            out.append(chars[i])
+            i += 1
+        }
+        return out
     }
 
     private static func normalizeLocalPathOrFileUri(_ raw: String) -> String? {
@@ -235,16 +273,25 @@ enum PdfAiParser {
         if path.isEmpty || path.unicodeScalars.contains(where: { $0.value < 0x20 }) { return nil }
         if path.lowercased().hasPrefix("file:") {
             var rest = String(path.dropFirst(5))
+            var hasEmptyAuthority = false
             if rest.hasPrefix("//") {
                 let afterAuthorityStart = rest.index(rest.startIndex, offsetBy: 2)
                 guard let slashIdx = rest[afterAuthorityStart...].firstIndex(of: "/") else { return nil }
                 let host = String(rest[afterAuthorityStart..<slashIdx])
                 if !host.isEmpty && host.lowercased() != "localhost" { return nil }
+                hasEmptyAuthority = host.isEmpty
                 rest = String(rest[slashIdx...])
             }
             guard rest.hasPrefix("/") else { return nil }
+            if hasEmptyAuthority && rest.hasPrefix("//") && !rest.hasPrefix("///") {
+                rest = String(rest.dropFirst(1))
+            }
             let decoded = rest.removingPercentEncoding ?? rest
-            path = "/" + decoded.drop(while: { $0 == "/" })
+            if decoded.count <= 1 || !decoded.hasPrefix("/") || decoded.hasPrefix("//") ||
+                decoded.unicodeScalars.contains(where: { $0.value < 0x20 }) {
+                return nil
+            }
+            path = decoded
         }
         return (path.hasPrefix("/Users/") || path.hasPrefix("/Volumes/")) ? path : nil
     }

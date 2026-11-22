@@ -5,7 +5,6 @@ const crypto = require('node:crypto');
 const { readPsd } = require('ag-psd');
 const { createReader } = require('ag-psd/dist/psdReader');
 const { readVersionAndDescriptor } = require('ag-psd/dist/descriptor');
-const { normalizePsdExternalPath } = require('./xml-path');
 
 const MAX_PARSE_FILE_SIZE = 300 * 1024 * 1024;
 const MAX_POOLED_PSD_REQUESTS = 16;
@@ -432,8 +431,7 @@ async function sendPsdRecords(parsed, send) {
   async function walkLayerPaths(layers) {
     for (const layer of layers || []) {
       if (typeof layer.linkedFile?.fullPath === 'string') {
-        const normalized = normalizePsdExternalPath(layer.linkedFile.fullPath);
-        await record('linked-path', normalized || layer.linkedFile.fullPath, null, entryCount++);
+        await record('linked-path', layer.linkedFile.fullPath, null, entryCount++);
       }
       await walkLayerPaths(layer.children);
     }
@@ -441,14 +439,12 @@ async function sendPsdRecords(parsed, send) {
   await walkLayerPaths(psd.children);
   for (const { file } of linkedSources) {
     if (typeof file?.linkedFile?.fullPath === 'string') {
-      const normalized = normalizePsdExternalPath(file.linkedFile.fullPath);
-      await record('linked-path', normalized || file.linkedFile.fullPath, null, entryCount++);
+      await record('linked-path', file.linkedFile.fullPath, null, entryCount++);
     }
   }
   for (const media of mediaSources) {
     if (typeof media.frameReader?.link?.fullPath === 'string') {
-      const normalized = normalizePsdExternalPath(media.frameReader.link.fullPath);
-      await record('linked-path', normalized || media.frameReader.link.fullPath, null, entryCount++);
+      await record('linked-path', media.frameReader.link.fullPath, null, entryCount++);
     }
   }
   for (const { file } of linkedSources) {
