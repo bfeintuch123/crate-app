@@ -136,10 +136,14 @@ enum WatchOps {
 
             // 2. Memory-mapped regular files (PROC_PIDREGIONPATHINFO) — matches lsof TXT/mapped vnodes
             var address: UInt64 = 0
+            var vmScanExhausted = false
             for _ in 0..<maxVmRegionsPerPid {
                 var regionInfo = proc_regionwithpathinfo()
                 let ret = proc_pidinfo(pid, PROC_PIDREGIONPATHINFO, address, &regionInfo, regionInfoSize)
-                if ret <= 0 { break }
+                if ret <= 0 {
+                    vmScanExhausted = true
+                    break
+                }
                 if regionInfo.prp_vip.vip_vi.vi_type == 1 {
                     let filePath = withUnsafePointer(to: &regionInfo.prp_vip.vip_path) { ptr -> String in
                         ptr.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { cStr in
@@ -149,8 +153,14 @@ enum WatchOps {
                     recordIfMatching(pid: pid, filePath: filePath, seenForPid: &seenForPid)
                 }
                 let nextAddress = regionInfo.prp_prinfo.pri_address &+ regionInfo.prp_prinfo.pri_size
-                if nextAddress <= address { break }
+                if nextAddress <= address {
+                    vmScanExhausted = true
+                    break
+                }
                 address = nextAddress
+            }
+            if !vmScanExhausted {
+                failedPids.append(Int(pid))
             }
         }
         return [
@@ -184,7 +194,7 @@ enum WatchOps {
                     && nanoseconds >= 0
                     && nanoseconds < 1_000_000_000 {
                     let unixMs = Double(seconds) * 1000.0 + Double(nanoseconds) / 1_000_000.0
-                    if unixMs.isFinite && unixMs <= 8_640_000_000_000.0 {
+                    if unixMs.isFinite && unixMs <= 8_640_000_000_000_000.0 {
                         out[filePath] = unixMs
                         continue
                     }

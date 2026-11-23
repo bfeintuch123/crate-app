@@ -23,6 +23,7 @@
 const path = require('node:path');
 const { BaseParser } = require('./base');
 const { nativeHelper } = require('./native-helper');
+const { decodeXMLPath, normalizePsdExternalPath } = require('./xml-path');
 
 // Exact supported link extensions for Quick Package Illustrator extraction.
 // Matches base Quick Package AI policy (including .psb) while deliberately
@@ -33,53 +34,198 @@ const QUICK_AI_SUPPORTED_EXTENSIONS = Object.freeze([
   'psd', 'psb', 'tiff', 'tif', 'afdesign', 'afphoto', 'afpub',
   'indd', 'idml', 'sketch', 'fig',
 ]);
-const QUICK_AI_SUPPORTED_EXT_SET = new Set(QUICK_AI_SUPPORTED_EXTENSIONS.map(ext => `.${ext}`));
-const QUICK_AI_LINKED_ASSET_SOURCE =
-  `(?:\\/Users\\/|\\/Volumes\\/)[^\\x00-\\x1f\\x22\\x27\\x7f<>|*\\n\\r]+?\\.(${QUICK_AI_SUPPORTED_EXTENSIONS.join('|')})`;
+const QUICK_AI_SUPPORTED_EXT_SET = new Set(QUICK_AI_SUPPORTED_EXTENSIONS);
+const QUICK_AI_MAX_PATH_LENGTH = 4096;
+
+function isAsciiAlnumCode(code) {
+  return (code >= 0x30 && code <= 0x39)
+    || (code >= 0x41 && code <= 0x5a)
+    || (code >= 0x61 && code <= 0x7a);
+}
+
+function isQuickAiDelimiterCode(code) {
+  // Exact base 00c5e92 delimiter set: \x00-\x1f, '"', '\'', \x7f, '<', '>', '|', '*', '?'
+  return code < 0x20
+    || code === 0x22
+    || code === 0x27
+    || code === 0x7f
+    || code === 0x3c
+    || code === 0x3e
+    || code === 0x7c
+    || code === 0x2a
+    || code === 0x3f;
+}
+
+function matchUsersOrVolumesPrefix(content, index, limit) {
+  if (content.charCodeAt(index) !== 0x2f) return 0; // '/'
+  if (index + 7 <= limit) {
+    const c1 = content.charCodeAt(index + 1);
+    const c2 = content.charCodeAt(index + 2);
+    const c3 = content.charCodeAt(index + 3);
+    const c4 = content.charCodeAt(index + 4);
+    const c5 = content.charCodeAt(index + 5);
+    if ((c1 === 0x55 || c1 === 0x75)
+      && (c2 === 0x73 || c2 === 0x53)
+      && (c3 === 0x65 || c3 === 0x45)
+      && (c4 === 0x72 || c4 === 0x52)
+      && (c5 === 0x73 || c5 === 0x53)
+      && content.charCodeAt(index + 6) === 0x2f) {
+      return 7;
+    }
+  }
+  if (index + 9 <= limit) {
+    const c1 = content.charCodeAt(index + 1);
+    const c2 = content.charCodeAt(index + 2);
+    const c3 = content.charCodeAt(index + 3);
+    const c4 = content.charCodeAt(index + 4);
+    const c5 = content.charCodeAt(index + 5);
+    const c6 = content.charCodeAt(index + 6);
+    const c7 = content.charCodeAt(index + 7);
+    if ((c1 === 0x56 || c1 === 0x76)
+      && (c2 === 0x6f || c2 === 0x4f)
+      && (c3 === 0x6c || c3 === 0x4c)
+      && (c4 === 0x75 || c4 === 0x55)
+      && (c5 === 0x6d || c5 === 0x4d)
+      && (c6 === 0x65 || c6 === 0x45)
+      && (c7 === 0x73 || c7 === 0x53)
+      && content.charCodeAt(index + 8) === 0x2f) {
+      return 9;
+    }
+  }
+  return 0;
+}
+
+function isSegmentBoundarySeparator(code) {
+  return code === 0x20 || code === 0x09 || code === 0x2c || code === 0x3b
+    || code === 0x28 || code === 0x29 || code === 0x5b || code === 0x5d;
+}
 
 function isSupportedQuickAiLinkedPath(candidatePath) {
-  if (typeof candidatePath !== 'string' || !candidatePath) return false;
-  const ext = path.extname(candidatePath).toLowerCase();
+  if (typeof candidatePath !== 'string' || !candidatePath || candidatePath.length > QUICK_AI_MAX_PATH_LENGTH) {
+    return false;
+  }
+  const dot = candidatePath.lastIndexOf('.');
+  const slash = candidatePath.lastIndexOf('/');
+  if (dot <= slash || dot < 0) return false;
+  const ext = candidatePath.slice(dot + 1).toLowerCase();
   return QUICK_AI_SUPPORTED_EXT_SET.has(ext);
 }
 
 /**
- * ReDoS-safe anchored lazy matcher for Quick Package .ai/.ait files.
- * Supports /Users/ and /Volumes/, multiple links on one line, and .psb,
- * matching the Swift helper's filtered output identically.
+ * Strictly O(N) single-pass raw path scanner for Quick Package .ai/.ait files.
+ * Shares exact delimiters, prefix segmentation, 4096-char ceiling, and
+ * last-whole-extension matching with native/crate-helper/PdfAiParser.swift.
  */
-function extractQuickAiLinkedPaths(content, filePath) {
-  const prefix = /(?:\/Users\/|\/Volumes\/)/gi;
-  const anchored = new RegExp(QUICK_AI_LINKED_ASSET_SOURCE, 'giy');
-  const delimiter = /[\x00-\x1f\x22\x27\x7f<>|*\n\r]/g;
-  const results = [];
-  let candidate;
-  while ((candidate = prefix.exec(content)) !== null) {
-    const startIdx = candidate.index;
-    // Cap scan at the earliest delimiter or subsequent /Users/ or /Volumes/ prefix
-    // so an unsupported extension (e.g. .woff2) never spans into the next path.
-    delimiter.lastIndex = startIdx;
-    const delimMatch = delimiter.exec(content);
-    const delimEnd = delimMatch ? delimMatch.index : content.length;
+function scanQuickAiRawPaths(content, onMatch) {
+  const n = content.length;
+  let i = 0;
+  while (i < n) {
+    while (i < n && isQuickAiDelimiterCode(content.charCodeAt(i))) i += 1;
+    const runStart = i;
+    while (i < n && !isQuickAiDelimiterCode(content.charCodeAt(i))) i += 1;
+    const runEnd = i;
+    if (runEnd - runStart < 10) continue;
 
-    const nextPrefixMatcher = /(?:\/Users\/|\/Volumes\/)/gi;
-    nextPrefixMatcher.lastIndex = startIdx + candidate[0].length;
-    const nextPrefixMatch = nextPrefixMatcher.exec(content);
-    const nextPrefixStart = nextPrefixMatch ? nextPrefixMatch.index : content.length;
+    // Collect /Users/ and /Volumes/ segment starts within this delimiter-free run.
+    // Preserve nested /Volumes/<disk>/Users/... paths unless preceded by a separator.
+    const segments = [];
+    let p = runStart;
+    while (p < runEnd - 7) {
+      const prefixLen = matchUsersOrVolumesPrefix(content, p, runEnd);
+      if (prefixLen === 9) {
+        segments.push({ pos: p, prefixLen: 9, isVolumes: true });
+        p += 9;
+        continue;
+      }
+      if (prefixLen === 7) {
+        const prevSeg = segments.length > 0 ? segments[segments.length - 1] : null;
+        const insideVolumes = Boolean(prevSeg && prevSeg.isVolumes);
+        const precededBySep = p > runStart && isSegmentBoundarySeparator(content.charCodeAt(p - 1));
+        if (!insideVolumes || precededBySep) {
+          segments.push({ pos: p, prefixLen: 7, isVolumes: false });
+          p += 7;
+          continue;
+        }
+      }
+      p += 1;
+    }
 
-    const segmentEnd = Math.min(delimEnd, nextPrefixStart);
-    const segment = content.slice(startIdx, segmentEnd);
-    anchored.lastIndex = 0;
-    const match = anchored.exec(segment);
-    if (match) {
-      if (match[0] !== filePath) results.push(match[0]);
-      prefix.lastIndex = startIdx + anchored.lastIndex;
-    } else if (nextPrefixStart < delimEnd) {
-      prefix.lastIndex = nextPrefixStart;
-    } else {
-      prefix.lastIndex = delimMatch ? delimEnd + 1 : content.length;
+    for (let s = 0; s < segments.length; s += 1) {
+      const segStart = segments[s].pos;
+      const prefixLen = segments[s].prefixLen;
+      const segEnd = s + 1 < segments.length ? segments[s + 1].pos : runEnd;
+      const cappedEnd = Math.min(segEnd, segStart + QUICK_AI_MAX_PATH_LENGTH);
+      if (cappedEnd <= segStart + prefixLen) continue;
+
+      // Scan backwards to find the LAST whole supported extension in this segment
+      // (preserves base behavior on paths like /Users/sam.ainsworth/.../logo.png
+      // and /Users/me/Client.ai files/hero.png while rejecting partial prefixes like .pngx).
+      for (let pos = cappedEnd - 1; pos >= segStart + prefixLen; pos -= 1) {
+        if (content.charCodeAt(pos) !== 0x2e) continue; // '.'
+        const extStart = pos + 1;
+        let extEnd = extStart;
+        while (extEnd < segEnd && extEnd - extStart <= 9 && isAsciiAlnumCode(content.charCodeAt(extEnd))) {
+          extEnd += 1;
+        }
+        if (extEnd > extStart && extEnd <= cappedEnd && extEnd - extStart <= 8) {
+          // Ensure whole ASCII-alnum run was consumed (reject .pngx, .aif, etc.)
+          if (extEnd < segEnd && isAsciiAlnumCode(content.charCodeAt(extEnd))) continue;
+          const ext = content.slice(extStart, extEnd).toLowerCase();
+          if (QUICK_AI_SUPPORTED_EXT_SET.has(ext)) {
+            onMatch(content.slice(segStart, extEnd));
+            break;
+          }
+        }
+      }
     }
   }
+}
+
+/**
+ * O(N) XMP / URI attribute extractor matching PdfAiParser.swift's scanXmpAndUris.
+ */
+function scanQuickAiXmpAndUris(content, onMatch) {
+  const markers = [
+    { token: 'stRef:filePath>', stop: '<' },
+    { token: 'stRef:filePath="', stop: '"' },
+    { token: 'LinkResourceURI="', stop: '"' },
+  ];
+  for (const { token, stop } of markers) {
+    let idx = content.indexOf(token);
+    while (idx !== -1) {
+      const start = idx + token.length;
+      const end = content.indexOf(stop, start);
+      if (end === -1) break;
+      if (end > start && end - start <= QUICK_AI_MAX_PATH_LENGTH) {
+        const rawVal = decodeXMLPath(content.slice(start, end)).trim();
+        const normalized = normalizePsdExternalPath(rawVal);
+        if (normalized
+          && (normalized.startsWith('/Users/') || normalized.startsWith('/Volumes/'))
+          && isSupportedQuickAiLinkedPath(normalized)) {
+          onMatch(normalized);
+        }
+      }
+      idx = content.indexOf(token, end + 1);
+    }
+  }
+}
+
+/**
+ * Unified O(N) Quick Package .ai/.ait extractor used by JS fallback (helper OFF)
+ * and matching native/crate-helper/PdfAiParser.swift identically on raw bytes.
+ */
+function extractQuickAiLinkedPaths(content, filePath) {
+  const results = [];
+  const seen = new Set();
+  const record = candidate => {
+    if (!candidate || candidate === filePath || candidate.length > QUICK_AI_MAX_PATH_LENGTH) return;
+    if (!seen.has(candidate)) {
+      seen.add(candidate);
+      results.push(candidate);
+    }
+  };
+  scanQuickAiRawPaths(content, record);
+  scanQuickAiXmpAndUris(content, record);
   return results;
 }
 

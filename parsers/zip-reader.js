@@ -336,10 +336,10 @@ function openZipArchive(filePath, options = {}) {
             throw admissionError(entryMessage);
           }
           if (entry.method === 8) {
-            // Deflate stored blocks add at most 5 bytes per 65,535 bytes of output;
-            // allow generous framing headroom while strictly blocking archive-sized
-            // compressed allocations before inflation.
-            const maxDeflateCompressedBytes = entryMaxBytes + Math.ceil(entryMaxBytes / 16384) * 5 + 65536;
+            // Deflate fixed-Huffman incompressible overhead is ~5.5%; allow 10% + 64 KiB
+            // framing headroom while strictly blocking archive-sized compressed
+            // allocations before inflation.
+            const maxDeflateCompressedBytes = entryMaxBytes + Math.ceil(entryMaxBytes * 0.1) + 65536;
             if (entry.compressedSize > maxDeflateCompressedBytes) {
               throw admissionError(entryMessage);
             }

@@ -568,11 +568,86 @@ test('PSDParser falls back to ag-psd when native parsePsd reports incomplete or 
   assert.deepEqual(assets, [{ path: linkedTarget, source: 'psd-smartobject', exists: false }]);
 });
 
-test('Photoshop CC external links: file://// four-slash URIs with spaces and NULs resolve across Swift, worker, and Quick Package', { skip: !hasNativeBinary }, async t => {
-  const { normalizePsdExternalPath } = require('../parsers/xml-path');
-  const { parsePsd, sendPsdRecords } = require('../parsers/add-files-psd-worker');
+test('Swift PsdParser real binary fixtures emit incomplete + issues for oversized PxSc, oversized/unreadable 1075, and non-8BIM resources (A-P1-7 / Fable B3)', { skip: !hasNativeBinary }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-psd-issues-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const client = new NativeHelperClient(DEFAULT_BINARY_PATH);
+  t.after(() => client.shutdown());
 
-  // Unit cases for normalizePsdExternalPath
+  function makeMinimalPsd({ resourcesBuf = Buffer.alloc(0), addLayerBuf = Buffer.alloc(0) }) {
+    const header = Buffer.alloc(26);
+    header.write('8BPS', 0, 'ascii');
+    header.writeUInt16BE(1, 4); // PSD v1
+    header.writeUInt16BE(3, 12); // RGB 3 channels
+    header.writeUInt32BE(2, 14); // height
+    header.writeUInt32BE(2, 18); // width
+    header.writeUInt16BE(8, 22); // depth
+    header.writeUInt16BE(3, 24); // RGB mode
+    const colorModeLen = Buffer.alloc(4);
+    const resLen = Buffer.alloc(4);
+    resLen.writeUInt32BE(resourcesBuf.length, 0);
+    // Layer & mask section: empty layerInfo (4B) + empty globalMask (4B) + additional layer info
+    const layerSecBody = Buffer.concat([Buffer.alloc(4), Buffer.alloc(4), addLayerBuf]);
+    const layerSecLen = Buffer.alloc(4);
+    layerSecLen.writeUInt32BE(layerSecBody.length, 0);
+    const imgData = Buffer.alloc(2 + 2 * 2 * 3);
+    return Buffer.concat([header, colorModeLen, resLen, resourcesBuf, layerSecLen, layerSecBody, imgData]);
+  }
+
+  function makeResourceBlock(sig, id, payload) {
+    const head = Buffer.alloc(12);
+    head.write(sig, 0, 'ascii');
+    head.writeUInt16BE(id, 4);
+    head.writeUInt8(0, 6); // empty Pascal name + 1 pad byte at 7
+    head.writeUInt32BE(payload.length, 8);
+    const pad = (payload.length % 2) === 1 ? Buffer.alloc(1) : Buffer.alloc(0);
+    return Buffer.concat([head, payload, pad]);
+  }
+
+  // 1. Oversized image resource 1075 (> 256 KiB)
+  const oversized1075Path = path.join(dir, 'oversized-1075.psd');
+  fs.writeFileSync(oversized1075Path, makeMinimalPsd({
+    resourcesBuf: makeResourceBlock('8BIM', 1075, Buffer.alloc(262200)),
+  }));
+  const res1 = await client.parsePsd(oversized1075Path);
+  assert.equal(res1.incomplete, true);
+  assert.ok(res1.issues.includes('oversized-resource-1075'));
+
+  // 2. Unreadable image resource 1075 (invalid descriptor bytes)
+  const bad1075Path = path.join(dir, 'bad-1075.psd');
+  fs.writeFileSync(bad1075Path, makeMinimalPsd({
+    resourcesBuf: makeResourceBlock('8BIM', 1075, Buffer.from([0, 0, 0, 16, 255, 255])),
+  }));
+  const res2 = await client.parsePsd(bad1075Path);
+  assert.equal(res2.incomplete, true);
+  assert.ok(res2.issues.includes('unreadable-resource-1075'));
+
+  // 3. Non-8BIM image resource signature
+  const non8bimPath = path.join(dir, 'non-8bim.psd');
+  fs.writeFileSync(non8bimPath, makeMinimalPsd({
+    resourcesBuf: makeResourceBlock('MeSa', 1000, Buffer.alloc(4)),
+  }));
+  const res3 = await client.parsePsd(non8bimPath);
+  assert.equal(res3.incomplete, true);
+  assert.ok(res3.issues.includes('non-8bim-image-resource'));
+
+  // 4. Oversized PxSc additional layer block (> 256 KiB)
+  const pxscPayload = Buffer.alloc(262200);
+  const pxscHeader = Buffer.alloc(12);
+  pxscHeader.write('8BIM', 0, 'ascii');
+  pxscHeader.write('PxSc', 4, 'ascii');
+  pxscHeader.writeUInt32BE(pxscPayload.length, 8);
+  const oversizedPxScPath = path.join(dir, 'oversized-pxsc.psd');
+  fs.writeFileSync(oversizedPxScPath, makeMinimalPsd({
+    addLayerBuf: Buffer.concat([pxscHeader, pxscPayload]),
+  }));
+  const res4 = await client.parsePsd(oversizedPxScPath);
+  assert.equal(res4.incomplete, true);
+  assert.ok(res4.issues.includes('oversized-pxsc-descriptor'));
+});
+
+test('normalizePsdExternalPath JS unit cases (always run in helper-ON and helper-OFF modes)', () => {
+  const { normalizePsdExternalPath } = require('../parsers/xml-path');
   assert.equal(
     normalizePsdExternalPath('file:////Users/synthetic/QA Folder/qa-asset-one.jpg\0'),
     '/Users/synthetic/QA Folder/qa-asset-one.jpg'
@@ -594,6 +669,15 @@ test('Photoshop CC external links: file://// four-slash URIs with spaces and NUL
   assert.equal(normalizePsdExternalPath('file://///Users/synthetic/a.jpg'), '');
   assert.equal(normalizePsdExternalPath('//Users/synthetic/a.jpg'), '');
   assert.equal(normalizePsdExternalPath(''), '');
+  assert.equal(normalizePsdExternalPath('/Users/synthetic/Brand Kit/Boundary.otf \0'), '/Users/synthetic/Brand Kit/Boundary.otf ');
+  assert.equal(normalizePsdExternalPath('/Users/synthetic/Brand Kit/Photo.png\u200B\0'), '/Users/synthetic/Brand Kit/Photo.png\u200B');
+  assert.equal(normalizePsdExternalPath('/Users/synthetic/Brand Kit/Hidden.otf\u200B'), '/Users/synthetic/Brand Kit/Hidden.otf\u200B');
+  assert.equal(normalizePsdExternalPath('/Users/synthetic/Brand\0Kit/bad.png'), '');
+});
+
+test('Photoshop CC external links: file://// four-slash URIs with spaces and NULs resolve across Swift, worker, and Quick Package', { skip: !hasNativeBinary }, async t => {
+  const { normalizePsdExternalPath } = require('../parsers/xml-path');
+  const { parsePsd, sendPsdRecords } = require('../parsers/add-files-psd-worker');
 
   // End-to-end PSD with Photoshop CC-style file://// fullPath + literal spaces + trailing NUL
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-psd-cc-uri-'));

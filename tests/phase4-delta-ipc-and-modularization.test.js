@@ -380,6 +380,53 @@ rl.on("line", line => {
   assert.equal(pong.spawn, 2);
 });
 
+test('NativeHelperClient stdin error handling: dying child produces clean rejection, never uncaught EPIPE (Fable B4)', async t => {
+  const { NativeHelperClient } = require('../parsers/native-helper');
+  const prevDisableEnv = process.env.CRATE_DISABLE_NATIVE_HELPER;
+  delete process.env.CRATE_DISABLE_NATIVE_HELPER;
+  t.after(() => {
+    if (prevDisableEnv === undefined) delete process.env.CRATE_DISABLE_NATIVE_HELPER;
+    else process.env.CRATE_DISABLE_NATIVE_HELPER = prevDisableEnv;
+  });
+
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'crate-nh-epipe-')));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  // Helper responds to 1 line and immediately exits with code 0
+  const crashHelper = path.join(dir, 'crash-helper.sh');
+  const script = `#!/bin/sh
+exec "${process.execPath}" -e '
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+rl.once("line", line => {
+  const req = JSON.parse(line);
+  process.stdout.write(JSON.stringify({ id: req.id, ok: true, result: { version: 1 } }) + "\\n", () => process.exit(0));
+});
+'
+`;
+  fs.writeFileSync(crashHelper, script, { mode: 0o755 });
+
+  let uncaught = null;
+  const onUncaught = err => { uncaught = err; };
+  process.on('uncaughtException', onUncaught);
+  t.after(() => process.removeListener('uncaughtException', onUncaught));
+
+  const client = new NativeHelperClient(crashHelper);
+  t.after(() => client.shutdown());
+
+  const first = await client.ping();
+  assert.equal(first.version, 1);
+
+  // Synchronously block briefly so the OS tears down the child's stdin pipe before
+  // Node's exit event runs, reproducing the EPIPE write window deterministically.
+  const endSpin = Date.now() + 150;
+  while (Date.now() < endSpin) { /* busy wait */ }
+
+  await assert.rejects(() => client.ping(), /native_helper_/);
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(uncaught, null, 'stdin write to exited helper must never raise uncaughtException');
+});
+
 test('Native watcher bridge client-injected tests: xattr errors throw, incomplete openFiles returns null, runningApps is case-sensitive (A-P1-3 / N4)', async () => {
   const {
     readNativeLastUsedXattrs,

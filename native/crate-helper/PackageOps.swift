@@ -294,10 +294,30 @@ enum PackageOps {
             _ = leafName.withCString { Darwin.unlinkat(dirFd, $0, 0) }
         }
 
+        func rollbackUnverifiedCloneIfOwned() {
+            // Only unlink if the leaf is still a single-link regular file owned by euid
+            // on dirStat.st_dev and distinct from the source file (never unlinks symlinks
+            // or attacker-swapped hardlinks/foreign files).
+            var leafStat = stat()
+            let stRc = leafName.withCString { cLeaf in
+                Darwin.fstatat(dirFd, cLeaf, &leafStat, AT_SYMLINK_NOFOLLOW)
+            }
+            guard stRc == 0
+                && (leafStat.st_mode & S_IFMT) == S_IFREG
+                && leafStat.st_nlink == 1
+                && leafStat.st_uid == geteuid()
+                && leafStat.st_dev == dirStat.st_dev
+                && !(leafStat.st_dev == srcBefore.st_dev && leafStat.st_ino == srcBefore.st_ino) else {
+                return
+            }
+            _ = leafName.withCString { Darwin.unlinkat(dirFd, $0, 0) }
+        }
+
         let outFd = leafName.withCString { cLeaf in
             Darwin.openat(dirFd, cLeaf, O_RDONLY | O_NOFOLLOW)
         }
         if outFd < 0 {
+            rollbackUnverifiedCloneIfOwned()
             throw HelperError("dest_verify_failed")
         }
         defer { Darwin.close(outFd) }
@@ -312,6 +332,7 @@ enum PackageOps {
             || preHardenStat.st_dev != dirStat.st_dev
             || Int64(preHardenStat.st_size) != expSrcSize
             || (preHardenStat.st_dev == srcBefore.st_dev && preHardenStat.st_ino == srcBefore.st_ino) {
+            rollbackUnverifiedCloneIfOwned()
             throw HelperError("dest_verify_failed")
         }
         ownedOutDev = preHardenStat.st_dev

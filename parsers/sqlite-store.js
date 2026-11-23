@@ -20,7 +20,7 @@ function hardenSqliteFile(filePath, expectedDirRealPath) {
   if (process.platform === 'win32') return true;
   let fd = null;
   try {
-    const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+    const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
     fd = fs.openSync(filePath, flags);
     const initialStat = fs.fstatSync(fd);
     if (!initialStat.isFile() || initialStat.nlink !== 1) return false;
@@ -275,24 +275,26 @@ class CrateSqliteStore {
         try {
           const parsedMeta = JSON.parse(metaRow.value_json);
           if (parsedMeta && parsedMeta.migratedFromLegacy === true) {
+            this._hydrateMemoryCache();
             this.kvCache.set('_meta', metaRow.value_json);
             return;
           }
         } catch (_) {}
       }
       const existingRows = this.stmts.selectAllProjects.all();
-      if (Array.isArray(legacyProjects) && legacyProjects.length > 0 && existingRows.length === 0) {
+      const hasExistingProjects = existingRows.length > 0;
+      if (Array.isArray(legacyProjects) && legacyProjects.length > 0 && !hasExistingProjects) {
         this._replaceProjectsDirect(legacyProjects);
-      } else if (existingRows.length > 0) {
+      } else if (hasExistingProjects) {
         this._hydrateMemoryCache();
       }
-      if (isPlainObject(legacySettings)) {
+      if (isPlainObject(legacySettings) && (!hasExistingProjects || !this.stmts.selectKv.get('settings'))) {
         this._setKvDirect('settings', legacySettings);
       }
-      if (isPlainObject(legacyUsage)) {
+      if (isPlainObject(legacyUsage) && (!hasExistingProjects || !this.stmts.selectKv.get('usage'))) {
         this._setKvDirect('usage', legacyUsage);
       }
-      if (Array.isArray(legacyQuickOutputs)) {
+      if (Array.isArray(legacyQuickOutputs) && (!hasExistingProjects || !this.stmts.selectKv.get('quickPackageOutputPaths'))) {
         this._setKvDirect('quickPackageOutputPaths', legacyQuickOutputs);
       }
       this._setKvDirect('_meta', { migratedFromLegacy: true, migratedAt: Date.now() });

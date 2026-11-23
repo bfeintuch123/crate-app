@@ -440,103 +440,156 @@ test('PowerPoint (.pptx) & Keynote (.key): in-process ZIP reader + OOXML externa
   assert.equal(keyAssets[0].zipPath, 'Data/slide-hero-1234.jpg');
 });
 
-test('main.js structural guards: denied second instance skips store init, thumbnail write checks cache generation, in-scan cache is byte-bounded', () => {
-  // 1. Denied second instance (!gotLock) must not open or migrate SQLite/electron-store
+test('main.js structural guards: denied second instance skips store & ready init, thumbnail write checks cache generation, in-scan cache is byte-bounded with transient tooLarge read', () => {
+  // 1. Denied second instance (!gotLock) must not open/migrate SQLite/electron-store or run whenReady startup
   const lockBlock = sliceMain('const gotLock = app.requestSingleInstanceLock();', '// One-time migration:');
   assert.ok(lockBlock.includes('if (gotLock) {'), 'store initialization must be guarded by if (gotLock)');
+  const readyBlock = sliceMain('app.whenReady().then(async () => {', 'if (localStoreStartupError)');
+  assert.ok(readyBlock.includes('if (!gotLock) return;'), 'whenReady handler must bail early when !gotLock');
 
   // 2. Thumbnail write-back must check cache generation and account guard right before cache publication
   const thumbBlock = sliceMain('function getBoundedRasterThumbnail(', 'function getProjectOwnedFileVisualRequestError(');
   assert.ok(thumbBlock.includes('rasterThumbnailCacheGeneration !== capturedCacheGeneration'));
   assert.ok(thumbBlock.includes('if (encoded && canPublishThumbnail())'));
 
-  // 3. Pre-package in-scan file cache enforces total byte budget and propagates tooLarge without raw readFile fallback
+  // 3. Pre-package in-scan file cache enforces total byte budget while preserving transient uncached tooLarge scan
   const cacheBlock = sliceMain('const IN_SCAN_FILE_CACHE_MAX_BYTES =', 'const ordinaryPsdOutputBatches =');
   assert.ok(cacheBlock.includes('IN_SCAN_FILE_CACHE_MAX_BYTES'));
   assert.ok(cacheBlock.includes("return { tooLarge: true }"));
   const regexBlock = sliceMain('const regexScanStartedAt = Date.now();', 'const regexScanElapsedMs =');
-  assert.ok(regexBlock.includes('if (!cachedFile || cachedFile.tooLarge || !cachedFile.buf) continue;'));
-  assert.equal(regexBlock.includes('fs.promises.readFile'), false, 'regex pass must not fall back to unrestricted readFile');
+  assert.ok(regexBlock.includes('if (cachedFile && cachedFile.tooLarge)'));
+  assert.ok(regexBlock.includes('const transientBuf = await fs.promises.readFile(designFile.path);'));
 });
 
-test('main.js behavioral fence: in-flight getBoundedRasterThumbnail refuses cache writes after logout/clear (A-P2-3)', async t => {
+test('main.js behavioral inScanFileCache: enforces LRU byte budget and propagates tooLarge without caching (A-P1-4 / Opus B3)', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-inscan-cache-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const f1 = path.join(dir, 'a.ai');
+  const f2 = path.join(dir, 'b.ai');
+  const f3 = path.join(dir, 'big.psd');
+  fs.writeFileSync(f1, Buffer.alloc(60, 0x41));
+  fs.writeFileSync(f2, Buffer.alloc(60, 0x42));
+  fs.writeFileSync(f3, Buffer.alloc(120, 0x43));
+
+  const helperSlice = sliceMain('const rememberInScanFileEntry = (key, entry) => {', 'const ordinaryPsdOutputBatches =');
+  const cacheCode = [
+    'const IN_SCAN_FILE_CACHE_MAX_BYTES = 100;',
+    'const MAX_PARSE_FILE_SIZE = 100;',
+    'const inScanFileCache = new Map();',
+    'let inScanFileCacheBytes = 0;',
+    helperSlice,
+    'function runGetInScanFileEntry(p) { return getInScanFileEntry(p); }',
+    'function getCacheSummary() { return { keys: [...inScanFileCache.keys()], bytes: inScanFileCacheBytes }; }',
+  ].join('\n');
+
+  const ctx = {
+    fs,
+    Map,
+    BigInt,
+    normalizeTrackedFilePath: p => p,
+  };
+  vm.runInNewContext(cacheCode, ctx);
+
+  const e1 = await ctx.runGetInScanFileEntry(f1);
+  assert.equal(e1.buf.length, 60);
+  assert.equal(ctx.getCacheSummary().bytes, 60);
+
+  // Adding 60B f2 evicts 60B f1 so total stays <= 100B
+  const e2 = await ctx.runGetInScanFileEntry(f2);
+  assert.equal(e2.buf.length, 60);
+  assert.deepEqual([...ctx.getCacheSummary().keys], [f2]);
+  assert.equal(ctx.getCacheSummary().bytes, 60);
+
+  // Oversized 120B f3 returns { tooLarge: true } and does not evict or enter cache
+  const e3 = await ctx.runGetInScanFileEntry(f3);
+  assert.equal(e3.tooLarge, true);
+  assert.deepEqual([...ctx.getCacheSummary().keys], [f2]);
+  assert.equal(ctx.getCacheSummary().bytes, 60);
+});
+
+test('main.js behavioral fence: in-flight getBoundedRasterThumbnail independently fences authGuard, global generation, and per-project epoch (A-P2-3)', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-thumb-fence-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const imgPath = path.join(dir, 'hero.png');
   fs.writeFileSync(imgPath, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
 
-  let resolveThumb;
-  const statCacheWrites = [];
-  let authed = true;
-  const thumbCode = [
-    'const RASTER_THUMBNAIL_STAT_CACHE_NAMESPACE = "raster-thumbnail";',
-    'const FILE_VISUAL_PIXEL_SIZE = 64;',
-    'const FILE_VISUAL_MAX_RASTER_QUEUE = 8;',
-    'const fileVisualProjectCache = new Map();',
-    'const fileVisualProjectCacheEpochs = new Map();',
-    'let fileVisualProjectCacheGeneration = 0;',
-    'let fileVisualRasterWorkTail = Promise.resolve();',
-    'let fileVisualRasterWorkPending = 0;',
-    'const embeddedPsdReviewCache = new Map();',
-    sliceMain('function getFileVisualProjectCacheEpoch(', 'function getCurrentFileVisualProjectCache('),
-    sliceMain('function runSerializedFileVisualRasterWork(', 'function getProjectOwnedFileVisualRequestError('),
-    'function getRasterThumbnailMemoryCacheSize() { return rasterThumbnailMemoryCache.size; }',
-  ].join('\n');
+  async function runScenario(invalidateFn) {
+    let resolveThumb;
+    let notifyInFlight;
+    const inFlightPromise = new Promise(resolve => { notifyInFlight = resolve; });
+    const statCacheWrites = [];
+    let authed = true;
+    const thumbCode = [
+      'const RASTER_THUMBNAIL_STAT_CACHE_NAMESPACE = "raster-thumbnail";',
+      'const FILE_VISUAL_PIXEL_SIZE = 64;',
+      'const FILE_VISUAL_MAX_RASTER_QUEUE = 8;',
+      'const fileVisualProjectCache = new Map();',
+      'const fileVisualProjectCacheEpochs = new Map();',
+      'let fileVisualProjectCacheGeneration = 0;',
+      'let fileVisualRasterWorkTail = Promise.resolve();',
+      'let fileVisualRasterWorkPending = 0;',
+      'const embeddedPsdReviewCache = new Map();',
+      sliceMain('function getFileVisualProjectCacheEpoch(', 'function getCurrentFileVisualProjectCache('),
+      sliceMain('function runSerializedFileVisualRasterWork(', 'function getProjectOwnedFileVisualRequestError('),
+      'function getRasterThumbnailMemoryCacheSize() { return rasterThumbnailMemoryCache.size; }',
+    ].join('\n');
 
-  const ctx = {
-    fs,
-    path,
-    accountSession: { canUseWorkspace: () => authed },
-    store: {
-      getStatCache: () => null,
-      setStatCache: (...args) => { statCacheWrites.push(args); },
-    },
-    openPreflightedRasterSource: async p => {
-      const handle = await fs.promises.open(p, 'r');
-      const sourceStat = await handle.stat({ bigint: true });
-      return { handle, sourceStat };
-    },
-    createProjectFileVisualRevisionFromStat: () => 'rev-1',
-    sameOpenFileStat: () => true,
-    createPrivateFileVisualSnapshot: async source => {
-      const snapPath = path.join(dir, 'snap.png');
-      fs.writeFileSync(snapPath, Buffer.from([137, 80, 78, 71]));
-      const handle = await fs.promises.open(snapPath, 'r');
-      const stat = await handle.stat({ bigint: true });
-      return { path: snapPath, directory: dir, handle, stat };
-    },
-    assertPrivateFileVisualDirectory: async () => {},
-    cleanupPrivateFileVisualSnapshot: async snap => {
-      if (snap?.handle) try { await snap.handle.close(); } catch (_) {}
-    },
-    nativeImage: {
-      createThumbnailFromPath: () => new Promise(resolve => { resolveThumb = resolve; }),
-    },
-    encodeBoundedFileVisual: () => 'data:image/png;base64,AAAA',
-    Map,
-    Promise,
-    Math,
-  };
-  vm.runInNewContext(thumbCode, ctx);
+    const ctx = {
+      fs,
+      path,
+      accountSession: { canUseWorkspace: () => authed },
+      store: {
+        getStatCache: () => null,
+        setStatCache: (...args) => { statCacheWrites.push(args); },
+      },
+      openPreflightedRasterSource: async p => {
+        const handle = await fs.promises.open(p, 'r');
+        const sourceStat = await handle.stat({ bigint: true });
+        return { handle, sourceStat };
+      },
+      createProjectFileVisualRevisionFromStat: () => 'rev-1',
+      sameOpenFileStat: () => true,
+      createPrivateFileVisualSnapshot: async () => {
+        const snapPath = path.join(dir, `snap-${Math.random().toString(16).slice(2)}.png`);
+        fs.writeFileSync(snapPath, Buffer.from([137, 80, 78, 71]));
+        const handle = await fs.promises.open(snapPath, 'r');
+        const stat = await handle.stat({ bigint: true });
+        return { path: snapPath, directory: dir, handle, stat };
+      },
+      assertPrivateFileVisualDirectory: async () => {},
+      cleanupPrivateFileVisualSnapshot: async snap => {
+        if (snap?.handle) try { await snap.handle.close(); } catch (_) {}
+      },
+      nativeImage: {
+        createThumbnailFromPath: () => new Promise(resolve => {
+          resolveThumb = resolve;
+          notifyInFlight();
+        }),
+      },
+      encodeBoundedFileVisual: () => 'data:image/png;base64,AAAA',
+      Map,
+      Promise,
+      Math,
+    };
+    vm.runInNewContext(thumbCode, ctx);
 
-  const authGuard = () => { if (!authed) throw new Error('logged_out'); };
-  const pendingThumb = ctx.getBoundedRasterThumbnail('proj-1', { path: imgPath, ext: '.png' }, 'rev-1', authGuard);
-
-  // Wait until render reaches nativeImage.createThumbnailFromPath
-  for (let i = 0; i < 50 && !resolveThumb; i++) {
-    await new Promise(resolve => setTimeout(resolve, 5));
+    const authGuard = () => { if (!authed) throw new Error('logged_out'); };
+    const pendingThumb = ctx.getBoundedRasterThumbnail('proj-1', { path: imgPath, ext: '.png' }, 'rev-1', authGuard);
+    await inFlightPromise;
+    invalidateFn({ ctx, setAuthed: v => { authed = v; } });
+    resolveThumb({ fake: true });
+    const result = await pendingThumb;
+    assert.equal(result, null);
+    assert.equal(ctx.getRasterThumbnailMemoryCacheSize(), 0);
+    assert.equal(statCacheWrites.length, 0);
   }
-  assert.ok(typeof resolveThumb === 'function', 'thumbnail render must be in flight');
 
-  // Simulate logout + cache clear while thumbnail render is still awaiting
-  authed = false;
-  ctx.clearFileVisualProjectCache();
-  resolveThumb({ fake: true });
-
-  const result = await pendingThumb;
-  assert.equal(result, null, 'stale in-flight thumbnail must return null after logout/clear');
-  assert.equal(ctx.getRasterThumbnailMemoryCacheSize(), 0, 'memory cache must stay empty');
-  assert.equal(statCacheWrites.length, 0, 'SQLite stat cache must receive zero writes after logout/clear');
+  // 1. Auth guard alone (without clearing cache)
+  await runScenario(({ setAuthed }) => setAuthed(false));
+  // 2. Global cache generation alone (while still authorized)
+  await runScenario(({ ctx }) => ctx.clearFileVisualProjectCache());
+  // 3. Per-project cache epoch alone (while still authorized)
+  await runScenario(({ ctx }) => ctx.clearFileVisualProjectCache('proj-1'));
 });
 
 test('main.js behavioral IPC coalescing: preserves valid caller over later stale token, emits unchanged-row refresh, drops on logout, omits full rows in Electron (G-P1 / A-P1-1 / N2)', async () => {

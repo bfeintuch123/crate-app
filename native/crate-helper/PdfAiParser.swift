@@ -16,11 +16,13 @@ enum PdfAiParser {
     private static let maxTotalInflatedOut = 64 * 1024 * 1024
     private static let maxStreamsToInflate = 512
 
+    // Exact base Quick Package AI supported extensions (matches parsers/ai.js).
+    // Excludes web-font (.woff2/.woff), installable-font, and video extensions.
     private static let allowedExtensions: Set<String> = [
         "jpg", "jpeg", "png", "gif", "webp", "svg", "pdf", "eps", "ai", "psd", "psb",
         "tiff", "tif", "afdesign", "afphoto", "afpub", "indd", "idml", "sketch", "fig",
-        "heic", "ttf", "otf", "woff2", "woff", "mp4", "mov", "avi", "webm",
     ]
+    private static let maxPathLength = 4096
 
     static func parse(filePath: String, includeDigest: Bool, decompressStreams: Bool) throws -> [String: Any] {
         let fd = Darwin.open(filePath, O_RDONLY | O_NOFOLLOW)
@@ -102,105 +104,124 @@ enum PdfAiParser {
         return result
     }
 
-    // Fast O(N) byte scanner for `/Users/...<ext>` and `/Volumes/...<ext>` without
-    // allocating a giant UTF-8 string for the entire file.
+    @inline(__always)
+    private static func isDelimiter(_ b: UInt8) -> Bool {
+        // Exact base 00c5e92 delimiter set: \x00-\x1f, '"', '\'', \x7f, '<', '>', '|', '*', '?'
+        return b < 0x20 || b == 0x22 || b == 0x27 || b == 0x7F
+            || b == 0x3C || b == 0x3E || b == 0x7C || b == 0x2A || b == 0x3F
+    }
+
+    @inline(__always)
+    private static func isAsciiAlnum(_ b: UInt8) -> Bool {
+        return (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A)
+    }
+
+    @inline(__always)
+    private static func isSegmentBoundarySeparator(_ b: UInt8) -> Bool {
+        return b == 0x20 || b == 0x09 || b == 0x2C || b == 0x3B
+            || b == 0x28 || b == 0x29 || b == 0x5B || b == 0x5D
+    }
+
+    @inline(__always)
+    private static func matchUsersOrVolumesPrefix(_ bytes: UnsafeBufferPointer<UInt8>, _ idx: Int, _ limit: Int) -> Int {
+        guard bytes[idx] == 0x2F else { return 0 }
+        if idx + 7 <= limit
+            && (bytes[idx + 1] == 0x55 || bytes[idx + 1] == 0x75)
+            && (bytes[idx + 2] == 0x73 || bytes[idx + 2] == 0x53)
+            && (bytes[idx + 3] == 0x65 || bytes[idx + 3] == 0x45)
+            && (bytes[idx + 4] == 0x72 || bytes[idx + 4] == 0x52)
+            && (bytes[idx + 5] == 0x73 || bytes[idx + 5] == 0x53)
+            && bytes[idx + 6] == 0x2F {
+            return 7
+        }
+        if idx + 9 <= limit
+            && (bytes[idx + 1] == 0x56 || bytes[idx + 1] == 0x76)
+            && (bytes[idx + 2] == 0x6F || bytes[idx + 2] == 0x4F)
+            && (bytes[idx + 3] == 0x6C || bytes[idx + 3] == 0x4C)
+            && (bytes[idx + 4] == 0x75 || bytes[idx + 4] == 0x55)
+            && (bytes[idx + 5] == 0x6D || bytes[idx + 5] == 0x4D)
+            && (bytes[idx + 6] == 0x65 || bytes[idx + 6] == 0x45)
+            && (bytes[idx + 7] == 0x73 || bytes[idx + 7] == 0x53)
+            && bytes[idx + 8] == 0x2F {
+            return 9
+        }
+        return 0
+    }
+
+    // Strictly O(N) byte scanner matching parsers/ai.js's scanQuickAiRawPaths identically:
+    // maximal delimiter-free runs -> /Users/ & /Volumes/ segments (preserving nested
+    // /Volumes/<disk>/Users/...) -> backwards scan for LAST whole supported extension.
     private static func scanRawPaths(bytes: UnsafeBufferPointer<UInt8>, onMatch: (String) -> Void) {
         let n = bytes.count
-        guard n >= 12 else { return }
+        guard n >= 10 else { return }
         var i = 0
-        while i < n - 8 {
-            if bytes[i] == 0x2F { // '/'
-                let isUsers = (i + 7 < n)
-                    && (bytes[i + 1] == 0x55 || bytes[i + 1] == 0x75) // U/u
-                    && (bytes[i + 2] == 0x73 || bytes[i + 2] == 0x53) // s
-                    && (bytes[i + 3] == 0x65 || bytes[i + 3] == 0x45) // e
-                    && (bytes[i + 4] == 0x72 || bytes[i + 4] == 0x52) // r
-                    && (bytes[i + 5] == 0x73 || bytes[i + 5] == 0x53) // s
-                    && bytes[i + 6] == 0x2F
-                let isVolumes = !isUsers && (i + 9 < n)
-                    && (bytes[i + 1] == 0x56 || bytes[i + 1] == 0x76) // V/v
-                    && (bytes[i + 2] == 0x6F || bytes[i + 2] == 0x4F) // o
-                    && (bytes[i + 3] == 0x6C || bytes[i + 3] == 0x4C) // l
-                    && (bytes[i + 4] == 0x75 || bytes[i + 4] == 0x55) // u
-                    && (bytes[i + 5] == 0x6D || bytes[i + 5] == 0x4D) // m
-                    && (bytes[i + 6] == 0x65 || bytes[i + 6] == 0x45) // e
-                    && (bytes[i + 7] == 0x73 || bytes[i + 7] == 0x53) // s
-                    && bytes[i + 8] == 0x2F
+        while i < n {
+            while i < n && isDelimiter(bytes[i]) { i += 1 }
+            let runStart = i
+            while i < n && !isDelimiter(bytes[i]) { i += 1 }
+            let runEnd = i
+            if runEnd - runStart < 10 { continue }
 
-                if isUsers || isVolumes {
-                    // Find end of valid path run (delimiters: control chars < 0x20, '"', '\'', DEL, '<', '>').
-                    // Do NOT stop on '(' or ')' so macOS filenames like `Logo (1).png` are preserved intact;
-                    // PDF literal strings like `(/Users/a.png)` still stop right after `.png`.
-                    var end = i + (isUsers ? 7 : 9)
-                    let limit = min(n, i + 4096)
-                    var matchedEnd = -1
-                    var stoppedAtNextPrefix = false
-                    while end < limit {
-                        let b = bytes[end]
-                        if b < 0x20 || b == 0x22 || b == 0x27 || b == 0x7F || b == 0x3C || b == 0x3E {
-                            break
-                        }
-                        if b == 0x2F { // Stop before a subsequent /Users/ or /Volumes/ prefix
-                            let nextIsUsers = (end + 7 < n)
-                                && (bytes[end + 1] == 0x55 || bytes[end + 1] == 0x75)
-                                && (bytes[end + 2] == 0x73 || bytes[end + 2] == 0x53)
-                                && (bytes[end + 3] == 0x65 || bytes[end + 3] == 0x45)
-                                && (bytes[end + 4] == 0x72 || bytes[end + 4] == 0x52)
-                                && (bytes[end + 5] == 0x73 || bytes[end + 5] == 0x53)
-                                && bytes[end + 6] == 0x2F
-                            let nextIsVolumes = !nextIsUsers && (end + 9 < n)
-                                && (bytes[end + 1] == 0x56 || bytes[end + 1] == 0x76)
-                                && (bytes[end + 2] == 0x6F || bytes[end + 2] == 0x4F)
-                                && (bytes[end + 3] == 0x6C || bytes[end + 3] == 0x4C)
-                                && (bytes[end + 4] == 0x75 || bytes[end + 4] == 0x55)
-                                && (bytes[end + 5] == 0x6D || bytes[end + 5] == 0x4D)
-                                && (bytes[end + 6] == 0x65 || bytes[end + 6] == 0x45)
-                                && (bytes[end + 7] == 0x73 || bytes[end + 7] == 0x53)
-                                && bytes[end + 8] == 0x2F
-                            if nextIsUsers || nextIsVolumes {
-                                stoppedAtNextPrefix = true
-                                break
-                            }
-                        }
-                        if b == 0x2E { // '.'
-                            // Check if a known extension follows immediately (prefer longer like woff2 over woff)
-                            let extStart = end + 1
-                            var extEnd = extStart
-                            while extEnd < min(limit, extStart + 9) {
-                                let eb = bytes[extEnd]
-                                let isAlnum = (eb >= 0x30 && eb <= 0x39) || (eb >= 0x41 && eb <= 0x5A) || (eb >= 0x61 && eb <= 0x7A)
-                                if !isAlnum { break }
-                                extEnd += 1
-                            }
-                            if extEnd > extStart {
-                                var extStr = ""
-                                for k in extStart..<extEnd {
-                                    let c = bytes[k]
-                                    let lc = (c >= 0x41 && c <= 0x5A) ? (c + 32) : c
-                                    extStr.append(Character(UnicodeScalar(lc)))
-                                }
-                                if allowedExtensions.contains(extStr) {
-                                    matchedEnd = extEnd
-                                    break
-                                }
-                            }
-                        }
-                        end += 1
-                    }
-                    if matchedEnd > i {
-                        let slice = UnsafeBufferPointer(rebasing: bytes[i..<matchedEnd])
-                        if let str = String(bytes: slice, encoding: .utf8) {
-                            onMatch(str)
-                        }
-                        i = matchedEnd
-                        continue
-                    } else {
-                        i = stoppedAtNextPrefix ? end : (end + 1)
+            var segments: [(pos: Int, prefixLen: Int, isVolumes: Bool)] = []
+            var p = runStart
+            while p < runEnd - 7 {
+                let prefixLen = matchUsersOrVolumesPrefix(bytes, p, runEnd)
+                if prefixLen == 9 {
+                    segments.append((p, 9, true))
+                    p += 9
+                    continue
+                }
+                if prefixLen == 7 {
+                    let insideVolumes = segments.last?.isVolumes ?? false
+                    let precededBySep = p > runStart && isSegmentBoundarySeparator(bytes[p - 1])
+                    if !insideVolumes || precededBySep {
+                        segments.append((p, 7, false))
+                        p += 7
                         continue
                     }
                 }
+                p += 1
             }
-            i += 1
+
+            for s in 0..<segments.count {
+                let segStart = segments[s].pos
+                let prefixLen = segments[s].prefixLen
+                let segEnd = (s + 1 < segments.count) ? segments[s + 1].pos : runEnd
+                let cappedEnd = min(segEnd, segStart + maxPathLength)
+                if cappedEnd <= segStart + prefixLen { continue }
+
+                var pos = cappedEnd - 1
+                while pos >= segStart + prefixLen {
+                    if bytes[pos] == 0x2E { // '.'
+                        let extStart = pos + 1
+                        var extEnd = extStart
+                        while extEnd < segEnd && extEnd - extStart <= 9 && isAsciiAlnum(bytes[extEnd]) {
+                            extEnd += 1
+                        }
+                        if extEnd > extStart && extEnd <= cappedEnd && extEnd - extStart <= 8 {
+                            if extEnd < segEnd && isAsciiAlnum(bytes[extEnd]) {
+                                pos -= 1
+                                continue
+                            }
+                            var extStr = ""
+                            extStr.reserveCapacity(extEnd - extStart)
+                            for k in extStart..<extEnd {
+                                let c = bytes[k]
+                                let lc = (c >= 0x41 && c <= 0x5A) ? (c + 32) : c
+                                extStr.append(Character(UnicodeScalar(lc)))
+                            }
+                            if allowedExtensions.contains(extStr) {
+                                let slice = UnsafeBufferPointer(rebasing: bytes[segStart..<extEnd])
+                                if let str = String(bytes: slice, encoding: .utf8) {
+                                    onMatch(str)
+                                }
+                                break
+                            }
+                        }
+                    }
+                    pos -= 1
+                }
+            }
         }
     }
 
@@ -226,7 +247,7 @@ enum PdfAiParser {
                         let start = i + mLen
                         let stopByte: UInt8 = (idx == 0) ? 0x3C : 0x22 // '<' or '"'
                         var end = start
-                        let limit = min(n, start + 4096)
+                        let limit = min(n, start + maxPathLength + 1)
                         while end < limit && bytes[end] != stopByte { end += 1 }
                         if end > start && end < limit {
                             let slice = UnsafeBufferPointer(rebasing: bytes[start..<end])
@@ -294,8 +315,17 @@ enum PdfAiParser {
         return out
     }
 
+    private static func isSupportedPathExtension(_ path: String) -> Bool {
+        guard path.utf8.count <= maxPathLength else { return false }
+        guard let dot = path.lastIndex(of: ".") else { return false }
+        if let slash = path.lastIndex(of: "/"), dot <= slash { return false }
+        let ext = String(path[path.index(after: dot)...]).lowercased()
+        return allowedExtensions.contains(ext)
+    }
+
     private static func normalizeLocalPathOrFileUri(_ raw: String) -> String? {
-        var path = raw.replacingOccurrences(of: "\0", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        var path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        while path.hasSuffix("\0") { path.removeLast() }
         if path.isEmpty || path.unicodeScalars.contains(where: { $0.value < 0x20 }) { return nil }
         if path.lowercased().hasPrefix("file:") {
             var rest = String(path.dropFirst(5))
@@ -319,7 +349,11 @@ enum PdfAiParser {
             }
             path = decoded
         }
-        return (path.hasPrefix("/Users/") || path.hasPrefix("/Volumes/")) ? path : nil
+        guard (path.hasPrefix("/Users/") || path.hasPrefix("/Volumes/")),
+              isSupportedPathExtension(path) else {
+            return nil
+        }
+        return path
     }
 
     // Locate `FlateDecode` streams (skipping `/Subtype /Image`), inflate with strict

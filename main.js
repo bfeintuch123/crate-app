@@ -22743,9 +22743,19 @@ end tell`;
         if (!fs.existsSync(designFile.path)) continue;
         const cachedFile = await getInScanFileEntry(designFile.path);
         if (!operationCurrent()) return null;
-        if (!cachedFile || cachedFile.tooLarge || !cachedFile.buf) continue;
-        // Decode transiently so regex strings are never retained across files.
-        const content = cachedFile.buf.toString('utf8');
+        let content;
+        if (cachedFile && cachedFile.tooLarge) {
+          // Preserve base 00c5e92 discovery for 300-512 MB design files via a
+          // transient uncached read without evicting or exceeding the 128 MiB cache.
+          const transientBuf = await fs.promises.readFile(designFile.path);
+          if (!operationCurrent()) return null;
+          content = transientBuf.toString('utf8');
+        } else if (cachedFile && cachedFile.buf) {
+          // Decode transiently so regex strings are never retained across files.
+          content = cachedFile.buf.toString('utf8');
+        } else {
+          continue;
+        }
         let match;
         LINKED_ASSET_REGEX.lastIndex = 0;
         while ((match = LINKED_ASSET_REGEX.exec(content)) !== null) {
@@ -28518,6 +28528,7 @@ registerTrustedIpcHandler('inactivity:pause', (event, projectId) => {
 // --- App Lifecycle ---
 
 app.whenReady().then(async () => {
+  if (!gotLock) return;
   startupPhaseJournal.mark('ready-handler-entered');
   if (process.versions && process.versions.electron) {
     const storeKind = typeof store?.getProjectById === 'function' ? 'sqlite-wal' : 'electron-store';

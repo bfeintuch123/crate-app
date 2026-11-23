@@ -113,6 +113,7 @@ class NativeHelperClient {
     });
 
     const onTerminate = reason => {
+      if (session.terminated) return;
       session.terminated = true;
       if (this.session === session) this.session = null;
       for (const [id, entry] of [...session.pending.entries()]) {
@@ -121,6 +122,8 @@ class NativeHelperClient {
         entry.reject(new Error(reason));
       }
     };
+    session.onTerminate = onTerminate;
+    child.stdin.on('error', () => onTerminate('native_helper_stdin_error'));
     child.once('error', () => onTerminate('native_helper_error'));
     child.once('exit', () => onTerminate('native_helper_exited'));
 
@@ -181,12 +184,19 @@ class NativeHelperClient {
 
       session.pending.set(id, { resolve, reject, timer });
       this._syncRef(session);
+      if (session.terminated || !child.stdin || child.stdin.destroyed) {
+        session.onTerminate('native_helper_stdin_error');
+        return;
+      }
       try {
-        child.stdin.write(`${JSON.stringify({ id, op, ...payload })}\n`);
+        child.stdin.write(`${JSON.stringify({ id, op, ...payload })}\n`, writeErr => {
+          if (writeErr) session.onTerminate('native_helper_stdin_error');
+        });
       } catch (error) {
         clearTimeout(timer);
         session.pending.delete(id);
         this._syncRef(session);
+        session.onTerminate('native_helper_stdin_error');
         reject(error);
       }
     });

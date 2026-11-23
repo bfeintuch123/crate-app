@@ -623,7 +623,10 @@ enum PsdParser {
             blockCount += 1
             if blockCount > maxBlocks { throw HelperError("psd_coverage_limit") }
             let rSig = try reader.readAscii(4, end: resourcesEnd)
-            if rSig != "8BIM" { break }
+            if rSig != "8BIM" {
+                if !issues.contains("non-8bim-image-resource") { issues.append("non-8bim-image-resource") }
+                break
+            }
             let resId = try reader.readU16(end: resourcesEnd)
             let nameLen = Int(try reader.readU8(end: resourcesEnd))
             let namePad = (nameLen + 1) % 2
@@ -631,11 +634,18 @@ enum PsdParser {
             let resSize = Int64(try reader.readU32(end: resourcesEnd))
             let resEnd = reader.offset + resSize
             if resSize < 0 || resEnd > resourcesEnd { throw HelperError("psd_framing_bounds") }
-            if resId == 1075 && resSize <= Int64(maxDescriptorBytes) {
-                let raw = try reader.readBytes(Int(resSize), end: resEnd)
-                var dr = DescriptorReader(bytes: raw)
-                if let desc = try? dr.readVersionAndDescriptor() {
-                    walkMediaDescriptor(desc: desc, carrier: "1075")
+            if resId == 1075 {
+                if resSize > Int64(maxDescriptorBytes) {
+                    if !issues.contains("oversized-resource-1075") { issues.append("oversized-resource-1075") }
+                } else {
+                    let raw = try reader.readBytes(Int(resSize), end: resEnd)
+                    var dr = DescriptorReader(bytes: raw)
+                    do {
+                        let desc = try dr.readVersionAndDescriptor()
+                        walkMediaDescriptor(desc: desc, carrier: "1075")
+                    } catch {
+                        if !issues.contains("unreadable-resource-1075") { issues.append("unreadable-resource-1075") }
+                    }
                 }
             }
             try reader.seek(to: resEnd)

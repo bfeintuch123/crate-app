@@ -359,13 +359,32 @@ test('Quick Package IDML checks existence at most once per distinct path while a
   assert.equal(checked.length, 4);
 });
 
-test('Quick Package Illustrator produces identical output for .psb, multi-link, /Volumes, and .woff2 exclusion with helper ON and OFF', async t => {
+test('Quick Package Illustrator unified O(N) grammar matches across helper ON and OFF for edge cases, base names, and web-font exclusion', async t => {
+  const { nativeHelper } = require('../parsers/native-helper');
   const dir = tempDir(t);
+  const longPath = `/Users/synthetic/${'a'.repeat(4100)}/hero.png`;
   const cases = [
     { name: 'psb', input: `${S}/Smart.psb`, expected: [`${S}/Smart.psb`] },
     { name: 'multi', input: `${S}/a.png ${S}/b.png`, expected: [`${S}/a.png`, `${S}/b.png`] },
     { name: 'volumes', input: '/Volumes/crate-synthetic/linked.png', expected: ['/Volumes/crate-synthetic/linked.png'] },
+    { name: 'volumes-nested-users', input: '/Volumes/StudioNAS/Users/alice/hero.png', expected: ['/Volumes/StudioNAS/Users/alice/hero.png'] },
     { name: 'woff2-excluded', input: `${S}/Brand.woff2`, expected: [] },
+    { name: 'woff2-then-volumes', input: `${S}/Brand.woff2 /Volumes/Studio/hero.png`, expected: ['/Volumes/Studio/hero.png'] },
+    { name: 'dotted-home-ai', input: '/Users/sam.ainsworth/Documents/logo.png', expected: ['/Users/sam.ainsworth/Documents/logo.png'] },
+    { name: 'dotted-home-fig', input: '/Users/ana.figueroa/Work/hero.jpg', expected: ['/Users/ana.figueroa/Work/hero.jpg'] },
+    { name: 'mid-path-ai-folder', input: '/Users/me/Client.ai files/hero.png', expected: ['/Users/me/Client.ai files/hero.png'] },
+    { name: 'double-ext', input: '/Users/me/shot.psd.png', expected: ['/Users/me/shot.psd.png'] },
+    { name: 'mid-path-mp4', input: '/Users/me/Movie.mp4 stills/frame.png', expected: ['/Users/me/Movie.mp4 stills/frame.png'] },
+    { name: 'mid-path-woff2', input: '/Users/me/Brand.woff2.png', expected: ['/Users/me/Brand.woff2.png'] },
+    { name: 'mid-path-ttf', input: '/Users/a/b.ttf and c.png', expected: ['/Users/a/b.ttf and c.png'] },
+    { name: 'reject-partial-pngx', input: '/Users/me/a.pngx', expected: [] },
+    { name: 'reject-partial-aif', input: '/Users/me/x.aif', expected: [] },
+    { name: 'reject-pipe-delimiter', input: '/Users/me/a|b.png', expected: [] },
+    { name: 'reject-star-delimiter', input: '/Users/me/a*b.png', expected: [] },
+    { name: 'reject-question-delimiter', input: '/Users/me/a?b.png', expected: [] },
+    { name: 'reject-over-4096', input: longPath, expected: [] },
+    { name: 'xmp-mid-path-ai', input: '<stRef:filePath>/Users/me/Client.ai files/hero.png</stRef:filePath>', expected: ['/Users/me/Client.ai files/hero.png'] },
+    { name: 'xmp-link-resource-uri', input: 'LinkResourceURI="file:///Users/me/a%20b.png"', expected: ['/Users/me/a%20b.png', '/Users/me/a b.png'] },
   ];
   const prevDisable = process.env.CRATE_DISABLE_NATIVE_HELPER;
   t.after(() => {
@@ -373,17 +392,43 @@ test('Quick Package Illustrator produces identical output for .psb, multi-link, 
     else process.env.CRATE_DISABLE_NATIVE_HELPER = prevDisable;
   });
 
+  // Always exercise helper OFF (forced JS fallback)
+  process.env.CRATE_DISABLE_NATIVE_HELPER = '1';
+  const offByCase = new Map();
   for (const tc of cases) {
     const file = build(dir, '.ai', tc.input);
-    // Helper OFF (forced JS fallback)
-    process.env.CRATE_DISABLE_NATIVE_HELPER = '1';
     const offPaths = (await quick(AIParser, file)).map(a => a.path);
     assert.deepEqual(offPaths, tc.expected, `${tc.name} (helper OFF)`);
+    offByCase.set(tc.name, offPaths);
+  }
 
-    // Helper ON (when built helper is available)
+  // Exercise helper ON explicitly when built helper is enabled (never silently run OFF twice)
+  if (prevDisable === undefined) delete process.env.CRATE_DISABLE_NATIVE_HELPER;
+  else process.env.CRATE_DISABLE_NATIVE_HELPER = prevDisable;
+  if (nativeHelper.isAvailable()) {
+    for (const tc of cases) {
+      const file = build(dir, '.ai', tc.input);
+      const onPaths = (await quick(AIParser, file)).map(a => a.path);
+      assert.deepEqual(onPaths, tc.expected, `${tc.name} (helper ON)`);
+      assert.deepEqual(onPaths, offByCase.get(tc.name), `${tc.name} (ON == OFF parity)`);
+    }
+  }
+});
+
+test('Quick Package Illustrator fallback stays strictly linear O(N) on pathological repeated /Users/ runs', async t => {
+  const dir = tempDir(t);
+  const prevDisable = process.env.CRATE_DISABLE_NATIVE_HELPER;
+  process.env.CRATE_DISABLE_NATIVE_HELPER = '1';
+  t.after(() => {
     if (prevDisable === undefined) delete process.env.CRATE_DISABLE_NATIVE_HELPER;
     else process.env.CRATE_DISABLE_NATIVE_HELPER = prevDisable;
-    const onPaths = (await quick(AIParser, file)).map(a => a.path);
-    assert.deepEqual(onPaths, tc.expected, `${tc.name} (helper ON/default)`);
-  }
+  });
+  // 256 KB delimiter-free run of repeated /Users/ (took >2,200 ms with quadratic rescanning)
+  const pathological = '/Users/'.repeat(36500);
+  const file = build(dir, '.ai', pathological);
+  const startedAt = Date.now();
+  const assets = await quick(AIParser, file);
+  const elapsedMs = Date.now() - startedAt;
+  assert.deepEqual(assets, []);
+  assert.ok(elapsedMs < 500, `expected linear O(N) scan under 500ms, got ${elapsedMs}ms`);
 });

@@ -207,7 +207,11 @@ class ProjectIpcDeltaBridge {
     const entry = { coalesced: false, emitFn, timer: null };
     entry.timer = setTimeout(() => {
       this.pendingTimers.delete(projectId);
-      entry.emitFn();
+      try {
+        entry.emitFn();
+      } catch (error) {
+        console.error('[crate][ipc-delta-bridge] scheduled emit failed:', error && error.message ? error.message : error);
+      }
     }, this.coalesceMs);
     if (typeof entry.timer.unref === 'function') entry.timer.unref();
     this.pendingTimers.set(projectId, entry);
@@ -268,7 +272,11 @@ class ProjectIpcDeltaBridge {
     entry.timer = setTimeout(() => {
       if (this.pendingTimers.get(projectId) !== entry) return;
       this.pendingTimers.delete(projectId);
-      invoke(entry);
+      try {
+        invoke(entry);
+      } catch (error) {
+        console.error('[crate][ipc-delta-bridge] coalesced emit failed:', error && error.message ? error.message : error);
+      }
     }, this.coalesceMs);
     if (typeof entry.timer.unref === 'function') entry.timer.unref();
     this.pendingTimers.set(projectId, entry);
