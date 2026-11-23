@@ -214,9 +214,18 @@ test('CrateSqliteStore: concurrent/second migration on same profile is atomic an
   const storeB = new CrateSqliteStore({ userDataRealPath: userData, defaults });
   t.after(() => { storeA.close(); storeB.close(); });
 
+  // Prime storeB's in-memory kvCache with pre-migration _meta = undefined so storeB's
+  // fast pre-check misses and it MUST hit the authoritative in-transaction SQLite check.
+  assert.equal(storeB._getKvRaw('_meta'), undefined);
+
   assert.equal(storeA.migrateFromLegacyStore(legacy), true);
-  // storeB has stale pre-migration memory cache, yet its in-transaction check sees _meta and skips re-migrating!
+  storeA.set('settings.postUpgradeFlag', true);
+
+  // storeB's stale cache passes pre-check, then its BEGIN IMMEDIATE check sees _meta,
+  // skips re-migrating, and rehydrates storeA's migrated project and post-upgrade setting.
   assert.equal(storeB.migrateFromLegacyStore(legacy), false);
+  assert.deepEqual(storeB.get('projects').map(p => p.id), ['p-orig']);
+  assert.equal(storeB.get('settings.postUpgradeFlag'), true);
   // Legacy JSON stays intact on disk (pre-upgrade rollback snapshot)
   assert.equal(fs.readFileSync(legacy.path, 'utf8'), legacyBefore);
 });

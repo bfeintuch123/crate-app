@@ -496,12 +496,15 @@ test('Swift PdfAiParser signals incomplete on >512 FlateDecode streams and AIPar
   const client = new NativeHelperClient(DEFAULT_BINARY_PATH);
   t.after(() => client.shutdown());
 
-  // Build a synthetic PDF/AI with 520 tiny FlateDecode streams (> 512 cap) + raw .psb and .woff2 links
+  // Build a synthetic PDF/AI with 520 tiny FlateDecode streams (> 512 cap), placing a
+  // compressed-only link in stream #1 plus raw .psb, .woff2, and /Volumes links at EOF.
+  const firstStreamCompressed = zlib.deflateSync(Buffer.from('BT (/Users/synthetic/compressed-only.png) Tj ET'));
   const tinyCompressed = zlib.deflateSync(Buffer.from('BT () Tj ET'));
   const parts = [Buffer.from('%PDF-1.6\n')];
   for (let i = 1; i <= 520; i++) {
-    parts.push(Buffer.from(`${i} 0 obj\n<< /Filter /FlateDecode /Length ${tinyCompressed.length} >>\nstream\n`));
-    parts.push(tinyCompressed);
+    const payload = i === 1 ? firstStreamCompressed : tinyCompressed;
+    parts.push(Buffer.from(`${i} 0 obj\n<< /Filter /FlateDecode /Length ${payload.length} >>\nstream\n`));
+    parts.push(payload);
     parts.push(Buffer.from('\nendstream\nendobj\n'));
   }
   parts.push(Buffer.from('% /Users/synthetic/Smart.psb /Users/synthetic/Brand.woff2 /Volumes/Studio/hero.png\n%%EOF\n'));
@@ -511,11 +514,14 @@ test('Swift PdfAiParser signals incomplete on >512 FlateDecode streams and AIPar
   const parsed = await client.parsePdfAi(cappedAi, { decompressStreams: true });
   assert.equal(parsed.incomplete, true);
   assert.ok(Array.isArray(parsed.issues) && parsed.issues.includes('flate-stream-count-limit'));
+  assert.ok(parsed.paths.includes('/Users/synthetic/compressed-only.png'), 'Swift helper found stream #1 link before hitting 512-stream cap');
 
-  // AIParser must fall back to JS scan on incomplete native output, keep .psb & /Volumes, and exclude .woff2
+  // AIParser MUST discard the incomplete native result and fall back to JS raw scan
+  // (so compressed-only.png is absent while raw .psb & /Volumes are kept and .woff2 excluded).
   const parser = new AIParser();
   const assets = await parser.extractAssets(cappedAi);
   const paths = assets.map(a => a.path);
+  assert.equal(paths.includes('/Users/synthetic/compressed-only.png'), false, 'must fall back to JS scan instead of trusting incomplete native output');
   assert.deepEqual(paths, ['/Users/synthetic/Smart.psb', '/Volumes/Studio/hero.png']);
 });
 

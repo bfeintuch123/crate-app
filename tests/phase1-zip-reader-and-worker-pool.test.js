@@ -490,7 +490,8 @@ test('openZipArchive rejects deflated entry whose compressedSize exceeds maxOutp
   central.writeUInt32LE(0x02014b50, 0);
   central.writeUInt16LE(20, 4);
   central.writeUInt16LE(20, 6);
-  central.writeUInt16LE(8, 8);
+  central.writeUInt16LE(0, 8);  // general purpose flags = 0
+  central.writeUInt16LE(8, 10); // compression method = 8 (deflate)
   central.writeUInt32LE(compPayload.length, 20);
   central.writeUInt32LE(64, 24);
   central.writeUInt16LE(nameBuf.length, 28);
@@ -509,6 +510,7 @@ test('openZipArchive rejects deflated entry whose compressedSize exceeds maxOutp
 
   const archive = openZipArchive(zipPath, { message: 'too large' });
   t.after(() => archive.close());
+  assert.equal(archive.entries[0].method, 8, 'entry must be parsed as deflate (method 8) to exercise deflate ceiling');
   assert.throws(
     () => archive.readEntry(archive.entries[0], { maxOutputBytes: 4096, message: 'entry too large' }),
     err => err && err.code === 'CRATE_PARSER_ADMISSION_LIMIT'

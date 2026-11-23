@@ -416,10 +416,10 @@ test('Quick Package Illustrator unified O(N) grammar matches across helper ON an
     offByCase.set(tc.name, offPaths);
   }
 
-  // Exercise helper ON explicitly when built helper is enabled (never silently run OFF twice)
+  // Exercise helper ON in an explicit subtest so helper-OFF runs report a visible skip
   if (prevDisable === undefined) delete process.env.CRATE_DISABLE_NATIVE_HELPER;
   else process.env.CRATE_DISABLE_NATIVE_HELPER = prevDisable;
-  if (nativeHelper.isAvailable()) {
+  await t.test('helper ON matches helper OFF', { skip: !nativeHelper.isAvailable() }, async () => {
     for (const tc of cases) {
       const file = Buffer.isBuffer(tc.input)
         ? path.join(dir, `${tc.name}.ai`)
@@ -428,7 +428,7 @@ test('Quick Package Illustrator unified O(N) grammar matches across helper ON an
       assert.deepEqual(onPaths, tc.expected, `${tc.name} (helper ON)`);
       assert.deepEqual(onPaths, offByCase.get(tc.name), `${tc.name} (ON == OFF parity)`);
     }
-  }
+  });
 });
 
 test('Quick Package Illustrator fallback stays strictly linear O(N) on pathological repeated /Users/ runs', async t => {
