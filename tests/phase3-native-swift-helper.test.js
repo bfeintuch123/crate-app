@@ -747,6 +747,29 @@ test('Photoshop CC external links: file://// four-slash URIs with spaces and NUL
   assert.ok(aiParsed.paths.includes('/Users/synthetic/QA Folder/ai-asset.jpg'));
   assert.ok(aiParsed.paths.includes('/Users/synthetic/R&D Team/logo.png'));
   assert.ok(!aiParsed.paths.some(p => p.includes('smuggled.jpg')));
+
+  // 5. Direct Swift PdfAiParser preserves inner /users/, /Volumes/, (old)/Users/, and lossy non-UTF-8 bytes
+  const edgeAiPath = path.join(dir, 'Illustrator_Edge_Dirs.ai');
+  fs.writeFileSync(
+    edgeAiPath,
+    Buffer.concat([
+      Buffer.from('%PDF-1.6\n'),
+      Buffer.from('/Users/me/Projects/users/avatar.png\n'),
+      Buffer.from('/Users/me/Old Mac/Users/jane/logo.png\n'),
+      Buffer.from('/Users/me/Client/Volumes/hero.png\n'),
+      Buffer.from('/Users/me/Archive (old)/Users/jo/a.png\n'),
+      Buffer.from('/Users/me/caf'), Buffer.from([0x8e]), Buffer.from('.png\n'),
+      Buffer.from('%%EOF\n'),
+    ])
+  );
+  const edgeParsed = await client.parsePdfAi(edgeAiPath, { decompressStreams: true });
+  assert.deepEqual(edgeParsed.paths, [
+    '/Users/me/Projects/users/avatar.png',
+    '/Users/me/Old Mac/Users/jane/logo.png',
+    '/Users/me/Client/Volumes/hero.png',
+    '/Users/me/Archive (old)/Users/jo/a.png',
+    '/Users/me/caf\uFFFD.png',
+  ]);
 });
 
 test('Photoshop external link normalization preserves literal trailing spaces and U+200B in Swift helper and JS', { skip: !hasNativeBinary }, async t => {

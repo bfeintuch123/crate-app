@@ -96,8 +96,10 @@ function matchUsersOrVolumesPrefix(content, index, limit) {
 }
 
 function isSegmentBoundarySeparator(code) {
+  // Exclude ')' and ']' so folder paths like `/Users/me/Archive (old)/Users/jo/a.png`
+  // stay intact; adjacent PDF strings `(/Users/a.png)(/Users/b.png)` still split on '('.
   return code === 0x20 || code === 0x09 || code === 0x2c || code === 0x3b
-    || code === 0x28 || code === 0x29 || code === 0x5b || code === 0x5d;
+    || code === 0x28 || code === 0x5b;
 }
 
 function isSupportedQuickAiLinkedPath(candidatePath) {
@@ -127,23 +129,19 @@ function scanQuickAiRawPaths(content, onMatch) {
     if (runEnd - runStart < 10) continue;
 
     // Collect /Users/ and /Volumes/ segment starts within this delimiter-free run.
-    // Preserve nested /Volumes/<disk>/Users/... paths unless preceded by a separator.
+    // After the first prefix, only start a new segment when preceded by a boundary
+    // separator so inner folder names like `/Users/me/Projects/users/avatar.png`,
+    // `/Users/me/Client/Volumes/hero.png`, and `/Users/me/Archive (old)/Users/jo/a.png`
+    // stay intact.
     const segments = [];
     let p = runStart;
     while (p < runEnd - 7) {
       const prefixLen = matchUsersOrVolumesPrefix(content, p, runEnd);
-      if (prefixLen === 9) {
-        segments.push({ pos: p, prefixLen: 9, isVolumes: true });
-        p += 9;
-        continue;
-      }
-      if (prefixLen === 7) {
-        const prevSeg = segments.length > 0 ? segments[segments.length - 1] : null;
-        const insideVolumes = Boolean(prevSeg && prevSeg.isVolumes);
+      if (prefixLen > 0) {
         const precededBySep = p > runStart && isSegmentBoundarySeparator(content.charCodeAt(p - 1));
-        if (!insideVolumes || precededBySep) {
-          segments.push({ pos: p, prefixLen: 7, isVolumes: false });
-          p += 7;
+        if (segments.length === 0 || precededBySep) {
+          segments.push({ pos: p, prefixLen });
+          p += prefixLen;
           continue;
         }
       }

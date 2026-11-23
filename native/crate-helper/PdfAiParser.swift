@@ -118,8 +118,10 @@ enum PdfAiParser {
 
     @inline(__always)
     private static func isSegmentBoundarySeparator(_ b: UInt8) -> Bool {
+        // Exclude ')' and ']' so folder paths like `/Users/me/Archive (old)/Users/jo/a.png`
+        // stay intact; adjacent PDF strings `(/Users/a.png)(/Users/b.png)` still split on '('.
         return b == 0x20 || b == 0x09 || b == 0x2C || b == 0x3B
-            || b == 0x28 || b == 0x29 || b == 0x5B || b == 0x5D
+            || b == 0x28 || b == 0x5B
     }
 
     @inline(__always)
@@ -162,21 +164,15 @@ enum PdfAiParser {
             let runEnd = i
             if runEnd - runStart < 10 { continue }
 
-            var segments: [(pos: Int, prefixLen: Int, isVolumes: Bool)] = []
+            var segments: [(pos: Int, prefixLen: Int)] = []
             var p = runStart
             while p < runEnd - 7 {
                 let prefixLen = matchUsersOrVolumesPrefix(bytes, p, runEnd)
-                if prefixLen == 9 {
-                    segments.append((p, 9, true))
-                    p += 9
-                    continue
-                }
-                if prefixLen == 7 {
-                    let insideVolumes = segments.last?.isVolumes ?? false
+                if prefixLen > 0 {
                     let precededBySep = p > runStart && isSegmentBoundarySeparator(bytes[p - 1])
-                    if !insideVolumes || precededBySep {
-                        segments.append((p, 7, false))
-                        p += 7
+                    if segments.isEmpty || precededBySep {
+                        segments.append((p, prefixLen))
+                        p += prefixLen
                         continue
                     }
                 }
@@ -212,9 +208,9 @@ enum PdfAiParser {
                             }
                             if allowedExtensions.contains(extStr) {
                                 let slice = UnsafeBufferPointer(rebasing: bytes[segStart..<extEnd])
-                                if let str = String(bytes: slice, encoding: .utf8) {
-                                    onMatch(str)
-                                }
+                                // Decode lossily with U+FFFD to match Node Buffer.toString('utf8')
+                                // so non-UTF-8 bytes (e.g. MacRoman) are never silently dropped.
+                                onMatch(String(decoding: slice, as: UTF8.self))
                                 break
                             }
                         }
@@ -251,11 +247,10 @@ enum PdfAiParser {
                         while end < limit && bytes[end] != stopByte { end += 1 }
                         if end > start && end < limit {
                             let slice = UnsafeBufferPointer(rebasing: bytes[start..<end])
-                            if var val = String(bytes: slice, encoding: .utf8) {
-                                val = decodeXmlEntities(val)
-                                if let local = normalizeLocalPathOrFileUri(val) {
-                                    onMatch(local)
-                                }
+                            var val = String(decoding: slice, as: UTF8.self)
+                            val = decodeXmlEntities(val)
+                            if let local = normalizeLocalPathOrFileUri(val) {
+                                onMatch(local)
                             }
                         }
                         i = end + 1

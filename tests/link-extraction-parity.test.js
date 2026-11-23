@@ -385,6 +385,14 @@ test('Quick Package Illustrator unified O(N) grammar matches across helper ON an
     { name: 'reject-over-4096', input: longPath, expected: [] },
     { name: 'xmp-mid-path-ai', input: '<stRef:filePath>/Users/me/Client.ai files/hero.png</stRef:filePath>', expected: ['/Users/me/Client.ai files/hero.png'] },
     { name: 'xmp-link-resource-uri', input: 'LinkResourceURI="file:///Users/me/a%20b.png"', expected: ['/Users/me/a%20b.png', '/Users/me/a b.png'] },
+    { name: 'inner-lowercase-users-dir', input: '/Users/me/Projects/users/avatar.png', expected: ['/Users/me/Projects/users/avatar.png'] },
+    { name: 'inner-backup-users-dir', input: '/Users/me/Old Mac/Users/jane/logo.png', expected: ['/Users/me/Old Mac/Users/jane/logo.png'] },
+    { name: 'inner-home-backup-users-dir', input: '/Users/me/Backup/Users/me/Documents/logo.png', expected: ['/Users/me/Backup/Users/me/Documents/logo.png'] },
+    { name: 'inner-volumes-dir', input: '/Users/me/Client/Volumes/hero.png', expected: ['/Users/me/Client/Volumes/hero.png'] },
+    { name: 'inner-volumes-archive-dir', input: '/Users/me/Volumes/Archive/logo.png', expected: ['/Users/me/Volumes/Archive/logo.png'] },
+    { name: 'inner-paren-before-users-dir', input: '/Users/me/Archive (old)/Users/jo/a.png', expected: ['/Users/me/Archive (old)/Users/jo/a.png'] },
+    { name: 'adjacent-pdf-strings-paren', input: '(/Users/a/1.png)(/Users/b/2.png)', expected: ['/Users/a/1.png', '/Users/b/2.png'] },
+    { name: 'non-utf8-macroman-byte', input: Buffer.concat([Buffer.from('/Users/me/caf'), Buffer.from([0x8e]), Buffer.from('.png')]), expected: ['/Users/me/caf\uFFFD.png'] },
   ];
   const prevDisable = process.env.CRATE_DISABLE_NATIVE_HELPER;
   t.after(() => {
@@ -396,7 +404,13 @@ test('Quick Package Illustrator unified O(N) grammar matches across helper ON an
   process.env.CRATE_DISABLE_NATIVE_HELPER = '1';
   const offByCase = new Map();
   for (const tc of cases) {
-    const file = build(dir, '.ai', tc.input);
+    const file = Buffer.isBuffer(tc.input)
+      ? (() => {
+          const p = path.join(dir, `${tc.name}.ai`);
+          fs.writeFileSync(p, Buffer.concat([Buffer.from('%PDF-1.5\n'), tc.input, Buffer.from('\n%%EOF\n')]));
+          return p;
+        })()
+      : build(dir, '.ai', tc.input);
     const offPaths = (await quick(AIParser, file)).map(a => a.path);
     assert.deepEqual(offPaths, tc.expected, `${tc.name} (helper OFF)`);
     offByCase.set(tc.name, offPaths);
@@ -407,7 +421,9 @@ test('Quick Package Illustrator unified O(N) grammar matches across helper ON an
   else process.env.CRATE_DISABLE_NATIVE_HELPER = prevDisable;
   if (nativeHelper.isAvailable()) {
     for (const tc of cases) {
-      const file = build(dir, '.ai', tc.input);
+      const file = Buffer.isBuffer(tc.input)
+        ? path.join(dir, `${tc.name}.ai`)
+        : build(dir, '.ai', tc.input);
       const onPaths = (await quick(AIParser, file)).map(a => a.path);
       assert.deepEqual(onPaths, tc.expected, `${tc.name} (helper ON)`);
       assert.deepEqual(onPaths, offByCase.get(tc.name), `${tc.name} (ON == OFF parity)`);

@@ -538,14 +538,14 @@ enum PsdParser {
                     try parseLinkBlock(end: blockEnd, carrier: key, layerIndex: layerIndex)
                 } else if key == "PxSc" {
                     if blockSize > Int64(maxDescriptorBytes) {
-                        issues.append("oversized-pxsc-descriptor")
+                        if !issues.contains("oversized-pxsc-descriptor") { issues.append("oversized-pxsc-descriptor") }
                     } else {
                         let raw = try reader.readBytes(Int(blockSize), end: blockEnd)
                         var dr = DescriptorReader(bytes: raw)
                         if let desc = try? dr.readVersionAndDescriptor() {
                             walkMediaDescriptor(desc: desc, carrier: "PxSc")
                         } else {
-                            issues.append("unreadable-pxsc-descriptor")
+                            if !issues.contains("unreadable-pxsc-descriptor") { issues.append("unreadable-pxsc-descriptor") }
                         }
                     }
                 } else if key == "Layr" || key == "Lr16" || key == "Lr32" {

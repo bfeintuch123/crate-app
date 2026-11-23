@@ -513,7 +513,7 @@ test('main.js behavioral fence: in-flight getBoundedRasterThumbnail independentl
   const imgPath = path.join(dir, 'hero.png');
   fs.writeFileSync(imgPath, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
 
-  async function runScenario(invalidateFn) {
+  async function runScenario(invalidateFn, { expectPublished = false } = {}) {
     let resolveThumb;
     let notifyInFlight;
     const inFlightPromise = new Promise(resolve => { notifyInFlight = resolve; });
@@ -579,11 +579,19 @@ test('main.js behavioral fence: in-flight getBoundedRasterThumbnail independentl
     invalidateFn({ ctx, setAuthed: v => { authed = v; } });
     resolveThumb({ fake: true });
     const result = await pendingThumb;
-    assert.equal(result, null);
-    assert.equal(ctx.getRasterThumbnailMemoryCacheSize(), 0);
-    assert.equal(statCacheWrites.length, 0);
+    if (expectPublished) {
+      assert.equal(result, 'data:image/png;base64,AAAA');
+      assert.equal(ctx.getRasterThumbnailMemoryCacheSize(), 1);
+      assert.equal(statCacheWrites.length, 1);
+    } else {
+      assert.equal(result, null);
+      assert.equal(ctx.getRasterThumbnailMemoryCacheSize(), 0);
+      assert.equal(statCacheWrites.length, 0);
+    }
   }
 
+  // 0. Positive control: uninterrupted thumbnail publishes to memory + SQLite stat cache
+  await runScenario(() => {}, { expectPublished: true });
   // 1. Auth guard alone (without clearing cache)
   await runScenario(({ setAuthed }) => setAuthed(false));
   // 2. Global cache generation alone (while still authorized)
@@ -652,6 +660,16 @@ test('main.js behavioral IPC coalescing: preserves valid caller over later stale
   bridge.clearAll();
   await new Promise(resolve => setTimeout(resolve, 40));
   assert.equal(emitted.length, 0, 'logout + clearAll must drop queued notifications');
+
+  // 3b. Paired caller fence: Caller A (valid token, stale account) + Caller B (stale token, valid account)
+  // must NOT cross-pair into an authorized emission (Fable paired-caller check).
+  authed = true;
+  emitted.length = 0;
+  ctx.sendProjectFileStateToRenderer('proj-ipc', 'tok-valid'); // captured under epoch 2
+  accountEpoch += 1; // invalidates Caller A's account
+  ctx.sendProjectFileStateToRenderer('proj-ipc', 'tok-stale'); // captured under epoch 3, but stale token
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(emitted.length, 0, 'valid token from stale account must not pair with valid account from stale token');
 
   // 4. Non-Electron path: if activation becomes stale during files:updated send, pendingSnap must not advance
   authed = true;
