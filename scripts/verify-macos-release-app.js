@@ -11,6 +11,8 @@ const packageJson = require('../package.json');
 const afterPack = require('./patch-helper-info-plists');
 const {
   RUNTIME_PARSER_FILES,
+  hasThinArm64ExecuteHeader,
+  inspectNativeHelperResource,
   resolveAsarPath,
   verifyPackagedAppContents,
 } = require('./verify-app-contents');
@@ -189,6 +191,38 @@ const EXTERNAL_SOURCE_BOUND_ENTRIES = Object.freeze([
     source: 'assets/icon.icns',
   }),
 ]);
+const NATIVE_HELPER_SOURCE_DIR = 'native/crate-helper';
+const NATIVE_HELPER_SOURCE_FILES = Object.freeze([
+  'main.swift',
+  'PsdParser.swift',
+  'PdfAiParser.swift',
+  'PackageOps.swift',
+  'WatchOps.swift',
+]);
+// Must stay token-for-token identical to scripts/build-native-helper.sh.
+const NATIVE_HELPER_SWIFTC_ARGS = Object.freeze([
+  '-O',
+  '-whole-module-optimization',
+  '-parse-as-library',
+  '-target',
+  'arm64-apple-macosx14.0',
+  '-lz',
+  '-framework',
+  'Foundation',
+  '-framework',
+  'CryptoKit',
+]);
+const NATIVE_HELPER_IDENTIFIER = 'crate-helper';
+
+function nativeHelperDeveloperIdRequirement(teamIdentifier) {
+  if (!/^[A-Z0-9]{10}$/u.test(String(teamIdentifier || ''))) return null;
+  return `identifier "${NATIVE_HELPER_IDENTIFIER}" and anchor apple generic and ` +
+    'certificate 1[field.1.2.840.113635.100.6.2.6] exists and ' +
+    'certificate leaf[field.1.2.840.113635.100.6.1.13] exists and ' +
+    `certificate leaf[subject.OU] = "${teamIdentifier}"`;
+}
+
+const EXPECTED_NATIVE_HELPER_REQUIREMENT = nativeHelperDeveloperIdRequirement(PUBLIC_TEAM_ID);
 const SOURCE_BOUND_ENTRY_COUNT = SOURCE_BOUND_ENTRIES.length +
   EXTERNAL_SOURCE_BOUND_ENTRIES.length;
 const EXPECTED_PACKAGED_MANIFEST_KEYS = Object.freeze([
@@ -801,6 +835,7 @@ function collectPolicyFailures(evidence, options = {}) {
   if (!evidence.bundleLayout || evidence.bundleLayout.valid !== true) {
     failures.push('Final app bundle layout contains unapproved content.');
   }
+  failures.push(...nativeHelperPolicyFailures(evidence.nativeHelper, expectedTeamId));
   const electronRuntime = evidence.electronRuntime || {};
   if (electronRuntime.valid !== true || electronRuntime.archiveVerified !== true ||
       electronRuntime.payloadMatches !== true ||
@@ -836,6 +871,25 @@ function collectPolicyFailures(evidence, options = {}) {
     }
   }
 
+  return failures;
+}
+
+function nativeHelperPolicyFailures(nativeHelper, expectedTeamId) {
+  const helper = isPlainObject(nativeHelper) ? nativeHelper : {};
+  const failures = [];
+  if (helper.resourceValid !== true) {
+    failures.push('Bundled native helper is missing or not approved.');
+  }
+  if (!hasApprovedNestedSignature(helper.signature, NATIVE_HELPER_IDENTIFIER, expectedTeamId) ||
+      helper.strictRequirementValid !== true) {
+    failures.push('Bundled native helper signature policy changed.');
+  }
+  if (!hasExactTrueKeys(helper.entitlements, EXPECTED_HELPER_ENTITLEMENTS)) {
+    failures.push('Bundled native helper entitlements do not match the approved policy.');
+  }
+  if (helper.sourceBound !== true) {
+    failures.push('Bundled native helper does not match the committed Swift sources.');
+  }
   return failures;
 }
 
@@ -893,6 +947,9 @@ function buildPrivacySafeProof(evidence, failures, options = {}) {
         ? 'pass'
         : 'fail',
       electronRuntime: electronRuntime.valid === true ? 'pass' : 'fail',
+      nativeHelper: nativeHelperPolicyFailures(evidence.nativeHelper, expectedTeamId).length === 0
+        ? 'pass'
+        : 'fail',
       sourceRevision: notarization.required === true
         ? (sourceBinding.releaseSourceClean === true &&
           sourceBinding.revision === options.expectedRevision ? 'pass' : 'fail')
@@ -1212,13 +1269,16 @@ function inspectBundleLayout(appPath, executableName) {
       'app.asar',
       'app.asar.unpacked',
       'icon.icns',
+      'native',
     ]);
     for (const entry of resourceEntries) {
       const entryPath = path.join(resourcesPath, entry.name);
       const metadata = fs.lstatSync(entryPath);
       if (metadata.isSymbolicLink()) return { valid: false };
       if (requiredResources.has(entry.name)) {
-        const expectedType = entry.name === 'app.asar.unpacked' ? 'directory' : 'file';
+        const expectedType = entry.name === 'app.asar.unpacked' || entry.name === 'native'
+          ? 'directory'
+          : 'file';
         if ((expectedType === 'directory' && !metadata.isDirectory()) ||
             (expectedType === 'file' && !metadata.isFile())) {
           return { valid: false };
@@ -1228,6 +1288,9 @@ function inspectBundleLayout(appPath, executableName) {
           if (!metadataBytes || !metadataBytes.equals(EXPECTED_APP_UPDATE_METADATA)) {
             return { valid: false };
           }
+        }
+        if (entry.name === 'native' && inspectNativeHelperResource(resourcesPath).valid !== true) {
+          return { valid: false };
         }
         requiredResources.delete(entry.name);
         continue;
@@ -2854,6 +2917,168 @@ function canonicalNativeDigestFromBytes(bytes, commandRunner = runCommand) {
   }
 }
 
+function compileNativeHelper(sourceBytesByName, { commandRunner = runCommand } = {}) {
+  if (!isPlainObject(sourceBytesByName) ||
+      !hasExactValues(Object.keys(sourceBytesByName).sort(), [...NATIVE_HELPER_SOURCE_FILES].sort()) ||
+      !NATIVE_HELPER_SOURCE_FILES.every(name => Buffer.isBuffer(sourceBytesByName[name]))) {
+    return null;
+  }
+  let temporaryRoot = null;
+  try {
+    temporaryRoot = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'crate-native-helper-build-'));
+    fs.chmodSync(temporaryRoot, 0o700);
+    const sourcePaths = NATIVE_HELPER_SOURCE_FILES.map(name => {
+      const sourcePath = path.join(temporaryRoot, name);
+      fs.writeFileSync(sourcePath, sourceBytesByName[name], { flag: 'wx', mode: 0o600 });
+      return sourcePath;
+    });
+    const outputDirectory = path.join(temporaryRoot, 'out');
+    fs.mkdirSync(outputDirectory, { mode: 0o700 });
+    const outputPath = path.join(outputDirectory, NATIVE_HELPER_IDENTIFIER);
+    const result = commandRunner('/usr/bin/swiftc', [
+      ...NATIVE_HELPER_SWIFTC_ARGS,
+      ...sourcePaths,
+      '-o',
+      outputPath,
+    ], { cwd: temporaryRoot });
+    if (!result || result.ok !== true) return null;
+    const bytes = readStableRegularFile(outputPath);
+    return bytes && hasThinArm64ExecuteHeader(bytes) ? bytes : null;
+  } catch (error) {
+    return null;
+  } finally {
+    if (temporaryRoot) fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+}
+
+function realDirectoryInside(rootPath, relativePath) {
+  let current = rootPath;
+  for (const segment of relativePath.split('/')) {
+    current = path.join(current, segment);
+    const metadata = fs.lstatSync(current);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) return false;
+  }
+  return true;
+}
+
+// Reads each committed Swift source only when the tree lists exactly the approved
+// files as regular blobs and the checkout bytes hash to those exact blob OIDs.
+function readCommittedNativeHelperSources(sourceRoot, revision, commandRunner) {
+  if (!/^[a-f0-9]{40}$/u.test(String(revision || ''))) return null;
+  try {
+    if (!realDirectoryInside(sourceRoot, NATIVE_HELPER_SOURCE_DIR)) return null;
+    const listing = gitCommand(
+      commandRunner,
+      ['ls-tree', '--name-only', revision, '--', `${NATIVE_HELPER_SOURCE_DIR}/`],
+      { cwd: sourceRoot }
+    );
+    if (!listing.ok) return null;
+    const listedNames = String(listing.stdout || '').split('\n').filter(Boolean).map(line => (
+      line.startsWith(`${NATIVE_HELPER_SOURCE_DIR}/`)
+        ? line.slice(NATIVE_HELPER_SOURCE_DIR.length + 1)
+        : null
+    ));
+    if (!hasExactValues(listedNames.sort(), [...NATIVE_HELPER_SOURCE_FILES].sort())) return null;
+    const sourceBytesByName = {};
+    for (const name of NATIVE_HELPER_SOURCE_FILES) {
+      const entry = `${NATIVE_HELPER_SOURCE_DIR}/${name}`;
+      const treeEntry = gitCommand(commandRunner, ['ls-tree', revision, '--', entry], {
+        cwd: sourceRoot,
+      });
+      const treeMatch = treeEntry.ok && String(treeEntry.stdout || '').trim().match(
+        /^100644 blob ([a-f0-9]{40})\t(.+)$/u
+      );
+      const bytes = readStableRegularFile(path.join(sourceRoot, ...entry.split('/')));
+      const sourceObject = bytes && gitCommand(commandRunner, ['hash-object', '--stdin'], {
+        cwd: sourceRoot,
+        input: bytes,
+      });
+      if (!treeMatch || treeMatch[2] !== entry || !sourceObject || !sourceObject.ok ||
+          String(sourceObject.stdout || '').trim().toLowerCase() !== treeMatch[1]) {
+        return null;
+      }
+      sourceBytesByName[name] = bytes;
+    }
+    return sourceBytesByName;
+  } catch (error) {
+    return null;
+  }
+}
+
+function invalidNativeHelperEvidence() {
+  return {
+    resourceValid: false,
+    signature: null,
+    strictRequirementValid: false,
+    entitlements: null,
+    sourceBound: false,
+  };
+}
+
+function collectNativeHelperEvidence(
+  appPath,
+  sourceRoot,
+  revision,
+  commandRunner = runCommand,
+  options = {}
+) {
+  if (Object.hasOwn(options, 'nativeHelperEvidence') && options.nativeHelperEvidence !== undefined) {
+    return isPlainObject(options.nativeHelperEvidence)
+      ? { ...options.nativeHelperEvidence }
+      : options.nativeHelperEvidence;
+  }
+  const evidence = invalidNativeHelperEvidence();
+  const resourcesPath = path.join(appPath, 'Contents', 'Resources');
+  const helperPath = path.join(resourcesPath, 'native', NATIVE_HELPER_IDENTIFIER);
+  const resource = inspectNativeHelperResource(resourcesPath);
+  if (resource.valid !== true) return evidence;
+  evidence.resourceValid = true;
+  try {
+    evidence.signature = readNestedSignature(
+      helperPath,
+      NATIVE_HELPER_IDENTIFIER,
+      options.expectedTeamId,
+      commandRunner
+    );
+  } catch (error) {
+    evidence.signature = null;
+  }
+  const requirement = nativeHelperDeveloperIdRequirement(options.expectedTeamId);
+  evidence.strictRequirementValid = Boolean(requirement) && commandRunner('/usr/bin/codesign', [
+    '--verify',
+    '--strict',
+    '--verbose=4',
+    `-R=${requirement}`,
+    helperPath,
+  ]).ok === true;
+  try {
+    evidence.entitlements = readSignedEntitlements(helperPath, commandRunner);
+  } catch (error) {
+    evidence.entitlements = null;
+  }
+  const sourceBytesByName = readCommittedNativeHelperSources(sourceRoot, revision, commandRunner);
+  if (sourceBytesByName) {
+    const compiler = options.nativeHelperCompiler || compileNativeHelper;
+    let rebuiltBytes = null;
+    try {
+      rebuiltBytes = compiler(sourceBytesByName, { commandRunner });
+    } catch (error) {
+      rebuiltBytes = null;
+    }
+    const packagedDigest = canonicalNativeDigestFromBytes(resource.bytes, commandRunner);
+    const rebuiltDigest = Buffer.isBuffer(rebuiltBytes)
+      ? canonicalNativeDigestFromBytes(rebuiltBytes, commandRunner)
+      : null;
+    evidence.sourceBound = Boolean(packagedDigest && rebuiltDigest && packagedDigest === rebuiltDigest);
+  }
+  const finalResource = inspectNativeHelperResource(resourcesPath);
+  if (finalResource.valid !== true || !finalResource.bytes.equals(resource.bytes)) {
+    evidence.resourceValid = false;
+    evidence.sourceBound = false;
+  }
+  return evidence;
+}
+
 function packagePayloadMatches(expectedPackage, actualFiles, options = {}) {
   const expectedEntries = [...expectedPackage.files.keys()].sort();
   const actualEntries = [...actualFiles.keys()].sort();
@@ -3418,6 +3643,17 @@ async function collectReleaseEvidenceFromSnapshot(appPath, options = {}) {
     authenticatedNativeEvidence,
     sourceRoot,
   });
+  let nativeHelper = collectNativeHelperEvidence(
+    resolvedAppPath,
+    sourceRoot,
+    sourceBinding.revision,
+    commandRunner,
+    {
+      expectedTeamId,
+      nativeHelperCompiler: options.nativeHelperCompiler,
+      nativeHelperEvidence: options.nativeHelperEvidence,
+    }
+  );
   const asarFileIntegrity = verifyAsarFileIntegrity(asar, asarPath, {
     authenticatedNativeEvidence,
   });
@@ -3447,6 +3683,7 @@ async function collectReleaseEvidenceFromSnapshot(appPath, options = {}) {
       valid: false,
       payloadMatches: false,
     };
+    if (isPlainObject(nativeHelper)) nativeHelper = { ...nativeHelper, sourceBound: false };
   }
 
   const notarization = {
@@ -3549,6 +3786,7 @@ async function collectReleaseEvidenceFromSnapshot(appPath, options = {}) {
     bundleLayout,
     packagedContents,
     sourceBinding,
+    nativeHelper,
     electronRuntime,
     notarization,
   };
@@ -3779,13 +4017,21 @@ module.exports = {
   EXPECTED_HELPER_INFO_KEYS,
   EXPECTED_MAIN_INFO_KEYS,
   EXPECTED_MAIN_ENTITLEMENTS,
+  EXPECTED_NATIVE_HELPER_REQUIREMENT,
   EXPECTED_NESTED_BUNDLE_NAMES,
   EXPECTED_PRIVACY_USAGE_KEYS,
+  NATIVE_HELPER_IDENTIFIER,
+  NATIVE_HELPER_SOURCE_DIR,
+  NATIVE_HELPER_SOURCE_FILES,
+  NATIVE_HELPER_SWIFTC_ARGS,
   PUBLIC_APP_ID,
   PUBLIC_TEAM_ID,
   SAFE_GIT_ARGUMENT_PREFIX,
   SOURCE_BOUND_ENTRIES,
   authenticateVerifierToolchain,
+  canonicalNativeDigestFromBytes,
+  collectNativeHelperEvidence,
+  compileNativeHelper,
   collectElectronRuntimeEvidence,
   collectReachableProductionLockPaths,
   collectReachableVerifierToolLockPaths,
@@ -3809,6 +4055,7 @@ module.exports = {
   parseCodeSignatureMetadata,
   runCli,
   safeCliErrorMessage,
+  nativeHelperDeveloperIdRequirement,
   verifyAsarFileIntegrity,
   verifierSourceMatchesExpectedRevision,
 };

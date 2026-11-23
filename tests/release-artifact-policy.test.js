@@ -27,13 +27,21 @@ const {
   EXPECTED_HELPER_INFO_KEYS,
   EXPECTED_MAIN_INFO_KEYS,
   EXPECTED_MAIN_ENTITLEMENTS,
+  EXPECTED_NATIVE_HELPER_REQUIREMENT,
   EXPECTED_PRIVACY_USAGE_KEYS,
+  NATIVE_HELPER_IDENTIFIER,
+  NATIVE_HELPER_SOURCE_DIR,
+  NATIVE_HELPER_SOURCE_FILES,
+  NATIVE_HELPER_SWIFTC_ARGS,
   PUBLIC_APP_ID,
   PUBLIC_TEAM_ID,
   SAFE_GIT_ARGUMENT_PREFIX,
   SOURCE_BOUND_ENTRIES,
   authenticateVerifierToolchain,
+  canonicalNativeDigestFromBytes,
   collectElectronRuntimeEvidence,
+  collectNativeHelperEvidence,
+  compileNativeHelper,
   collectReachableProductionLockPaths,
   collectReachableVerifierToolLockPaths,
   collectReleaseEvidence,
@@ -46,6 +54,7 @@ const {
   installedPackageMatchesLockArchive,
   inspectAppArchitectures,
   inspectBundleLayout,
+  nativeHelperDeveloperIdRequirement,
   npmCacheContentPath,
   parseCliArguments,
   parseCodeSignatureMetadata,
@@ -61,6 +70,7 @@ const {
   runBootstrap,
   sourceFilesMatchRevision,
 } = require('../scripts/run-macos-release-proof');
+const { verifyPackagedAppContents } = require('../scripts/verify-app-contents');
 
 const ROOT = path.join(__dirname, '..');
 const SAFE_INTEGRITY = `sha512-${Buffer.alloc(64, 7).toString('base64')}`;
@@ -301,10 +311,25 @@ function createFixtureGitRunner(sourceRoot, revision = 'b'.repeat(40), options =
     if (args[0] === 'status') {
       return { ok: true, stdout: options.status || '', stderr: '' };
     }
+    if (args[0] === 'ls-tree' && args[1] === '--name-only') {
+      const directory = args[args.length - 1].replace(/\/$/u, '');
+      const names = fs.readdirSync(path.join(canonicalRoot, ...directory.split('/')))
+        .filter(name => !(options.omittedTreeNames || []).includes(name))
+        .concat(options.extraTreeNames || [])
+        .sort();
+      return {
+        ok: true,
+        stdout: names.map(name => `${directory}/${name}\n`).join(''),
+        stderr: '',
+      };
+    }
     if (args[0] === 'ls-tree') {
       const entry = args[args.length - 1];
-      const bytes = fs.readFileSync(path.join(canonicalRoot, ...entry.split('/')));
-      const mode = options.symlinkEntry === entry ? '120000' : '100644';
+      const committedBytes = options.committedBytes && options.committedBytes[entry];
+      const bytes = committedBytes || fs.readFileSync(path.join(canonicalRoot, ...entry.split('/')));
+      const mode = options.symlinkEntry === entry
+        ? '120000'
+        : options.executableEntry === entry ? '100755' : '100644';
       return {
         ok: true,
         stdout: `${mode} blob ${gitBlobOid(bytes)}\t${entry}\n`,
@@ -588,6 +613,35 @@ function safeNestedBundle(name) {
   };
 }
 
+// Synthetic header bytes only; never executed.
+function syntheticNativeHelperBytes(marker = 'packaged') {
+  const bytes = Buffer.alloc(96, 0);
+  bytes.writeUInt32LE(0xfeedfacf, 0);
+  bytes.writeUInt32LE(0x0100000c, 4);
+  bytes.writeUInt32LE(0, 8);
+  bytes.writeUInt32LE(2, 12);
+  Buffer.from(marker, 'utf8').copy(bytes, 32);
+  return bytes;
+}
+
+function writeNativeHelperResource(resourcesPath, bytes = syntheticNativeHelperBytes(), mode = 0o755) {
+  const helperPath = path.join(resourcesPath, 'native', 'crate-helper');
+  fs.mkdirSync(path.dirname(helperPath), { recursive: true });
+  fs.writeFileSync(helperPath, bytes);
+  fs.chmodSync(helperPath, mode);
+  return helperPath;
+}
+
+function safeNativeHelper() {
+  return {
+    resourceValid: true,
+    signature: safeNestedSignature('crate-helper'),
+    strictRequirementValid: true,
+    entitlements: Object.fromEntries(EXPECTED_HELPER_ENTITLEMENTS.map(key => [key, true])),
+    sourceBound: true,
+  };
+}
+
 function safeEvidence(version = packageJson.version) {
   return {
     artifactPath: '/Users/example/private-builds/Crate.app',
@@ -646,6 +700,7 @@ function safeEvidence(version = packageJson.version) {
       revision: 'b'.repeat(40),
       entryCount: SOURCE_BOUND_ENTRIES.length + EXTERNAL_SOURCE_BOUND_ENTRIES.length,
     },
+    nativeHelper: safeNativeHelper(),
     electronRuntime: {
       valid: true,
       lockedVersion: '42.9.0',
@@ -699,6 +754,7 @@ test('signed release evidence passes only with the complete security policy', ()
   assert.equal(result.proof.counts.helperApps, 4);
   assert.equal(result.proof.counts.nestedCodeBundles, 8);
   assert.equal(result.proof.checks.architecture, 'pass');
+  assert.equal(result.proof.checks.nativeHelper, 'pass');
   assert.equal(result.proof.counts.machOBinaries, 12);
 });
 
@@ -824,6 +880,7 @@ test('bundle layout requires the configured executable and exact resource entry 
       'updaterCacheDirName: crate-app-updater\n'
     );
     fs.writeFileSync(path.join(contentsPath, 'PkgInfo'), 'APPL????');
+    writeNativeHelperResource(path.join(contentsPath, 'Resources'));
     assert.equal(inspectBundleLayout(appPath, 'Crate').valid, true);
 
     fs.rmSync(path.join(contentsPath, 'CodeResources'));
@@ -883,9 +940,420 @@ test('bundle layout requires the configured executable and exact resource entry 
     assert.equal(inspectBundleLayout(appPath, 'Crate').valid, false);
     fs.rmSync(unexpectedResourcePath);
 
+    const nativePath = path.join(contentsPath, 'Resources', 'native');
+    const helperPath = path.join(nativePath, 'crate-helper');
+    const resetNative = () => {
+      fs.rmSync(nativePath, { recursive: true, force: true });
+      writeNativeHelperResource(path.join(contentsPath, 'Resources'));
+      assert.equal(inspectBundleLayout(appPath, 'Crate').valid, true);
+    };
+    const fatHelper = syntheticNativeHelperBytes();
+    fatHelper.writeUInt32BE(0xcafebabe, 0);
+    const x86Helper = syntheticNativeHelperBytes();
+    x86Helper.writeUInt32LE(0x01000007, 4);
+    const arm64eHelper = syntheticNativeHelperBytes();
+    arm64eHelper.writeUInt32LE(2, 8);
+    const dylibHelper = syntheticNativeHelperBytes();
+    dylibHelper.writeUInt32LE(6, 12);
+    for (const [label, mutate] of [
+      ['missing native', () => fs.rmSync(nativePath, { recursive: true })],
+      ['missing helper', () => fs.rmSync(helperPath)],
+      ['native file', () => {
+        fs.rmSync(nativePath, { recursive: true });
+        fs.writeFileSync(nativePath, syntheticNativeHelperBytes());
+      }],
+      ['extra sibling file', () => fs.writeFileSync(path.join(nativePath, 'extra'), 'fixture')],
+      ['extra sibling directory', () => fs.mkdirSync(path.join(nativePath, 'extra'))],
+      ['Finder metadata sibling', () => fs.writeFileSync(path.join(nativePath, '.DS_Store'), 'fixture')],
+      ['symlinked native', () => {
+        const realNative = path.join(fixtureRoot, 'real-native');
+        fs.renameSync(nativePath, realNative);
+        fs.symlinkSync(realNative, nativePath);
+      }],
+      ['symlinked helper', () => {
+        const realHelper = path.join(fixtureRoot, 'real-helper');
+        fs.renameSync(helperPath, realHelper);
+        fs.symlinkSync(realHelper, helperPath);
+      }],
+      ['helper directory', () => {
+        fs.rmSync(helperPath);
+        fs.mkdirSync(helperPath);
+      }],
+      ['mode 0644', () => fs.chmodSync(helperPath, 0o644)],
+      ['mode 04755', () => fs.chmodSync(helperPath, 0o4755)],
+      ['x86_64 helper', () => fs.writeFileSync(helperPath, x86Helper)],
+      ['fat helper', () => fs.writeFileSync(helperPath, fatHelper)],
+      ['arm64e helper', () => fs.writeFileSync(helperPath, arm64eHelper)],
+      ['dylib helper', () => fs.writeFileSync(helperPath, dylibHelper)],
+      ['script helper', () => fs.writeFileSync(helperPath, '#!/bin/sh\nexit 0\n'.padEnd(64, ' '))],
+      ['empty helper', () => fs.writeFileSync(helperPath, '')],
+      ['31-byte helper', () => fs.writeFileSync(helperPath, syntheticNativeHelperBytes().subarray(0, 31))],
+    ]) {
+      mutate();
+      assert.equal(inspectBundleLayout(appPath, 'Crate').valid, false, label);
+      fs.rmSync(path.join(fixtureRoot, 'real-native'), { recursive: true, force: true });
+      fs.rmSync(path.join(fixtureRoot, 'real-helper'), { force: true });
+      resetNative();
+    }
+
     assert.equal(inspectBundleLayout(appPath, 'Renamed').valid, false);
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+const NATIVE_HELPER_FAILURES = Object.freeze({
+  resource: 'Bundled native helper is missing or not approved.',
+  signature: 'Bundled native helper signature policy changed.',
+  entitlements: 'Bundled native helper entitlements do not match the approved policy.',
+  source: 'Bundled native helper does not match the committed Swift sources.',
+});
+
+test('release evidence requires the source-bound Developer ID native helper', () => {
+  const passing = evaluateReleaseEvidence(safeEvidence(), releaseOptions());
+  assert.equal(passing.ok, true);
+  assert.equal(passing.proof.checks.nativeHelper, 'pass');
+
+  for (const [label, mutate, expected] of [
+    ['resource rejected', helper => { helper.resourceValid = false; }, [NATIVE_HELPER_FAILURES.resource]],
+    ['invalid signature', helper => { helper.signature.valid = false; }, [NATIVE_HELPER_FAILURES.signature]],
+    ['wrong identifier', helper => { helper.signature.identifier = 'com.crate.app.helper'; }, [NATIVE_HELPER_FAILURES.signature]],
+    ['wrong team', helper => { helper.signature.teamIdentifier = 'OTHERTEAM1'; }, [NATIVE_HELPER_FAILURES.signature]],
+    ['missing Developer ID authority', helper => {
+      helper.signature.authorities = ['Apple Development: Local Developer'];
+    }, [NATIVE_HELPER_FAILURES.signature]],
+    ['no hardened runtime', helper => { helper.signature.hardenedRuntime = false; }, [NATIVE_HELPER_FAILURES.signature]],
+    ['no secure timestamp', helper => { helper.signature.timestamped = false; }, [NATIVE_HELPER_FAILURES.signature]],
+    ['missing code fingerprint', helper => { delete helper.signature.codeDirectoryHash; }, [NATIVE_HELPER_FAILURES.signature]],
+    ['missing signature', helper => { helper.signature = null; }, [NATIVE_HELPER_FAILURES.signature]],
+    ['strict requirement rejected', helper => { helper.strictRequirementValid = false; }, [NATIVE_HELPER_FAILURES.signature]],
+    ['strict requirement truthy non-boolean', helper => { helper.strictRequirementValid = 'true'; }, [NATIVE_HELPER_FAILURES.signature]],
+    ['missing entitlement', helper => {
+      delete helper.entitlements['com.apple.security.cs.allow-jit'];
+    }, [NATIVE_HELPER_FAILURES.entitlements]],
+    ['extra entitlement', helper => {
+      helper.entitlements['com.apple.security.automation.apple-events'] = true;
+    }, [NATIVE_HELPER_FAILURES.entitlements]],
+    ['false entitlement value', helper => {
+      helper.entitlements['com.apple.security.cs.allow-jit'] = false;
+    }, [NATIVE_HELPER_FAILURES.entitlements]],
+    ['missing entitlements', helper => { helper.entitlements = null; }, [NATIVE_HELPER_FAILURES.entitlements]],
+    ['not source bound', helper => { helper.sourceBound = false; }, [NATIVE_HELPER_FAILURES.source]],
+    ['source bound truthy non-boolean', helper => { helper.sourceBound = 1; }, [NATIVE_HELPER_FAILURES.source]],
+  ]) {
+    const evidence = safeEvidence();
+    mutate(evidence.nativeHelper);
+    const result = evaluateReleaseEvidence(evidence, releaseOptions());
+    assert.equal(result.ok, false, label);
+    assert.deepEqual(result.failures, expected, label);
+    assert.equal(result.proof.checks.nativeHelper, 'fail', label);
+    assert.equal(result.proof.releaseReady, false, label);
+  }
+
+  for (const [label, value] of [
+    ['absent', undefined],
+    ['null', null],
+    ['string', 'valid'],
+    ['array', [safeNativeHelper()]],
+  ]) {
+    const evidence = safeEvidence();
+    if (value === undefined) delete evidence.nativeHelper;
+    else evidence.nativeHelper = value;
+    const result = evaluateReleaseEvidence(evidence, releaseOptions());
+    assert.deepEqual(result.failures, [
+      NATIVE_HELPER_FAILURES.resource,
+      NATIVE_HELPER_FAILURES.signature,
+      NATIVE_HELPER_FAILURES.entitlements,
+      NATIVE_HELPER_FAILURES.source,
+    ], label);
+    assert.equal(result.proof.checks.nativeHelper, 'fail', label);
+  }
+
+  const hostile = safeEvidence();
+  hostile.nativeHelper.signature.identifier = '/Users/private/native/crate-helper';
+  const hostileProof = JSON.stringify(evaluateReleaseEvidence(hostile, releaseOptions()).proof);
+  assert.equal(hostileProof.includes('/Users/private'), false);
+  assert.equal(hostileProof.includes('Private Signer Name'), false);
+});
+
+test('native helper Developer ID requirement pins the identifier, Apple anchor, Developer ID intermediate, and team', () => {
+  assert.equal(NATIVE_HELPER_IDENTIFIER, 'crate-helper');
+  assert.equal(
+    EXPECTED_NATIVE_HELPER_REQUIREMENT,
+    'identifier "crate-helper" and anchor apple generic and ' +
+      'certificate 1[field.1.2.840.113635.100.6.2.6] exists and ' +
+      'certificate leaf[field.1.2.840.113635.100.6.1.13] exists and ' +
+      'certificate leaf[subject.OU] = "YY7WDMUFWJ"'
+  );
+  assert.equal(nativeHelperDeveloperIdRequirement(PUBLIC_TEAM_ID), EXPECTED_NATIVE_HELPER_REQUIREMENT);
+  assert.equal(
+    nativeHelperDeveloperIdRequirement('ABCDE12345').endsWith('certificate leaf[subject.OU] = "ABCDE12345"'),
+    true
+  );
+  for (const invalid of ['', 'yy7wdmufwj', 'TOO-SHORT', 'YY7WDMUFWJ" or true', null]) {
+    assert.equal(nativeHelperDeveloperIdRequirement(invalid), null);
+  }
+});
+
+function nativeHelperSourceFixture(fixtureRoot) {
+  const sourceRoot = path.join(fixtureRoot, 'source');
+  const sourceBytes = {};
+  for (const name of NATIVE_HELPER_SOURCE_FILES) {
+    const sourcePath = path.join(sourceRoot, ...NATIVE_HELPER_SOURCE_DIR.split('/'), name);
+    fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+    sourceBytes[name] = Buffer.from(`// synthetic Swift source ${name}\n`);
+    fs.writeFileSync(sourcePath, sourceBytes[name]);
+  }
+  const appPath = path.join(fixtureRoot, 'Crate.app');
+  const packagedBytes = syntheticNativeHelperBytes('packaged-helper');
+  const helperPath = writeNativeHelperResource(
+    path.join(appPath, 'Contents', 'Resources'),
+    packagedBytes
+  );
+  return { appPath, helperPath, packagedBytes, sourceBytes, sourceRoot };
+}
+
+function nativeHelperCommandRunner(sourceRoot, gitOptions = {}, behavior = {}) {
+  const gitRunner = createFixtureGitRunner(sourceRoot, 'b'.repeat(40), gitOptions);
+  const calls = [];
+  const runner = (command, args, options = {}) => {
+    calls.push({ command, args: [...args] });
+    if (command === '/usr/bin/git') return gitRunner(command, args, options);
+    if (command === '/usr/bin/codesign' && args[0] === '-dv') {
+      return { ok: true, stdout: '', stderr: signedMetadata(NATIVE_HELPER_IDENTIFIER, 'e') };
+    }
+    if (command === '/usr/bin/codesign' && args.includes('--entitlements')) {
+      return {
+        ok: true,
+        stdout: '<?xml version="1.0"?><plist><dict><key>helper-entitlements</key><true/></dict></plist>',
+        stderr: '',
+      };
+    }
+    if (command === '/usr/bin/codesign' && behavior.rejectStrictRequirement &&
+        args.includes(`-R=${EXPECTED_NATIVE_HELPER_REQUIREMENT}`)) {
+      return { ok: false, stdout: '', stderr: '' };
+    }
+    if (command === '/usr/bin/codesign' || command === '/usr/bin/strip') {
+      return { ok: true, stdout: '', stderr: '' };
+    }
+    if (command === '/usr/bin/plutil' && options.input) {
+      return {
+        ok: true,
+        stdout: JSON.stringify(Object.fromEntries(EXPECTED_HELPER_ENTITLEMENTS.map(key => [key, true]))),
+        stderr: '',
+      };
+    }
+    return { ok: false, stdout: '', stderr: '' };
+  };
+  return { calls, runner };
+}
+
+test('native helper evidence binds packaged bytes to a rebuild of the exact committed Swift blobs', () => {
+  const fixtureRoot = fs.mkdtempSync('/tmp/crate-native-evidence-');
+  try {
+    const fixture = nativeHelperSourceFixture(fixtureRoot);
+    const canonicalSourceRoot = fs.realpathSync(fixture.sourceRoot);
+    const revision = 'b'.repeat(40);
+    const compilerCalls = [];
+    const matchingCompiler = (sources, options) => {
+      compilerCalls.push({ sources, options });
+      return Buffer.from(fixture.packagedBytes);
+    };
+    const collect = (gitOptions = {}, options = {}, behavior = {}) => {
+      const { calls, runner } = nativeHelperCommandRunner(canonicalSourceRoot, gitOptions, behavior);
+      const evidence = collectNativeHelperEvidence(
+        fixture.appPath,
+        canonicalSourceRoot,
+        options.revision === undefined ? revision : options.revision,
+        runner,
+        {
+          expectedTeamId: PUBLIC_TEAM_ID,
+          nativeHelperCompiler: Object.hasOwn(options, 'compiler') ? options.compiler : matchingCompiler,
+        }
+      );
+      return { calls, evidence, runner };
+    };
+
+    const accepted = collect();
+    assert.equal(accepted.evidence.resourceValid, true);
+    assert.equal(accepted.evidence.strictRequirementValid, true);
+    assert.equal(accepted.evidence.sourceBound, true);
+    assert.equal(accepted.evidence.signature.valid, true);
+    assert.equal(accepted.evidence.signature.identifier, NATIVE_HELPER_IDENTIFIER);
+    assert.deepEqual(
+      Object.keys(accepted.evidence.entitlements).sort(),
+      [...EXPECTED_HELPER_ENTITLEMENTS]
+    );
+    const acceptedReport = evaluateReleaseEvidence(
+      { ...safeEvidence(), nativeHelper: accepted.evidence },
+      releaseOptions()
+    );
+    assert.deepEqual(acceptedReport.failures, []);
+    assert.equal(compilerCalls.length, 1);
+    assert.deepEqual(Object.keys(compilerCalls[0].sources), [...NATIVE_HELPER_SOURCE_FILES]);
+    for (const name of NATIVE_HELPER_SOURCE_FILES) {
+      assert.equal(compilerCalls[0].sources[name].equals(fixture.sourceBytes[name]), true);
+    }
+    assert.equal(compilerCalls[0].options.commandRunner, accepted.runner);
+    assert.deepEqual(
+      accepted.calls.filter(call => call.args.includes(`-R=${EXPECTED_NATIVE_HELPER_REQUIREMENT}`)),
+      [{
+        command: '/usr/bin/codesign',
+        args: ['--verify', '--strict', '--verbose=4', `-R=${EXPECTED_NATIVE_HELPER_REQUIREMENT}`, fixture.helperPath],
+      }]
+    );
+    const listingCall = accepted.calls.find(call => call.command === '/usr/bin/git' &&
+      call.args.includes('--name-only'));
+    assert.deepEqual(listingCall.args, [
+      ...SAFE_GIT_ARGUMENT_PREFIX,
+      'ls-tree',
+      '--name-only',
+      revision,
+      '--',
+      `${NATIVE_HELPER_SOURCE_DIR}/`,
+    ]);
+
+    const strictRejected = collect({}, {}, { rejectStrictRequirement: true });
+    assert.equal(strictRejected.evidence.strictRequirementValid, false);
+    assert.equal(strictRejected.evidence.sourceBound, true);
+
+    compilerCalls.length = 0;
+    const sourceEntry = `${NATIVE_HELPER_SOURCE_DIR}/main.swift`;
+    for (const [label, gitOptions, options] of [
+      ['changed source byte', {
+        committedBytes: { [sourceEntry]: Buffer.from('// synthetic Swift source main.swifT\n') },
+      }, {}],
+      ['extra tree entry', { extraTreeNames: ['Extra.swift'] }, {}],
+      ['missing tree entry', { omittedTreeNames: ['WatchOps.swift'] }, {}],
+      ['symlink tree entry', { symlinkEntry: sourceEntry }, {}],
+      ['executable tree entry', { executableEntry: sourceEntry }, {}],
+      ['invalid revision', {}, { revision: '' }],
+    ]) {
+      const result = collect(gitOptions, options);
+      assert.equal(result.evidence.resourceValid, true, label);
+      assert.equal(result.evidence.sourceBound, false, label);
+    }
+    assert.equal(compilerCalls.length, 0);
+
+    for (const [label, compiler] of [
+      ['null compiler result', () => null],
+      ['different rebuilt bytes', () => syntheticNativeHelperBytes('different-helper')],
+      ['throwing compiler', () => { throw new Error('synthetic compiler failure'); }],
+      ['non-buffer compiler result', () => 'packaged-helper'],
+    ]) {
+      assert.equal(collect({}, { compiler }).evidence.sourceBound, false, label);
+    }
+
+    const extraSourcePath = path.join(canonicalSourceRoot, NATIVE_HELPER_SOURCE_DIR, 'Extra.swift');
+    fs.writeFileSync(extraSourcePath, '// synthetic extra source\n');
+    assert.equal(collect().evidence.sourceBound, false);
+    fs.rmSync(extraSourcePath);
+
+    const sourceDirectory = path.join(canonicalSourceRoot, ...NATIVE_HELPER_SOURCE_DIR.split('/'));
+    const realSourceDirectory = path.join(fixtureRoot, 'real-swift-sources');
+    fs.renameSync(sourceDirectory, realSourceDirectory);
+    fs.symlinkSync(realSourceDirectory, sourceDirectory);
+    assert.equal(collect().evidence.sourceBound, false);
+    fs.unlinkSync(sourceDirectory);
+    fs.renameSync(realSourceDirectory, sourceDirectory);
+    assert.equal(collect().evidence.sourceBound, true);
+
+    fs.chmodSync(fixture.helperPath, 0o644);
+    const rejectedResource = collect();
+    assert.deepEqual(rejectedResource.evidence, {
+      resourceValid: false,
+      signature: null,
+      strictRequirementValid: false,
+      entitlements: null,
+      sourceBound: false,
+    });
+    assert.equal(rejectedResource.calls.length, 0);
+
+    const injected = { ...safeNativeHelper(), sourceBound: false };
+    const injectedEvidence = collectNativeHelperEvidence(fixture.appPath, canonicalSourceRoot, revision, () => {
+      throw new Error('injected evidence must not run commands');
+    }, { nativeHelperEvidence: injected });
+    assert.deepEqual(injectedEvidence, injected);
+    assert.notEqual(injectedEvidence, injected);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('native helper compiler stages exact private sources and accepts only a thin arm64 executable', () => {
+  const sources = Object.fromEntries(NATIVE_HELPER_SOURCE_FILES.map(name => [
+    name,
+    Buffer.from(`// synthetic compiler input ${name}\n`),
+  ]));
+  const observed = [];
+  const runnerWriting = output => (command, args, options) => {
+    const outputPath = args[args.length - 1];
+    const temporaryRoot = path.dirname(path.dirname(outputPath));
+    const sourcePaths = args.slice(NATIVE_HELPER_SWIFTC_ARGS.length, -2);
+    observed.push({
+      command,
+      args: [...args],
+      cwd: options && options.cwd,
+      temporaryRoot,
+      rootMode: fs.lstatSync(temporaryRoot).mode & 0o777,
+      outputDirectoryMode: fs.lstatSync(path.dirname(outputPath)).mode & 0o777,
+      sources: sourcePaths.map(sourcePath => ({
+        name: path.basename(sourcePath),
+        parent: path.dirname(sourcePath),
+        mode: fs.lstatSync(sourcePath).mode & 0o777,
+        bytes: fs.readFileSync(sourcePath),
+      })),
+    });
+    if (output === null) return { ok: false, stdout: '', stderr: '' };
+    fs.writeFileSync(outputPath, output);
+    return { ok: true, stdout: '', stderr: '' };
+  };
+
+  const executable = syntheticNativeHelperBytes('compiled');
+  const compiled = compileNativeHelper(sources, { commandRunner: runnerWriting(executable) });
+  assert.equal(Buffer.isBuffer(compiled) && compiled.equals(executable), true);
+  const [call] = observed;
+  assert.equal(call.command, '/usr/bin/swiftc');
+  assert.deepEqual(call.args.slice(0, NATIVE_HELPER_SWIFTC_ARGS.length), [...NATIVE_HELPER_SWIFTC_ARGS]);
+  assert.deepEqual(call.args.slice(-2), ['-o', path.join(call.temporaryRoot, 'out', 'crate-helper')]);
+  assert.equal(call.cwd, call.temporaryRoot);
+  assert.equal(call.rootMode, 0o700);
+  assert.equal(call.outputDirectoryMode, 0o700);
+  assert.deepEqual(call.sources.map(source => source.name), [...NATIVE_HELPER_SOURCE_FILES]);
+  for (const source of call.sources) {
+    assert.equal(source.parent, call.temporaryRoot);
+    assert.equal(source.mode, 0o600);
+    assert.equal(source.bytes.equals(sources[source.name]), true);
+  }
+  assert.equal(fs.existsSync(call.temporaryRoot), false);
+
+  const x86 = syntheticNativeHelperBytes('compiled');
+  x86.writeUInt32LE(0x01000007, 4);
+  for (const [label, output] of [
+    ['failed compiler', null],
+    ['x86_64 output', x86],
+    ['short output', executable.subarray(0, 31)],
+  ]) {
+    observed.length = 0;
+    assert.equal(compileNativeHelper(sources, { commandRunner: runnerWriting(output) }), null, label);
+    assert.equal(observed.length, 1, label);
+    assert.equal(fs.existsSync(observed[0].temporaryRoot), false, label);
+  }
+
+  const missing = { ...sources };
+  delete missing['WatchOps.swift'];
+  const extra = { ...sources, 'Extra.swift': Buffer.from('// extra\n') };
+  const nonBuffer = { ...sources, 'main.swift': '// string source\n' };
+  for (const [label, input] of [
+    ['missing source', missing],
+    ['extra source', extra],
+    ['non-buffer source', nonBuffer],
+    ['null input', null],
+    ['array input', [...NATIVE_HELPER_SOURCE_FILES]],
+  ]) {
+    observed.length = 0;
+    assert.equal(compileNativeHelper(input, { commandRunner: runnerWriting(executable) }), null, label);
+    assert.equal(observed.length, 0, label);
   }
 });
 
@@ -3153,6 +3621,11 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
     );
     fs.writeFileSync(path.join(contentsPath, 'PkgInfo'), 'APPL????');
     fs.chmodSync(path.join(contentsPath, 'MacOS', executableName), 0o755);
+    const nativeHelperBytes = syntheticNativeHelperBytes('collector-helper');
+    const nativeHelperPath = writeNativeHelperResource(
+      path.join(contentsPath, 'Resources'),
+      nativeHelperBytes
+    );
     const helperNames = [
       'Crate Helper.app',
       'Crate Helper (GPU).app',
@@ -3183,6 +3656,16 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
       fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
       fs.writeFileSync(sourcePath, 'fixture');
     }
+    for (const name of NATIVE_HELPER_SOURCE_FILES) {
+      const sourcePath = path.join(sourceRoot, ...NATIVE_HELPER_SOURCE_DIR.split('/'), name);
+      fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+      fs.writeFileSync(sourcePath, `// synthetic collector Swift source ${name}\n`);
+    }
+    const nativeHelperCompilations = [];
+    const nativeHelperCompiler = sources => {
+      nativeHelperCompilations.push(Object.keys(sources));
+      return Buffer.from(nativeHelperBytes);
+    };
     const sourceManifest = {
       dependencies: { 'runtime-dep': '^1.0.0' },
       description: 'safe',
@@ -3256,6 +3739,7 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
       'Mantle.framework': 'com.electron.mantle',
       'ReactiveObjC.framework': 'com.electron.reactive',
       'Squirrel.framework': 'com.github.Squirrel',
+      'crate-helper': NATIVE_HELPER_IDENTIFIER,
     };
     const gitRunner = createFixtureGitRunner(sourceRoot);
     const commandCalls = [];
@@ -3285,7 +3769,9 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
       }
       if (command === '/usr/bin/codesign' && args.includes('--entitlements')) {
         const marker = target === appPath ? 'main-entitlements' :
-          target.endsWith('.app') ? 'helper-entitlements' : 'framework-entitlements';
+          target.endsWith('.app') || target === nativeHelperPath
+            ? 'helper-entitlements'
+            : 'framework-entitlements';
         return {
           ok: true,
           stdout: `<?xml version="1.0"?><plist><dict><key>${marker}</key><true/></dict></plist>`,
@@ -3298,7 +3784,7 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
         return { ok: true, stdout: '', stderr: signedMetadata(identifier, 'd') };
       }
       if (command === '/usr/bin/codesign' || command === '/usr/sbin/spctl' ||
-          command === '/usr/bin/xcrun') {
+          command === '/usr/bin/xcrun' || command === '/usr/bin/strip') {
         return { ok: true, stdout: '', stderr: '' };
       }
       return { ok: false, stdout: '', stderr: '' };
@@ -3316,6 +3802,7 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
       createAppSnapshot: passThroughAppSnapshot,
       expectedExecutableName: executableName,
       getFuseWire: async () => fuseWire,
+      nativeHelperCompiler,
       inspectArchitectures: () => ({
         valid: true,
         expected: EXPECTED_ARCHITECTURE,
@@ -3333,6 +3820,15 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
     assert.equal(evidence.artifactStable, true);
     assert.equal(evidence.helpers.length, 4);
     assert.equal(evidence.nestedBundles.length, 4);
+    assert.deepEqual(evidence.nativeHelper.signature, {
+      valid: true,
+      ...parseCodeSignatureMetadata(signedMetadata(NATIVE_HELPER_IDENTIFIER, 'd')),
+    });
+    assert.equal(evidence.nativeHelper.resourceValid, true);
+    assert.equal(evidence.nativeHelper.strictRequirementValid, true);
+    assert.equal(evidence.nativeHelper.sourceBound, true);
+    assert.deepEqual(nativeHelperCompilations, [[...NATIVE_HELPER_SOURCE_FILES]]);
+    assert.deepEqual(evaluateReleaseEvidence(evidence, releaseOptions()).failures, []);
     assert.equal(evaluateReleaseEvidence(evidence, releaseOptions()).ok, true);
 
     const recordedCommandCallCount = commandCalls.length;
@@ -3344,6 +3840,7 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
       createAppSnapshot: passThroughAppSnapshot,
       expectedExecutableName: executableName,
       getFuseWire: async () => disabledWasmWire,
+      nativeHelperCompiler,
       inspectArchitectures: () => ({
         valid: true,
         expected: EXPECTED_ARCHITECTURE,
@@ -3369,11 +3866,18 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
       call.command === '/usr/bin/codesign' &&
       call.args.some(argument => argument.startsWith('-R=anchor apple generic'))
     ));
-    assert.equal(trustRequirementCalls.length, 10);
+    assert.equal(trustRequirementCalls.length, 11);
     assert.equal(trustRequirementCalls.every(call => call.args.some(argument => (
       argument.includes('field.1.2.840.113635.100.6.1.13') &&
       argument.includes(`subject.OU] = "${PUBLIC_TEAM_ID}"`)
     ))), true);
+    assert.deepEqual(commandCalls.filter(call => (
+      call.command === '/usr/bin/codesign' &&
+      call.args.includes(`-R=${EXPECTED_NATIVE_HELPER_REQUIREMENT}`)
+    )), [{
+      command: '/usr/bin/codesign',
+      args: ['--verify', '--strict', '--verbose=4', `-R=${EXPECTED_NATIVE_HELPER_REQUIREMENT}`, nativeHelperPath],
+    }]);
     assert.deepEqual(commandCalls.filter(call => (
       call.command === '/usr/sbin/spctl' || call.command === '/usr/bin/xcrun'
     )), [
@@ -3457,6 +3961,75 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
     assert.equal(failedTrust.failures.includes('Code signature verification failed.'), true);
     assert.equal(failedTrust.failures.includes('Helper app signature policy changed.'), true);
     assert.equal(failedTrust.failures.includes('Nested code-signature policy changed.'), true);
+    assert.equal(failedTrust.failures.includes(NATIVE_HELPER_FAILURES.signature), true);
+
+    const nativeOptions = {
+      archiveVerifier: () => true,
+      asar,
+      commandRunner,
+      createAppSnapshot: passThroughAppSnapshot,
+      expectedExecutableName: executableName,
+      getFuseWire: async () => fuseWire,
+      inspectArchitectures: () => ({
+        valid: true,
+        expected: EXPECTED_ARCHITECTURE,
+        main: [EXPECTED_ARCHITECTURE],
+        machOBinaryCount: 12,
+      }),
+      nativeHelperCompiler,
+      requireNotarization: true,
+      sourceRoot,
+      expectedRevision: 'b'.repeat(40),
+      verifyVerifierSource: () => true,
+      verifyElectronRuntime: () => electronRuntime,
+      verifyPackagedContents: () => ({ asarEntryCount: 100, unpackedEntryCount: 10 }),
+    };
+    const rebuiltMismatch = await collectReleaseEvidence(appPath, {
+      ...nativeOptions,
+      nativeHelperCompiler: () => syntheticNativeHelperBytes('different-helper'),
+    });
+    assert.equal(rebuiltMismatch.nativeHelper.sourceBound, false);
+    assert.deepEqual(
+      evaluateReleaseEvidence(rebuiltMismatch, releaseOptions()).failures,
+      [NATIVE_HELPER_FAILURES.source]
+    );
+
+    let checkoutDrifted = false;
+    const driftedCheckout = await collectReleaseEvidence(appPath, {
+      ...nativeOptions,
+      commandRunner(command, args, options) {
+        const gitArgs = normalizeFixtureGitArgs(args);
+        if (checkoutDrifted && command === '/usr/bin/git' && gitArgs[0] === 'status') {
+          return { ok: true, stdout: ` M ${NATIVE_HELPER_SOURCE_DIR}/main.swift\n`, stderr: '' };
+        }
+        return commandRunner(command, args, options);
+      },
+      nativeHelperCompiler(sources) {
+        checkoutDrifted = true;
+        return nativeHelperCompiler(sources);
+      },
+    });
+    assert.equal(checkoutDrifted, true);
+    assert.equal(driftedCheckout.nativeHelper.sourceBound, false);
+    assert.equal(driftedCheckout.sourceBinding.releaseSourceClean, false);
+    assert.equal(
+      evaluateReleaseEvidence(driftedCheckout, releaseOptions()).failures.includes(
+        NATIVE_HELPER_FAILURES.source
+      ),
+      true
+    );
+
+    fs.chmodSync(nativeHelperPath, 0o644);
+    const rejectedHelper = await collectReleaseEvidence(appPath, nativeOptions);
+    assert.equal(rejectedHelper.bundleLayout.valid, false);
+    assert.equal(rejectedHelper.nativeHelper.resourceValid, false);
+    assert.equal(
+      evaluateReleaseEvidence(rejectedHelper, releaseOptions()).failures.includes(
+        NATIVE_HELPER_FAILURES.resource
+      ),
+      true
+    );
+    fs.chmodSync(nativeHelperPath, 0o755);
 
     const originalAppPath = `${appPath}.original`;
     const replacedEvidence = await collectReleaseEvidence(appPath, {
@@ -5011,4 +5584,254 @@ test('CODEOWNERS declares Crate review ownership for sensitive release-policy fi
   ]) {
     assert.equal(ownersByPath.get(protectedPath), '@bfeintuch123');
   }
+});
+
+const REAL_SWIFT_TOOLCHAIN_SKIP = process.platform !== 'darwin' || !fs.existsSync('/usr/bin/swiftc')
+  ? 'requires macOS with /usr/bin/swiftc'
+  : false;
+let cachedCompiledNativeHelper = null;
+
+function repositoryNativeHelperSources() {
+  return Object.fromEntries(NATIVE_HELPER_SOURCE_FILES.map(name => [
+    name,
+    fs.readFileSync(path.join(ROOT, ...NATIVE_HELPER_SOURCE_DIR.split('/'), name)),
+  ]));
+}
+
+function compileRepositoryNativeHelper() {
+  if (!cachedCompiledNativeHelper) {
+    cachedCompiledNativeHelper = compileNativeHelper(repositoryNativeHelperSources());
+    assert.equal(Buffer.isBuffer(cachedCompiledNativeHelper), true);
+  }
+  return cachedCompiledNativeHelper;
+}
+
+function machOTextSectionRange(bytes) {
+  const commandCount = bytes.readUInt32LE(16);
+  let offset = 32;
+  for (let index = 0; index < commandCount; index += 1) {
+    const command = bytes.readUInt32LE(offset);
+    const size = bytes.readUInt32LE(offset + 4);
+    if (command === 0x19) {
+      const sectionCount = bytes.readUInt32LE(offset + 64);
+      for (let section = 0; section < sectionCount; section += 1) {
+        const sectionOffset = offset + 72 + section * 80;
+        const name = bytes.subarray(sectionOffset, sectionOffset + 16).toString('latin1').replace(/\0+$/u, '');
+        const segment = bytes.subarray(sectionOffset + 16, sectionOffset + 32).toString('latin1').replace(/\0+$/u, '');
+        if (segment === '__TEXT' && name === '__text') {
+          return {
+            offset: bytes.readUInt32LE(sectionOffset + 48),
+            size: Number(bytes.readBigUInt64LE(sectionOffset + 40)),
+          };
+        }
+      }
+    }
+    offset += size;
+  }
+  return null;
+}
+
+function codesignStrictRequirement(filePath) {
+  return spawnSync('/usr/bin/codesign', [
+    '--verify',
+    '--strict',
+    `-R=${EXPECTED_NATIVE_HELPER_REQUIREMENT}`,
+    filePath,
+  ], { env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' }, encoding: 'utf8' });
+}
+
+test('native helper recipe matches the developer build script token for token', () => {
+  const script = fs.readFileSync(path.join(ROOT, 'scripts', 'build-native-helper.sh'), 'utf8');
+  assert.equal(script.includes('SRC_DIR="$ROOT_DIR/native/crate-helper"'), true);
+  assert.equal(NATIVE_HELPER_SOURCE_DIR, 'native/crate-helper');
+  const invocation = script.match(/\/usr\/bin\/swiftc \\\n([\s\S]*?)\n\s*-o "\$OUT_BIN"\n/u);
+  assert.ok(invocation);
+  const tokens = invocation[1].replace(/\s*\\$/u, '').split(/\\\n/u)
+    .flatMap(line => line.trim().split(/\s+/u)).filter(Boolean);
+  const firstSource = tokens.findIndex(token => token.startsWith('"$SRC_DIR/'));
+  assert.deepEqual(tokens.slice(0, firstSource), [...NATIVE_HELPER_SWIFTC_ARGS]);
+  assert.deepEqual(
+    tokens.slice(firstSource).map(token => token.replace(/^"\$SRC_DIR\//u, '').replace(/"$/u, '')),
+    [...NATIVE_HELPER_SOURCE_FILES]
+  );
+  assert.deepEqual(
+    fs.readdirSync(path.join(ROOT, ...NATIVE_HELPER_SOURCE_DIR.split('/'))).sort(),
+    [...NATIVE_HELPER_SOURCE_FILES].sort()
+  );
+});
+
+test('real Swift toolchain rebuilds the committed helper byte-identically from different private directories', {
+  skip: REAL_SWIFT_TOOLCHAIN_SKIP,
+}, t => {
+  const parent = fs.realpathSync(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'crate-native-determinism-')));
+  t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+  const firstTemp = path.join(parent, 'a');
+  const secondTemp = path.join(parent, 'a-considerably-longer-private-directory-name');
+  fs.mkdirSync(firstTemp, { mode: 0o700 });
+  fs.mkdirSync(secondTemp, { mode: 0o700 });
+  const originalTmpdir = process.env.TMPDIR;
+  const sources = repositoryNativeHelperSources();
+  let first;
+  let second;
+  try {
+    process.env.TMPDIR = firstTemp;
+    first = compileNativeHelper(sources);
+    process.env.TMPDIR = secondTemp;
+    second = compileNativeHelper(sources);
+  } finally {
+    if (originalTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmpdir;
+  }
+  assert.equal(Buffer.isBuffer(first) && Buffer.isBuffer(second), true);
+  assert.equal(first.equals(second), true);
+  assert.equal(first.readUInt32LE(0), 0xfeedfacf);
+  assert.equal(first.readUInt32LE(4), 0x0100000c);
+  assert.equal(first.readUInt32LE(12), 2);
+  assert.deepEqual(fs.readdirSync(firstTemp), []);
+  assert.deepEqual(fs.readdirSync(secondTemp), []);
+  cachedCompiledNativeHelper = first;
+});
+
+test('canonical helper digest survives runtime re-signing but not a code byte change or a trust downgrade', {
+  skip: REAL_SWIFT_TOOLCHAIN_SKIP,
+}, t => {
+  const compiled = compileRepositoryNativeHelper();
+  const directory = fs.realpathSync(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'crate-native-digest-')));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const helperPath = path.join(directory, 'crate-helper');
+  fs.writeFileSync(helperPath, compiled, { mode: 0o755 });
+
+  const compiledDigest = canonicalNativeDigestFromBytes(compiled);
+  assert.match(String(compiledDigest), /^[a-f0-9]{64}$/u);
+  assert.notEqual(codesignStrictRequirement(helperPath).status, 0);
+
+  const resigned = spawnSync('/usr/bin/codesign', [
+    '--force',
+    '--sign',
+    '-',
+    '--options',
+    'runtime',
+    '--entitlements',
+    path.join(ROOT, 'entitlements.inherit.plist'),
+    helperPath,
+  ], { env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' }, encoding: 'utf8' });
+  assert.equal(resigned.status, 0);
+  const resignedBytes = fs.readFileSync(helperPath);
+  assert.equal(resignedBytes.equals(compiled), false);
+  assert.equal(canonicalNativeDigestFromBytes(resignedBytes), compiledDigest);
+  assert.notEqual(codesignStrictRequirement(helperPath).status, 0);
+
+  const unsignedPath = path.join(directory, 'unsigned');
+  fs.writeFileSync(unsignedPath, compiled, { mode: 0o755 });
+  assert.equal(spawnSync('/usr/bin/codesign', ['--remove-signature', unsignedPath]).status, 0);
+  assert.notEqual(codesignStrictRequirement(unsignedPath).status, 0);
+
+  const text = machOTextSectionRange(compiled);
+  assert.ok(text && text.size > 0);
+  const flipped = Buffer.from(compiled);
+  const flipOffset = text.offset + Math.floor(text.size / 2);
+  flipped[flipOffset] ^= 0x01;
+  const flippedDigest = canonicalNativeDigestFromBytes(flipped);
+  assert.match(String(flippedDigest), /^[a-f0-9]{64}$/u);
+  assert.notEqual(flippedDigest, compiledDigest);
+});
+
+async function probeBundledNativeHelper(t, resourcesPath) {
+  const {
+    NativeHelperClient,
+    resolveNativeHelperBinaryPath,
+  } = require('../parsers/native-helper');
+  const originalResourcesPath = Object.getOwnPropertyDescriptor(process, 'resourcesPath');
+  const originalDisable = process.env.CRATE_DISABLE_NATIVE_HELPER;
+  t.after(() => {
+    if (originalResourcesPath) Object.defineProperty(process, 'resourcesPath', originalResourcesPath);
+    else delete process.resourcesPath;
+    if (originalDisable === undefined) delete process.env.CRATE_DISABLE_NATIVE_HELPER;
+    else process.env.CRATE_DISABLE_NATIVE_HELPER = originalDisable;
+  });
+  delete process.env.CRATE_DISABLE_NATIVE_HELPER;
+  Object.defineProperty(process, 'resourcesPath', {
+    configurable: true,
+    enumerable: true,
+    value: resourcesPath,
+    writable: true,
+  });
+  const expectedPath = path.join(resourcesPath, 'native', 'crate-helper');
+  assert.equal(resolveNativeHelperBinaryPath(), expectedPath);
+
+  const client = new NativeHelperClient();
+  t.after(() => client.shutdown());
+  assert.equal(client.binaryPath, expectedPath);
+  const pong = await client.ping();
+  assert.equal(pong.version, 1);
+  assert.equal(pong.arch, 'arm64');
+  assert.equal(pong.pid, client.child.pid);
+
+  const directory = fs.realpathSync(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'crate-native-probe-')));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const syntheticPath = path.join(directory, 'synthetic-input.bin');
+  const syntheticBytes = crypto.randomBytes(256 * 1024 + 17);
+  fs.writeFileSync(syntheticPath, syntheticBytes);
+  const digest = await client.sha256File(syntheticPath);
+  assert.equal(digest.sha256, crypto.createHash('sha256').update(syntheticBytes).digest('hex'));
+  assert.equal(digest.size, syntheticBytes.length);
+
+  process.env.CRATE_DISABLE_NATIVE_HELPER = '1';
+  const disabled = new NativeHelperClient();
+  await assert.rejects(async () => disabled.ping(), /native_helper_unavailable/u);
+  assert.equal(disabled.child, null);
+}
+
+test('packaged helper location resolves and answers the runtime probe', {
+  skip: REAL_SWIFT_TOOLCHAIN_SKIP,
+}, async t => {
+  const fixtureRoot = fs.realpathSync(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'crate-native-runtime-')));
+  t.after(() => fs.rmSync(fixtureRoot, { recursive: true, force: true }));
+  const resourcesPath = path.join(fixtureRoot, 'Fixture.app', 'Contents', 'Resources');
+  writeNativeHelperResource(resourcesPath, compileRepositoryNativeHelper());
+  await probeBundledNativeHelper(t, resourcesPath);
+});
+
+const SIGNED_APP_UNDER_TEST = process.env.CRATE_SIGNED_APP_UNDER_TEST;
+const SIGNED_APP_SKIP = typeof SIGNED_APP_UNDER_TEST === 'string' && path.isAbsolute(SIGNED_APP_UNDER_TEST) &&
+  SIGNED_APP_UNDER_TEST.endsWith('.app') && process.platform === 'darwin'
+  ? false
+  : 'set CRATE_SIGNED_APP_UNDER_TEST to an absolute signed Crate.app path';
+
+test('signed candidate bundles the source-bound Developer ID native helper', {
+  skip: SIGNED_APP_SKIP,
+}, async t => {
+  const appPath = SIGNED_APP_UNDER_TEST;
+  const contents = verifyPackagedAppContents(appPath);
+  assert.ok(contents.asarEntryCount > 0);
+  const revision = spawnSync('/usr/bin/git', ['rev-parse', '--verify', 'HEAD^{commit}'], {
+    cwd: ROOT,
+    encoding: 'utf8',
+    env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' },
+  });
+  assert.equal(revision.status, 0);
+  const evidence = collectNativeHelperEvidence(
+    appPath,
+    fs.realpathSync(ROOT),
+    revision.stdout.trim(),
+    undefined,
+    { expectedTeamId: PUBLIC_TEAM_ID }
+  );
+  assert.equal(evidence.resourceValid, true);
+  assert.equal(evidence.strictRequirementValid, true);
+  assert.equal(evidence.signature.valid, true);
+  assert.equal(evidence.signature.identifier, NATIVE_HELPER_IDENTIFIER);
+  assert.equal(evidence.signature.teamIdentifier, PUBLIC_TEAM_ID);
+  assert.equal(evidence.signature.hardenedRuntime, true);
+  assert.equal(evidence.signature.timestamped, true);
+  assert.equal(evidence.sourceBound, true);
+  assert.deepEqual(
+    evaluateReleaseEvidence({ ...safeEvidence(), nativeHelper: evidence }, releaseOptions()).failures,
+    []
+  );
+  assert.equal(
+    codesignStrictRequirement(path.join(appPath, 'Contents', 'Resources', 'native', 'crate-helper')).status,
+    0
+  );
+  await probeBundledNativeHelper(t, path.join(appPath, 'Contents', 'Resources'));
 });

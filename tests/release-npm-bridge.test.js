@@ -24,7 +24,12 @@ const {
   forceTraversalCollector,
   releaseArgsAreExact,
   sha256,
+  stageNativeHelper,
 } = require('../scripts/run-electron-builder-release');
+const {
+  NATIVE_HELPER_SOURCE_FILES,
+  compileNativeHelper,
+} = require('../scripts/verify-macos-release-app');
 
 const CANONICAL_NODE = fs.realpathSync(process.execPath);
 const NODE_ENV = {
@@ -104,7 +109,7 @@ function archiveFixture(t) {
   return { root, archive, bytes, packageRoot, cache, contentPath, manifest, lock, launcher };
 }
 
-async function invokeFixture(fixture, args = REQUIRED_ARGS, env = {}, build = async () => []) {
+async function invokeFixture(fixture, args = REQUIRED_ARGS, env = {}, build = async () => [], stage = null) {
   const originalLoad = Module._load;
   const originalArgv = process.argv;
   const originalCwd = process.cwd();
@@ -114,6 +119,12 @@ async function invokeFixture(fixture, args = REQUIRED_ARGS, env = {}, build = as
   let builderCalls = 0;
   let observedArgs;
   let observedOptions;
+  const stageCalls = [];
+  // Never compile into a checkout from launcher tests; record the staging call instead.
+  const stageNativeHelperStub = projectRoot => {
+    stageCalls.push({ projectRoot, builderCallsBefore: builderCalls });
+    if (stage) stage(projectRoot);
+  };
   Module._load = function(request, ...rest) {
     if (request === 'lazy-val') return { Lazy: class { constructor(factory) { this.value = factory(); } } };
     if (request === 'app-builder-lib/out/node-module-collector') return collector;
@@ -138,9 +149,14 @@ async function invokeFixture(fixture, args = REQUIRED_ARGS, env = {}, build = as
     process.argv = [CANONICAL_NODE, 'launcher', ...args];
     let status;
     let error;
-    try { status = await fixture.launcher.run(args, { ...NODE_ENV, CRATE_RELEASE_ELECTRON_ARCHIVE: fixture.archive, ...env }); }
-    catch (caught) { error = caught; }
-    return { builderCalls, observedArgs, observedOptions, status, error };
+    try {
+      status = await fixture.launcher.run(
+        args,
+        { ...NODE_ENV, CRATE_RELEASE_ELECTRON_ARCHIVE: fixture.archive, ...env },
+        { stageNativeHelper: stageNativeHelperStub }
+      );
+    } catch (caught) { error = caught; }
+    return { builderCalls, observedArgs, observedOptions, stageCalls, status, error };
   } finally {
     Module._load = originalLoad;
     process.argv = originalArgv;
@@ -250,15 +266,58 @@ test('release launcher preserves ordinary arguments when no local input is suppl
   const originalLoad = Module._load;
   const originalArgv = process.argv;
   let observed;
+  const events = [];
   Module._load = function(request, ...rest) {
-    if (request === '../node_modules/electron-builder/out/cli/cli.js') { observed = process.argv.slice(2); return {}; }
+    if (request === '../node_modules/electron-builder/out/cli/cli.js') {
+      events.push('builder');
+      observed = process.argv.slice(2);
+      return {};
+    }
     return originalLoad.call(this, request, ...rest);
   };
+  const launcher = require('../scripts/run-electron-builder-release');
   try {
     process.argv = [CANONICAL_NODE, 'launcher', ...REQUIRED_ARGS];
-    assert.equal(require('../scripts/run-electron-builder-release').run(REQUIRED_ARGS, NODE_ENV), 0);
+    const staged = [];
+    assert.equal(launcher.run(REQUIRED_ARGS, NODE_ENV, {
+      stageNativeHelper: projectRoot => { staged.push(projectRoot); events.push('stage'); },
+    }), 0);
     assert.deepEqual(observed, REQUIRED_ARGS);
+    assert.deepEqual(staged, [fs.realpathSync(path.join(__dirname, '..'))]);
+    assert.deepEqual(events, ['stage', 'builder']);
+
+    observed = undefined;
+    events.length = 0;
+    assert.throws(() => launcher.run(REQUIRED_ARGS, NODE_ENV, {
+      stageNativeHelper: () => { events.push('stage'); throw new Error('synthetic staging failure'); },
+    }), /synthetic staging failure/u);
+    assert.equal(observed, undefined);
+    assert.deepEqual(events, ['stage']);
   } finally { Module._load = originalLoad; process.argv = originalArgv; }
+});
+
+test('release launcher stages the native helper exactly once, before Builder, at the canonical root', async t => {
+  const fixture = archiveFixture(t);
+  const result = await invokeFixture(fixture);
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0);
+  assert.equal(result.builderCalls, 1);
+  assert.deepEqual(result.stageCalls, [{ projectRoot: fixture.root, builderCallsBefore: 0 }]);
+});
+
+test('release launcher native helper staging failure prevents every Builder call', async t => {
+  const fixture = archiveFixture(t);
+  const result = await invokeFixture(fixture, REQUIRED_ARGS, {}, async () => [], () => {
+    throw new Error('synthetic staging failure');
+  });
+  assert.equal(result.builderCalls, 0);
+  assert.match(String(result.error && result.error.message), /synthetic staging failure/u);
+  assert.equal(result.stageCalls.length, 1);
+  const unauthenticated = await invokeFixture(fixture, REQUIRED_ARGS, {
+    CRATE_RELEASE_CANONICAL_NODE_SHA256: '0'.repeat(64),
+  });
+  assert.equal(unauthenticated.builderCalls, 0);
+  assert.equal(unauthenticated.stageCalls.length, 0);
 });
 
 for (const [name, replace] of [
@@ -452,6 +511,11 @@ test('locked successful extraction continuation removes only official defaults b
       assert.deepEqual(Object.keys(integrity), ['Resources/app.asar']);
       const evidence = { infoPlist: { ElectronAsarIntegrity: integrity }, asarIntegrityHash: integrity['Resources/app.asar'].hash };
       assert.equal(evaluateReleaseEvidence(evidence).failures.some(message => message.startsWith('Embedded ASAR integrity metadata')), false);
+      assert.equal(inspectBundleLayout(app, 'Electron').valid, false);
+      // Electron Builder copies the staged helper (extraResources) before afterPack.
+      fs.mkdirSync(path.join(resources, 'native'));
+      fs.writeFileSync(path.join(resources, 'native', 'crate-helper'), syntheticHelperBytes('extra-resource'));
+      fs.chmodSync(path.join(resources, 'native', 'crate-helper'), 0o755);
       assert.equal(inspectBundleLayout(app, 'Electron').valid, true);
       const extra = { ...integrity, 'Resources/default_app.asar': integrity['Resources/app.asar'] };
       assert.equal(evaluateReleaseEvidence({ ...evidence, infoPlist: { ElectronAsarIntegrity: extra } }).failures.includes('Embedded ASAR integrity metadata is missing or invalid.'), true);
@@ -650,4 +714,131 @@ test('traversal collector builds the production graph without a package-manager 
   const result = await collector.getNodeModules({ packageName: 'crate-app' });
   assert.equal(result.nodeModules.length > 0, true);
   assert.equal(result.nodeModules.some(dependency => dependency.name === 'electron-store'), true);
+});
+
+// Synthetic header bytes only; never executed.
+function syntheticHelperBytes(marker = 'staged') {
+  const bytes = Buffer.alloc(96, 0);
+  bytes.writeUInt32LE(0xfeedfacf, 0);
+  bytes.writeUInt32LE(0x0100000c, 4);
+  bytes.writeUInt32LE(2, 12);
+  Buffer.from(marker).copy(bytes, 32);
+  return bytes;
+}
+
+function nativeProjectFixture(t, sourceDirectory = path.join(__dirname, '..', 'native', 'crate-helper')) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'crate-native-stage-')));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const sources = path.join(root, 'native', 'crate-helper');
+  fs.mkdirSync(sources, { recursive: true });
+  for (const name of NATIVE_HELPER_SOURCE_FILES) {
+    fs.copyFileSync(path.join(sourceDirectory, name), path.join(sources, name));
+  }
+  return { root, sources, bin: path.join(root, 'native', 'bin'), output: path.join(root, 'native', 'bin', 'crate-helper') };
+}
+
+test('native helper staging replaces a stale output with the freshly compiled helper', {
+  skip: process.platform !== 'darwin' || !fs.existsSync('/usr/bin/swiftc') ? 'requires macOS with /usr/bin/swiftc' : false,
+}, t => {
+  const project = nativeProjectFixture(t);
+  fs.mkdirSync(project.bin, { mode: 0o755 });
+  fs.writeFileSync(project.output, 'stale helper from an earlier build', { mode: 0o644 });
+  const staleIdentity = fs.lstatSync(project.output);
+  const originalUmask = process.umask(0o077);
+  let staged;
+  try {
+    staged = stageNativeHelper(project.root);
+  } finally {
+    process.umask(originalUmask);
+  }
+  const written = fs.readFileSync(project.output);
+  const metadata = fs.lstatSync(project.output);
+  assert.equal(staged.path, project.output);
+  assert.equal(staged.digest, crypto.createHash('sha256').update(written).digest('hex'));
+  assert.equal(metadata.mode & 0o7777, 0o755);
+  assert.equal(metadata.isFile() && !metadata.isSymbolicLink(), true);
+  assert.equal(metadata.ino === staleIdentity.ino && written.equals(Buffer.from('stale helper from an earlier build')), false);
+  assert.equal(written.readUInt32LE(0), 0xfeedfacf);
+  assert.equal(written.readUInt32LE(4), 0x0100000c);
+  assert.equal(written.readUInt32LE(12), 2);
+  const sources = Object.fromEntries(NATIVE_HELPER_SOURCE_FILES.map(name => [
+    name,
+    fs.readFileSync(path.join(project.sources, name)),
+  ]));
+  assert.equal(compileNativeHelper(sources).equals(written), true);
+});
+
+test('native helper staging creates the output directory and refuses unsafe inputs and outputs', t => {
+  const compiled = syntheticHelperBytes();
+  const compilerCalls = [];
+  const compileNativeHelperStub = sources => {
+    compilerCalls.push(Object.keys(sources));
+    return Buffer.from(compiled);
+  };
+  const options = { compileNativeHelper: compileNativeHelperStub };
+
+  const fresh = nativeProjectFixture(t);
+  const staged = stageNativeHelper(fresh.root, options);
+  assert.equal(fs.lstatSync(fresh.bin).mode & 0o777, 0o755);
+  assert.equal(fs.readFileSync(fresh.output).equals(compiled), true);
+  assert.equal(fs.lstatSync(fresh.output).mode & 0o7777, 0o755);
+  assert.equal(staged.digest, crypto.createHash('sha256').update(compiled).digest('hex'));
+  assert.deepEqual(compilerCalls, [[...NATIVE_HELPER_SOURCE_FILES]]);
+
+  const symlinkedBin = nativeProjectFixture(t);
+  const outsideBin = path.join(symlinkedBin.root, 'outside-bin');
+  fs.mkdirSync(outsideBin);
+  fs.symlinkSync(outsideBin, symlinkedBin.bin);
+  assert.throws(() => stageNativeHelper(symlinkedBin.root, options), /directory is invalid/u);
+  assert.deepEqual(fs.readdirSync(outsideBin), []);
+
+  const symlinkedOutput = nativeProjectFixture(t);
+  fs.mkdirSync(symlinkedOutput.bin);
+  const outsideFile = path.join(symlinkedOutput.root, 'outside-file');
+  fs.writeFileSync(outsideFile, 'must stay unchanged');
+  fs.symlinkSync(outsideFile, symlinkedOutput.output);
+  assert.throws(() => stageNativeHelper(symlinkedOutput.root, options), /not a regular file/u);
+  assert.equal(fs.readFileSync(outsideFile, 'utf8'), 'must stay unchanged');
+  assert.equal(fs.lstatSync(symlinkedOutput.output).isSymbolicLink(), true);
+
+  const directoryOutput = nativeProjectFixture(t);
+  fs.mkdirSync(directoryOutput.output, { recursive: true });
+  assert.throws(() => stageNativeHelper(directoryOutput.root, options), /not a regular file/u);
+
+  compilerCalls.length = 0;
+  for (const [label, mutate, pattern] of [
+    ['extra source', project => fs.writeFileSync(path.join(project.sources, 'Extra.swift'), '// extra\n'), /approved file set/u],
+    ['missing source', project => fs.rmSync(path.join(project.sources, 'WatchOps.swift')), /approved file set/u],
+    ['symlinked source file', project => {
+      const outside = path.join(project.root, 'outside-main.swift');
+      fs.renameSync(path.join(project.sources, 'main.swift'), outside);
+      fs.symlinkSync(outside, path.join(project.sources, 'main.swift'));
+    }, /authentication input is invalid/u],
+    ['symlinked source directory', project => {
+      const outside = path.join(project.root, 'outside-sources');
+      fs.renameSync(project.sources, outside);
+      fs.symlinkSync(outside, project.sources);
+    }, /sources are missing|directory is invalid/u],
+    ['missing source directory', project => fs.rmSync(project.sources, { recursive: true }), /sources are missing/u],
+  ]) {
+    const project = nativeProjectFixture(t);
+    mutate(project);
+    assert.throws(() => stageNativeHelper(project.root, options), pattern, label);
+    assert.equal(fs.existsSync(project.bin), false, label);
+  }
+  assert.equal(compilerCalls.length, 0);
+
+  const failedCompile = nativeProjectFixture(t);
+  fs.mkdirSync(failedCompile.bin);
+  fs.writeFileSync(failedCompile.output, 'stale');
+  assert.throws(
+    () => stageNativeHelper(failedCompile.root, { compileNativeHelper: () => null }),
+    /compilation failed/u
+  );
+  assert.equal(fs.readFileSync(failedCompile.output, 'utf8'), 'stale');
+
+  const aliasRoot = path.join(fresh.root, 'alias');
+  fs.symlinkSync(fresh.root, aliasRoot);
+  assert.throws(() => stageNativeHelper(aliasRoot, options), /project root is invalid/u);
+  assert.throws(() => stageNativeHelper('relative/project', options), /project root is invalid/u);
 });

@@ -59,6 +59,87 @@ const REQUIRED_ASAR_ENTRIES = Object.freeze([
   ...RUNTIME_PARSER_FILES.map(fileName => `/parsers/${fileName}`)
 ]);
 
+const NATIVE_HELPER_RESOURCE_DIRECTORY = 'native';
+const NATIVE_HELPER_FILE_NAME = 'crate-helper';
+const NATIVE_HELPER_FILE_MODE = 0o755;
+const MACHO_MAGIC_64 = 0xfeedfacf;
+const MACHO_CPU_TYPE_ARM64 = 0x0100000c;
+const MACHO_CPU_SUBTYPE_MASK = 0x00ffffff;
+const MACHO_FILE_TYPE_EXECUTE = 2;
+const MACHO_HEADER_64_SIZE = 32;
+
+// Thin little-endian arm64 (CPU_SUBTYPE_ARM64_ALL) MH_EXECUTE only: fat, x86_64,
+// arm64e, dylib, bundle and script inputs are all rejected.
+function hasThinArm64ExecuteHeader(bytes) {
+  return Buffer.isBuffer(bytes) && bytes.length >= MACHO_HEADER_64_SIZE &&
+    bytes.readUInt32LE(0) === MACHO_MAGIC_64 &&
+    bytes.readUInt32LE(4) === MACHO_CPU_TYPE_ARM64 &&
+    (bytes.readUInt32LE(8) & MACHO_CPU_SUBTYPE_MASK) === 0 &&
+    bytes.readUInt32LE(12) === MACHO_FILE_TYPE_EXECUTE;
+}
+
+function sameFileIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size &&
+    left.mode === right.mode && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+}
+
+function readStableNativeHelperBytes(filePath) {
+  let descriptor = null;
+  try {
+    const before = fs.lstatSync(filePath);
+    if (before.isSymbolicLink() || !before.isFile() ||
+        (before.mode & 0o7777) !== NATIVE_HELPER_FILE_MODE) {
+      return null;
+    }
+    descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const opened = fs.fstatSync(descriptor);
+    if (!opened.isFile() || !sameFileIdentity(before, opened)) return null;
+    const bytes = fs.readFileSync(descriptor);
+    const after = fs.fstatSync(descriptor);
+    const current = fs.lstatSync(filePath);
+    if (!after.isFile() || !sameFileIdentity(opened, after) || current.isSymbolicLink() ||
+        !current.isFile() || !sameFileIdentity(after, current) || bytes.length !== opened.size) {
+      return null;
+    }
+    return bytes;
+  } catch (error) {
+    return null;
+  } finally {
+    if (descriptor !== null) {
+      try {
+        fs.closeSync(descriptor);
+      } catch (error) {
+        // The caller fails closed when the stable read cannot complete.
+      }
+    }
+  }
+}
+
+// `<Resources>/native` must be a real directory holding exactly one regular,
+// mode-0755, thin arm64 executable named `crate-helper`.
+function inspectNativeHelperResource(resourcesPath) {
+  const invalid = { valid: false, bytes: null };
+  try {
+    const nativePath = path.join(resourcesPath, NATIVE_HELPER_RESOURCE_DIRECTORY);
+    const nativeBefore = fs.lstatSync(nativePath);
+    if (nativeBefore.isSymbolicLink() || !nativeBefore.isDirectory()) return invalid;
+    const entries = fs.readdirSync(nativePath);
+    if (entries.length !== 1 || entries[0] !== NATIVE_HELPER_FILE_NAME) return invalid;
+    const bytes = readStableNativeHelperBytes(path.join(nativePath, NATIVE_HELPER_FILE_NAME));
+    if (!bytes || !hasThinArm64ExecuteHeader(bytes)) return invalid;
+    const nativeAfter = fs.lstatSync(nativePath);
+    if (nativeAfter.isSymbolicLink() || !nativeAfter.isDirectory() ||
+        nativeAfter.dev !== nativeBefore.dev || nativeAfter.ino !== nativeBefore.ino) {
+      return invalid;
+    }
+    const entriesAfter = fs.readdirSync(nativePath);
+    if (entriesAfter.length !== 1 || entriesAfter[0] !== NATIVE_HELPER_FILE_NAME) return invalid;
+    return { valid: true, bytes };
+  } catch (error) {
+    return invalid;
+  }
+}
+
 function normalizeEntry(entry) {
   if (typeof entry !== 'string' || !entry.trim()) return null;
   const slashPath = entry.replace(/\\/g, '/');
@@ -216,6 +297,12 @@ function verifyPackagedAppContents(inputPath, options = {}) {
     throw createVerificationError(['Crate packaged-content policy failed.', ...failures].join('\n'), 1);
   }
 
+  // A bare ASAR input has no bundle around it; only an app bundle carries the helper.
+  if (!path.resolve(inputPath).endsWith('.asar') &&
+      !inspectNativeHelperResource(path.join(path.resolve(inputPath), 'Contents', 'Resources')).valid) {
+    throw createVerificationError('Bundled native helper is missing or not approved.', 1);
+  }
+
   return {
     asarEntryCount: asarResult.entryCount,
     unpackedEntryCount: unpackedResult.entryCount
@@ -236,13 +323,19 @@ function run(argv = process.argv.slice(2)) {
 if (require.main === module) run();
 
 module.exports = {
+  NATIVE_HELPER_FILE_MODE,
+  NATIVE_HELPER_FILE_NAME,
+  NATIVE_HELPER_RESOURCE_DIRECTORY,
   REQUIRED_ASAR_ENTRIES,
   RUNTIME_PARSER_FILES,
+  hasThinArm64ExecuteHeader,
   inspectAsarEntries,
+  inspectNativeHelperResource,
   inspectUnpackedEntries,
   isAllowedAsarEntry,
   isSensitiveEntry,
   normalizeEntry,
+  readStableNativeHelperBytes,
   resolveAsarPath,
   verifyPackagedAppContents
 };

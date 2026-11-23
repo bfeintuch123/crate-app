@@ -11,13 +11,43 @@ const packageJson = require('../package.json');
 const packageLock = require('../package-lock.json');
 const afterPack = require('../scripts/patch-helper-info-plists');
 const {
+  NATIVE_HELPER_FILE_MODE,
   REQUIRED_ASAR_ENTRIES,
   RUNTIME_PARSER_FILES,
+  hasThinArm64ExecuteHeader,
   inspectAsarEntries,
+  inspectNativeHelperResource,
   inspectUnpackedEntries,
   normalizeEntry,
   verifyPackagedAppContents
 } = require('../scripts/verify-app-contents');
+
+// Synthetic Mach-O header bytes only; nothing here is executed.
+function syntheticMachO({
+  magic = 0xfeedfacf,
+  cpuType = 0x0100000c,
+  cpuSubtype = 0,
+  fileType = 2,
+  length = 64
+} = {}) {
+  const header = Buffer.alloc(16);
+  header.writeUInt32LE(magic >>> 0, 0);
+  header.writeUInt32LE(cpuType >>> 0, 4);
+  header.writeUInt32LE(cpuSubtype >>> 0, 8);
+  header.writeUInt32LE(fileType >>> 0, 12);
+  const bytes = Buffer.alloc(length, 0x5a);
+  header.copy(bytes, 0, 0, Math.min(16, length));
+  return bytes;
+}
+
+function writeNativeHelper(resourcesPath, bytes = syntheticMachO(), mode = 0o755) {
+  const nativePath = path.join(resourcesPath, 'native');
+  fs.mkdirSync(nativePath, { recursive: true });
+  const helperPath = path.join(nativePath, 'crate-helper');
+  fs.writeFileSync(helperPath, bytes);
+  fs.chmodSync(helperPath, mode);
+  return helperPath;
+}
 
 const EXPECTED_BUILD_FILES = Object.freeze([
   'main.js',
@@ -245,6 +275,7 @@ test('packaged app verification accepts an injected safe ASAR inventory', () => 
   const asarPath = path.join(appBundle, 'Contents', 'Resources', 'app.asar');
   fs.mkdirSync(path.dirname(asarPath), { recursive: true });
   fs.writeFileSync(asarPath, 'synthetic test placeholder');
+  writeNativeHelper(path.dirname(asarPath));
 
   try {
     const result = verifyPackagedAppContents(appBundle, {
@@ -306,5 +337,136 @@ test('afterPack hardens the final app transport policy before signing', () => {
     assert.deepEqual(transportPolicy, afterPack.STRICT_APP_TRANSPORT_SECURITY);
   } finally {
     fs.rmSync(appBundle, { recursive: true, force: true });
+  }
+});
+
+test('native helper resource accepts only one regular mode-0755 thin arm64 executable', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-native-resource-'));
+  let caseIndex = 0;
+  const freshResources = () => {
+    const resourcesPath = path.join(root, `case-${caseIndex += 1}`, 'Resources');
+    fs.mkdirSync(resourcesPath, { recursive: true });
+    return resourcesPath;
+  };
+  const rejects = (label, setup) => {
+    const resourcesPath = freshResources();
+    setup(resourcesPath);
+    assert.deepEqual(inspectNativeHelperResource(resourcesPath), { valid: false, bytes: null }, label);
+  };
+
+  try {
+    assert.equal(NATIVE_HELPER_FILE_MODE, 0o755);
+    const validResources = freshResources();
+    const validBytes = syntheticMachO();
+    writeNativeHelper(validResources, validBytes);
+    const accepted = inspectNativeHelperResource(validResources);
+    assert.equal(accepted.valid, true);
+    assert.equal(Buffer.compare(accepted.bytes, validBytes), 0);
+    assert.equal(hasThinArm64ExecuteHeader(syntheticMachO({ length: 32 })), true);
+
+    rejects('missing native directory', () => {});
+    rejects('empty native directory', resourcesPath => {
+      fs.mkdirSync(path.join(resourcesPath, 'native'));
+    });
+    rejects('native is a file', resourcesPath => {
+      fs.writeFileSync(path.join(resourcesPath, 'native'), syntheticMachO());
+    });
+    for (const sibling of ['extra-file', '.DS_Store']) {
+      rejects(`extra sibling ${sibling}`, resourcesPath => {
+        writeNativeHelper(resourcesPath);
+        fs.writeFileSync(path.join(resourcesPath, 'native', sibling), 'synthetic');
+      });
+    }
+    rejects('extra sibling directory', resourcesPath => {
+      writeNativeHelper(resourcesPath);
+      fs.mkdirSync(path.join(resourcesPath, 'native', 'extra-directory'));
+    });
+    rejects('symlinked native directory', resourcesPath => {
+      const realNative = path.join(path.dirname(resourcesPath), 'real-native');
+      fs.mkdirSync(realNative);
+      fs.writeFileSync(path.join(realNative, 'crate-helper'), syntheticMachO());
+      fs.chmodSync(path.join(realNative, 'crate-helper'), 0o755);
+      fs.symlinkSync(realNative, path.join(resourcesPath, 'native'));
+    });
+    rejects('symlinked helper', resourcesPath => {
+      const target = path.join(path.dirname(resourcesPath), 'real-helper');
+      fs.writeFileSync(target, syntheticMachO());
+      fs.chmodSync(target, 0o755);
+      fs.mkdirSync(path.join(resourcesPath, 'native'));
+      fs.symlinkSync(target, path.join(resourcesPath, 'native', 'crate-helper'));
+    });
+    rejects('helper directory', resourcesPath => {
+      fs.mkdirSync(path.join(resourcesPath, 'native', 'crate-helper'), { recursive: true });
+    });
+    rejects('helper FIFO', resourcesPath => {
+      fs.mkdirSync(path.join(resourcesPath, 'native'));
+      const created = require('node:child_process').spawnSync('/usr/bin/mkfifo', [
+        path.join(resourcesPath, 'native', 'crate-helper')
+      ]);
+      assert.equal(created.status, 0);
+    });
+    for (const mode of [0o644, 0o700, 0o775, 0o4755]) {
+      rejects(`mode ${mode.toString(8)}`, resourcesPath => {
+        const helperPath = writeNativeHelper(resourcesPath, syntheticMachO(), mode);
+        assert.equal(fs.lstatSync(helperPath).mode & 0o7777, mode);
+      });
+    }
+    const fatHeader = syntheticMachO();
+    fatHeader.writeUInt32BE(0xcafebabe, 0);
+    for (const [label, bytes] of [
+      ['x86_64', syntheticMachO({ cpuType: 0x01000007 })],
+      ['fat', fatHeader],
+      ['arm64e', syntheticMachO({ cpuSubtype: 2 })],
+      ['arm64e with pointer-auth capability bits', syntheticMachO({ cpuSubtype: 0x80000002 })],
+      ['32-bit arm', syntheticMachO({ magic: 0xfeedface, cpuType: 12 })],
+      ['MH_DYLIB', syntheticMachO({ fileType: 6 })],
+      ['MH_BUNDLE', syntheticMachO({ fileType: 8 })],
+      ['shell script', Buffer.from('#!/bin/sh\necho synthetic\n'.padEnd(64, ' '))],
+      ['empty file', Buffer.alloc(0)],
+      ['31-byte file', syntheticMachO({ length: 31 })]
+    ]) {
+      rejects(label, resourcesPath => writeNativeHelper(resourcesPath, bytes));
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('packaged app verification rejects a missing or invalid bundled helper but keeps bare ASAR input', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-content-policy-helper-'));
+  const options = {
+    asar: { listPackage: () => REQUIRED_ASAR_ENTRIES },
+    unpackedEntries: []
+  };
+  const expectRejected = appBundle => {
+    assert.throws(() => verifyPackagedAppContents(appBundle, options), error => (
+      error.message === 'Bundled native helper is missing or not approved.' && error.exitCode === 1
+    ));
+  };
+  try {
+    const appBundle = path.join(root, 'Crate.app');
+    const resourcesPath = path.join(appBundle, 'Contents', 'Resources');
+    fs.mkdirSync(resourcesPath, { recursive: true });
+    fs.writeFileSync(path.join(resourcesPath, 'app.asar'), 'synthetic test placeholder');
+    expectRejected(appBundle);
+
+    fs.mkdirSync(path.join(resourcesPath, 'native'));
+    expectRejected(appBundle);
+
+    const helperPath = writeNativeHelper(resourcesPath, syntheticMachO(), 0o644);
+    expectRejected(appBundle);
+    fs.chmodSync(helperPath, 0o755);
+    fs.writeFileSync(helperPath, syntheticMachO({ cpuType: 0x01000007 }));
+    expectRejected(appBundle);
+
+    fs.writeFileSync(helperPath, syntheticMachO());
+    assert.equal(verifyPackagedAppContents(appBundle, options).asarEntryCount, REQUIRED_ASAR_ENTRIES.length);
+
+    const bareAsar = path.join(root, 'bare', 'app.asar');
+    fs.mkdirSync(path.dirname(bareAsar));
+    fs.writeFileSync(bareAsar, 'synthetic test placeholder');
+    assert.equal(verifyPackagedAppContents(bareAsar, options).asarEntryCount, REQUIRED_ASAR_ENTRIES.length);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
