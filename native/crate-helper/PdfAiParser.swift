@@ -53,6 +53,7 @@ enum PdfAiParser {
         var foundSet = Set<String>()
         var compressedStreamsScanned = 0
         var compressedHits = 0
+        var issues: [String] = []
 
         func recordPath(_ raw: String, fromCompressed: Bool = false) {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -71,7 +72,7 @@ enum PdfAiParser {
 
             // 2. Selective FlateDecode PDF stream decompression (non-image streams)
             if decompressStreams {
-                scanFlateDecodeStreams(bytes: bytes, streamsScanned: &compressedStreamsScanned) { inflated in
+                scanFlateDecodeStreams(bytes: bytes, streamsScanned: &compressedStreamsScanned, issues: &issues) { inflated in
                     inflated.withUnsafeBytes { ibuf in
                         let ib = ibuf.bindMemory(to: UInt8.self)
                         scanRawPaths(bytes: ib, onMatch: { recordPath($0, fromCompressed: true) })
@@ -85,6 +86,8 @@ enum PdfAiParser {
             "paths": foundOrder,
             "compressedStreamsScanned": compressedStreamsScanned,
             "compressedHits": compressedHits,
+            "incomplete": !issues.isEmpty,
+            "issues": issues,
             "sourceIdentity": [
                 "dev": Int64(st.st_dev),
                 "ino": Int64(st.st_ino),
@@ -131,10 +134,33 @@ enum PdfAiParser {
                     var end = i + (isUsers ? 7 : 9)
                     let limit = min(n, i + 4096)
                     var matchedEnd = -1
+                    var stoppedAtNextPrefix = false
                     while end < limit {
                         let b = bytes[end]
                         if b < 0x20 || b == 0x22 || b == 0x27 || b == 0x7F || b == 0x3C || b == 0x3E {
                             break
+                        }
+                        if b == 0x2F { // Stop before a subsequent /Users/ or /Volumes/ prefix
+                            let nextIsUsers = (end + 7 < n)
+                                && (bytes[end + 1] == 0x55 || bytes[end + 1] == 0x75)
+                                && (bytes[end + 2] == 0x73 || bytes[end + 2] == 0x53)
+                                && (bytes[end + 3] == 0x65 || bytes[end + 3] == 0x45)
+                                && (bytes[end + 4] == 0x72 || bytes[end + 4] == 0x52)
+                                && (bytes[end + 5] == 0x73 || bytes[end + 5] == 0x53)
+                                && bytes[end + 6] == 0x2F
+                            let nextIsVolumes = !nextIsUsers && (end + 9 < n)
+                                && (bytes[end + 1] == 0x56 || bytes[end + 1] == 0x76)
+                                && (bytes[end + 2] == 0x6F || bytes[end + 2] == 0x4F)
+                                && (bytes[end + 3] == 0x6C || bytes[end + 3] == 0x4C)
+                                && (bytes[end + 4] == 0x75 || bytes[end + 4] == 0x55)
+                                && (bytes[end + 5] == 0x6D || bytes[end + 5] == 0x4D)
+                                && (bytes[end + 6] == 0x65 || bytes[end + 6] == 0x45)
+                                && (bytes[end + 7] == 0x73 || bytes[end + 7] == 0x53)
+                                && bytes[end + 8] == 0x2F
+                            if nextIsUsers || nextIsVolumes {
+                                stoppedAtNextPrefix = true
+                                break
+                            }
                         }
                         if b == 0x2E { // '.'
                             // Check if a known extension follows immediately (prefer longer like woff2 over woff)
@@ -169,7 +195,7 @@ enum PdfAiParser {
                         i = matchedEnd
                         continue
                     } else {
-                        i = end + 1
+                        i = stoppedAtNextPrefix ? end : (end + 1)
                         continue
                     }
                 }
@@ -301,6 +327,7 @@ enum PdfAiParser {
     private static func scanFlateDecodeStreams(
         bytes: UnsafeBufferPointer<UInt8>,
         streamsScanned: inout Int,
+        issues: inout [String],
         onInflated: (Data) -> Void
     ) {
         let streamToken = Array("stream".utf8)
@@ -310,6 +337,10 @@ enum PdfAiParser {
         let n = bytes.count
         var totalInflated = 0
         var i = 0
+
+        func recordIssue(_ code: String) {
+            if !issues.contains(code) { issues.append(code) }
+        }
 
         func containsSubsequence(_ range: Range<Int>, _ needle: [UInt8]) -> Bool {
             let nl = needle.count
@@ -329,7 +360,7 @@ enum PdfAiParser {
             return false
         }
 
-        while i < n - 16 && streamsScanned < maxStreamsToInflate && totalInflated < maxTotalInflatedOut {
+        while i < n - 16 {
             // Match "stream" followed by \n or \r\n (and NOT preceded by "end")
             if bytes[i] == streamToken[0] && i + 7 < n {
                 var ok = true
@@ -368,6 +399,14 @@ enum PdfAiParser {
                         }
                         if foundEnd > dataStart {
                             if isFlate && !isImage {
+                                if streamsScanned >= maxStreamsToInflate {
+                                    recordIssue("flate-stream-count-limit")
+                                    break
+                                }
+                                if totalInflated >= maxTotalInflatedOut {
+                                    recordIssue("flate-total-output-limit")
+                                    break
+                                }
                                 var compEnd = foundEnd
                                 while compEnd > dataStart && (bytes[compEnd - 1] == 0x0A || bytes[compEnd - 1] == 0x0D) {
                                     compEnd -= 1
@@ -383,11 +422,15 @@ enum PdfAiParser {
                                         streamsScanned += 1
                                         totalInflated += inflated.count
                                         onInflated(inflated)
+                                    } else {
+                                        recordIssue("flate-stream-budget-or-decode")
                                     }
                                 }
                             }
                             i = foundEnd + endstreamToken.count
                             continue
+                        } else if isFlate && !isImage {
+                            recordIssue("flate-endstream-unbounded")
                         }
                     }
                 }

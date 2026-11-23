@@ -196,11 +196,15 @@ class ProjectIpcDeltaBridge {
       return;
     }
     const pending = this.pendingTimers.get(projectId);
-    if (pending) {
+    if (pending && !pending.coalesced) {
       pending.emitFn = emitFn;
       return;
     }
-    const entry = { emitFn, timer: null };
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.pendingTimers.delete(projectId);
+    }
+    const entry = { coalesced: false, emitFn, timer: null };
     entry.timer = setTimeout(() => {
       this.pendingTimers.delete(projectId);
       entry.emitFn();
@@ -209,19 +213,92 @@ class ProjectIpcDeltaBridge {
     this.pendingTimers.set(projectId, entry);
   }
 
+  /**
+   * Coalesce notifications per projectId while retaining the union of scheduled
+   * activation tokens and account-authorization assertions so a stale caller
+   * cannot overwrite/drop an earlier valid refresh, and logout/account changes
+   * cannot leak queued notifications.
+   */
+  scheduleCoalesced(projectId, { activationToken = null, assertAuthorized = null, emitFn } = {}) {
+    if (typeof projectId !== 'string' || !projectId || typeof emitFn !== 'function') return;
+    const caller = {
+      activationToken,
+      assertAuthorized: typeof assertAuthorized === 'function' ? assertAuthorized : null,
+    };
+    const invoke = (entry) => {
+      entry.emitFn({
+        tokens: entry.tokens,
+        hasNullToken: entry.hasNullToken,
+        authChecks: entry.authChecks,
+        callers: entry.callers,
+      });
+    };
+    if (this.coalesceMs <= 0) {
+      invoke({
+        emitFn,
+        tokens: activationToken === null ? new Set() : new Set([activationToken]),
+        hasNullToken: activationToken === null,
+        authChecks: caller.assertAuthorized ? [caller.assertAuthorized] : [],
+        callers: [caller],
+      });
+      return;
+    }
+    const existing = this.pendingTimers.get(projectId);
+    if (existing && existing.coalesced) {
+      if (activationToken === null) existing.hasNullToken = true;
+      else existing.tokens.add(activationToken);
+      if (caller.assertAuthorized) existing.authChecks.push(caller.assertAuthorized);
+      existing.callers.push(caller);
+      existing.emitFn = emitFn;
+      return;
+    }
+    if (existing) {
+      clearTimeout(existing.timer);
+      this.pendingTimers.delete(projectId);
+    }
+    const entry = {
+      coalesced: true,
+      tokens: activationToken === null ? new Set() : new Set([activationToken]),
+      hasNullToken: activationToken === null,
+      authChecks: caller.assertAuthorized ? [caller.assertAuthorized] : [],
+      callers: [caller],
+      emitFn,
+      timer: null,
+    };
+    entry.timer = setTimeout(() => {
+      if (this.pendingTimers.get(projectId) !== entry) return;
+      this.pendingTimers.delete(projectId);
+      invoke(entry);
+    }, this.coalesceMs);
+    if (typeof entry.timer.unref === 'function') entry.timer.unref();
+    this.pendingTimers.set(projectId, entry);
+  }
+
   flush(projectId = null) {
+    const fire = (entry) => {
+      if (entry.coalesced) {
+        entry.emitFn({
+          tokens: entry.tokens,
+          hasNullToken: entry.hasNullToken,
+          authChecks: entry.authChecks,
+          callers: entry.callers,
+        });
+      } else {
+        entry.emitFn();
+      }
+    };
     if (projectId) {
       const entry = this.pendingTimers.get(projectId);
       if (!entry) return;
       clearTimeout(entry.timer);
       this.pendingTimers.delete(projectId);
-      entry.emitFn();
+      fire(entry);
       return;
     }
     for (const [id, entry] of [...this.pendingTimers.entries()]) {
       clearTimeout(entry.timer);
       this.pendingTimers.delete(id);
-      entry.emitFn();
+      fire(entry);
     }
   }
 

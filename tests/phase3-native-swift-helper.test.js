@@ -10,11 +10,11 @@ const test = require('node:test');
 const zlib = require('node:zlib');
 
 const agPsd = require('ag-psd');
-const { NativeHelperClient, DEFAULT_BINARY_PATH } = require('../parsers/native-helper');
+const { NativeHelperClient, DEFAULT_BINARY_PATH, nativeHelper } = require('../parsers/native-helper');
 const { AIParser } = require('../parsers/ai');
 const { PSDParser } = require('../parsers/psd');
 
-const hasNativeBinary = fs.existsSync(DEFAULT_BINARY_PATH);
+const hasNativeBinary = nativeHelper.isAvailable();
 
 test('Swift native helper: ping and clean shutdown', { skip: !hasNativeBinary }, async t => {
   const client = new NativeHelperClient(DEFAULT_BINARY_PATH);
@@ -159,62 +159,28 @@ test('Swift native helper: PDF/AI parser recovers FlateDecode compressed streams
   assert.ok(foundPaths.includes(rawLink));
 });
 
-test('Swift native helper: openat + APFS fclonefileat packaging, CryptoKit SHA-256, symlink refusal, and rollback', { skip: !hasNativeBinary }, async t => {
+test('Swift native helper: CryptoKit SHA-256 works and deprecated package_batch op is removed', { skip: !hasNativeBinary }, async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-swift-pkg-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const client = new NativeHelperClient(DEFAULT_BINARY_PATH);
   t.after(() => client.shutdown());
 
   const srcA = path.join(dir, 'sourceA.bin');
-  const srcB = path.join(dir, 'sourceB.bin');
   const bytesA = crypto.randomBytes(256 * 1024);
-  const bytesB = crypto.randomBytes(128 * 1024);
   fs.writeFileSync(srcA, bytesA);
-  fs.writeFileSync(srcB, bytesB);
   const shaA = crypto.createHash('sha256').update(bytesA).digest('hex');
-  const shaB = crypto.createHash('sha256').update(bytesB).digest('hex');
 
   // Direct hardware CryptoKit sha256 check
   const directHash = await client.sha256File(srcA);
   assert.equal(directHash.sha256, shaA);
   assert.equal(directHash.size, bytesA.length);
 
-  // Batch clone + hash into pinned destination directory
-  const outDir = path.join(dir, 'out');
-  fs.mkdirSync(outDir, { mode: 0o700 });
-  const batch = await client.packageBatch(outDir, [
-    { sourcePath: srcA, leafName: 'A.bin' },
-    { sourcePath: srcB, leafName: 'B.bin' },
-  ], { mode: 'clone_or_copy', computeHash: true });
-
-  assert.equal(batch.files.length, 2);
-  assert.equal(batch.files[0].sha256, shaA);
-  assert.equal(batch.files[1].sha256, shaB);
-  assert.equal(fs.lstatSync(path.join(outDir, 'A.bin')).mode & 0o777, 0o600);
-  assert.deepEqual(fs.readFileSync(path.join(outDir, 'A.bin')), bytesA);
-  assert.deepEqual(fs.readFileSync(path.join(outDir, 'B.bin')), bytesB);
-
-  // Symlink destination directory refused
-  const symDir = path.join(dir, 'out-link');
-  fs.symlinkSync(outDir, symDir);
+  // Deprecated package_batch op must be removed from both JS client and Swift helper
+  assert.equal(typeof client.packageBatch, 'undefined');
   await assert.rejects(
-    () => client.packageBatch(symDir, [{ sourcePath: srcA, leafName: 'C.bin' }]),
-    /dest_dir_unsafe/
+    () => client.call('package_batch', { destDir: dir, items: [] }),
+    /unknown_op/
   );
-
-  // Atomic rollback on mid-batch collision (EEXIST) or symlink source
-  const rollbackDir = path.join(dir, 'rollback');
-  fs.mkdirSync(rollbackDir, { mode: 0o700 });
-  const symSrc = path.join(dir, 'sym-src.bin');
-  fs.symlinkSync(srcA, symSrc);
-  await assert.rejects(
-    () => client.packageBatch(rollbackDir, [
-      { sourcePath: srcA, leafName: 'good.bin' },
-      { sourcePath: symSrc, leafName: 'bad.bin' },
-    ]),
-    /source_symlink/
-  );
-  assert.deepEqual(fs.readdirSync(rollbackDir), [], 'failed batch must roll back earlier created files');
 });
 
 test('Swift native helper: NSWorkspace runningApps, libproc openFiles, and getxattr lastUsed', { skip: !hasNativeBinary }, async t => {
@@ -493,17 +459,113 @@ test('Phase 3B hardening: cloneVerifiedFile strips source xattrs and falls back 
   assert.equal(lockedRes.fallback, true);
   assert.equal(lockedRes.reason, 'source_has_flags');
   assert.equal(fs.existsSync(path.join(destDir, 'locked-asset.png')), false, 'locked fallback must leave no undeletable file in staging');
+});
 
-  // 3. packageBatch must also fall back to streaming copy on a locked source
-  const batchDir = path.join(dir, 'batch-out');
-  fs.mkdirSync(batchDir, { mode: 0o700 });
-  const batchRes = await client.packageBatch(batchDir, [{ sourcePath: lockedPath, leafName: 'locked-copy.png' }], {
-    mode: 'clone_or_copy',
-    computeHash: true,
+test('WatchOps completeness & error distinction: xattr errors, invalid PIDs, and case-sensitive runningApps', { skip: !hasNativeBinary }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-swift-watch-errors-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const client = new NativeHelperClient(DEFAULT_BINARY_PATH);
+  t.after(() => client.shutdown());
+
+  // 1. Missing xattr (ENOATTR) => null with zero errors; missing file (ENOENT) => explicit error!
+  const plainFile = path.join(dir, 'plain.png');
+  const missingFile = path.join(dir, 'does-not-exist.png');
+  fs.writeFileSync(plainFile, 'ok');
+  const xattrRes = await client.readLastUsedXattrs([plainFile, missingFile]);
+  assert.equal(xattrRes.timestamps[plainFile], null);
+  assert.equal(xattrRes.errors[plainFile], undefined);
+  assert.ok(typeof xattrRes.errors[missingFile] === 'string' && xattrRes.errors[missingFile].startsWith('errno_'));
+
+  // 2. openFiles on valid PID is complete; openFiles including nonexistent PID signals complete=false + failedPids
+  const okOpen = await client.openFiles([process.pid], []);
+  assert.equal(okOpen.complete, true);
+  assert.deepEqual(okOpen.failedPids, []);
+
+  const badOpen = await client.openFiles([process.pid, 999999], []);
+  assert.equal(badOpen.complete, false);
+  assert.ok(badOpen.failedPids.includes(999999));
+
+  // 3. runningApps caseSensitive=true respects exact keyword casing
+  const exactRes = await client.runningApps(['NO_SUCH_CASE_VARIANT_XYZ'], 3000, { caseSensitive: true });
+  assert.deepEqual(exactRes.apps, []);
+});
+
+test('Swift PdfAiParser signals incomplete on >512 FlateDecode streams and AIParser falls back safely without broadening web-font policy', { skip: !hasNativeBinary }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-swift-ai-cap-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const client = new NativeHelperClient(DEFAULT_BINARY_PATH);
+  t.after(() => client.shutdown());
+
+  // Build a synthetic PDF/AI with 520 tiny FlateDecode streams (> 512 cap) + raw .psb and .woff2 links
+  const tinyCompressed = zlib.deflateSync(Buffer.from('BT () Tj ET'));
+  const parts = [Buffer.from('%PDF-1.6\n')];
+  for (let i = 1; i <= 520; i++) {
+    parts.push(Buffer.from(`${i} 0 obj\n<< /Filter /FlateDecode /Length ${tinyCompressed.length} >>\nstream\n`));
+    parts.push(tinyCompressed);
+    parts.push(Buffer.from('\nendstream\nendobj\n'));
+  }
+  parts.push(Buffer.from('% /Users/synthetic/Smart.psb /Users/synthetic/Brand.woff2 /Volumes/Studio/hero.png\n%%EOF\n'));
+  const cappedAi = path.join(dir, 'many-streams.ai');
+  fs.writeFileSync(cappedAi, Buffer.concat(parts));
+
+  const parsed = await client.parsePdfAi(cappedAi, { decompressStreams: true });
+  assert.equal(parsed.incomplete, true);
+  assert.ok(Array.isArray(parsed.issues) && parsed.issues.includes('flate-stream-count-limit'));
+
+  // AIParser must fall back to JS scan on incomplete native output, keep .psb & /Volumes, and exclude .woff2
+  const parser = new AIParser();
+  const assets = await parser.extractAssets(cappedAi);
+  const paths = assets.map(a => a.path);
+  assert.deepEqual(paths, ['/Users/synthetic/Smart.psb', '/Volumes/Studio/hero.png']);
+});
+
+test('PSDParser falls back to ag-psd when native parsePsd reports incomplete or issues (A-P1-7)', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-psd-issues-fallback-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const linkedTarget = '/Users/synthetic/fallback-hero.png';
+  const psdBytes = agPsd.writePsdBuffer({
+    width: 2,
+    height: 2,
+    channels: 3,
+    bitsPerChannel: 8,
+    colorMode: 3,
+    linkedFiles: [{
+      id: '44444444-4444-4444-8444-444444444444',
+      name: 'fallback-hero.png',
+      childDocumentID: '',
+      linkedFile: {
+        fileSize: 128,
+        name: 'fallback-hero.png',
+        fullPath: linkedTarget,
+        originalPath: linkedTarget,
+        relativePath: '',
+      },
+    }],
   });
-  assert.equal(batchRes.files.length, 1);
-  assert.equal(batchRes.files[0].cloned, false);
-  assert.deepEqual(fs.readFileSync(path.join(batchDir, 'locked-copy.png')), payload);
+  const psdPath = path.join(dir, 'incomplete-native.psd');
+  fs.writeFileSync(psdPath, psdBytes);
+
+  const origIsAvailable = nativeHelper.isAvailable;
+  const origParsePsd = nativeHelper.parsePsd;
+  let nativeCalled = false;
+  nativeHelper.isAvailable = () => true;
+  nativeHelper.parsePsd = async () => {
+    nativeCalled = true;
+    return {
+      linkedPaths: [],
+      mediaPaths: [],
+      issues: ['unsupported-additional-signature'],
+      incomplete: true,
+    };
+  };
+  t.after(() => {
+    nativeHelper.isAvailable = origIsAvailable;
+    nativeHelper.parsePsd = origParsePsd;
+  });
+
+  const assets = await new PSDParser().extractAssets(psdPath);
+  assert.equal(nativeCalled, true);
+  assert.deepEqual(assets, [{ path: linkedTarget, source: 'psd-smartobject', exists: false }]);
 });
 
 test('Photoshop CC external links: file://// four-slash URIs with spaces and NULs resolve across Swift, worker, and Quick Package', { skip: !hasNativeBinary }, async t => {

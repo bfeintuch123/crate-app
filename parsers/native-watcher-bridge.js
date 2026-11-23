@@ -43,15 +43,21 @@ function canUseNativeProcessWatcher(execFn, execFileFn) {
 function canUseNativePackageClone() {
   const client = packageNativeHelper || nativeHelper;
   if (!client || !client.isAvailable()) return false;
-  return Boolean(process.versions && process.versions.electron) || process.env.CRATE_ENABLE_NATIVE_CLONE === '1';
+  // Keep APFS native clone opt-in only until dedicated organized-writer fault
+  // parity is established; default Electron and test runs stay on the
+  // descriptor-bound package-transaction-worker writer.
+  return process.env.CRATE_ENABLE_NATIVE_CLONE === '1';
 }
 
-async function readNativeLastUsedXattrs(filePaths, timeoutMs) {
-  const client = watcherNativeHelper || nativeHelper;
+async function readNativeLastUsedXattrs(filePaths, timeoutMs, { client: explicitClient = null } = {}) {
+  const client = explicitClient || watcherNativeHelper || nativeHelper;
   if (!client) return null;
   const response = await client.readLastUsedXattrs(filePaths, timeoutMs);
   const timestamps = response && response.timestamps;
   if (!timestamps || typeof timestamps !== 'object') return null;
+  if (response.errors && typeof response.errors === 'object' && Object.keys(response.errors).length > 0) {
+    throw new Error('native xattr read error');
+  }
 
   const values = new Map();
   for (const filePath of filePaths) {
@@ -64,16 +70,19 @@ async function readNativeLastUsedXattrs(filePaths, timeoutMs) {
   return values;
 }
 
-async function getNativeRunningDesignApps(keywords, timeoutMs = 3000) {
-  const client = watcherNativeHelper || nativeHelper;
+async function getNativeRunningDesignApps(keywords, timeoutMs = 3000, { client: explicitClient = null } = {}) {
+  const client = explicitClient || watcherNativeHelper || nativeHelper;
   if (!client) return null;
-  const result = await client.runningApps(keywords, timeoutMs);
+  const result = await client.runningApps(keywords, timeoutMs, { caseSensitive: true });
   const pids = [];
   const pidToCmd = new Map();
+  const filterKeywords = Array.isArray(keywords) ? keywords.filter(k => typeof k === 'string' && k.length > 0) : [];
   for (const appInfo of (result && result.apps) || []) {
     if (!Number.isInteger(appInfo.pid) || appInfo.pid <= 0) continue;
+    const cmd = appInfo.command || appInfo.name || '';
+    if (filterKeywords.length > 0 && !filterKeywords.some(kw => cmd.includes(kw))) continue;
     pids.push(appInfo.pid);
-    pidToCmd.set(appInfo.pid, appInfo.command || appInfo.name || '');
+    pidToCmd.set(appInfo.pid, cmd);
   }
   return { pids, pidToCmd };
 }
@@ -108,11 +117,18 @@ function formatNativeOpenFilesAsLsofF(validPids, files) {
   return lines.join('\n');
 }
 
-async function pollNativeOpenFilesAsLsofF(validPids, timeoutMs = 12000) {
-  const client = watcherNativeHelper || nativeHelper;
+async function pollNativeOpenFilesAsLsofF(validPids, timeoutMs = 12000, { client: explicitClient = null } = {}) {
+  const client = explicitClient || watcherNativeHelper || nativeHelper;
   if (!client) return null;
   const response = await client.openFiles(validPids, [], timeoutMs);
-  if (!response || !Array.isArray(response.files)) return null;
+  if (
+    !response ||
+    !Array.isArray(response.files) ||
+    response.complete !== true ||
+    (Array.isArray(response.failedPids) && response.failedPids.length > 0)
+  ) {
+    return null;
+  }
   return formatNativeOpenFilesAsLsofF(validPids, response.files);
 }
 

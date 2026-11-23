@@ -12,8 +12,9 @@ enum WatchOps {
     private static let maxJavascriptDateSeconds: Int64 = 8_640_000_000_000
     private static let maxVmRegionsPerPid = 16_384
 
-    static func runningApps(keywords: [String]) -> [[String: Any]] {
-        let lowerKeywords = keywords.map { $0.lowercased() }.filter { !$0.isEmpty }
+    static func runningApps(keywords: [String], caseSensitive: Bool = false) -> [[String: Any]] {
+        let exactKeywords = keywords.filter { !$0.isEmpty }
+        let lowerKeywords = exactKeywords.map { $0.lowercased() }
         let estimated = proc_listallpids(nil, 0)
         guard estimated > 0 else { return [] }
 
@@ -36,9 +37,14 @@ enum WatchOps {
             let command = String(cString: pathBuf)
             if command.isEmpty { continue }
             let name = (command as NSString).lastPathComponent
-            if !lowerKeywords.isEmpty {
-                let hay = command.lowercased()
-                let matched = lowerKeywords.contains { hay.contains($0) }
+            if !exactKeywords.isEmpty {
+                let matched: Bool
+                if caseSensitive {
+                    matched = exactKeywords.contains { command.contains($0) }
+                } else {
+                    let hay = command.lowercased()
+                    matched = lowerKeywords.contains { hay.contains($0) }
+                }
                 if !matched { continue }
             }
             out.append([
@@ -51,17 +57,18 @@ enum WatchOps {
         return out
     }
 
-    static func openFiles(pids: [Int32], extensions: Set<String>) -> [[String: Any]] {
+    static func openFiles(pids: [Int32], extensions: Set<String>) -> [String: Any] {
         var results: [[String: Any]] = []
+        var failedPids: [Int] = []
         let fdInfoSize = MemoryLayout<proc_fdinfo>.stride
         let vnodeInfoSize = Int32(MemoryLayout<vnode_fdinfowithpath>.size)
         let regionInfoSize = Int32(MemoryLayout<proc_regionwithpathinfo>.size)
 
         func recordIfMatching(pid: Int32, filePath: String, seenForPid: inout Set<String>) {
-            if filePath.isEmpty || !filePath.hasPrefix("/") { return }
+            guard !filePath.isEmpty, filePath.hasPrefix("/") else { return }
             if !extensions.isEmpty {
-                let ext = (filePath as NSString).pathExtension.lowercased()
-                if ext.isEmpty || !extensions.contains(".\(ext)") { return }
+                let ext = "." + ((filePath as NSString).pathExtension).lowercased()
+                if !extensions.contains(ext) { return }
             }
             if seenForPid.insert(filePath).inserted {
                 results.append([
@@ -74,33 +81,57 @@ enum WatchOps {
         for pid in pids {
             var seenForPid = Set<String>()
 
-            // 1. Open file descriptors (PROC_PIDLISTFDS)
-            let bufSize = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
-            if bufSize > 0 {
-                let count = Int(bufSize) / fdInfoSize
-                var fds = [proc_fdinfo](repeating: proc_fdinfo(), count: count)
-                let actual = fds.withUnsafeMutableBytes { raw -> Int32 in
-                    proc_pidinfo(pid, PROC_PIDLISTFDS, 0, raw.baseAddress, bufSize)
-                }
-                if actual > 0 {
-                    let actualCount = Int(actual) / fdInfoSize
-                    for idx in 0..<actualCount {
-                        let fdInfo = fds[idx]
-                        if fdInfo.proc_fdtype != PROX_FDTYPE_VNODE { continue }
-                        var vnodeInfo = vnode_fdinfowithpath()
-                        let ret = proc_pidfdinfo(pid, fdInfo.proc_fd, PROC_PIDFDVNODEPATHINFO, &vnodeInfo, vnodeInfoSize)
-                        if ret <= 0 { continue }
-                        // Regular files only (VREG == 1)
-                        if vnodeInfo.pvip.vip_vi.vi_type != 1 { continue }
+            // 1. Open file descriptors (PROC_PIDLISTFDS) with explicit completeness & truncation retry.
+            let initialBufSize = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
+            if initialBufSize <= 0 {
+                failedPids.append(Int(pid))
+                continue
+            }
 
-                        let filePath = withUnsafePointer(to: &vnodeInfo.pvip.vip_path) { ptr -> String in
-                            ptr.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { cStr in
-                                String(cString: cStr)
-                            }
-                        }
-                        recordIfMatching(pid: pid, filePath: filePath, seenForPid: &seenForPid)
+            var allocCount = max(1, (Int(initialBufSize) / fdInfoSize) + 32)
+            var fdReadOk = false
+            var fds: [proc_fdinfo] = []
+            var actualCount = 0
+
+            for _ in 0..<3 {
+                let allocBytes = Int32(allocCount * fdInfoSize)
+                fds = [proc_fdinfo](repeating: proc_fdinfo(), count: allocCount)
+                let actual = fds.withUnsafeMutableBytes { raw -> Int32 in
+                    proc_pidinfo(pid, PROC_PIDLISTFDS, 0, raw.baseAddress, allocBytes)
+                }
+                if actual <= 0 {
+                    fdReadOk = false
+                    break
+                }
+                if actual >= allocBytes {
+                    allocCount *= 2
+                    continue
+                }
+                actualCount = Int(actual) / fdInfoSize
+                fdReadOk = true
+                break
+            }
+
+            if !fdReadOk {
+                failedPids.append(Int(pid))
+                continue
+            }
+
+            for idx in 0..<actualCount {
+                let fdInfo = fds[idx]
+                if fdInfo.proc_fdtype != PROX_FDTYPE_VNODE { continue }
+                var vnodeInfo = vnode_fdinfowithpath()
+                let ret = proc_pidfdinfo(pid, fdInfo.proc_fd, PROC_PIDFDVNODEPATHINFO, &vnodeInfo, vnodeInfoSize)
+                if ret <= 0 { continue }
+                // Regular files only (VREG == 1)
+                if vnodeInfo.pvip.vip_vi.vi_type != 1 { continue }
+
+                let filePath = withUnsafePointer(to: &vnodeInfo.pvip.vip_path) { ptr -> String in
+                    ptr.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { cStr in
+                        String(cString: cStr)
                     }
                 }
+                recordIfMatching(pid: pid, filePath: filePath, seenForPid: &seenForPid)
             }
 
             // 2. Memory-mapped regular files (PROC_PIDREGIONPATHINFO) — matches lsof TXT/mapped vnodes
@@ -122,13 +153,19 @@ enum WatchOps {
                 address = nextAddress
             }
         }
-        return results
+        return [
+            "files": results,
+            "complete": failedPids.isEmpty,
+            "failedPids": failedPids,
+        ]
     }
 
     static func readLastUsedXattrs(paths: [String]) -> [String: Any] {
         var out: [String: Any] = [:]
+        var errors: [String: String] = [:]
         var raw = [UInt8](repeating: 0, count: 16)
         for filePath in paths {
+            errno = 0
             let len = filePath.withCString { cPath in
                 lastUsedXattrName.withCString { cAttr in
                     Darwin.getxattr(cPath, cAttr, &raw, raw.count, 0, XATTR_NOFOLLOW)
@@ -147,14 +184,31 @@ enum WatchOps {
                     && nanoseconds >= 0
                     && nanoseconds < 1_000_000_000 {
                     let unixMs = Double(seconds) * 1000.0 + Double(nanoseconds) / 1_000_000.0
-                    if unixMs.isFinite && unixMs <= 8_640_000_000_000_000.0 {
+                    if unixMs.isFinite && unixMs <= 8_640_000_000_000.0 {
                         out[filePath] = unixMs
                         continue
                     }
                 }
+                errors[filePath] = "invalid_timespec"
+                out[filePath] = NSNull()
+                continue
             }
+            if len < 0 {
+                let err = errno
+                if err == ENOATTR {
+                    out[filePath] = NSNull()
+                } else {
+                    errors[filePath] = "errno_\(err)"
+                    out[filePath] = NSNull()
+                }
+                continue
+            }
+            errors[filePath] = "invalid_length_\(len)"
             out[filePath] = NSNull()
         }
-        return out
+        return [
+            "timestamps": out,
+            "errors": errors,
+        ]
     }
 }

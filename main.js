@@ -258,6 +258,7 @@ function initializeAccountSession() {
     const identityChanged = accountWorkspaceId !== snapshot.identity?.id;
     const generationChanged = accountWorkspaceGeneration !== accountSession.generation;
     if (!allowed || identityChanged || generationChanged) {
+      projectIpcDeltaBridge.clearAll();
       invalidateAllPackageReviews();
       if (!allowed || identityChanged) {
         clearFileVisualProjectCache();
@@ -6734,6 +6735,8 @@ function getFileVisualProjectCacheEpoch(projectId) {
   return fileVisualProjectCacheEpochs.get(projectId) || 0;
 }
 
+let rasterThumbnailCacheGeneration = 0;
+
 function clearFileVisualProjectCache(projectId = null) {
   // The epoch also invalidates workspace builders that are between their
   // asynchronous filesystem reads and cache publication. Array/object
@@ -6744,6 +6747,7 @@ function clearFileVisualProjectCache(projectId = null) {
     return;
   }
   fileVisualProjectCacheGeneration += 1;
+  rasterThumbnailCacheGeneration += 1;
   fileVisualProjectCache.clear();
   if (typeof rasterThumbnailMemoryCache?.clear === 'function') rasterThumbnailMemoryCache.clear();
   if (typeof embeddedPsdReviewCache?.clear === 'function') embeddedPsdReviewCache.clear();
@@ -7427,12 +7431,26 @@ function rememberRasterThumbnail(cacheKey, dataUrl) {
   rasterThumbnailMemoryCache.set(cacheKey, dataUrl);
 }
 
-function getBoundedRasterThumbnail(projectId, file, visualRevision) {
+function getBoundedRasterThumbnail(projectId, file, visualRevision, authGuard = null) {
+  const capturedCacheGeneration = rasterThumbnailCacheGeneration;
+  const capturedProjectEpoch = getFileVisualProjectCacheEpoch(projectId);
+  const canPublishThumbnail = () => {
+    if (rasterThumbnailCacheGeneration !== capturedCacheGeneration) return false;
+    if (getFileVisualProjectCacheEpoch(projectId) !== capturedProjectEpoch) return false;
+    if (typeof authGuard === 'function') {
+      try { authGuard(); } catch (_) { return false; }
+    } else if (accountSession && !accountSession.canUseWorkspace()) {
+      return false;
+    }
+    return true;
+  };
   return runSerializedFileVisualRasterWork(async () => {
+    if (!canPublishThumbnail()) return null;
     const source = await openPreflightedRasterSource(file.path);
     if (!source) return null;
     let snapshot = null;
     try {
+      if (!canPublishThumbnail()) return null;
       if (createProjectFileVisualRevisionFromStat(projectId, file, source.sourceStat) !== visualRevision) {
         return { stale: true };
       }
@@ -7445,7 +7463,7 @@ function getBoundedRasterThumbnail(projectId, file, visualRevision) {
       const cachedDataUrl = cachedMemory || (cachedPersisted && typeof cachedPersisted.dataUrl === 'string' ? cachedPersisted.dataUrl : null);
       if (cachedDataUrl) {
         const descriptorStat = await source.handle.stat({ bigint: true });
-        if (!sameOpenFileStat(source.sourceStat, descriptorStat)) return null;
+        if (!sameOpenFileStat(source.sourceStat, descriptorStat) || !canPublishThumbnail()) return null;
         if (!cachedMemory && memoryKey) rememberRasterThumbnail(memoryKey, cachedDataUrl);
         return cachedDataUrl;
       }
@@ -7465,10 +7483,11 @@ function getBoundedRasterThumbnail(projectId, file, visualRevision) {
         !sameOpenFileStat(source.sourceStat, descriptorStat) ||
         snapshotPathStat.isSymbolicLink() ||
         !sameOpenFileStat(snapshot.stat, snapshotStat) ||
-        !sameOpenFileStat(snapshotStat, snapshotPathStat)
+        !sameOpenFileStat(snapshotStat, snapshotPathStat) ||
+        !canPublishThumbnail()
       ) return null;
       const encoded = encodeBoundedFileVisual(thumbnail);
-      if (encoded) {
+      if (encoded && canPublishThumbnail()) {
         if (memoryKey) rememberRasterThumbnail(memoryKey, encoded);
         store?.setStatCache?.(RASTER_THUMBNAIL_STAT_CACHE_NAMESPACE, file.path, source.sourceStat, { dataUrl: encoded });
       }
@@ -7559,7 +7578,8 @@ async function getProjectOwnedFileVisual(projectId, visualIdentity, visualRevisi
     typeof file.path === 'string' && path.isAbsolute(file.path) &&
     typeof nativeImage.createThumbnailFromPath === 'function'
   ) {
-    const dataUrl = await getBoundedRasterThumbnail(projectId, file, visualRevision);
+    const authGuard = accountSession ? captureAccountAuthorization() : null;
+    const dataUrl = await getBoundedRasterThumbnail(projectId, file, visualRevision, authGuard);
     const rasterRequestError = getProjectOwnedFileVisualRequestError(request);
     if (rasterRequestError) return rasterRequestError;
     if (dataUrl?.stale) return { error: 'stale_visual' };
@@ -8915,48 +8935,14 @@ if (!gotLock) {
 let localStorePaths = null;
 let localStoreStartupError = null;
 let store = null;
-startupPhaseJournal.mark('store-preflight-start');
-try {
-  localStorePaths = preflightLocalStorePaths(app.getPath('userData'));
-  startupPhaseJournal.mark('store-path-preflight-complete');
-  const candidateStore = new Store({
-    cwd: localStorePaths.userDataRealPath,
-    configFileMode: OWNER_ONLY_FILE_MODE,
-    defaults: {
-      projects: [],
-      settings: {
-        namingTemplate: DEFAULT_NAMING_TEMPLATE,
-        notifications: true,
-        existingAssetsNotifications: true,
-        needsSaveNotifications: true,
-        includeDiagnosticReport: false,
-        showPackageDetails: true,
-        packageOutputLayoutMode: PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
-      },
-      usage: {
-        packagesThisMonth: 0,
-        resetDate: getNextMonthReset()
-      }
-    }
-  });
-  startupPhaseJournal.mark('store-constructor-complete');
-  if (
-    typeof candidateStore.path !== 'string' ||
-    fs.realpathSync.native(candidateStore.path) !== fs.realpathSync.native(localStorePaths.configPath) ||
-    !hardenLocalStorePermissions(candidateStore.path, localStorePaths.userDataRealPath)
-  ) {
-    throw new Error('Crate could not secure local settings storage.');
-  }
-  startupPhaseJournal.mark('store-path-security-complete');
-  validateLocalStoreShape(candidateStore);
-  startupPhaseJournal.mark('store-shape-validation-complete');
-  const isRealElectronStore = (
-    typeof candidateStore.openInEditor === 'function' &&
-    typeof candidateStore.onDidChange === 'function'
-  );
-  if (isRealElectronStore && CrateSqliteStore) {
-    const sqliteStore = new CrateSqliteStore({
-      userDataRealPath: localStorePaths.userDataRealPath,
+if (gotLock) {
+  startupPhaseJournal.mark('store-preflight-start');
+  try {
+    localStorePaths = preflightLocalStorePaths(app.getPath('userData'));
+    startupPhaseJournal.mark('store-path-preflight-complete');
+    const candidateStore = new Store({
+      cwd: localStorePaths.userDataRealPath,
+      configFileMode: OWNER_ONLY_FILE_MODE,
       defaults: {
         projects: [],
         settings: {
@@ -8974,19 +8960,55 @@ try {
         }
       }
     });
-    sqliteStore.migrateFromLegacyStore(candidateStore);
-    validateLocalStoreShape(sqliteStore);
-    store = sqliteStore;
-  } else {
-    store = candidateStore;
+    startupPhaseJournal.mark('store-constructor-complete');
+    if (
+      typeof candidateStore.path !== 'string' ||
+      fs.realpathSync.native(candidateStore.path) !== fs.realpathSync.native(localStorePaths.configPath) ||
+      !hardenLocalStorePermissions(candidateStore.path, localStorePaths.userDataRealPath)
+    ) {
+      throw new Error('Crate could not secure local settings storage.');
+    }
+    startupPhaseJournal.mark('store-path-security-complete');
+    validateLocalStoreShape(candidateStore);
+    startupPhaseJournal.mark('store-shape-validation-complete');
+    const isRealElectronStore = (
+      typeof candidateStore.openInEditor === 'function' &&
+      typeof candidateStore.onDidChange === 'function'
+    );
+    if (isRealElectronStore && CrateSqliteStore) {
+      const sqliteStore = new CrateSqliteStore({
+        userDataRealPath: localStorePaths.userDataRealPath,
+        defaults: {
+          projects: [],
+          settings: {
+            namingTemplate: DEFAULT_NAMING_TEMPLATE,
+            notifications: true,
+            existingAssetsNotifications: true,
+            needsSaveNotifications: true,
+            includeDiagnosticReport: false,
+            showPackageDetails: true,
+            packageOutputLayoutMode: PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
+          },
+          usage: {
+            packagesThisMonth: 0,
+            resetDate: getNextMonthReset()
+          }
+        }
+      });
+      sqliteStore.migrateFromLegacyStore(candidateStore);
+      validateLocalStoreShape(sqliteStore);
+      store = sqliteStore;
+    } else {
+      store = candidateStore;
+    }
+    migrateSettings();
+    startupPhaseJournal.mark('store-migrations-complete');
+    startupPhaseJournal.mark('store-preflight-complete');
+  } catch (_) {
+    store = null;
+    localStoreStartupError = new Error('Crate could not secure local settings storage.');
+    startupPhaseJournal.mark('store-preflight-failed');
   }
-  migrateSettings();
-  startupPhaseJournal.mark('store-migrations-complete');
-  startupPhaseJournal.mark('store-preflight-complete');
-} catch (_) {
-  store = null;
-  localStoreStartupError = new Error('Crate could not secure local settings storage.');
-  startupPhaseJournal.mark('store-preflight-failed');
 }
 
 // One-time migration: update old naming template format to new one
@@ -11517,36 +11539,66 @@ function getProjectByIdFast(projectId) {
 }
 
 function sendProjectFileStateToRenderer(projectId, activationToken = null) {
-  const emitNow = () => {
-    const current = () => isBoundWatchingActivationCurrent(projectId, activationToken);
-    const project = current() && getProjectByIdFast(projectId);
-    if (!project || !current()) return;
-    syncAcceptedSourceWatchSubscriptions(projectId);
-    const { files = [], pendingFiles = [] } = getIllustratorScopedProjectView(project);
-    const update = projectIpcDeltaBridge.computeProjectUpdate(projectId, files, pendingFiles);
-    if (!update) return;
-    const isElectronRuntime = Boolean(process.versions && process.versions.electron);
-    const includeFullArrays = !isElectronRuntime;
-    if (update.filesChanged || update.revision === 1) {
+  const assertAuthorized = accountSession ? captureAccountAuthorization() : null;
+  projectIpcDeltaBridge.scheduleCoalesced(projectId, {
+    activationToken,
+    assertAuthorized,
+    emitFn: ({ callers }) => {
+      const current = () => {
+        if (accountSession && !accountSession.canUseWorkspace()) return false;
+        return callers.some(caller => {
+          if (accountSession && typeof caller.assertAuthorized === 'function') {
+            try { caller.assertAuthorized(); } catch (_) { return false; }
+          }
+          return (
+            caller.activationToken === null ||
+            isBoundWatchingActivationCurrent(projectId, caller.activationToken)
+          );
+        });
+      };
+      const project = current() && getProjectByIdFast(projectId);
+      if (!project || !current()) return;
+      syncAcceptedSourceWatchSubscriptions(projectId);
+      const { files = [], pendingFiles = [] } = getIllustratorScopedProjectView(project);
+      if (!current()) return;
+      const isElectronRuntime = Boolean(process.versions && process.versions.electron);
+      const counts = { files: files.length, pending: pendingFiles.length };
+      // Coalesce burst notifications without suppressing unchanged-row refreshes
+      // (the renderer uses these events as refresh triggers), and omit unused
+      // full-row payloads over Electron IPC.
+      if (isElectronRuntime) {
+        const revision = projectIpcDeltaBridge.getRevision(projectId) + 1;
+        projectIpcDeltaBridge.projectState.set(projectId, { revision, filesSnap: null, pendingSnap: null });
+        sendToRenderer('files:updated', { projectId, revision, counts });
+        if (current()) {
+          sendToRenderer('files:pending', { projectId, revision, counts });
+        }
+        return;
+      }
+      const prevPendingSnap = projectIpcDeltaBridge.projectState.get(projectId)?.pendingSnap || null;
+      const update = projectIpcDeltaBridge.computeProjectUpdate(projectId, files, pendingFiles);
+      if (!update) return;
       sendToRenderer('files:updated', {
         projectId,
         revision: update.revision,
         delta: update.filesDelta,
         counts: update.counts,
-        ...(includeFullArrays ? { files } : {}),
+        files,
       });
-    }
-    if (current() && (update.pendingChanged || update.revision === 1)) {
-      sendToRenderer('files:pending', {
-        projectId,
-        revision: update.revision,
-        delta: update.pendingDelta,
-        counts: update.counts,
-        ...(includeFullArrays ? { pendingFiles } : {}),
-      });
-    }
-  };
-  projectIpcDeltaBridge.schedule(projectId, emitNow);
+      if (current()) {
+        sendToRenderer('files:pending', {
+          projectId,
+          revision: update.revision,
+          delta: update.pendingDelta,
+          counts: update.counts,
+          pendingFiles,
+        });
+      } else {
+        const state = projectIpcDeltaBridge.projectState.get(projectId);
+        if (state) state.pendingSnap = prevPendingSnap;
+      }
+    },
+  });
 }
 
 function projectWatchActivityTime(project) {
@@ -22028,7 +22080,10 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   const operation = captureProjectOperation(projectId); if (!operation) return null;
   const operationCurrent = operation.current;
   const preScanStartedAt = Date.now();
+  const IN_SCAN_FILE_CACHE_MAX_BYTES = 128 * 1024 * 1024;
+  const IN_SCAN_BUFFER_EXTENSIONS = new Set(['.ai', '.pdf', '.xd', '.indd', '.psd']);
   const inScanFileCache = new Map();
+  let inScanFileCacheBytes = 0;
   let inScanRunningAppsPromise = null;
   let inScanPhotoshopPaths = null;
   const getInScanRunningApps = async () => {
@@ -22063,18 +22118,42 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     }
     return inScanRunningAppsPromise;
   };
+  const rememberInScanFileEntry = (key, entry) => {
+    const existing = inScanFileCache.get(key);
+    if (existing) {
+      inScanFileCacheBytes -= existing.buf.length;
+      inScanFileCache.delete(key);
+    }
+    if (entry.buf.length > IN_SCAN_FILE_CACHE_MAX_BYTES) {
+      return;
+    }
+    while (inScanFileCacheBytes + entry.buf.length > IN_SCAN_FILE_CACHE_MAX_BYTES && inScanFileCache.size > 0) {
+      const oldestKey = inScanFileCache.keys().next().value;
+      const oldest = inScanFileCache.get(oldestKey);
+      inScanFileCache.delete(oldestKey);
+      if (oldest) inScanFileCacheBytes -= oldest.buf.length;
+    }
+    inScanFileCache.set(key, entry);
+    inScanFileCacheBytes += entry.buf.length;
+  };
   const getInScanFileEntry = async (filePath) => {
     const key = normalizeTrackedFilePath(filePath);
     if (!key) return null;
     try {
       const st = await fs.promises.stat(filePath, { bigint: true });
-      if (!st.isFile() || st.size > BigInt(MAX_PARSE_FILE_SIZE)) return null;
+      if (!st.isFile()) return null;
+      if (st.size > BigInt(MAX_PARSE_FILE_SIZE)) return { tooLarge: true };
       const statKey = `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
       const cached = inScanFileCache.get(key);
-      if (cached && cached.statKey === statKey) return cached;
+      if (cached && cached.statKey === statKey) {
+        // Refresh LRU position
+        inScanFileCache.delete(key);
+        inScanFileCache.set(key, cached);
+        return cached;
+      }
       const buf = await fs.promises.readFile(filePath);
-      const entry = { statKey, buf, text: null };
-      inScanFileCache.set(key, entry);
+      const entry = { statKey, buf };
+      rememberInScanFileEntry(key, entry);
       return entry;
     } catch (_) {
       return null;
@@ -22664,15 +22743,9 @@ end tell`;
         if (!fs.existsSync(designFile.path)) continue;
         const cachedFile = await getInScanFileEntry(designFile.path);
         if (!operationCurrent()) return null;
-        let content;
-        if (cachedFile) {
-          if (cachedFile.text === null) cachedFile.text = cachedFile.buf.toString('utf8');
-          content = cachedFile.text;
-        } else {
-          const buf = await fs.promises.readFile(designFile.path);
-          if (!operationCurrent()) return null;
-          content = buf.toString('utf8');
-        }
+        if (!cachedFile || cachedFile.tooLarge || !cachedFile.buf) continue;
+        // Decode transiently so regex strings are never retained across files.
+        const content = cachedFile.buf.toString('utf8');
         let match;
         LINKED_ASSET_REGEX.lastIndex = 0;
         while ((match = LINKED_ASSET_REGEX.exec(content)) !== null) {
@@ -22722,11 +22795,12 @@ end tell`;
       if (skipDoubleCheck(file)) continue;
       try {
         if (!fs.existsSync(file.path)) continue;
-        const cachedFile = await getInScanFileEntry(file.path);
+        const cachedFile = IN_SCAN_BUFFER_EXTENSIONS.has(file.ext)
+          ? await getInScanFileEntry(file.path)
+          : null;
         if (!operationCurrent()) return null;
         const linkedPaths = await extractLinkedAssets(file.path, {
-          ...(cachedFile ? { sourceBuffer: cachedFile.buf } : {}),
-          ...(cachedFile && typeof cachedFile.text === 'string' ? { sourceText: cachedFile.text } : {}),
+          ...(cachedFile && !cachedFile.tooLarge && cachedFile.buf ? { sourceBuffer: cachedFile.buf } : {}),
           ...(Array.isArray(inScanPhotoshopPaths) ? { inScanPhotoshopPaths } : {}),
         });
         if (!operationCurrent()) return null;

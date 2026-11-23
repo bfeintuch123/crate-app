@@ -282,3 +282,158 @@ test('Phase 4C: resolveNativeHelperBinaryPath supports packaged resourcesPath an
     Object.defineProperty(process, 'resourcesPath', { value: prevResourcesPath, configurable: true, writable: true });
   }
 });
+
+test('Coalesced IPC preserves union of tokens and cancels cleanly on account logout (G-P1 / A-P1-1)', async () => {
+  const bridge = new ProjectIpcDeltaBridge({ coalesceMs: 16 });
+  const emitted = [];
+
+  // Scenario 1: valid token followed by stale token within 16ms window must NOT drop refresh
+  let activeToken = 1;
+  let authed = true;
+  bridge.scheduleCoalesced('proj-1', {
+    activationToken: 1,
+    assertAuthorized: () => { if (!authed) throw new Error('logged_out'); },
+    emitFn: ({ tokens, hasNullToken, authChecks }) => {
+      const okAuth = authChecks.some(fn => { try { fn(); return true; } catch (_) { return false; } });
+      const okTok = hasNullToken || [...tokens].some(tok => tok === activeToken);
+      if (okAuth && okTok) emitted.push({ projectId: 'proj-1', tokens: [...tokens] });
+    },
+  });
+  bridge.scheduleCoalesced('proj-1', {
+    activationToken: 999, // stale token
+    assertAuthorized: () => { if (!authed) throw new Error('logged_out'); },
+    emitFn: ({ tokens, hasNullToken, authChecks }) => {
+      const okAuth = authChecks.some(fn => { try { fn(); return true; } catch (_) { return false; } });
+      const okTok = hasNullToken || [...tokens].some(tok => tok === activeToken);
+      if (okAuth && okTok) emitted.push({ projectId: 'proj-1', tokens: [...tokens] });
+    },
+  });
+  await new Promise(resolve => setTimeout(resolve, 45));
+  assert.equal(emitted.length, 1);
+  assert.deepEqual(emitted[0].tokens.sort((a, b) => a - b), [1, 999]);
+
+  // Scenario 2: null-token send followed by logout/clearAll within 16ms emits nothing
+  bridge.scheduleCoalesced('proj-2', {
+    activationToken: null,
+    assertAuthorized: () => { if (!authed) throw new Error('logged_out'); },
+    emitFn: () => { emitted.push({ projectId: 'proj-2', leaked: true }); },
+  });
+  authed = false;
+  bridge.clearAll();
+  await new Promise(resolve => setTimeout(resolve, 45));
+  assert.equal(emitted.filter(e => e.projectId === 'proj-2').length, 0);
+});
+
+test('NativeHelperClient per-child lifecycle: retired timed-out helper exit cannot reject replacement helper requests (A-P2-2)', async t => {
+  const { NativeHelperClient } = require('../parsers/native-helper');
+  const prevDisableEnv = process.env.CRATE_DISABLE_NATIVE_HELPER;
+  delete process.env.CRATE_DISABLE_NATIVE_HELPER;
+  t.after(() => {
+    if (prevDisableEnv === undefined) delete process.env.CRATE_DISABLE_NATIVE_HELPER;
+    else process.env.CRATE_DISABLE_NATIVE_HELPER = prevDisableEnv;
+  });
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'crate-nh-lifecycle-')));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  // Synthetic helper script: delays on "slow" op, answers immediately on "ping",
+  // and sleeps briefly on SIGTERM before exiting so the replacement spawns first.
+  const fakeHelper = path.join(dir, 'fake-helper.js');
+  const markerFile = path.join(dir, 'spawn-count');
+  fs.writeFileSync(markerFile, '0');
+  const script = `#!/bin/sh
+exec "${process.execPath}" -e '
+const fs = require("node:fs");
+const readline = require("node:readline");
+const marker = ${JSON.stringify(markerFile)};
+const count = Number(fs.readFileSync(marker, "utf8")) + 1;
+fs.writeFileSync(marker, String(count));
+process.on("SIGTERM", () => { setTimeout(() => process.exit(0), 60); });
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", line => {
+  const req = JSON.parse(line);
+  if (req.op === "shutdown") { process.stdout.write(JSON.stringify({ id: req.id, ok: true }) + "\\n"); process.exit(0); }
+  if (req.op === "slow") return; // deliberately time out
+  if (req.op === "ping") {
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify({ id: req.id, ok: true, result: { version: 1, spawn: count, pid: process.pid } }) + "\\n");
+    }, 100);
+  }
+});
+'
+`;
+  fs.writeFileSync(fakeHelper, script, { mode: 0o755 });
+
+  const client = new NativeHelperClient(fakeHelper);
+  t.after(() => client.shutdown());
+
+  // 0. Ensure child #1 is alive and has recorded spawn 1 before triggering timeout
+  const firstPong = await client.ping();
+  assert.equal(firstPong.version, 1);
+  assert.equal(firstPong.spawn, 1);
+
+  // 1. Trigger a timeout on child #1 (which delays its SIGTERM exit by 60ms)
+  await assert.rejects(() => client.call('slow', {}, 30), /native_helper_timeout/);
+
+  // 2. Immediately issue ping on child #2 (takes 100ms, spanning child #1's exit at 60ms)
+  const pong = await client.ping();
+  assert.equal(pong.version, 1);
+  assert.equal(pong.spawn, 2);
+});
+
+test('Native watcher bridge client-injected tests: xattr errors throw, incomplete openFiles returns null, runningApps is case-sensitive (A-P1-3 / N4)', async () => {
+  const {
+    readNativeLastUsedXattrs,
+    pollNativeOpenFilesAsLsofF,
+    getNativeRunningDesignApps,
+  } = require('../parsers/native-watcher-bridge');
+
+  // 1. xattr errors must throw (triggering /usr/bin/xattr fallback / fail-closed scan)
+  await assert.rejects(
+    () => readNativeLastUsedXattrs(['/Users/synthetic/a.png'], 1000, {
+      client: {
+        readLastUsedXattrs: async () => ({
+          timestamps: { '/Users/synthetic/a.png': null },
+          errors: { '/Users/synthetic/a.png': 'errno_13' },
+        }),
+      },
+    }),
+    /native xattr read error/
+  );
+
+  // 2. Incomplete openFiles or failedPids must return null (NEVER emit empty p<pid> header)
+  const incompleteOut = await pollNativeOpenFilesAsLsofF([101, 202], 1000, {
+    client: {
+      openFiles: async () => ({ files: [], complete: false, failedPids: [202] }),
+    },
+  });
+  assert.equal(incompleteOut, null);
+
+  const completeOut = await pollNativeOpenFilesAsLsofF([101, 202], 1000, {
+    client: {
+      openFiles: async () => ({
+        files: [{ pid: 101, path: '/Users/synthetic/poster.psd' }],
+        complete: true,
+        failedPids: [],
+      }),
+    },
+  });
+  assert.equal(completeOut, 'p101\ntREG\nn/Users/synthetic/poster.psd\np202');
+
+  // 3. getNativeRunningDesignApps passes caseSensitive=true and enforces exact case match
+  let receivedOpts = null;
+  const apps = await getNativeRunningDesignApps(['Adobe Photoshop', 'Keynote'], 1000, {
+    client: {
+      runningApps: async (keywords, _timeout, opts) => {
+        receivedOpts = opts;
+        return {
+          apps: [
+            { pid: 10, command: '/Applications/Adobe Photoshop 2026/Adobe Photoshop 2026.app/Contents/MacOS/Adobe Photoshop 2026' },
+            { pid: 20, command: '/usr/local/bin/adobe photoshop spoof' },
+          ],
+        };
+      },
+    },
+  });
+  assert.deepEqual(receivedOpts, { caseSensitive: true });
+  assert.deepEqual(apps.pids, [10]);
+});

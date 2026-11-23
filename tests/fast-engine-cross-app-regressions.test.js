@@ -21,12 +21,12 @@ const { AIParser } = require('../parsers/ai');
 const { InDesignParser } = require('../parsers/indesign');
 const { PowerPointParser } = require('../parsers/powerpoint');
 const { packageMasterFile } = require('../parsers/index');
-const { DEFAULT_BINARY_PATH } = require('../parsers/native-helper');
+const { DEFAULT_BINARY_PATH, nativeHelper } = require('../parsers/native-helper');
 
 const mainSource = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
 const psdWorkerPath = path.join(__dirname, '..', 'parsers', 'add-files-psd-worker.js');
 const regexWorkerPath = path.join(__dirname, '..', 'parsers', 'add-files-regex-worker.js');
-const hasNativeBinary = fs.existsSync(DEFAULT_BINARY_PATH);
+const hasNativeBinary = nativeHelper.isAvailable();
 
 function sliceMain(start, end) {
   const a = mainSource.indexOf(start);
@@ -438,4 +438,200 @@ test('PowerPoint (.pptx) & Keynote (.key): in-process ZIP reader + OOXML externa
   assert.equal(keyAssets.length, 1);
   assert.equal(keyAssets[0].source, 'keynote-embedded');
   assert.equal(keyAssets[0].zipPath, 'Data/slide-hero-1234.jpg');
+});
+
+test('main.js structural guards: denied second instance skips store init, thumbnail write checks cache generation, in-scan cache is byte-bounded', () => {
+  // 1. Denied second instance (!gotLock) must not open or migrate SQLite/electron-store
+  const lockBlock = sliceMain('const gotLock = app.requestSingleInstanceLock();', '// One-time migration:');
+  assert.ok(lockBlock.includes('if (gotLock) {'), 'store initialization must be guarded by if (gotLock)');
+
+  // 2. Thumbnail write-back must check cache generation and account guard right before cache publication
+  const thumbBlock = sliceMain('function getBoundedRasterThumbnail(', 'function getProjectOwnedFileVisualRequestError(');
+  assert.ok(thumbBlock.includes('rasterThumbnailCacheGeneration !== capturedCacheGeneration'));
+  assert.ok(thumbBlock.includes('if (encoded && canPublishThumbnail())'));
+
+  // 3. Pre-package in-scan file cache enforces total byte budget and propagates tooLarge without raw readFile fallback
+  const cacheBlock = sliceMain('const IN_SCAN_FILE_CACHE_MAX_BYTES =', 'const ordinaryPsdOutputBatches =');
+  assert.ok(cacheBlock.includes('IN_SCAN_FILE_CACHE_MAX_BYTES'));
+  assert.ok(cacheBlock.includes("return { tooLarge: true }"));
+  const regexBlock = sliceMain('const regexScanStartedAt = Date.now();', 'const regexScanElapsedMs =');
+  assert.ok(regexBlock.includes('if (!cachedFile || cachedFile.tooLarge || !cachedFile.buf) continue;'));
+  assert.equal(regexBlock.includes('fs.promises.readFile'), false, 'regex pass must not fall back to unrestricted readFile');
+});
+
+test('main.js behavioral fence: in-flight getBoundedRasterThumbnail refuses cache writes after logout/clear (A-P2-3)', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-thumb-fence-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const imgPath = path.join(dir, 'hero.png');
+  fs.writeFileSync(imgPath, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+
+  let resolveThumb;
+  const statCacheWrites = [];
+  let authed = true;
+  const thumbCode = [
+    'const RASTER_THUMBNAIL_STAT_CACHE_NAMESPACE = "raster-thumbnail";',
+    'const FILE_VISUAL_PIXEL_SIZE = 64;',
+    'const FILE_VISUAL_MAX_RASTER_QUEUE = 8;',
+    'const fileVisualProjectCache = new Map();',
+    'const fileVisualProjectCacheEpochs = new Map();',
+    'let fileVisualProjectCacheGeneration = 0;',
+    'let fileVisualRasterWorkTail = Promise.resolve();',
+    'let fileVisualRasterWorkPending = 0;',
+    'const embeddedPsdReviewCache = new Map();',
+    sliceMain('function getFileVisualProjectCacheEpoch(', 'function getCurrentFileVisualProjectCache('),
+    sliceMain('function runSerializedFileVisualRasterWork(', 'function getProjectOwnedFileVisualRequestError('),
+    'function getRasterThumbnailMemoryCacheSize() { return rasterThumbnailMemoryCache.size; }',
+  ].join('\n');
+
+  const ctx = {
+    fs,
+    path,
+    accountSession: { canUseWorkspace: () => authed },
+    store: {
+      getStatCache: () => null,
+      setStatCache: (...args) => { statCacheWrites.push(args); },
+    },
+    openPreflightedRasterSource: async p => {
+      const handle = await fs.promises.open(p, 'r');
+      const sourceStat = await handle.stat({ bigint: true });
+      return { handle, sourceStat };
+    },
+    createProjectFileVisualRevisionFromStat: () => 'rev-1',
+    sameOpenFileStat: () => true,
+    createPrivateFileVisualSnapshot: async source => {
+      const snapPath = path.join(dir, 'snap.png');
+      fs.writeFileSync(snapPath, Buffer.from([137, 80, 78, 71]));
+      const handle = await fs.promises.open(snapPath, 'r');
+      const stat = await handle.stat({ bigint: true });
+      return { path: snapPath, directory: dir, handle, stat };
+    },
+    assertPrivateFileVisualDirectory: async () => {},
+    cleanupPrivateFileVisualSnapshot: async snap => {
+      if (snap?.handle) try { await snap.handle.close(); } catch (_) {}
+    },
+    nativeImage: {
+      createThumbnailFromPath: () => new Promise(resolve => { resolveThumb = resolve; }),
+    },
+    encodeBoundedFileVisual: () => 'data:image/png;base64,AAAA',
+    Map,
+    Promise,
+    Math,
+  };
+  vm.runInNewContext(thumbCode, ctx);
+
+  const authGuard = () => { if (!authed) throw new Error('logged_out'); };
+  const pendingThumb = ctx.getBoundedRasterThumbnail('proj-1', { path: imgPath, ext: '.png' }, 'rev-1', authGuard);
+
+  // Wait until render reaches nativeImage.createThumbnailFromPath
+  for (let i = 0; i < 50 && !resolveThumb; i++) {
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  assert.ok(typeof resolveThumb === 'function', 'thumbnail render must be in flight');
+
+  // Simulate logout + cache clear while thumbnail render is still awaiting
+  authed = false;
+  ctx.clearFileVisualProjectCache();
+  resolveThumb({ fake: true });
+
+  const result = await pendingThumb;
+  assert.equal(result, null, 'stale in-flight thumbnail must return null after logout/clear');
+  assert.equal(ctx.getRasterThumbnailMemoryCacheSize(), 0, 'memory cache must stay empty');
+  assert.equal(statCacheWrites.length, 0, 'SQLite stat cache must receive zero writes after logout/clear');
+});
+
+test('main.js behavioral IPC coalescing: preserves valid caller over later stale token, emits unchanged-row refresh, drops on logout, omits full rows in Electron (G-P1 / A-P1-1 / N2)', async () => {
+  const { ProjectIpcDeltaBridge } = require('../parsers/ipc-delta-bridge');
+  const sendFnSource = sliceMain('function sendProjectFileStateToRenderer(', 'function projectWatchActivityTime(');
+
+  const emitted = [];
+  let authed = true;
+  let accountEpoch = 1;
+  let activeToken = 'tok-valid';
+  const project = {
+    id: 'proj-ipc',
+    files: [{ path: '/Users/synthetic/a.jpg', name: 'a.jpg' }],
+    pendingFiles: [{ path: '/Users/synthetic/p.png', name: 'p.png' }],
+  };
+
+  const bridge = new ProjectIpcDeltaBridge({ coalesceMs: 16 });
+  const ctx = {
+    projectIpcDeltaBridge: bridge,
+    accountSession: { canUseWorkspace: () => authed },
+    captureAccountAuthorization: () => {
+      const capturedEpoch = accountEpoch;
+      return () => {
+        if (!authed || accountEpoch !== capturedEpoch) throw new Error('stale_account');
+      };
+    },
+    isBoundWatchingActivationCurrent: (_projectId, token) => token === activeToken,
+    getProjectByIdFast: id => (id === project.id ? project : null),
+    syncAcceptedSourceWatchSubscriptions: () => {},
+    getIllustratorScopedProjectView: p => ({ files: p.files, pendingFiles: p.pendingFiles }),
+    sendToRenderer: (channel, payload) => { emitted.push({ channel, payload }); },
+    process: { versions: { electron: '42.11.16' } },
+  };
+  vm.runInNewContext(sendFnSource, ctx);
+
+  // 1. Valid caller followed immediately by a stale caller within the 16ms coalesce window
+  ctx.sendProjectFileStateToRenderer('proj-ipc', 'tok-valid');
+  ctx.sendProjectFileStateToRenderer('proj-ipc', 'tok-stale');
+  await new Promise(resolve => setTimeout(resolve, 40));
+
+  assert.equal(emitted.length, 2, 'must emit both files:updated and files:pending despite trailing stale caller');
+  assert.equal(emitted[0].channel, 'files:updated');
+  assert.equal(emitted[1].channel, 'files:pending');
+  assert.equal(emitted[0].payload.files, undefined, 'Electron IPC payload must omit unused full files array');
+  assert.equal(emitted[1].payload.pendingFiles, undefined, 'Electron IPC payload must omit unused full pendingFiles array');
+  assert.deepEqual({ ...emitted[0].payload.counts }, { files: 1, pending: 1 });
+
+  // 2. Unchanged rows still emit refresh notifications (N2)
+  emitted.length = 0;
+  ctx.sendProjectFileStateToRenderer('proj-ipc', 'tok-valid');
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(emitted.length, 2, 'unchanged rows must not suppress renderer refresh');
+  assert.equal(emitted[0].payload.revision, 2);
+
+  // 3. Account logout / clearAll cancels pending coalesced notification before timer fires
+  emitted.length = 0;
+  ctx.sendProjectFileStateToRenderer('proj-ipc', 'tok-valid');
+  authed = false;
+  accountEpoch += 1;
+  bridge.clearAll();
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(emitted.length, 0, 'logout + clearAll must drop queued notifications');
+
+  // 4. Non-Electron path: if activation becomes stale during files:updated send, pendingSnap must not advance
+  authed = true;
+  const nonElectronBridge = new ProjectIpcDeltaBridge({ coalesceMs: 0 });
+  const nonElectronEmitted = [];
+  let dropAfterFirstSend = true;
+  const ctx2 = {
+    projectIpcDeltaBridge: nonElectronBridge,
+    accountSession: { canUseWorkspace: () => authed },
+    captureAccountAuthorization: () => () => {},
+    isBoundWatchingActivationCurrent: (_projectId, token) => token === activeToken,
+    getProjectByIdFast: id => (id === project.id ? project : null),
+    syncAcceptedSourceWatchSubscriptions: () => {},
+    getIllustratorScopedProjectView: p => ({ files: p.files, pendingFiles: p.pendingFiles }),
+    sendToRenderer: (channel, payload) => {
+      nonElectronEmitted.push({ channel, payload });
+      if (dropAfterFirstSend && channel === 'files:updated') {
+        activeToken = 'tok-new';
+      }
+    },
+    process: { versions: {} },
+  };
+  vm.runInNewContext(sendFnSource, ctx2);
+  ctx2.sendProjectFileStateToRenderer('proj-ipc', 'tok-valid');
+  assert.equal(nonElectronEmitted.length, 1, 'files:pending must be skipped once token becomes stale');
+  assert.equal(nonElectronEmitted[0].channel, 'files:updated');
+  assert.equal(nonElectronBridge.projectState.get('proj-ipc').pendingSnap, null, 'pendingSnap must not advance for unsent files:pending');
+
+  // Next call with new valid token still sees pendingDelta.changed === true
+  dropAfterFirstSend = false;
+  nonElectronEmitted.length = 0;
+  ctx2.sendProjectFileStateToRenderer('proj-ipc', 'tok-new');
+  assert.equal(nonElectronEmitted.length, 2);
+  assert.equal(nonElectronEmitted[1].channel, 'files:pending');
+  assert.equal(nonElectronEmitted[1].payload.delta.changed, true);
 });

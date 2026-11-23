@@ -331,8 +331,19 @@ function openZipArchive(filePath, options = {}) {
         if (dataOffset + entry.compressedSize > fileSize) {
           throw new Error('zip_truncated_entry');
         }
-        if (entry.method === 0 && Number.isSafeInteger(entryMaxBytes) && entry.compressedSize > entryMaxBytes) {
-          throw admissionError(entryMessage);
+        if (Number.isSafeInteger(entryMaxBytes)) {
+          if (entry.method === 0 && entry.compressedSize > entryMaxBytes) {
+            throw admissionError(entryMessage);
+          }
+          if (entry.method === 8) {
+            // Deflate stored blocks add at most 5 bytes per 65,535 bytes of output;
+            // allow generous framing headroom while strictly blocking archive-sized
+            // compressed allocations before inflation.
+            const maxDeflateCompressedBytes = entryMaxBytes + Math.ceil(entryMaxBytes / 16384) * 5 + 65536;
+            if (entry.compressedSize > maxDeflateCompressedBytes) {
+              throw admissionError(entryMessage);
+            }
+          }
         }
 
         const compressed = readExactSync(fd, dataOffset, entry.compressedSize);

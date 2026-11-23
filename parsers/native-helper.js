@@ -53,11 +53,12 @@ class NativeHelperClient {
   constructor(binaryPath = null) {
     this.explicitBinaryPath = binaryPath;
     this.binaryPath = resolveNativeHelperBinaryPath(binaryPath);
-    this.child = null;
-    this.buffer = '';
+    this.session = null;
     this.nextId = 1;
-    this.pending = new Map();
-    this.disposing = false;
+  }
+
+  get child() {
+    return this.session ? this.session.child : null;
   }
 
   isAvailable() {
@@ -69,15 +70,19 @@ class NativeHelperClient {
     return isExecutableRegularFile(this.binaryPath);
   }
 
-  _ensureRunning() {
-    if (this.child && !this.child.killed && this.child.exitCode === null) {
-      return this.child;
+  _ensureSession() {
+    if (
+      this.session &&
+      !this.session.disposing &&
+      this.session.child &&
+      !this.session.child.killed &&
+      this.session.child.exitCode === null
+    ) {
+      return this.session;
     }
     if (!this.isAvailable()) {
       throw new Error('native_helper_unavailable');
     }
-    this.disposing = false;
-    this.buffer = '';
     const child = spawn(this.binaryPath, [], {
       stdio: ['pipe', 'pipe', 'ignore'],
       env: {},
@@ -86,37 +91,47 @@ class NativeHelperClient {
     if (typeof child.stdin?.unref === 'function') child.stdin.unref();
     if (typeof child.stdout?.unref === 'function') child.stdout.unref();
 
+    const session = {
+      child,
+      buffer: '',
+      pending: new Map(),
+      disposing: false,
+      terminated: false,
+    };
+
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', chunk => {
-      this.buffer += chunk;
-      let nl = this.buffer.indexOf('\n');
+      if (session.terminated) return;
+      session.buffer += chunk;
+      let nl = session.buffer.indexOf('\n');
       while (nl >= 0) {
-        const line = this.buffer.slice(0, nl).trim();
-        this.buffer = this.buffer.slice(nl + 1);
-        if (line) this._handleLine(line);
-        nl = this.buffer.indexOf('\n');
+        const line = session.buffer.slice(0, nl).trim();
+        session.buffer = session.buffer.slice(nl + 1);
+        if (line) this._handleLine(session, line);
+        nl = session.buffer.indexOf('\n');
       }
     });
 
     const onTerminate = reason => {
-      if (this.child === child) this.child = null;
-      for (const [id, entry] of [...this.pending.entries()]) {
+      session.terminated = true;
+      if (this.session === session) this.session = null;
+      for (const [id, entry] of [...session.pending.entries()]) {
         clearTimeout(entry.timer);
-        this.pending.delete(id);
+        session.pending.delete(id);
         entry.reject(new Error(reason));
       }
     };
     child.once('error', () => onTerminate('native_helper_error'));
     child.once('exit', () => onTerminate('native_helper_exited'));
 
-    this.child = child;
-    return child;
+    this.session = session;
+    return session;
   }
 
-  _syncRef() {
-    const child = this.child;
-    if (!child) return;
-    if (this.pending.size > 0) {
+  _syncRef(session) {
+    const child = session && session.child;
+    if (!child || session.terminated) return;
+    if (session.pending.size > 0) {
       if (typeof child.ref === 'function') child.ref();
       if (typeof child.stdout?.ref === 'function') child.stdout.ref();
     } else {
@@ -126,7 +141,7 @@ class NativeHelperClient {
     }
   }
 
-  _handleLine(line) {
+  _handleLine(session, line) {
     let msg;
     try {
       msg = JSON.parse(line);
@@ -134,11 +149,11 @@ class NativeHelperClient {
       return;
     }
     const id = msg && msg.id;
-    const entry = this.pending.get(id);
+    const entry = session.pending.get(id);
     if (!entry) return;
     clearTimeout(entry.timer);
-    this.pending.delete(id);
-    this._syncRef();
+    session.pending.delete(id);
+    this._syncRef(session);
     if (msg.ok === true) {
       entry.resolve(msg.result);
     } else {
@@ -149,27 +164,29 @@ class NativeHelperClient {
   }
 
   call(op, payload = {}, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
-    const child = this._ensureRunning();
+    const session = this._ensureSession();
+    const { child } = session;
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        if (!this.pending.has(id)) return;
-        this.pending.delete(id);
-        this._syncRef();
+        if (!session.pending.has(id)) return;
+        session.pending.delete(id);
+        session.disposing = true;
+        if (this.session === session) this.session = null;
+        this._syncRef(session);
         try { child.kill(); } catch (_) {}
-        if (this.child === child) this.child = null;
         reject(new Error('native_helper_timeout'));
       }, timeoutMs);
       if (typeof timer.unref === 'function') timer.unref();
 
-      this.pending.set(id, { resolve, reject, timer });
-      this._syncRef();
+      session.pending.set(id, { resolve, reject, timer });
+      this._syncRef(session);
       try {
         child.stdin.write(`${JSON.stringify({ id, op, ...payload })}\n`);
       } catch (error) {
         clearTimeout(timer);
-        this.pending.delete(id);
-        this._syncRef();
+        session.pending.delete(id);
+        this._syncRef(session);
         reject(error);
       }
     });
@@ -191,16 +208,12 @@ class NativeHelperClient {
     return this.call('sha256_file', { filePath }, timeoutMs);
   }
 
-  packageBatch(destDir, items, { mode = 'clone_or_copy', computeHash = true, timeoutMs = 60_000 } = {}) {
-    return this.call('package_batch', { destDir, items, mode, computeHash }, timeoutMs);
-  }
-
   cloneVerifiedFile(params, timeoutMs = 30_000) {
     return this.call('clone_verified_file', params, timeoutMs);
   }
 
-  runningApps(keywords = [], timeoutMs = 3000) {
-    return this.call('running_apps', { keywords }, timeoutMs);
+  runningApps(keywords = [], timeoutMs = 3000, { caseSensitive = false } = {}) {
+    return this.call('running_apps', { keywords, caseSensitive: Boolean(caseSensitive) }, timeoutMs);
   }
 
   openFiles(pids = [], extensions = [], timeoutMs = 5000) {
@@ -212,10 +225,11 @@ class NativeHelperClient {
   }
 
   async shutdown() {
-    const child = this.child;
-    if (!child) return;
-    this.disposing = true;
-    this.child = null;
+    const session = this.session;
+    if (!session || !session.child) return;
+    const { child } = session;
+    session.disposing = true;
+    this.session = null;
     if (typeof child.ref === 'function') child.ref();
     await new Promise(resolve => {
       let done = false;

@@ -269,7 +269,28 @@ enum PackageOps {
             throw HelperError("clone_failed")
         }
 
+        var ownedOutDev: dev_t = 0
+        var ownedOutIno: UInt64 = 0
+        var hasOwnedIdentity = false
+
+        func verifyLeafMatchesOwnedIdentity() -> Bool {
+            guard hasOwnedIdentity else { return false }
+            var leafStat = stat()
+            let stRc = leafName.withCString { cLeaf in
+                Darwin.fstatat(dirFd, cLeaf, &leafStat, AT_SYMLINK_NOFOLLOW)
+            }
+            return stRc == 0
+                && (leafStat.st_mode & S_IFMT) == S_IFREG
+                && leafStat.st_nlink == 1
+                && leafStat.st_uid == geteuid()
+                && leafStat.st_dev == ownedOutDev
+                && UInt64(leafStat.st_ino) == ownedOutIno
+        }
+
         func rollbackClone() {
+            // Only unlink if the directory leaf still refers to our exact owned
+            // regular file identity (single-link, same dev/ino, owned by euid).
+            guard verifyLeafMatchesOwnedIdentity() else { return }
             _ = leafName.withCString { Darwin.unlinkat(dirFd, $0, 0) }
         }
 
@@ -277,10 +298,28 @@ enum PackageOps {
             Darwin.openat(dirFd, cLeaf, O_RDONLY | O_NOFOLLOW)
         }
         if outFd < 0 {
-            rollbackClone()
             throw HelperError("dest_verify_failed")
         }
         defer { Darwin.close(outFd) }
+
+        // Establish exclusive file ownership and single-link identity BEFORE any
+        // mode change, xattr stripping, or potential rollback unlink.
+        var preHardenStat = stat()
+        if fstat(outFd, &preHardenStat) != 0
+            || (preHardenStat.st_mode & S_IFMT) != S_IFREG
+            || preHardenStat.st_nlink != 1
+            || preHardenStat.st_uid != geteuid()
+            || preHardenStat.st_dev != dirStat.st_dev
+            || Int64(preHardenStat.st_size) != expSrcSize
+            || (preHardenStat.st_dev == srcBefore.st_dev && preHardenStat.st_ino == srcBefore.st_ino) {
+            throw HelperError("dest_verify_failed")
+        }
+        ownedOutDev = preHardenStat.st_dev
+        ownedOutIno = UInt64(preHardenStat.st_ino)
+        hasOwnedIdentity = true
+        if !verifyLeafMatchesOwnedIdentity() {
+            throw HelperError("dest_verify_failed")
+        }
 
         if fchmod(outFd, targetMode) != 0 {
             rollbackClone()
@@ -300,8 +339,13 @@ enum PackageOps {
         var outStat = stat()
         if fstat(outFd, &outStat) != 0
             || (outStat.st_mode & S_IFMT) != S_IFREG
+            || outStat.st_nlink != 1
+            || outStat.st_uid != geteuid()
+            || outStat.st_dev != ownedOutDev
+            || UInt64(outStat.st_ino) != ownedOutIno
             || (outStat.st_mode & 0o777) != targetMode
-            || Int64(outStat.st_size) != expSrcSize {
+            || Int64(outStat.st_size) != expSrcSize
+            || !verifyLeafMatchesOwnedIdentity() {
             rollbackClone()
             throw HelperError("dest_verify_failed")
         }
@@ -329,195 +373,6 @@ enum PackageOps {
                 "dev": String(outStat.st_dev),
                 "ino": String(outStat.st_ino),
             ],
-        ]
-    }
-
-    static func packageBatch(
-        destDir: String,
-        items: [[String: Any]],
-        mode: String,
-        computeHash: Bool
-    ) throws -> [String: Any] {
-        let dirFd = Darwin.open(destDir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-        if dirFd < 0 {
-            if errno == ELOOP || errno == ENOTDIR { throw HelperError("dest_dir_unsafe") }
-            throw HelperError("dest_dir_open_failed")
-        }
-        defer { Darwin.close(dirFd) }
-
-        var dirStat = stat()
-        if fstat(dirFd, &dirStat) != 0 || (dirStat.st_mode & S_IFMT) != S_IFDIR {
-            throw HelperError("dest_dir_unsafe")
-        }
-
-        var results: [[String: Any]] = []
-        var createdLeaves: [String] = []
-        var buf = [UInt8](repeating: 0, count: chunkBytes)
-
-        func rollbackCreated() {
-            for leaf in createdLeaves {
-                _ = leaf.withCString { Darwin.unlinkat(dirFd, $0, 0) }
-            }
-        }
-
-        do {
-            for item in items {
-                guard let sourcePath = item["sourcePath"] as? String,
-                      let leafName = item["leafName"] as? String,
-                      isSafeLeafName(leafName) else {
-                    throw HelperError("invalid_package_item")
-                }
-
-                let srcFd = Darwin.open(sourcePath, O_RDONLY | O_NOFOLLOW)
-                if srcFd < 0 {
-                    if errno == ELOOP { throw HelperError("source_symlink") }
-                    throw HelperError("source_open_failed")
-                }
-                defer { Darwin.close(srcFd) }
-
-                var srcBefore = stat()
-                if fstat(srcFd, &srcBefore) != 0 || (srcBefore.st_mode & S_IFMT) != S_IFREG {
-                    throw HelperError("source_not_file")
-                }
-                let srcSize = Int64(srcBefore.st_size)
-
-                // Verify optional expected source identity
-                if let expected = item["expectedStat"] as? [String: Any] {
-                    if let expDev = expected["dev"] as? NSNumber, expDev.int64Value != Int64(srcBefore.st_dev) {
-                        throw HelperError("source_changed")
-                    }
-                    if let expIno = expected["ino"] as? NSNumber, expIno.int64Value != Int64(srcBefore.st_ino) {
-                        throw HelperError("source_changed")
-                    }
-                    if let expSize = expected["size"] as? NSNumber, expSize.int64Value != srcSize {
-                        throw HelperError("source_changed")
-                    }
-                }
-
-                let sameDevice = (srcBefore.st_dev == dirStat.st_dev)
-                let tryClone = sameDevice && srcBefore.st_flags == 0 && (mode == "clone" || mode == "clone_or_copy")
-                var cloned = false
-                var sha256Hex: String? = nil
-                var outDev: Int64 = 0
-                var outIno: Int64 = 0
-
-                if tryClone {
-                    let rc = leafName.withCString { cLeaf in
-                        fclonefileat(srcFd, dirFd, cLeaf, UInt32(CLONE_NOFOLLOW))
-                    }
-                    if rc == 0 {
-                        // Strip xattrs/ACLs, harden mode, and verify cloned file identity via openat(O_NOFOLLOW)
-                        let outFd = leafName.withCString { cLeaf in
-                            Darwin.openat(dirFd, cLeaf, O_RDONLY | O_NOFOLLOW)
-                        }
-                        if outFd < 0 {
-                            _ = leafName.withCString { Darwin.unlinkat(dirFd, $0, 0) }
-                            throw HelperError("dest_verify_failed")
-                        }
-                        defer { Darwin.close(outFd) }
-                        if fchmod(outFd, ownerOnlyFileMode) != 0 || !stripCloneMetadata(fd: outFd) {
-                            _ = leafName.withCString { Darwin.unlinkat(dirFd, $0, 0) }
-                        } else {
-                            cloned = true
-                            createdLeaves.append(leafName)
-                            var outStat = stat()
-                            if fstat(outFd, &outStat) != 0 || (outStat.st_mode & S_IFMT) != S_IFREG {
-                                throw HelperError("dest_verify_failed")
-                            }
-                            outDev = Int64(outStat.st_dev)
-                            outIno = Int64(outStat.st_ino)
-                            if computeHash {
-                                sha256Hex = try computeSha256FromFd(fd: outFd, fileSize: Int64(outStat.st_size))
-                            }
-                        }
-                    } else if errno == EEXIST {
-                        throw HelperError("dest_already_exists")
-                    }
-                    // For EXDEV / ENOTSUP / EINVAL / metadata_strip_failed, fall through to openat streaming copy!
-                }
-
-                if !cloned {
-                    let outFd = leafName.withCString { cLeaf in
-                        Darwin.openat(
-                            dirFd,
-                            cLeaf,
-                            O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
-                            ownerOnlyFileMode
-                        )
-                    }
-                    if outFd < 0 {
-                        if errno == EEXIST { throw HelperError("dest_already_exists") }
-                        throw HelperError("dest_create_failed")
-                    }
-                    createdLeaves.append(leafName)
-                    defer { Darwin.close(outFd) }
-                    _ = fchmod(outFd, ownerOnlyFileMode)
-
-                    var hasher = SHA256()
-                    var offset: Int64 = 0
-                    while offset < srcSize {
-                        let toRead = Int(min(Int64(chunkBytes), srcSize - offset))
-                        let r = buf.withUnsafeMutableBytes { raw -> Int in
-                            Darwin.pread(srcFd, raw.baseAddress!, toRead, off_t(offset))
-                        }
-                        if r <= 0 { throw HelperError("source_read_failed") }
-                        if computeHash {
-                            hasher.update(data: buf[0..<r])
-                        }
-                        var written = 0
-                        while written < r {
-                            let w = buf.withUnsafeBytes { raw -> Int in
-                                Darwin.write(outFd, raw.baseAddress!.advanced(by: written), r - written)
-                            }
-                            if w <= 0 { throw HelperError("dest_write_failed") }
-                            written += w
-                        }
-                        offset += Int64(r)
-                    }
-
-                    var outStat = stat()
-                    if fstat(outFd, &outStat) != 0 || Int64(outStat.st_size) != srcSize {
-                        throw HelperError("dest_verify_failed")
-                    }
-                    outDev = Int64(outStat.st_dev)
-                    outIno = Int64(outStat.st_ino)
-                    if computeHash {
-                        sha256Hex = hasher.finalize().map { String(format: "%02x", $0) }.joined()
-                    }
-                }
-
-                // Re-check source did not mutate during copy/clone
-                var srcAfter = stat()
-                if fstat(srcFd, &srcAfter) != 0
-                    || srcBefore.st_dev != srcAfter.st_dev
-                    || srcBefore.st_ino != srcAfter.st_ino
-                    || srcBefore.st_size != srcAfter.st_size
-                    || srcBefore.st_mtimespec.tv_sec != srcAfter.st_mtimespec.tv_sec
-                    || srcBefore.st_mtimespec.tv_nsec != srcAfter.st_mtimespec.tv_nsec {
-                    throw HelperError("source_changed")
-                }
-
-                var entry: [String: Any] = [
-                    "leafName": leafName,
-                    "bytes": srcSize,
-                    "cloned": cloned,
-                    "dev": outDev,
-                    "ino": outIno,
-                ]
-                if let sha = sha256Hex {
-                    entry["sha256"] = sha
-                }
-                results.append(entry)
-            }
-        } catch {
-            rollbackCreated()
-            throw error
-        }
-
-        return [
-            "destDev": Int64(dirStat.st_dev),
-            "destIno": Int64(dirStat.st_ino),
-            "files": results,
         ]
     }
 }

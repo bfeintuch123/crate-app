@@ -467,3 +467,50 @@ test('pooled workers recycle automatically when hitting maxPooledRequests cap', 
   assert.equal(psdExited, 1);
   assert.equal(psdMessages.some(m => m.type === 'session-idle'), false);
 });
+
+test('openZipArchive rejects deflated entry whose compressedSize exceeds maxOutputBytes ceiling before allocating (A-P1-5)', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-zip-comp-cap-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  // Craft a synthetic ZIP with a deflated entry whose compressed payload is 128 KiB
+  // while its declared uncompressed size is 64 bytes and caller requests maxOutputBytes = 4096.
+  const nameBuf = Buffer.from('Spreads/Spread_1.xml', 'utf8');
+  const compPayload = Buffer.alloc(128 * 1024, 0x00);
+  const local = Buffer.alloc(30 + nameBuf.length);
+  local.writeUInt32LE(0x04034b50, 0);
+  local.writeUInt16LE(20, 4);
+  local.writeUInt16LE(8, 8); // deflate
+  local.writeUInt32LE(compPayload.length, 18); // compressedSize = 128 KiB
+  local.writeUInt32LE(64, 22); // declared size = 64 bytes
+  local.writeUInt16LE(nameBuf.length, 26);
+  nameBuf.copy(local, 30);
+
+  const cdOffset = local.length + compPayload.length;
+  const central = Buffer.alloc(46 + nameBuf.length);
+  central.writeUInt32LE(0x02014b50, 0);
+  central.writeUInt16LE(20, 4);
+  central.writeUInt16LE(20, 6);
+  central.writeUInt16LE(8, 8);
+  central.writeUInt32LE(compPayload.length, 20);
+  central.writeUInt32LE(64, 24);
+  central.writeUInt16LE(nameBuf.length, 28);
+  central.writeUInt32LE(0, 42);
+  nameBuf.copy(central, 46);
+
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(1, 8);
+  eocd.writeUInt16LE(1, 10);
+  eocd.writeUInt32LE(central.length, 12);
+  eocd.writeUInt32LE(cdOffset, 16);
+
+  const zipPath = path.join(dir, 'oversized-deflate.idml');
+  fs.writeFileSync(zipPath, Buffer.concat([local, compPayload, central, eocd]));
+
+  const archive = openZipArchive(zipPath, { message: 'too large' });
+  t.after(() => archive.close());
+  assert.throws(
+    () => archive.readEntry(archive.entries[0], { maxOutputBytes: 4096, message: 'entry too large' }),
+    err => err && err.code === 'CRATE_PARSER_ADMISSION_LIMIT'
+  );
+});

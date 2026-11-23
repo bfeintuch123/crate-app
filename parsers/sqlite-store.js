@@ -18,16 +18,37 @@ const SQLITE_FILENAME = 'crate-state.sqlite';
 
 function hardenSqliteFile(filePath, expectedDirRealPath) {
   if (process.platform === 'win32') return true;
+  let fd = null;
   try {
-    const stat = fs.lstatSync(filePath);
-    if (stat.isSymbolicLink() || !stat.isFile()) return false;
+    const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+    fd = fs.openSync(filePath, flags);
+    const initialStat = fs.fstatSync(fd);
+    if (!initialStat.isFile() || initialStat.nlink !== 1) return false;
+    if (typeof process.getuid === 'function' && initialStat.uid !== process.getuid()) return false;
     const real = fs.realpathSync.native(filePath);
     if (path.dirname(real) !== expectedDirRealPath) return false;
-    fs.chmodSync(real, OWNER_ONLY_FILE_MODE);
-    return (fs.lstatSync(real).mode & 0o777) === OWNER_ONLY_FILE_MODE;
+    fs.fchmodSync(fd, OWNER_ONLY_FILE_MODE);
+    const finalStat = fs.fstatSync(fd);
+    const pathStat = fs.lstatSync(filePath);
+    return (
+      finalStat.isFile() &&
+      finalStat.nlink === 1 &&
+      finalStat.dev === initialStat.dev &&
+      finalStat.ino === initialStat.ino &&
+      (finalStat.mode & 0o777) === OWNER_ONLY_FILE_MODE &&
+      !pathStat.isSymbolicLink() &&
+      pathStat.isFile() &&
+      pathStat.dev === finalStat.dev &&
+      pathStat.ino === finalStat.ino &&
+      pathStat.nlink === 1
+    );
   } catch (error) {
     if (error && error.code === 'ENOENT') return true;
     return false;
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch (_) {}
+    }
   }
 }
 
@@ -235,17 +256,35 @@ class CrateSqliteStore {
 
   migrateFromLegacyStore(legacyStore) {
     if (!legacyStore || typeof legacyStore.get !== 'function') return false;
-    const meta = this._getKvRaw('_meta');
-    if (meta && meta.migratedFromLegacy === true) return false;
+    // Fast pre-check avoids reading legacy JSON on ordinary subsequent startups;
+    // authoritative check still runs atomically inside BEGIN IMMEDIATE below.
+    const cachedMeta = this._getKvRaw('_meta');
+    if (cachedMeta && cachedMeta.migratedFromLegacy === true) return false;
 
     const legacyProjects = legacyStore.get('projects', []);
     const legacySettings = legacyStore.get('settings', this.defaults.settings || {});
     const legacyUsage = legacyStore.get('usage', this.defaults.usage || {});
     const legacyQuickOutputs = legacyStore.get('quickPackageOutputPaths', undefined);
 
+    let migrated = false;
     this.transaction(() => {
-      if (Array.isArray(legacyProjects) && legacyProjects.length > 0 && this.projectOrder.length === 0) {
+      // Authoritative in-transaction check against SQLite (never trust stale memory cache)
+      // so two concurrent processes cannot both migrate the same profile.
+      const metaRow = this.stmts.selectKv.get('_meta');
+      if (metaRow) {
+        try {
+          const parsedMeta = JSON.parse(metaRow.value_json);
+          if (parsedMeta && parsedMeta.migratedFromLegacy === true) {
+            this.kvCache.set('_meta', metaRow.value_json);
+            return;
+          }
+        } catch (_) {}
+      }
+      const existingRows = this.stmts.selectAllProjects.all();
+      if (Array.isArray(legacyProjects) && legacyProjects.length > 0 && existingRows.length === 0) {
         this._replaceProjectsDirect(legacyProjects);
+      } else if (existingRows.length > 0) {
+        this._hydrateMemoryCache();
       }
       if (isPlainObject(legacySettings)) {
         this._setKvDirect('settings', legacySettings);
@@ -257,15 +296,16 @@ class CrateSqliteStore {
         this._setKvDirect('quickPackageOutputPaths', legacyQuickOutputs);
       }
       this._setKvDirect('_meta', { migratedFromLegacy: true, migratedAt: Date.now() });
+      migrated = true;
     });
-    return true;
+    return migrated;
   }
 
   transaction(fn) {
     if (this.closed) throw new Error('SQLite store is closed.');
     if (this.inTransaction) return fn();
-    this.inTransaction = true;
     this.db.exec('BEGIN IMMEDIATE');
+    this.inTransaction = true;
     try {
       const result = fn();
       this.db.exec('COMMIT');

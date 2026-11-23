@@ -536,11 +536,17 @@ enum PsdParser {
 
                 if key == "lnk2" || key == "lnk3" || key == "lnkD" || key == "lnkE" {
                     try parseLinkBlock(end: blockEnd, carrier: key, layerIndex: layerIndex)
-                } else if key == "PxSc" && blockSize <= Int64(maxDescriptorBytes) {
-                    let raw = try reader.readBytes(Int(blockSize), end: blockEnd)
-                    var dr = DescriptorReader(bytes: raw)
-                    if let desc = try? dr.readVersionAndDescriptor() {
-                        walkMediaDescriptor(desc: desc, carrier: "PxSc")
+                } else if key == "PxSc" {
+                    if blockSize > Int64(maxDescriptorBytes) {
+                        issues.append("oversized-pxsc-descriptor")
+                    } else {
+                        let raw = try reader.readBytes(Int(blockSize), end: blockEnd)
+                        var dr = DescriptorReader(bytes: raw)
+                        if let desc = try? dr.readVersionAndDescriptor() {
+                            walkMediaDescriptor(desc: desc, carrier: "PxSc")
+                        } else {
+                            issues.append("unreadable-pxsc-descriptor")
+                        }
                     }
                 } else if key == "Layr" || key == "Lr16" || key == "Lr32" {
                     try parseLayerInfo(layerEnd: blockEnd, depth: depth + 1)
@@ -675,6 +681,7 @@ enum PsdParser {
             "linkedRecords": linkedRecords,
             "embeddedRecords": embeddedRecords,
             "issues": issues,
+            "incomplete": !issues.isEmpty,
             "sourceIdentity": [
                 "dev": Int64(st.st_dev),
                 "ino": Int64(st.st_ino),

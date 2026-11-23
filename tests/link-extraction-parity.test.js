@@ -235,6 +235,8 @@ test('other shared formats agree on a simple single link inside both stacks\' po
   fs.writeFileSync(presentPsdLink, 'synthetic linked asset');
   const rows = [
     ['.ai', `${S}/linked.png`, [`${S}/linked.png`]],
+    ['.ai', `${S}/a.png ${S}/b.png`, [`${S}/a.png`, `${S}/b.png`]],
+    ['.ai', '/Volumes/crate-synthetic/linked.png', ['/Volumes/crate-synthetic/linked.png']],
     ['.indd', `${S}/linked.tif`, [`${S}/linked.tif`]],
     ['.pptx', `file://${S}/linked.png`, [`${S}/linked.png`]],
     ['.psd', presentPsdLink, [presentPsdLink]],
@@ -249,6 +251,9 @@ test('other shared formats agree on a simple single link inside both stacks\' po
 // Differences this PR deliberately leaves in place. Each row pins both stacks'
 // current output so a change to either one fails here and must be reviewed.
 const KNOWN_DIFFERENCES = [
+  { id: 'ai-font-extension', ext: '.ai', input: `${S}/Brand.woff2`,
+    watching: [`${S}/Brand.woff2`], quick: [],
+    reason: 'different extension lists: Quick Package AI does not copy web-font extensions (.woff2/.woff)' },
   { id: 'ai-psb-extension', ext: '.ai', input: `${S}/Smart.psb`,
     watching: [], quick: [`${S}/Smart.psb`],
     reason: 'different extension lists: only Quick Package AI lists .psb' },
@@ -352,4 +357,33 @@ test('Quick Package IDML checks existence at most once per distinct path while a
   // The memo is per extraction: a second extraction checks again.
   await parser.extractAssets(file);
   assert.equal(checked.length, 4);
+});
+
+test('Quick Package Illustrator produces identical output for .psb, multi-link, /Volumes, and .woff2 exclusion with helper ON and OFF', async t => {
+  const dir = tempDir(t);
+  const cases = [
+    { name: 'psb', input: `${S}/Smart.psb`, expected: [`${S}/Smart.psb`] },
+    { name: 'multi', input: `${S}/a.png ${S}/b.png`, expected: [`${S}/a.png`, `${S}/b.png`] },
+    { name: 'volumes', input: '/Volumes/crate-synthetic/linked.png', expected: ['/Volumes/crate-synthetic/linked.png'] },
+    { name: 'woff2-excluded', input: `${S}/Brand.woff2`, expected: [] },
+  ];
+  const prevDisable = process.env.CRATE_DISABLE_NATIVE_HELPER;
+  t.after(() => {
+    if (prevDisable === undefined) delete process.env.CRATE_DISABLE_NATIVE_HELPER;
+    else process.env.CRATE_DISABLE_NATIVE_HELPER = prevDisable;
+  });
+
+  for (const tc of cases) {
+    const file = build(dir, '.ai', tc.input);
+    // Helper OFF (forced JS fallback)
+    process.env.CRATE_DISABLE_NATIVE_HELPER = '1';
+    const offPaths = (await quick(AIParser, file)).map(a => a.path);
+    assert.deepEqual(offPaths, tc.expected, `${tc.name} (helper OFF)`);
+
+    // Helper ON (when built helper is available)
+    if (prevDisable === undefined) delete process.env.CRATE_DISABLE_NATIVE_HELPER;
+    else process.env.CRATE_DISABLE_NATIVE_HELPER = prevDisable;
+    const onPaths = (await quick(AIParser, file)).map(a => a.path);
+    assert.deepEqual(onPaths, tc.expected, `${tc.name} (helper ON/default)`);
+  }
 });

@@ -88,27 +88,6 @@ struct CrateHelperMain {
                 return ["id": reqId, "ok": false, "error": "sha256_failed"]
             }
 
-        case "package_batch":
-            guard let destDir = req["destDir"] as? String,
-                  let items = req["items"] as? [[String: Any]] else {
-                return ["id": reqId, "ok": false, "error": "invalid_package_batch"]
-            }
-            let mode = (req["mode"] as? String) ?? "clone_or_copy"
-            let computeHash = (req["computeHash"] as? Bool) ?? true
-            do {
-                let result = try PackageOps.packageBatch(
-                    destDir: destDir,
-                    items: items,
-                    mode: mode,
-                    computeHash: computeHash
-                )
-                return ["id": reqId, "ok": true, "result": result]
-            } catch let err as HelperError {
-                return ["id": reqId, "ok": false, "error": err.code]
-            } catch {
-                return ["id": reqId, "ok": false, "error": "package_batch_failed"]
-            }
-
         case "clone_verified_file":
             do {
                 let result = try PackageOps.cloneVerifiedFile(req: req)
@@ -121,20 +100,21 @@ struct CrateHelperMain {
 
         case "running_apps":
             let keywords = (req["keywords"] as? [String]) ?? []
-            let apps = WatchOps.runningApps(keywords: keywords)
+            let caseSensitive = (req["caseSensitive"] as? Bool) ?? false
+            let apps = WatchOps.runningApps(keywords: keywords, caseSensitive: caseSensitive)
             return ["id": reqId, "ok": true, "result": ["apps": apps]]
 
         case "open_files":
             let rawPids = (req["pids"] as? [NSNumber]) ?? []
             let pids = rawPids.map { Int32($0.int32Value) }.filter { $0 > 0 }
             let extensions = Set(((req["extensions"] as? [String]) ?? []).map { $0.lowercased() })
-            let files = WatchOps.openFiles(pids: pids, extensions: extensions)
-            return ["id": reqId, "ok": true, "result": ["files": files]]
+            let openResult = WatchOps.openFiles(pids: pids, extensions: extensions)
+            return ["id": reqId, "ok": true, "result": openResult]
 
         case "read_last_used_xattr":
             let paths = (req["paths"] as? [String]) ?? []
-            let timestamps = WatchOps.readLastUsedXattrs(paths: paths)
-            return ["id": reqId, "ok": true, "result": ["timestamps": timestamps]]
+            let xattrResult = WatchOps.readLastUsedXattrs(paths: paths)
+            return ["id": reqId, "ok": true, "result": xattrResult]
 
         default:
             return ["id": reqId, "ok": false, "error": "unknown_op"]

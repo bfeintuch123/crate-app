@@ -24,6 +24,9 @@ class PSDParser extends BaseParser {
       }
       try {
         const parsed = await nativeHelper.parsePsd(filePath);
+        if (parsed && (parsed.incomplete === true || (Array.isArray(parsed.issues) && parsed.issues.length > 0))) {
+          throw new Error('psd_native_incomplete');
+        }
         const assets = [];
         for (const rawCandidate of [...(parsed.linkedPaths || []), ...(parsed.mediaPaths || [])]) {
           const candidate = normalizePsdExternalPath(rawCandidate);

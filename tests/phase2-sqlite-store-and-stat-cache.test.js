@@ -153,3 +153,70 @@ test('CrateSqliteStore: stat-keyed cache persists across restarts and invalidate
   assert.notEqual(statV3.ino, statV1.ino);
   assert.equal(reopened.getStatCache('font-inspect', fontPath, statV3), null);
 });
+
+test('CrateSqliteStore: rejects hardlinked database file (nlink > 1) and recovers transaction flag after BEGIN failure (A-P1-6)', t => {
+  const userData = makeUserDataDir(t);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-sqlite-hardlink-'));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+
+  const target = path.join(outside, 'shared.sqlite');
+  fs.writeFileSync(target, '');
+  fs.linkSync(target, path.join(userData, SQLITE_FILENAME));
+
+  assert.throws(
+    () => new CrateSqliteStore({ userDataRealPath: userData }),
+    /could not secure local SQLite storage/
+  );
+
+  // Separate clean profile: inject a BEGIN IMMEDIATE failure and confirm inTransaction does NOT stick
+  const cleanDir = makeUserDataDir(t);
+  const sqlite = new CrateSqliteStore({
+    userDataRealPath: cleanDir,
+    defaults: { projects: [], usage: { packagesThisMonth: 0 } },
+  });
+  t.after(() => sqlite.close());
+
+  const originalExec = sqlite.db.exec.bind(sqlite.db);
+  let failOnce = true;
+  sqlite.db.exec = (sql) => {
+    if (failOnce && sql === 'BEGIN IMMEDIATE') {
+      failOnce = false;
+      throw new Error('SQLITE_BUSY');
+    }
+    return originalExec(sql);
+  };
+
+  assert.throws(() => sqlite.transaction(() => {
+    sqlite.set('usage', { packagesThisMonth: 5 });
+  }), /SQLITE_BUSY/);
+  assert.equal(sqlite.inTransaction, false, 'inTransaction must remain false when BEGIN IMMEDIATE fails');
+
+  // Subsequent transaction must still roll back atomically on error
+  assert.throws(() => sqlite.transaction(() => {
+    sqlite.set('usage', { packagesThisMonth: 77 });
+    throw new Error('rollback_check');
+  }), /rollback_check/);
+  assert.equal(sqlite.get('usage').packagesThisMonth, 0);
+});
+
+test('CrateSqliteStore: concurrent/second migration on same profile is atomic and preserves legacy JSON for rollback (N1)', t => {
+  const userData = makeUserDataDir(t);
+  const defaults = {
+    projects: [],
+    settings: { namingTemplate: '{ProjectName}' },
+    usage: { packagesThisMonth: 0 },
+  };
+  const legacy = new Store({ cwd: userData, configFileMode: 0o600, defaults });
+  legacy.set('projects', [{ id: 'p-orig', name: 'Original', status: 'paused', files: [] }]);
+  const legacyBefore = fs.readFileSync(legacy.path, 'utf8');
+
+  const storeA = new CrateSqliteStore({ userDataRealPath: userData, defaults });
+  const storeB = new CrateSqliteStore({ userDataRealPath: userData, defaults });
+  t.after(() => { storeA.close(); storeB.close(); });
+
+  assert.equal(storeA.migrateFromLegacyStore(legacy), true);
+  // storeB has stale pre-migration memory cache, yet its in-transaction check sees _meta and skips re-migrating!
+  assert.equal(storeB.migrateFromLegacyStore(legacy), false);
+  // Legacy JSON stays intact on disk (pre-upgrade rollback snapshot)
+  assert.equal(fs.readFileSync(legacy.path, 'utf8'), legacyBefore);
+});
