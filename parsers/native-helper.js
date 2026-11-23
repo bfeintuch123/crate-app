@@ -10,6 +10,7 @@ const path = require('node:path');
 
 const DEV_BINARY_PATH = path.resolve(__dirname, '..', 'native', 'bin', 'crate-helper');
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+const MAX_STDOUT_LINE_CHARS = 64 * 1024 * 1024;
 
 function isExecutableRegularFile(candidatePath) {
   if (typeof candidatePath !== 'string' || !path.isAbsolute(candidatePath)) return false;
@@ -50,9 +51,12 @@ function resolveNativeHelperBinaryPath(explicitPath = null) {
 const DEFAULT_BINARY_PATH = resolveNativeHelperBinaryPath();
 
 class NativeHelperClient {
-  constructor(binaryPath = null) {
+  constructor(binaryPath = null, { maxStdoutLineChars = MAX_STDOUT_LINE_CHARS } = {}) {
     this.explicitBinaryPath = binaryPath;
     this.binaryPath = resolveNativeHelperBinaryPath(binaryPath);
+    this.maxStdoutLineChars = Number.isInteger(maxStdoutLineChars) && maxStdoutLineChars > 0
+      ? maxStdoutLineChars
+      : MAX_STDOUT_LINE_CHARS;
     this.session = null;
     this.nextId = 1;
   }
@@ -100,16 +104,36 @@ class NativeHelperClient {
     };
 
     child.stdout.setEncoding('utf8');
+    const maxLineChars = this.maxStdoutLineChars;
     child.stdout.on('data', chunk => {
       if (session.terminated) return;
-      session.buffer += chunk;
-      let nl = session.buffer.indexOf('\n');
+      let start = 0;
+      let nl = chunk.indexOf('\n', start);
       while (nl >= 0) {
-        const line = session.buffer.slice(0, nl).trim();
-        session.buffer = session.buffer.slice(nl + 1);
+        const pieceLen = nl - start;
+        if (session.buffer.length + pieceLen > maxLineChars) {
+          session.buffer = '';
+          session.disposing = true;
+          try { child.kill(); } catch (_) {}
+          onTerminate('native_helper_response_too_large');
+          return;
+        }
+        const line = (session.buffer + chunk.slice(start, nl)).trim();
+        session.buffer = '';
         if (line) this._handleLine(session, line);
-        nl = session.buffer.indexOf('\n');
+        if (session.terminated) return;
+        start = nl + 1;
+        nl = chunk.indexOf('\n', start);
       }
+      const tail = start === 0 ? chunk : chunk.slice(start);
+      if (session.buffer.length + tail.length > maxLineChars) {
+        session.buffer = '';
+        session.disposing = true;
+        try { child.kill(); } catch (_) {}
+        onTerminate('native_helper_response_too_large');
+        return;
+      }
+      session.buffer += tail;
     });
 
     const onTerminate = reason => {
@@ -272,6 +296,7 @@ const packageClient = new NativeHelperClient();
 module.exports = {
   DEFAULT_BINARY_PATH,
   DEV_BINARY_PATH,
+  MAX_STDOUT_LINE_CHARS,
   NativeHelperClient,
   isExecutableRegularFile,
   nativeHelper: defaultClient,

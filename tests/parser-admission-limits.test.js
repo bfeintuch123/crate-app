@@ -595,3 +595,93 @@ test('normal IDML archives keep their linked-asset result shape', async () => {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
+
+test('Illustrator Quick Package enforces raw repeat count & byte budgets during scanning without double-counting XMP duplicates (A2)', async () => {
+  const { nativeHelper } = require('../parsers/native-helper');
+  const tmpRoot = makeTempDir();
+  try {
+    // 1. Exact base parity at the 10,000 raw-occurrence boundary (even for a single repeated path)
+    const atLimitPath = path.join(tmpRoot, 'repeat-at-limit.ai');
+    const repeatedTarget = '/Users/crate-repeat-parity/logo.png';
+    fs.writeFileSync(
+      atLimitPath,
+      Array.from({ length: ADMISSION_LIMITS.parserReferences }, () => repeatedTarget).join('\n')
+    );
+    const atLimitAssets = await new AIParser().extractAssets(atLimitPath);
+    assert.deepEqual(atLimitAssets, [{ path: repeatedTarget, source: 'ai-regex', exists: false }]);
+
+    // 2. 10,001 repeated raw occurrences MUST reject with CRATE_PARSER_ADMISSION_LIMIT
+    const overLimitPath = path.join(tmpRoot, 'repeat-over-limit.ai');
+    fs.writeFileSync(
+      overLimitPath,
+      Array.from({ length: ADMISSION_LIMITS.parserReferences + 1 }, () => repeatedTarget).join('\n')
+    );
+    await assert.rejects(
+      () => new AIParser().extractAssets(overLimitPath),
+      error => isParserAdmissionError(error)
+        && !error.message.includes('crate-repeat-parity')
+        && !error.message.includes(tmpRoot)
+    );
+
+    // 3. Repeated long paths exceeding parserReferenceBytes (16 MiB) under 10,000 count MUST reject
+    const overBytesPath = path.join(tmpRoot, 'repeat-over-bytes.ai');
+    const longRepeatedTarget = `/Users/crate-byte-flood/${'a'.repeat(3500)}.png`;
+    const byteFloodCount = Math.floor(ADMISSION_LIMITS.parserReferenceBytes / Buffer.byteLength(longRepeatedTarget, 'utf8')) + 2;
+    assert.ok(byteFloodCount < ADMISSION_LIMITS.parserReferences, 'byte flood must stay below count limit');
+    fs.writeFileSync(
+      overBytesPath,
+      Array.from({ length: byteFloodCount }, () => longRepeatedTarget).join('\n')
+    );
+    await assert.rejects(
+      () => new AIParser().extractAssets(overBytesPath),
+      error => isParserAdmissionError(error)
+        && !error.message.includes('crate-byte-flood')
+        && !error.message.includes(tmpRoot)
+    );
+
+    // 4. 4,000 plain raw links mirrored in 4,000 <stRef:filePath> XMP tags = 8,000 raw matches
+    //    (which base admits) + 4,000 XMP matches. Because XMP only charges unseen paths, total
+    //    charged stays 8,000 (not 12,000) and the file stays admitted.
+    const xmpParityPath = path.join(tmpRoot, 'xmp-parity.ai');
+    const rawFourThousand = Array.from({ length: 4000 }, (_, i) => `/Users/crate-xmp-parity/a-${i}.png`);
+    const xmpDupes = rawFourThousand.map(p => `<stRef:filePath>${p}</stRef:filePath>`);
+    fs.writeFileSync(xmpParityPath, `${rawFourThousand.join('\n')}\n${xmpDupes.join('\n')}\n`);
+    const xmpParityAssets = await new AIParser().extractAssets(xmpParityPath);
+    assert.equal(xmpParityAssets.length, 4000);
+
+    // 5. 6,000 raw links + 4,001 NEW unseen entity-encoded XMP links (hidden from raw scan via &#46;)
+    //    => 6,000 raw + 4,001 unseen XMP = 10,001 charged -> MUST reject!
+    const xmpOverPath = path.join(tmpRoot, 'xmp-over.ai');
+    const rawSixThousand = Array.from({ length: 6000 }, (_, i) => `/Users/crate-xmp-parity/b-${i}.png`);
+    const xmpNew = Array.from({ length: 4001 }, (_, i) => `<stRef:filePath>/Users/crate-xmp-parity/new-${i}&#46;png</stRef:filePath>`);
+    fs.writeFileSync(xmpOverPath, `${rawSixThousand.join('\n')}\n${xmpNew.join('\n')}\n`);
+    await assert.rejects(
+      () => new AIParser().extractAssets(xmpOverPath),
+      error => isParserAdmissionError(error)
+    );
+
+    // 6. Native helper typed `pdf_ai_reference_limit` MUST map directly to CRATE_PARSER_ADMISSION_LIMIT
+    //    and NEVER fall back to the JS scanner (even when the underlying file on disk is tiny/valid).
+    const tinyValidAi = path.join(tmpRoot, 'tiny-valid.ai');
+    fs.writeFileSync(tinyValidAi, '/Users/crate-tiny/valid.png\n');
+    const origIsAvailable = nativeHelper.isAvailable;
+    const origParsePdfAi = nativeHelper.parsePdfAi;
+    nativeHelper.isAvailable = () => true;
+    nativeHelper.parsePdfAi = async () => {
+      const err = new Error('pdf_ai_reference_limit');
+      err.code = 'pdf_ai_reference_limit';
+      throw err;
+    };
+    try {
+      await assert.rejects(
+        () => new AIParser().extractAssets(tinyValidAi),
+        error => isParserAdmissionError(error)
+      );
+    } finally {
+      nativeHelper.isAvailable = origIsAvailable;
+      nativeHelper.parsePdfAi = origParsePdfAi;
+    }
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});

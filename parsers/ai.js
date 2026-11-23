@@ -22,8 +22,11 @@
 
 const path = require('node:path');
 const { BaseParser } = require('./base');
+const { ADMISSION_LIMITS, admissionError } = require('./admission-budgets');
 const { nativeHelper } = require('./native-helper');
 const { decodeXMLPath, normalizePsdExternalPath } = require('./xml-path');
+
+const AI_REFERENCE_LIMIT_MESSAGE = 'This design file contains too many file references for Crate to inspect safely.';
 
 // Exact supported link extensions for Quick Package Illustrator extraction.
 // Matches base Quick Package AI policy (including .psb) while deliberately
@@ -120,6 +123,33 @@ function isSupportedQuickAiLinkedPath(candidatePath) {
  */
 function scanQuickAiRawPaths(content, onMatch) {
   const n = content.length;
+
+  function processSegment(segStart, prefixLen, segEnd) {
+    const cappedEnd = Math.min(segEnd, segStart + QUICK_AI_MAX_PATH_LENGTH);
+    if (cappedEnd <= segStart + prefixLen) return;
+
+    // Scan backwards to find the LAST whole supported extension in this segment
+    // (preserves base behavior on paths like /Users/sam.ainsworth/.../logo.png
+    // and /Users/me/Client.ai files/hero.png while rejecting partial prefixes like .pngx).
+    for (let pos = cappedEnd - 1; pos >= segStart + prefixLen; pos -= 1) {
+      if (content.charCodeAt(pos) !== 0x2e) continue; // '.'
+      const extStart = pos + 1;
+      let extEnd = extStart;
+      while (extEnd < segEnd && extEnd - extStart <= 9 && isAsciiAlnumCode(content.charCodeAt(extEnd))) {
+        extEnd += 1;
+      }
+      if (extEnd > extStart && extEnd <= cappedEnd && extEnd - extStart <= 8) {
+        // Ensure whole ASCII-alnum run was consumed (reject .pngx, .aif, etc.)
+        if (extEnd < segEnd && isAsciiAlnumCode(content.charCodeAt(extEnd))) continue;
+        const ext = content.slice(extStart, extEnd).toLowerCase();
+        if (QUICK_AI_SUPPORTED_EXT_SET.has(ext)) {
+          onMatch(content.slice(segStart, extEnd));
+          break;
+        }
+      }
+    }
+  }
+
   let i = 0;
   while (i < n) {
     while (i < n && isQuickAiDelimiterCode(content.charCodeAt(i))) i += 1;
@@ -128,53 +158,38 @@ function scanQuickAiRawPaths(content, onMatch) {
     const runEnd = i;
     if (runEnd - runStart < 10) continue;
 
-    // Collect /Users/ and /Volumes/ segment starts within this delimiter-free run.
+    // Stream /Users/ and /Volumes/ segments within this delimiter-free run in O(1) memory.
     // After the first prefix, only start a new segment when preceded by a boundary
     // separator so inner folder names like `/Users/me/Projects/users/avatar.png`,
     // `/Users/me/Client/Volumes/hero.png`, and `/Users/me/Archive (old)/Users/jo/a.png`
     // stay intact.
-    const segments = [];
+    let hasCurrent = false;
+    let curStart = 0;
+    let curPrefixLen = 0;
     let p = runStart;
     while (p < runEnd - 7) {
       const prefixLen = matchUsersOrVolumesPrefix(content, p, runEnd);
       if (prefixLen > 0) {
         const precededBySep = p > runStart && isSegmentBoundarySeparator(content.charCodeAt(p - 1));
-        if (segments.length === 0 || precededBySep) {
-          segments.push({ pos: p, prefixLen });
+        if (!hasCurrent) {
+          hasCurrent = true;
+          curStart = p;
+          curPrefixLen = prefixLen;
+          p += prefixLen;
+          continue;
+        }
+        if (precededBySep) {
+          processSegment(curStart, curPrefixLen, p);
+          curStart = p;
+          curPrefixLen = prefixLen;
           p += prefixLen;
           continue;
         }
       }
       p += 1;
     }
-
-    for (let s = 0; s < segments.length; s += 1) {
-      const segStart = segments[s].pos;
-      const prefixLen = segments[s].prefixLen;
-      const segEnd = s + 1 < segments.length ? segments[s + 1].pos : runEnd;
-      const cappedEnd = Math.min(segEnd, segStart + QUICK_AI_MAX_PATH_LENGTH);
-      if (cappedEnd <= segStart + prefixLen) continue;
-
-      // Scan backwards to find the LAST whole supported extension in this segment
-      // (preserves base behavior on paths like /Users/sam.ainsworth/.../logo.png
-      // and /Users/me/Client.ai files/hero.png while rejecting partial prefixes like .pngx).
-      for (let pos = cappedEnd - 1; pos >= segStart + prefixLen; pos -= 1) {
-        if (content.charCodeAt(pos) !== 0x2e) continue; // '.'
-        const extStart = pos + 1;
-        let extEnd = extStart;
-        while (extEnd < segEnd && extEnd - extStart <= 9 && isAsciiAlnumCode(content.charCodeAt(extEnd))) {
-          extEnd += 1;
-        }
-        if (extEnd > extStart && extEnd <= cappedEnd && extEnd - extStart <= 8) {
-          // Ensure whole ASCII-alnum run was consumed (reject .pngx, .aif, etc.)
-          if (extEnd < segEnd && isAsciiAlnumCode(content.charCodeAt(extEnd))) continue;
-          const ext = content.slice(extStart, extEnd).toLowerCase();
-          if (QUICK_AI_SUPPORTED_EXT_SET.has(ext)) {
-            onMatch(content.slice(segStart, extEnd));
-            break;
-          }
-        }
-      }
+    if (hasCurrent) {
+      processSegment(curStart, curPrefixLen, runEnd);
     }
   }
 }
@@ -215,15 +230,32 @@ function scanQuickAiXmpAndUris(content, onMatch) {
 function extractQuickAiLinkedPaths(content, filePath) {
   const results = [];
   const seen = new Set();
-  const record = candidate => {
+  let chargedCount = 0;
+  let chargedBytes = 0;
+
+  const record = (candidate, chargeRepeats) => {
     if (!candidate || candidate === filePath || candidate.length > QUICK_AI_MAX_PATH_LENGTH) return;
-    if (!seen.has(candidate)) {
+    const isNew = !seen.has(candidate);
+    if (chargeRepeats || isNew) {
+      const pathBytes = Buffer.byteLength(candidate, 'utf8');
+      chargedCount += 1;
+      chargedBytes += pathBytes;
+      if (
+        pathBytes > ADMISSION_LIMITS.parserReferencePathBytes
+        || chargedCount > ADMISSION_LIMITS.parserReferences
+        || !Number.isSafeInteger(chargedBytes)
+        || chargedBytes > ADMISSION_LIMITS.parserReferenceBytes
+      ) {
+        throw admissionError(AI_REFERENCE_LIMIT_MESSAGE);
+      }
+    }
+    if (isNew) {
       seen.add(candidate);
       results.push(candidate);
     }
   };
-  scanQuickAiRawPaths(content, record);
-  scanQuickAiXmpAndUris(content, record);
+  scanQuickAiRawPaths(content, candidate => record(candidate, true));
+  scanQuickAiXmpAndUris(content, candidate => record(candidate, false));
   return results;
 }
 
@@ -242,7 +274,6 @@ class AIParser extends BaseParser {
     // when Illustrator is closed).
     if (nativeHelper.isAvailable()) {
       const fs = require('node:fs');
-      const { ADMISSION_LIMITS, admissionError } = require('./admission-budgets');
       let stat;
       try { stat = fs.lstatSync(filePath); } catch (_) { stat = null; }
       if (stat && (stat.isSymbolicLink() || !stat.isFile() || stat.size > ADMISSION_LIMITS.localParserFileBytes)) {
@@ -264,6 +295,9 @@ class AIParser extends BaseParser {
         }
         return this.deduplicateAssets(assets);
       } catch (err) {
+        if (err && err.code === 'pdf_ai_reference_limit') {
+          throw admissionError(AI_REFERENCE_LIMIT_MESSAGE);
+        }
         if (err && err.code === 'CRATE_PARSER_ADMISSION_LIMIT') throw err;
         // Fall through to bounded JS regex scan on any native edge case or incomplete coverage.
       }

@@ -229,3 +229,163 @@ test('CrateSqliteStore: concurrent/second migration on same profile is atomic an
   // Legacy JSON stays intact on disk (pre-upgrade rollback snapshot)
   assert.equal(fs.readFileSync(legacy.path, 'utf8'), legacyBefore);
 });
+
+test('CrateSqliteStore: migration rolls back without _meta on missing, non-object, or duplicate legacy project IDs (A5)', t => {
+  const defaults = {
+    projects: [],
+    settings: { namingTemplate: '{ProjectName}', notifications: true },
+    usage: { packagesThisMonth: 0, resetDate: '2026-12-01' },
+  };
+
+  const invalidCases = [
+    {
+      label: 'missing id',
+      projects: [{ id: 'p-valid', name: 'Good', files: [] }, { name: 'MissingId', files: [] }],
+      expectedInvalid: 1,
+      expectedDuplicate: 0,
+    },
+    {
+      label: 'empty string id',
+      projects: [{ id: 'p-valid', name: 'Good', files: [] }, { id: '', name: 'EmptyId', files: [] }],
+      expectedInvalid: 1,
+      expectedDuplicate: 0,
+    },
+    {
+      label: 'non-object entry (null / string / array)',
+      projects: [{ id: 'p-valid', name: 'Good', files: [] }, null, 'bad-entry', ['nested']],
+      expectedInvalid: 3,
+      expectedDuplicate: 0,
+    },
+    {
+      label: 'duplicate id',
+      projects: [
+        { id: 'p-dup', name: 'First', files: [] },
+        { id: 'p-dup', name: 'Second', files: [] },
+      ],
+      expectedInvalid: 0,
+      expectedDuplicate: 1,
+    },
+  ];
+
+  for (const tc of invalidCases) {
+    const userData = makeUserDataDir(t);
+    const legacy = new Store({ cwd: userData, configFileMode: 0o600, defaults });
+    legacy.set('projects', tc.projects);
+    legacy.set('usage', { packagesThisMonth: 9, resetDate: '2026-12-01' });
+    const legacySnapshot = fs.readFileSync(legacy.path, 'utf8');
+
+    const sqlite = new CrateSqliteStore({ userDataRealPath: userData, defaults });
+    t.after(() => sqlite.close());
+
+    assert.throws(
+      () => sqlite.migrateFromLegacyStore(legacy),
+      err => err
+        && err.code === 'CRATE_LEGACY_MIGRATION_INVALID_PROJECTS'
+        && err.legacyCount === tc.projects.length
+        && err.invalidEntries === tc.expectedInvalid
+        && err.duplicateIds === tc.expectedDuplicate,
+      `migration must reject ${tc.label}`
+    );
+
+    assert.equal(sqlite._getKvRaw('_meta'), undefined, `_meta must not be written after ${tc.label}`);
+    assert.deepEqual(sqlite.get('projects', []), [], `no partial projects should commit after ${tc.label}`);
+    assert.equal(sqlite.get('usage').packagesThisMonth, 0, `usage should roll back after ${tc.label}`);
+    assert.equal(fs.readFileSync(legacy.path, 'utf8'), legacySnapshot, `legacy JSON must remain intact after ${tc.label}`);
+
+    // Once legacy projects are repaired to valid unique IDs, migration on the same DB succeeds cleanly
+    legacy.set('projects', [{ id: 'p-repaired', name: 'Repaired', status: 'paused', files: [] }]);
+    assert.equal(sqlite.migrateFromLegacyStore(legacy), true, `repaired profile should migrate after ${tc.label}`);
+    assert.deepEqual(sqlite.get('projects', []).map(p => p.id), ['p-repaired']);
+    assert.equal(sqlite._getKvRaw('_meta')?.migratedFromLegacy, true);
+  }
+});
+
+test('main.js startup falls back to JSON only on CRATE_LEGACY_MIGRATION_INVALID_PROJECTS and stays fail-closed on other SQLite errors (A5)', t => {
+  const vm = require('node:vm');
+  const mainSource = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const startMarker = 'let localStorePaths = null;';
+  const endMarker = '// One-time migration: update old naming template format to new one';
+  const startIdx = mainSource.indexOf(startMarker);
+  const endIdx = mainSource.indexOf(endMarker);
+  assert.ok(startIdx > 0 && endIdx > startIdx, 'must locate main.js startup store initialization block');
+  const initSnippet = mainSource.slice(startIdx, endIdx);
+
+  function runStartupBlock(userData) {
+    const warnings = [];
+    const marks = [];
+    const configPath = path.join(userData, 'config.json');
+    const context = {
+      fs,
+      path,
+      console: { warn: msg => warnings.push(String(msg)) },
+      gotLock: true,
+      Store,
+      CrateSqliteStore,
+      OWNER_ONLY_FILE_MODE: 0o600,
+      DEFAULT_NAMING_TEMPLATE: '{ProjectName}',
+      PACKAGE_OUTPUT_LAYOUT_MODES: { BY_EXTENSION: 'by-extension-v1' },
+      getNextMonthReset: () => '2026-12-01',
+      app: { getPath: () => userData },
+      startupPhaseJournal: { mark: m => marks.push(m) },
+      preflightLocalStorePaths: () => ({ userDataRealPath: userData, configPath }),
+      hardenLocalStorePermissions: () => true,
+      validateLocalStoreShape: candidate => {
+        if (!Array.isArray(candidate.get('projects', null))) throw new Error('invalid shape');
+      },
+      migrateSettings: () => {},
+    };
+    vm.runInNewContext(
+      `${initSnippet}\nthis.__result = { store, localStoreStartupError };`,
+      context
+    );
+    return { ...context.__result, warnings, marks };
+  }
+
+  // Case 1: duplicate project ID -> closes SQLite without _meta, logs sanitized counts, falls back to JSON store
+  const dupDir = makeUserDataDir(t);
+  const legacyDup = new Store({
+    cwd: dupDir,
+    configFileMode: 0o600,
+    defaults: {
+      projects: [],
+      settings: { namingTemplate: '{ProjectName}', notifications: true },
+      usage: { packagesThisMonth: 0, resetDate: '2026-12-01' },
+    },
+  });
+  legacyDup.set('projects', [
+    { id: 'secret-dup-project-id', name: 'One', files: [] },
+    { id: 'secret-dup-project-id', name: 'Two', files: [] },
+  ]);
+
+  const fallbackRes = runStartupBlock(dupDir);
+  assert.equal(fallbackRes.localStoreStartupError, null);
+  assert.ok(fallbackRes.store && typeof fallbackRes.store.openInEditor === 'function', 'must fall back to electron-store JSON');
+  assert.equal(fallbackRes.store.get('projects').length, 2, 'JSON fallback preserves all legacy entries');
+  assert.equal(fallbackRes.warnings.length, 1);
+  assert.ok(fallbackRes.warnings[0].includes('legacyCount=2'));
+  assert.ok(fallbackRes.warnings[0].includes('duplicateIds=1'));
+  assert.equal(fallbackRes.warnings[0].includes('secret-dup-project-id'), false, 'warning must not leak project IDs');
+  assert.equal(fallbackRes.warnings[0].includes(dupDir), false, 'warning must not leak userData path');
+
+  const checkDb = new CrateSqliteStore({ userDataRealPath: dupDir });
+  t.after(() => checkDb.close());
+  assert.equal(checkDb._getKvRaw('_meta'), undefined, '_meta must remain absent after fallback');
+  assert.deepEqual(checkDb.get('projects', []), []);
+
+  // Case 2: non-validation SQLite error (symlinked DB) MUST still fail closed (store === null)
+  const symlinkDir = makeUserDataDir(t);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-sqlite-failclosed-'));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  const outsideDb = path.join(outside, 'target.sqlite');
+  fs.writeFileSync(outsideDb, '');
+  fs.symlinkSync(outsideDb, path.join(symlinkDir, SQLITE_FILENAME));
+
+  const failClosedRes = runStartupBlock(symlinkDir);
+  assert.equal(failClosedRes.store, null, 'non-validation SQLite errors must stay fail-closed');
+  assert.ok(
+    failClosedRes.localStoreStartupError && typeof failClosedRes.localStoreStartupError.message === 'string',
+    'fail-closed startup must set localStoreStartupError'
+  );
+  assert.match(failClosedRes.localStoreStartupError.message, /could not secure local settings storage/);
+  assert.ok(failClosedRes.marks.includes('store-preflight-failed'));
+});

@@ -855,3 +855,129 @@ test('Photoshop external link normalization preserves literal trailing spaces an
     ['Boundary.otf ', 'Hidden.otf\u200B']
   );
 });
+
+test('canUseNativePackageClone stays disabled unconditionally even when CRATE_ENABLE_NATIVE_CLONE=1 (A1/A7)', t => {
+  const bridge = require('../parsers/native-watcher-bridge');
+  const prevCloneEnv = process.env.CRATE_ENABLE_NATIVE_CLONE;
+  process.env.CRATE_ENABLE_NATIVE_CLONE = '1';
+  t.after(() => {
+    if (prevCloneEnv === undefined) delete process.env.CRATE_ENABLE_NATIVE_CLONE;
+    else process.env.CRATE_ENABLE_NATIVE_CLONE = prevCloneEnv;
+  });
+
+  assert.equal(bridge.canUseNativePackageClone(), false);
+  const origElectronDesc = Object.getOwnPropertyDescriptor(process.versions, 'electron');
+  Object.defineProperty(process.versions, 'electron', { value: '42.11.16', configurable: true });
+  t.after(() => {
+    if (origElectronDesc) Object.defineProperty(process.versions, 'electron', origElectronDesc);
+    else delete process.versions.electron;
+  });
+  assert.equal(bridge.canUseNativePackageClone(), false);
+});
+
+test('NativeHelperClient caps unfinished stdout lines and kills oversized helper sessions (A2)', { skip: process.platform !== 'darwin' }, async t => {
+  const prevDisable = process.env.CRATE_DISABLE_NATIVE_HELPER;
+  delete process.env.CRATE_DISABLE_NATIVE_HELPER;
+  t.after(() => {
+    if (prevDisable === undefined) delete process.env.CRATE_DISABLE_NATIVE_HELPER;
+    else process.env.CRATE_DISABLE_NATIVE_HELPER = prevDisable;
+  });
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-helper-stdout-cap-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const fakeHelper = path.join(dir, 'oversized-helper.sh');
+  fs.writeFileSync(
+    fakeHelper,
+    '#!/bin/sh\nIFS= read -r _line\nprintf "%0*d\\n" 512 0\n',
+    { mode: 0o755 }
+  );
+
+  const client = new NativeHelperClient(fakeHelper, { maxStdoutLineChars: 128 });
+  t.after(() => client.shutdown());
+
+  await assert.rejects(
+    () => client.ping(),
+    /native_helper_response_too_large/
+  );
+  assert.equal(client.session, null, 'oversized helper session must be terminated and detached');
+});
+
+test('Swift PdfAiParser enforces reference count & byte ceilings during scanning and returns pdf_ai_reference_limit (A2)', { skip: !hasNativeBinary }, async t => {
+  const { ADMISSION_LIMITS } = require('../parsers/admission-budgets');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-swift-ai-budget-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const client = new NativeHelperClient(DEFAULT_BINARY_PATH);
+  t.after(() => client.shutdown());
+
+  // 1. 10,001 repeated raw links -> Swift throws typed pdf_ai_reference_limit directly
+  const repeatOverPath = path.join(dir, 'repeat-over.ai');
+  const target = '/Users/synthetic-swift-budget/hero.png';
+  fs.writeFileSync(
+    repeatOverPath,
+    Array.from({ length: ADMISSION_LIMITS.parserReferences + 1 }, () => target).join('\n')
+  );
+  await assert.rejects(
+    () => client.parsePdfAi(repeatOverPath, { decompressStreams: true }),
+    error => error && error.code === 'pdf_ai_reference_limit'
+  );
+
+  // 2. Repeated long paths exceeding 16 MiB under 10,000 count -> pdf_ai_reference_limit
+  const byteOverPath = path.join(dir, 'bytes-over.ai');
+  const longTarget = `/Users/synthetic-swift-budget/${'b'.repeat(3500)}.png`;
+  const countForBytes = Math.floor(ADMISSION_LIMITS.parserReferenceBytes / Buffer.byteLength(longTarget, 'utf8')) + 2;
+  assert.ok(countForBytes < ADMISSION_LIMITS.parserReferences);
+  fs.writeFileSync(
+    byteOverPath,
+    Array.from({ length: countForBytes }, () => longTarget).join('\n')
+  );
+  await assert.rejects(
+    () => client.parsePdfAi(byteOverPath, { decompressStreams: true }),
+    error => error && error.code === 'pdf_ai_reference_limit'
+  );
+
+  // 3. 4,000 raw links + 4,000 matching XMP + 4,000 matching FlateDecode links
+  //    (8,000 raw hits + 0 unseen XMP + 0 unseen FlateDecode) -> admitted without double-counting
+  const parityPath = path.join(dir, 'parity-xmp-flate.ai');
+  const rawLinks = Array.from({ length: 4000 }, (_, i) => `/Users/synthetic-swift-budget/img-${i}.png`);
+  const xmpDupes = rawLinks.map(p => `<stRef:filePath>${p}</stRef:filePath>`);
+  const inflatedPayload = zlib.deflateSync(Buffer.from(rawLinks.join('\n')));
+  const streamBlock = Buffer.concat([
+    Buffer.from('1 0 obj\n<< /Filter /FlateDecode /Length '),
+    Buffer.from(`${inflatedPayload.length} >>\nstream\n`),
+    inflatedPayload,
+    Buffer.from('\nendstream\nendobj\n'),
+  ]);
+  fs.writeFileSync(
+    parityPath,
+    Buffer.concat([
+      Buffer.from('%PDF-1.6\n'),
+      Buffer.from(`${rawLinks.join('\n')}\n${xmpDupes.join('\n')}\n`),
+      streamBlock,
+      Buffer.from('%%EOF\n'),
+    ])
+  );
+  const parsed = await client.parsePdfAi(parityPath, { decompressStreams: true });
+  assert.equal(parsed.incomplete, false);
+  assert.equal(parsed.paths.length, 4000);
+
+  // 4. 6,000 raw links + 4,001 NEW unseen FlateDecode links -> 10,001 charged -> pdf_ai_reference_limit
+  const flateOverPath = path.join(dir, 'flate-over.ai');
+  const rawSixK = Array.from({ length: 6000 }, (_, i) => `/Users/synthetic-swift-budget/raw-${i}.png`);
+  const flateNew = Array.from({ length: 4001 }, (_, i) => `/Users/synthetic-swift-budget/flate-${i}.png`);
+  const overPayload = zlib.deflateSync(Buffer.from(flateNew.join('\n')));
+  fs.writeFileSync(
+    flateOverPath,
+    Buffer.concat([
+      Buffer.from('%PDF-1.6\n'),
+      Buffer.from(`${rawSixK.join('\n')}\n`),
+      Buffer.from(`1 0 obj\n<< /Filter /FlateDecode /Length ${overPayload.length} >>\nstream\n`),
+      overPayload,
+      Buffer.from('\nendstream\nendobj\n%%EOF\n'),
+    ])
+  );
+  await assert.rejects(
+    () => client.parsePdfAi(flateOverPath, { decompressStreams: true }),
+    error => error && error.code === 'pdf_ai_reference_limit'
+  );
+});

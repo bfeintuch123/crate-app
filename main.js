@@ -8976,28 +8976,46 @@ if (gotLock) {
       typeof candidateStore.onDidChange === 'function'
     );
     if (isRealElectronStore && CrateSqliteStore) {
-      const sqliteStore = new CrateSqliteStore({
-        userDataRealPath: localStorePaths.userDataRealPath,
-        defaults: {
-          projects: [],
-          settings: {
-            namingTemplate: DEFAULT_NAMING_TEMPLATE,
-            notifications: true,
-            existingAssetsNotifications: true,
-            needsSaveNotifications: true,
-            includeDiagnosticReport: false,
-            showPackageDetails: true,
-            packageOutputLayoutMode: PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
-          },
-          usage: {
-            packagesThisMonth: 0,
-            resetDate: getNextMonthReset()
+      let sqliteStore = null;
+      try {
+        sqliteStore = new CrateSqliteStore({
+          userDataRealPath: localStorePaths.userDataRealPath,
+          defaults: {
+            projects: [],
+            settings: {
+              namingTemplate: DEFAULT_NAMING_TEMPLATE,
+              notifications: true,
+              existingAssetsNotifications: true,
+              needsSaveNotifications: true,
+              includeDiagnosticReport: false,
+              showPackageDetails: true,
+              packageOutputLayoutMode: PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
+            },
+            usage: {
+              packagesThisMonth: 0,
+              resetDate: getNextMonthReset()
+            }
           }
+        });
+        sqliteStore.migrateFromLegacyStore(candidateStore);
+        validateLocalStoreShape(sqliteStore);
+        store = sqliteStore;
+      } catch (sqliteMigrationErr) {
+        if (sqliteStore) {
+          try { sqliteStore.close(); } catch (_) {}
         }
-      });
-      sqliteStore.migrateFromLegacyStore(candidateStore);
-      validateLocalStoreShape(sqliteStore);
-      store = sqliteStore;
+        if (sqliteMigrationErr && sqliteMigrationErr.code === 'CRATE_LEGACY_MIGRATION_INVALID_PROJECTS') {
+          console.warn(
+            `[crate][fast-engine] sqlite-migration-skipped reason=invalid-legacy-projects ` +
+            `legacyCount=${Number(sqliteMigrationErr.legacyCount) || 0} ` +
+            `invalidEntries=${Number(sqliteMigrationErr.invalidEntries) || 0} ` +
+            `duplicateIds=${Number(sqliteMigrationErr.duplicateIds) || 0}`
+          );
+          store = candidateStore;
+        } else {
+          throw sqliteMigrationErr;
+        }
+      }
     } else {
       store = candidateStore;
     }

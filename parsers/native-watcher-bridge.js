@@ -41,12 +41,10 @@ function canUseNativeProcessWatcher(execFn, execFileFn) {
 }
 
 function canUseNativePackageClone() {
-  const client = packageNativeHelper || nativeHelper;
-  if (!client || !client.isAvailable()) return false;
-  // Keep APFS native clone opt-in only until dedicated organized-writer fault
-  // parity is established; default Electron and test runs stay on the
-  // descriptor-bound package-transaction-worker writer.
-  return process.env.CRATE_ENABLE_NATIVE_CLONE === '1';
+  // Permanently disabled until APFS clone creation, hardening, rollback, and
+  // mixed byte-copy worker cleanup achieve descriptor-bound identity parity
+  // with the package-transaction-worker writer.
+  return false;
 }
 
 async function readNativeLastUsedXattrs(filePaths, timeoutMs, { client: explicitClient = null } = {}) {

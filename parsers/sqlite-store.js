@@ -284,7 +284,36 @@ class CrateSqliteStore {
       const existingRows = this.stmts.selectAllProjects.all();
       const hasExistingProjects = existingRows.length > 0;
       if (Array.isArray(legacyProjects) && legacyProjects.length > 0 && !hasExistingProjects) {
+        const seenLegacyIds = new Set();
+        let invalidEntries = 0;
+        let duplicateIds = 0;
+        for (const project of legacyProjects) {
+          if (!isPlainObject(project) || typeof project.id !== 'string' || !project.id) {
+            invalidEntries += 1;
+            continue;
+          }
+          if (seenLegacyIds.has(project.id)) {
+            duplicateIds += 1;
+            continue;
+          }
+          seenLegacyIds.add(project.id);
+        }
+        if (invalidEntries > 0 || duplicateIds > 0) {
+          const err = new Error('Legacy project entries failed migration validation.');
+          err.code = 'CRATE_LEGACY_MIGRATION_INVALID_PROJECTS';
+          err.legacyCount = legacyProjects.length;
+          err.invalidEntries = invalidEntries;
+          err.duplicateIds = duplicateIds;
+          throw err;
+        }
         this._replaceProjectsDirect(legacyProjects);
+        if (this.projectOrder.length !== legacyProjects.length) {
+          const err = new Error('Legacy project migration count mismatch.');
+          err.code = 'CRATE_LEGACY_MIGRATION_INVALID_PROJECTS';
+          err.legacyCount = legacyProjects.length;
+          err.importedCount = this.projectOrder.length;
+          throw err;
+        }
       } else if (hasExistingProjects) {
         this._hydrateMemoryCache();
       }

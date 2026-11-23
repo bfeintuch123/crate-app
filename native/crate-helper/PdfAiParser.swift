@@ -15,6 +15,8 @@ enum PdfAiParser {
     private static let maxSingleStreamOut = 8 * 1024 * 1024
     private static let maxTotalInflatedOut = 64 * 1024 * 1024
     private static let maxStreamsToInflate = 512
+    private static let maxReferenceCount = 10_000
+    private static let maxReferenceBytes = 16 * 1024 * 1024
 
     // Exact base Quick Package AI supported extensions (matches parsers/ai.js).
     // Excludes web-font (.woff2/.woff), installable-font, and video extensions.
@@ -53,32 +55,45 @@ enum PdfAiParser {
 
         var foundOrder: [String] = []
         var foundSet = Set<String>()
+        var chargedReferenceCount = 0
+        var chargedReferenceBytes = 0
         var compressedStreamsScanned = 0
         var compressedHits = 0
         var issues: [String] = []
 
-        func recordPath(_ raw: String, fromCompressed: Bool = false) {
+        func recordPath(_ raw: String, chargeRepeats: Bool, fromCompressed: Bool = false) throws {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty, trimmed != filePath else { return }
-            if foundSet.insert(trimmed).inserted {
+            let byteCount = trimmed.utf8.count
+            guard byteCount <= maxPathLength else { return }
+            let isNew = !foundSet.contains(trimmed)
+            if chargeRepeats || isNew {
+                chargedReferenceCount += 1
+                chargedReferenceBytes += byteCount
+                if chargedReferenceCount > maxReferenceCount || chargedReferenceBytes > maxReferenceBytes {
+                    throw HelperError("pdf_ai_reference_limit")
+                }
+            }
+            if isNew {
+                foundSet.insert(trimmed)
                 foundOrder.append(trimmed)
                 if fromCompressed { compressedHits += 1 }
             }
         }
 
         // 1. Direct raw byte scan for /Users/ and /Volumes/ asset paths + XMP tags
-        data.withUnsafeBytes { buf in
+        try data.withUnsafeBytes { buf in
             let bytes = buf.bindMemory(to: UInt8.self)
-            scanRawPaths(bytes: bytes, onMatch: { recordPath($0) })
-            scanXmpAndUris(bytes: bytes, onMatch: { recordPath($0) })
+            try scanRawPaths(bytes: bytes, onMatch: { try recordPath($0, chargeRepeats: true) })
+            try scanXmpAndUris(bytes: bytes, onMatch: { try recordPath($0, chargeRepeats: false) })
 
             // 2. Selective FlateDecode PDF stream decompression (non-image streams)
             if decompressStreams {
-                scanFlateDecodeStreams(bytes: bytes, streamsScanned: &compressedStreamsScanned, issues: &issues) { inflated in
-                    inflated.withUnsafeBytes { ibuf in
+                try scanFlateDecodeStreams(bytes: bytes, streamsScanned: &compressedStreamsScanned, issues: &issues) { inflated in
+                    try inflated.withUnsafeBytes { ibuf in
                         let ib = ibuf.bindMemory(to: UInt8.self)
-                        scanRawPaths(bytes: ib, onMatch: { recordPath($0, fromCompressed: true) })
-                        scanXmpAndUris(bytes: ib, onMatch: { recordPath($0, fromCompressed: true) })
+                        try scanRawPaths(bytes: ib, onMatch: { try recordPath($0, chargeRepeats: false, fromCompressed: true) })
+                        try scanXmpAndUris(bytes: ib, onMatch: { try recordPath($0, chargeRepeats: false, fromCompressed: true) })
                     }
                 }
             }
@@ -151,11 +166,49 @@ enum PdfAiParser {
     }
 
     // Strictly O(N) byte scanner matching parsers/ai.js's scanQuickAiRawPaths identically:
-    // maximal delimiter-free runs -> /Users/ & /Volumes/ segments (preserving nested
+    // maximal delimiter-free runs -> streaming /Users/ & /Volumes/ segments (preserving nested
     // /Volumes/<disk>/Users/...) -> backwards scan for LAST whole supported extension.
-    private static func scanRawPaths(bytes: UnsafeBufferPointer<UInt8>, onMatch: (String) -> Void) {
+    private static func scanRawPaths(bytes: UnsafeBufferPointer<UInt8>, onMatch: (String) throws -> Void) throws {
         let n = bytes.count
         guard n >= 10 else { return }
+
+        func processSegment(segStart: Int, prefixLen: Int, segEnd: Int) throws {
+            let cappedEnd = min(segEnd, segStart + maxPathLength)
+            if cappedEnd <= segStart + prefixLen { return }
+
+            var pos = cappedEnd - 1
+            while pos >= segStart + prefixLen {
+                if bytes[pos] == 0x2E { // '.'
+                    let extStart = pos + 1
+                    var extEnd = extStart
+                    while extEnd < segEnd && extEnd - extStart <= 9 && isAsciiAlnum(bytes[extEnd]) {
+                        extEnd += 1
+                    }
+                    if extEnd > extStart && extEnd <= cappedEnd && extEnd - extStart <= 8 {
+                        if extEnd < segEnd && isAsciiAlnum(bytes[extEnd]) {
+                            pos -= 1
+                            continue
+                        }
+                        var extStr = ""
+                        extStr.reserveCapacity(extEnd - extStart)
+                        for k in extStart..<extEnd {
+                            let c = bytes[k]
+                            let lc = (c >= 0x41 && c <= 0x5A) ? (c + 32) : c
+                            extStr.append(Character(UnicodeScalar(lc)))
+                        }
+                        if allowedExtensions.contains(extStr) {
+                            let slice = UnsafeBufferPointer(rebasing: bytes[segStart..<extEnd])
+                            // Decode lossily with U+FFFD to match Node Buffer.toString('utf8')
+                            // so non-UTF-8 bytes (e.g. MacRoman) are never silently dropped.
+                            try onMatch(String(decoding: slice, as: UTF8.self))
+                            break
+                        }
+                    }
+                }
+                pos -= 1
+            }
+        }
+
         var i = 0
         while i < n {
             while i < n && isDelimiter(bytes[i]) { i += 1 }
@@ -164,14 +217,24 @@ enum PdfAiParser {
             let runEnd = i
             if runEnd - runStart < 10 { continue }
 
-            var segments: [(pos: Int, prefixLen: Int)] = []
+            var hasCurrent = false
+            var curStart = 0
+            var curPrefixLen = 0
             var p = runStart
             while p < runEnd - 7 {
                 let prefixLen = matchUsersOrVolumesPrefix(bytes, p, runEnd)
                 if prefixLen > 0 {
                     let precededBySep = p > runStart && isSegmentBoundarySeparator(bytes[p - 1])
-                    if segments.isEmpty || precededBySep {
-                        segments.append((p, prefixLen))
+                    if !hasCurrent {
+                        hasCurrent = true
+                        curStart = p
+                        curPrefixLen = prefixLen
+                        p += prefixLen
+                        continue
+                    } else if precededBySep {
+                        try processSegment(segStart: curStart, prefixLen: curPrefixLen, segEnd: p)
+                        curStart = p
+                        curPrefixLen = prefixLen
                         p += prefixLen
                         continue
                     }
@@ -179,50 +242,14 @@ enum PdfAiParser {
                 p += 1
             }
 
-            for s in 0..<segments.count {
-                let segStart = segments[s].pos
-                let prefixLen = segments[s].prefixLen
-                let segEnd = (s + 1 < segments.count) ? segments[s + 1].pos : runEnd
-                let cappedEnd = min(segEnd, segStart + maxPathLength)
-                if cappedEnd <= segStart + prefixLen { continue }
-
-                var pos = cappedEnd - 1
-                while pos >= segStart + prefixLen {
-                    if bytes[pos] == 0x2E { // '.'
-                        let extStart = pos + 1
-                        var extEnd = extStart
-                        while extEnd < segEnd && extEnd - extStart <= 9 && isAsciiAlnum(bytes[extEnd]) {
-                            extEnd += 1
-                        }
-                        if extEnd > extStart && extEnd <= cappedEnd && extEnd - extStart <= 8 {
-                            if extEnd < segEnd && isAsciiAlnum(bytes[extEnd]) {
-                                pos -= 1
-                                continue
-                            }
-                            var extStr = ""
-                            extStr.reserveCapacity(extEnd - extStart)
-                            for k in extStart..<extEnd {
-                                let c = bytes[k]
-                                let lc = (c >= 0x41 && c <= 0x5A) ? (c + 32) : c
-                                extStr.append(Character(UnicodeScalar(lc)))
-                            }
-                            if allowedExtensions.contains(extStr) {
-                                let slice = UnsafeBufferPointer(rebasing: bytes[segStart..<extEnd])
-                                // Decode lossily with U+FFFD to match Node Buffer.toString('utf8')
-                                // so non-UTF-8 bytes (e.g. MacRoman) are never silently dropped.
-                                onMatch(String(decoding: slice, as: UTF8.self))
-                                break
-                            }
-                        }
-                    }
-                    pos -= 1
-                }
+            if hasCurrent {
+                try processSegment(segStart: curStart, prefixLen: curPrefixLen, segEnd: runEnd)
             }
         }
     }
 
     // Extract XMP <stRef:filePath>...</stRef:filePath> and LinkResourceURI="..." values.
-    private static func scanXmpAndUris(bytes: UnsafeBufferPointer<UInt8>, onMatch: (String) -> Void) {
+    private static func scanXmpAndUris(bytes: UnsafeBufferPointer<UInt8>, onMatch: (String) throws -> Void) rethrows {
         let markers: [[UInt8]] = [
             Array("stRef:filePath>".utf8),
             Array("stRef:filePath=\"".utf8),
@@ -250,7 +277,7 @@ enum PdfAiParser {
                             var val = String(decoding: slice, as: UTF8.self)
                             val = decodeXmlEntities(val)
                             if let local = normalizeLocalPathOrFileUri(val) {
-                                onMatch(local)
+                                try onMatch(local)
                             }
                         }
                         i = end + 1
@@ -357,8 +384,8 @@ enum PdfAiParser {
         bytes: UnsafeBufferPointer<UInt8>,
         streamsScanned: inout Int,
         issues: inout [String],
-        onInflated: (Data) -> Void
-    ) {
+        onInflated: (Data) throws -> Void
+    ) rethrows {
         let streamToken = Array("stream".utf8)
         let endstreamToken = Array("endstream".utf8)
         let flateToken = Array("FlateDecode".utf8)
@@ -450,7 +477,7 @@ enum PdfAiParser {
                                     ) {
                                         streamsScanned += 1
                                         totalInflated += inflated.count
-                                        onInflated(inflated)
+                                        try onInflated(inflated)
                                     } else {
                                         recordIssue("flate-stream-budget-or-decode")
                                     }
