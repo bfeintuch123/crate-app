@@ -55,12 +55,13 @@ class NativeHelperClient {
   constructor(binaryPath = null, { maxStdoutLineBytes = null, maxStdoutLineChars = null } = {}) {
     this.explicitBinaryPath = binaryPath;
     this.binaryPath = resolveNativeHelperBinaryPath(binaryPath);
-    const requestedLimit = maxStdoutLineBytes !== null && maxStdoutLineBytes !== undefined
+    const validBytes = Number.isInteger(maxStdoutLineBytes) && maxStdoutLineBytes > 0
       ? maxStdoutLineBytes
-      : maxStdoutLineChars;
-    this.maxStdoutLineBytes = Number.isInteger(requestedLimit) && requestedLimit > 0
-      ? requestedLimit
-      : MAX_STDOUT_LINE_BYTES;
+      : null;
+    const validChars = Number.isInteger(maxStdoutLineChars) && maxStdoutLineChars > 0
+      ? maxStdoutLineChars
+      : null;
+    this.maxStdoutLineBytes = validBytes ?? validChars ?? MAX_STDOUT_LINE_BYTES;
     this.maxStdoutLineChars = this.maxStdoutLineBytes;
     this.session = null;
     this.nextId = 1;

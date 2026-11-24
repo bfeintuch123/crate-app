@@ -50,6 +50,7 @@ const {
   writeFileIntoPackage,
 } = require('./package-safety');
 const {
+  computeCrc32,
   isUnsupportedZipEntryError,
   openZipArchive,
 } = require('./zip-reader');
@@ -154,77 +155,49 @@ function getUniqueKeynoteWildcardFallback(zipPath, assets) {
   };
 }
 
-function unzipPatternMatchesEntry(pattern, entryPath) {
-  if (typeof pattern !== 'string' || typeof entryPath !== 'string') return false;
-  if (pattern === entryPath) return true;
-  if (!/[*?[\]\\]/.test(pattern)) return false;
+const UNZIP_GLOB_META_RE = /[*?[\]\\]/;
+const MAX_UNZIP_WILDCARD_CHECKS = 25_000;
 
-  // Tokenize Info-ZIP /usr/bin/unzip wildcard syntax (*, ?, [...], \) and match
-  // with linear-time DP (no regex backtracking). Bracket expressions [...] are
-  // conservatively treated as matching either their literal text or any single char.
-  const tokens = [];
-  for (let i = 0; i < pattern.length; i += 1) {
+function findLastUnzipMetaIndex(pattern) {
+  for (let i = pattern.length - 1; i >= 0; i -= 1) {
     const ch = pattern[i];
-    if (ch === '\\' && i + 1 < pattern.length) {
-      i += 1;
-      tokens.push({ type: 'char', value: pattern[i] });
-    } else if (ch === '*') {
-      if (tokens.length === 0 || tokens[tokens.length - 1].type !== 'star') {
-        tokens.push({ type: 'star' });
-      }
-    } else if (ch === '?') {
-      tokens.push({ type: 'any' });
-    } else if (ch === '[') {
-      const closeIdx = pattern.indexOf(']', i + 1);
-      if (closeIdx > i + 1) {
-        tokens.push({ type: 'bracket', literal: pattern.slice(i, closeIdx + 1) });
-        i = closeIdx;
-      } else {
-        tokens.push({ type: 'any' });
-      }
-    } else {
-      tokens.push({ type: 'char', value: ch });
-    }
+    if (ch === '*' || ch === '?' || ch === '[' || ch === ']' || ch === '\\') return i;
   }
-
-  const m = entryPath.length;
-  let dp = new Uint8Array(m + 1);
-  dp[0] = 1;
-  for (const tok of tokens) {
-    const next = new Uint8Array(m + 1);
-    if (tok.type === 'star') {
-      let seen = 0;
-      for (let j = 0; j <= m; j += 1) {
-        if (dp[j]) seen = 1;
-        next[j] = seen;
-      }
-    } else if (tok.type === 'any') {
-      for (let j = 0; j < m; j += 1) {
-        if (dp[j]) next[j + 1] = 1;
-      }
-    } else if (tok.type === 'bracket') {
-      const litLen = tok.literal.length;
-      for (let j = 0; j <= m; j += 1) {
-        if (!dp[j]) continue;
-        if (j < m) next[j + 1] = 1;
-        if (j + litLen <= m && entryPath.startsWith(tok.literal, j)) {
-          next[j + litLen] = 1;
-        }
-      }
-    } else {
-      for (let j = 0; j < m; j += 1) {
-        if (dp[j] && entryPath[j] === tok.value) next[j + 1] = 1;
-      }
-    }
-    dp = next;
-  }
-  return dp[m] === 1;
+  return -1;
 }
 
-function countUnzipPatternMatches(entries, pattern) {
+function countUnzipPatternMatches(entries, pattern, budget = null) {
+  if (typeof pattern !== 'string') return 0;
+  const firstMeta = pattern.search(UNZIP_GLOB_META_RE);
+  if (firstMeta < 0) {
+    let count = 0;
+    for (const entry of entries || []) {
+      if (entry && entry.path === pattern) {
+        count += 1;
+        if (count >= 2) return count;
+      }
+    }
+    return count;
+  }
+  // Provable superset of Info-ZIP /usr/bin/unzip matching across *, ?, [...],
+  // \], and byte-level ? matching over multi-byte UTF-8: any entry matched by
+  // unzip MUST start with the literal prefix before the first metacharacter and
+  // end with the literal suffix after the last metacharacter.
+  const lastMeta = findLastUnzipMetaIndex(pattern);
+  const prefix = pattern.slice(0, firstMeta);
+  const suffix = pattern.slice(lastMeta + 1);
+  const minLen = prefix.length + suffix.length;
   let count = 0;
   for (const entry of entries || []) {
-    if (entry && typeof entry.path === 'string' && unzipPatternMatchesEntry(pattern, entry.path)) {
+    if (budget) {
+      budget.checks += 1;
+      if (budget.checks > MAX_UNZIP_WILDCARD_CHECKS) {
+        throw admissionError(PRESENTATION_ADMISSION_MESSAGE);
+      }
+    }
+    const p = entry && entry.path;
+    if (typeof p !== 'string' || p.length < minLen) continue;
+    if (p.startsWith(prefix) && p.endsWith(suffix)) {
       count += 1;
       if (count >= 2) return count;
     }
@@ -234,6 +207,7 @@ function countUnzipPatternMatches(entries, pattern) {
 
 function buildListingPathIndex(entries) {
   const counts = new Map();
+  const budget = { checks: 0 };
   for (const entry of entries) {
     if (!entry || typeof entry.path !== 'string') continue;
     counts.set(entry.path, (counts.get(entry.path) || 0) + 1);
@@ -241,8 +215,11 @@ function buildListingPathIndex(entries) {
   return {
     entries,
     counts,
+    budget,
     hasAmbiguousPath(targetPath) {
-      return (counts.get(targetPath) || 0) >= 2 || countUnzipPatternMatches(entries, targetPath) >= 2;
+      if ((counts.get(targetPath) || 0) >= 2) return true;
+      if (typeof targetPath !== 'string' || !UNZIP_GLOB_META_RE.test(targetPath)) return false;
+      return countUnzipPatternMatches(entries, targetPath, budget) >= 2;
     },
   };
 }
@@ -262,13 +239,23 @@ async function listArchiveEntriesWithUnzip(archivePath) {
   }
 }
 
-async function extractArchiveEntryData(archivePath, zipPath, ext, assets, archive = null, fallbackListing = null) {
+async function extractArchiveEntryData(
+  archivePath,
+  zipPath,
+  ext,
+  assets,
+  archive = null,
+  fallbackListing = null,
+  archiveWildcardBudget = null
+) {
+  let expectedEntry = null;
   if (archive) {
     if (typeof archive.hasAmbiguousPath === 'function' && archive.hasAmbiguousPath(zipPath)) {
       throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
     }
     const exactEntry = archive.findEntry(zipPath);
     if (exactEntry) {
+      expectedEntry = exactEntry;
       try {
         const data = assertBufferWithinBudget(
           archive.readEntry(exactEntry, {
@@ -299,6 +286,7 @@ async function extractArchiveEntryData(archivePath, zipPath, ext, assets, archiv
       if (typeof archive.hasAmbiguousPath === 'function' && archive.hasAmbiguousPath(archiveMatches[0].path)) {
         throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
       }
+      expectedEntry = archiveMatches[0];
       try {
         const data = assertBufferWithinBudget(
           archive.readEntry(archiveMatches[0], {
@@ -341,7 +329,7 @@ async function extractArchiveEntryData(archivePath, zipPath, ext, assets, archiv
     }
     if (
       fallbackListing.hasAmbiguousPath(listingMatches[0].path)
-      || countUnzipPatternMatches(fallbackListing.entries, fallback.wildcardPath) !== 1
+      || countUnzipPatternMatches(fallbackListing.entries, fallback.wildcardPath, fallbackListing.budget) !== 1
     ) {
       throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
     }
@@ -350,23 +338,36 @@ async function extractArchiveEntryData(archivePath, zipPath, ext, assets, archiv
   }
 
   // Unsupported-compression fall-through from an open in-process archive must
-  // still ensure /usr/bin/unzip -p matches strictly one member.
-  if (archive && countUnzipPatternMatches(archive.entries, zipPath) >= 2) {
+  // still ensure /usr/bin/unzip -p matches strictly one member and returns the
+  // exact admitted member's size and CRC-32.
+  const verifyExpectedEntry = data => {
+    if (expectedEntry && (data.length !== expectedEntry.size || computeCrc32(data) !== expectedEntry.crc32)) {
+      throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
+    }
+    return data;
+  };
+  if (archive && countUnzipPatternMatches(archive.entries, zipPath, archiveWildcardBudget) >= 2) {
     throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
   }
   try {
-    const data = await readArchiveEntryData(archivePath, zipPath);
+    const data = verifyExpectedEntry(await readArchiveEntryData(archivePath, zipPath));
     return { data, outputTail: ext === '.key' ? getKeynoteArchiveEntryOutputTail(zipPath) : null };
   } catch (exactError) {
-    if (ext !== '.key' || isParserAdmissionError(exactError)) throw exactError;
+    if (
+      ext !== '.key'
+      || isParserAdmissionError(exactError)
+      || exactError?.code === 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME'
+    ) {
+      throw exactError;
+    }
 
     const fallback = getUniqueKeynoteWildcardFallback(zipPath, assets);
     if (!fallback) throw exactError;
-    if (archive && countUnzipPatternMatches(archive.entries, fallback.wildcardPath) !== 1) {
+    if (archive && countUnzipPatternMatches(archive.entries, fallback.wildcardPath, archiveWildcardBudget) !== 1) {
       throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
     }
 
-    const data = await readArchiveEntryData(archivePath, fallback.wildcardPath);
+    const data = verifyExpectedEntry(await readArchiveEntryData(archivePath, fallback.wildcardPath));
     return { data, outputTail: getKeynoteArchiveEntryOutputTail(zipPath, fallback.tail) || fallback.tail };
   }
 }
@@ -573,6 +574,7 @@ class PowerPointParser extends BaseParser {
 
       let fallbackListing = null;
       let fallbackListingError = null;
+      const archiveWildcardBudget = { checks: 0 };
       if (!archive && assets.some(asset => asset && asset.zipPath)) {
         try {
           fallbackListing = await listArchiveEntriesWithUnzip(archivePath);
@@ -593,7 +595,8 @@ class PowerPointParser extends BaseParser {
             ext,
             assets,
             archive,
-            fallbackListing
+            fallbackListing,
+            archiveWildcardBudget
           );
           extractedBytes += data.length;
           if (extractedBytes > ADMISSION_LIMITS.presentationMediaBytes) {

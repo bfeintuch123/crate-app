@@ -44,7 +44,7 @@ function buildSyntheticZip(entries) {
   for (const entry of entries) {
     const nameBuf = Buffer.isBuffer(entry.name) ? entry.name : Buffer.from(entry.name, 'utf8');
     const rawData = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data, 'utf8');
-    const method = entry.deflate ? 8 : 0;
+    const method = Number.isInteger(entry.method) ? entry.method : (entry.deflate ? 8 : 0);
     const compData = method === 8 ? zlib.deflateRawSync(rawData) : rawData;
     const crc = zlib.crc32(rawData) >>> 0;
 
@@ -1030,4 +1030,98 @@ test('Keynote (.key) & PPTX: reject duplicate identical-raw-name ZIP entries dur
   assert.equal(starExtErrors.length, 1, 'literal wildcard entry name matching multiple files via unzip must fail extraction');
   assert.deepEqual(starExtracted, []);
   assert.deepEqual(fs.readdirSync(starOutDir), []);
+
+  // 6. Byte-level '?' vs multi-byte UTF-8 ('caf??' vs 'café') and escaped brackets ('x[a\]b]' vs 'xa')
+  const utf8QKeyPath = path.join(dir, 'utf8-q-trailing.key');
+  fs.writeFileSync(utf8QKeyPath, Buffer.concat([
+    buildSyntheticZip([
+      { name: 'Data/caf??-1001.jpg', data: fullImage, unix: true },
+      { name: 'Data/caf\u00e9-1001.jpg', data: fullImage2, unix: true },
+    ]),
+    Buffer.from([0x00]),
+  ]));
+  assert.equal(openZipArchive(utf8QKeyPath), null);
+  const utf8QInspErrors = [];
+  assert.deepEqual(await parser.extractAssets(utf8QKeyPath, { onInspectionError: err => utf8QInspErrors.push(err) }), []);
+  assert.equal(utf8QInspErrors.length, 1, 'byte-level ? matching multi-byte UTF-8 sibling must fail inspection');
+  const utf8QOutDir = path.join(dir, 'out-utf8-q');
+  fs.mkdirSync(utf8QOutDir, { recursive: true });
+  const utf8QExtErrors = [];
+  assert.deepEqual(
+    await parser.extractToDirectory(
+      utf8QKeyPath,
+      utf8QOutDir,
+      [{ path: 'caf??-1001.jpg', source: 'keynote-embedded', exists: true, zipPath: 'Data/caf??-1001.jpg', size: fullImage.length }],
+      { onExtractionError: err => utf8QExtErrors.push(err) }
+    ),
+    []
+  );
+  assert.equal(utf8QExtErrors.length, 1, 'byte-level ? matching multi-byte UTF-8 sibling must fail extraction');
+  assert.deepEqual(fs.readdirSync(utf8QOutDir), []);
+
+  const bracketKeyPath = path.join(dir, 'escaped-bracket-trailing.key');
+  fs.writeFileSync(bracketKeyPath, Buffer.concat([
+    buildSyntheticZip([
+      { name: 'Data/x[a\\]b]-1001.jpg', data: fullImage, unix: true },
+      { name: 'Data/xa-1001.jpg', data: fullImage2, unix: true },
+    ]),
+    Buffer.from([0x00]),
+  ]));
+  assert.equal(openZipArchive(bracketKeyPath), null);
+  const bracketInspErrors = [];
+  assert.deepEqual(await parser.extractAssets(bracketKeyPath, { onInspectionError: err => bracketInspErrors.push(err) }), []);
+  assert.equal(bracketInspErrors.length, 1, 'escaped-bracket name matching sibling under Info-ZIP must fail inspection');
+  const bracketOutDir = path.join(dir, 'out-escaped-bracket');
+  fs.mkdirSync(bracketOutDir, { recursive: true });
+  const bracketExtErrors = [];
+  assert.deepEqual(
+    await parser.extractToDirectory(
+      bracketKeyPath,
+      bracketOutDir,
+      [{ path: 'x[a\\]b]-1001.jpg', source: 'keynote-embedded', exists: true, zipPath: 'Data/x[a\\]b]-1001.jpg', size: fullImage.length }],
+      { onExtractionError: err => bracketExtErrors.push(err) }
+    ),
+    []
+  );
+  assert.equal(bracketExtErrors.length, 1, 'escaped-bracket name matching sibling under Info-ZIP must fail extraction');
+  assert.deepEqual(fs.readdirSync(bracketOutDir), []);
+
+  // 7. Unsupported-compression fall-through (method 9) on an open in-process archive must also refuse escaped-bracket ambiguity
+  const method9KeyPath = path.join(dir, 'method9-bracket.key');
+  fs.writeFileSync(method9KeyPath, buildSyntheticZip([
+    { name: 'Data/x[a\\]b]-1001.jpg', data: fullImage, method: 9, unix: true },
+    { name: 'Data/xa-1001.jpg', data: fullImage2, method: 0, unix: true },
+  ]));
+  const method9OutDir = path.join(dir, 'out-method9-bracket');
+  fs.mkdirSync(method9OutDir, { recursive: true });
+  const method9ExtErrors = [];
+  assert.deepEqual(
+    await parser.extractToDirectory(
+      method9KeyPath,
+      method9OutDir,
+      [{ path: 'x[a\\]b]-1001.jpg', source: 'keynote-embedded', exists: true, zipPath: 'Data/x[a\\]b]-1001.jpg', size: fullImage.length }],
+      { onExtractionError: err => method9ExtErrors.push(err) }
+    ),
+    []
+  );
+  assert.equal(method9ExtErrors.length, 1, 'unsupported-compression fall-through must refuse wildcard-ambiguous names');
+  assert.deepEqual(fs.readdirSync(method9OutDir), []);
+
+  // 8. Bounded wildcard-check budget prevents quadratic slowdown on many long '?' entries in unzip fallback
+  const { isParserAdmissionError } = require('../parsers/admission-budgets');
+  const manyWildcards = [];
+  const longPad = 'a'.repeat(580);
+  for (let i = 0; i < 200; i += 1) {
+    manyWildcards.push({ name: `Data/q?${String(i).padStart(4, '0')}-${longPad}.jpg`, data: fullImage, unix: true });
+  }
+  const manyWildcardPath = path.join(dir, 'many-wildcards-trailing.key');
+  fs.writeFileSync(manyWildcardPath, Buffer.concat([buildSyntheticZip(manyWildcards), Buffer.from([0x00])]));
+  assert.equal(openZipArchive(manyWildcardPath), null);
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => parser.extractAssets(manyWildcardPath),
+    err => isParserAdmissionError(err),
+    'excessive wildcard-bearing entries on unzip fallback must fail closed with an admission error'
+  );
+  assert.ok(Date.now() - startedAt < 2000, 'bounded wildcard check must complete quickly without freezing');
 });
