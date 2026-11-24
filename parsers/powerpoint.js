@@ -154,7 +154,37 @@ function getUniqueKeynoteWildcardFallback(zipPath, assets) {
   };
 }
 
-async function extractArchiveEntryData(archivePath, zipPath, ext, assets, archive = null) {
+function buildListingPathIndex(entries) {
+  const counts = new Map();
+  for (const entry of entries) {
+    if (!entry || typeof entry.path !== 'string') continue;
+    counts.set(entry.path, (counts.get(entry.path) || 0) + 1);
+  }
+  return {
+    entries,
+    counts,
+    hasAmbiguousPath(targetPath) {
+      return (counts.get(targetPath) || 0) >= 2;
+    },
+  };
+}
+
+async function listArchiveEntriesWithUnzip(archivePath) {
+  try {
+    const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', archivePath], {
+      timeout: 10000,
+      maxBuffer: ADMISSION_LIMITS.archiveListingBufferBytes,
+      encoding: 'utf8',
+    });
+    const entries = parseArchiveListing(listing, { message: PRESENTATION_ADMISSION_MESSAGE });
+    return buildListingPathIndex(entries);
+  } catch (error) {
+    if (isChildProcessAdmissionError(error)) throw admissionError(PRESENTATION_ADMISSION_MESSAGE);
+    throw error;
+  }
+}
+
+async function extractArchiveEntryData(archivePath, zipPath, ext, assets, archive = null, fallbackListing = null) {
   if (archive) {
     if (typeof archive.hasAmbiguousPath === 'function' && archive.hasAmbiguousPath(zipPath)) {
       throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
@@ -207,6 +237,35 @@ async function extractArchiveEntryData(archivePath, zipPath, ext, assets, archiv
     } else {
       throw Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
     }
+  } else if (fallbackListing) {
+    if (fallbackListing.hasAmbiguousPath(zipPath)) {
+      throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
+    }
+    const exactCount = fallbackListing.counts.get(zipPath) || 0;
+    if (exactCount === 1) {
+      const data = await readArchiveEntryData(archivePath, zipPath);
+      return { data, outputTail: ext === '.key' ? getKeynoteArchiveEntryOutputTail(zipPath) : null };
+    }
+    if (ext !== '.key') {
+      throw Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
+    }
+    const fallback = getUniqueKeynoteWildcardFallback(zipPath, assets);
+    if (!fallback) {
+      throw Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
+    }
+    const listingMatches = fallbackListing.entries.filter(entry => (
+      entry.path.startsWith('Data/')
+      && hasEmbeddedMediaExtension(entry.path)
+      && path.basename(entry.path).trim().endsWith(fallback.tail)
+    ));
+    if (listingMatches.length !== 1) {
+      throw Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
+    }
+    if (fallbackListing.hasAmbiguousPath(listingMatches[0].path)) {
+      throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
+    }
+    const data = await readArchiveEntryData(archivePath, fallback.wildcardPath);
+    return { data, outputTail: getKeynoteArchiveEntryOutputTail(zipPath, fallback.tail) || fallback.tail };
   }
 
   try {
@@ -277,16 +336,13 @@ class PowerPointParser extends BaseParser {
       });
 
       let entries;
+      let fallbackListing = null;
       if (archive) {
         entries = archive.entries;
       } else {
         // Fallback for non-standard/legacy fixtures: list ZIP contents via /usr/bin/unzip
-        const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', filePath], {
-          timeout: 10000,
-          maxBuffer: ADMISSION_LIMITS.archiveListingBufferBytes,
-          encoding: 'utf8'
-        });
-        entries = parseArchiveListing(listing, { message: PRESENTATION_ADMISSION_MESSAGE });
+        fallbackListing = await listArchiveEntriesWithUnzip(filePath);
+        entries = fallbackListing.entries;
       }
 
       if (ext === '.pptx') {
@@ -334,7 +390,10 @@ class PowerPointParser extends BaseParser {
           if (/-small(-\d{3,6})?\.[a-z]+$/i.test(entryName)) continue;
         }
 
-        if (archive && typeof archive.hasAmbiguousPath === 'function' && archive.hasAmbiguousPath(zipPath)) {
+        const isAmbiguousPath = archive && typeof archive.hasAmbiguousPath === 'function'
+          ? archive.hasAmbiguousPath(zipPath)
+          : Boolean(fallbackListing && fallbackListing.hasAmbiguousPath(zipPath));
+        if (isAmbiguousPath) {
           // Clear only embedded archive entries (preserve any validated pptx-linked entries)
           for (let idx = assets.length - 1; idx >= 0; idx -= 1) {
             if (assets[idx] && assets[idx].zipPath) assets.splice(idx, 1);
@@ -423,11 +482,30 @@ class PowerPointParser extends BaseParser {
         message: PRESENTATION_ADMISSION_MESSAGE,
       });
 
+      let fallbackListing = null;
+      let fallbackListingError = null;
+      if (!archive && assets.some(asset => asset && asset.zipPath)) {
+        try {
+          fallbackListing = await listArchiveEntriesWithUnzip(archivePath);
+        } catch (listError) {
+          if (isParserAdmissionError(listError)) throw listError;
+          fallbackListingError = listError;
+        }
+      }
+
       for (const asset of assets) {
         if (!asset.zipPath) continue;
 
         try {
-          const { data, outputTail } = await extractArchiveEntryData(archivePath, asset.zipPath, ext, assets, archive);
+          if (!archive && fallbackListingError) throw fallbackListingError;
+          const { data, outputTail } = await extractArchiveEntryData(
+            archivePath,
+            asset.zipPath,
+            ext,
+            assets,
+            archive,
+            fallbackListing
+          );
           extractedBytes += data.length;
           if (extractedBytes > ADMISSION_LIMITS.presentationMediaBytes) {
             throw admissionError(PRESENTATION_ADMISSION_MESSAGE);

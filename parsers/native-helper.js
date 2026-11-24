@@ -125,7 +125,7 @@ class NativeHelperClient {
           onTerminate('native_helper_response_too_large');
           return;
         }
-        const piece = start === 0 && nl === buf.length ? buf : buf.subarray(start, nl);
+        const piece = buf.subarray(start, nl);
         const lineBuf = session.chunks.length > 0
           ? Buffer.concat([...session.chunks, piece], session.bufferBytes + pieceLen)
           : piece;

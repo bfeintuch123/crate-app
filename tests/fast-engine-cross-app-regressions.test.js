@@ -888,4 +888,85 @@ test('Keynote (.key) & PPTX: reject duplicate identical-raw-name ZIP entries dur
   assert.equal(pptExtErrors.length, 1, 'duplicate PPTX entry name must fail direct extraction');
   assert.deepEqual(pptExtracted, []);
   assert.deepEqual(fs.readdirSync(pptOutDir), []);
+
+  // 3. Trailing-byte ZIPs that fall back from openZipArchive (null) to /usr/bin/unzip must ALSO refuse duplicates
+  const fullImage2 = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(700, 0x45)]);
+  const trailingDupKeyPath = path.join(dir, 'duplicate-trailing.key');
+  fs.writeFileSync(trailingDupKeyPath, Buffer.concat([
+    buildSyntheticZip([
+      { name: 'Data/photo-1001.jpg', data: fullImage },
+      { name: 'Data/photo-1001.jpg', data: fullImage2 },
+    ]),
+    Buffer.from([0x00]),
+  ]));
+  assert.equal(openZipArchive(trailingDupKeyPath), null, 'trailing byte must exercise unzip fallback');
+
+  const trailingKeyInspErrors = [];
+  const trailingKeyDiscovered = await parser.extractAssets(trailingDupKeyPath, {
+    onInspectionError: err => trailingKeyInspErrors.push(err),
+  });
+  assert.equal(trailingKeyInspErrors.length, 1, 'duplicate Keynote entry via unzip fallback must fail inspection');
+  assert.deepEqual(trailingKeyDiscovered, []);
+
+  const trailingKeyOutDir = path.join(dir, 'out-trailing-dup-key');
+  fs.mkdirSync(trailingKeyOutDir, { recursive: true });
+  const trailingKeyExtErrors = [];
+  const trailingKeyExtracted = await parser.extractToDirectory(
+    trailingDupKeyPath,
+    trailingKeyOutDir,
+    [{ path: 'photo-1001.jpg', source: 'keynote-embedded', exists: true, zipPath: 'Data/photo-1001.jpg', size: fullImage.length }],
+    { onExtractionError: err => trailingKeyExtErrors.push(err) }
+  );
+  assert.equal(trailingKeyExtErrors.length, 1, 'duplicate Keynote entry via unzip fallback must fail direct extraction');
+  assert.deepEqual(trailingKeyExtracted, []);
+  assert.deepEqual(fs.readdirSync(trailingKeyOutDir), []);
+
+  const trailingDupPptxPath = path.join(dir, 'duplicate-trailing.pptx');
+  fs.writeFileSync(trailingDupPptxPath, Buffer.concat([
+    buildSyntheticZip([
+      { name: 'ppt/media/image1.jpg', data: fullImage },
+      { name: 'ppt/media/image1.jpg', data: fullImage2 },
+    ]),
+    Buffer.from([0x00]),
+  ]));
+  assert.equal(openZipArchive(trailingDupPptxPath), null, 'trailing byte PPTX must exercise unzip fallback');
+
+  const trailingPptOutDir = path.join(dir, 'out-trailing-dup-pptx');
+  fs.mkdirSync(trailingPptOutDir, { recursive: true });
+  const trailingPptExtErrors = [];
+  const trailingPptExtracted = await parser.extractToDirectory(
+    trailingDupPptxPath,
+    trailingPptOutDir,
+    [{ path: 'image1.jpg', source: 'pptx-embedded', exists: true, zipPath: 'ppt/media/image1.jpg', size: fullImage.length }],
+    { onExtractionError: err => trailingPptExtErrors.push(err) }
+  );
+  assert.equal(trailingPptExtErrors.length, 1, 'duplicate PPTX entry via unzip fallback must fail direct extraction');
+  assert.deepEqual(trailingPptExtracted, []);
+  assert.deepEqual(fs.readdirSync(trailingPptOutDir), []);
+
+  // 4. Positive control: valid single-entry trailing-byte Keynote archive still inspects & extracts via unzip fallback
+  const trailingValidKeyPath = path.join(dir, 'valid-trailing.key');
+  fs.writeFileSync(trailingValidKeyPath, Buffer.concat([
+    buildSyntheticZip([{ name: 'Data/photo-2002.jpg', data: fullImage }]),
+    Buffer.from([0x00]),
+  ]));
+  assert.equal(openZipArchive(trailingValidKeyPath), null);
+  const validTrailingInspErrors = [];
+  const validTrailingAssets = await parser.extractAssets(trailingValidKeyPath, {
+    onInspectionError: err => validTrailingInspErrors.push(err),
+  });
+  assert.equal(validTrailingInspErrors.length, 0);
+  assert.equal(validTrailingAssets.length, 1);
+  const validTrailingOutDir = path.join(dir, 'out-trailing-valid-key');
+  fs.mkdirSync(validTrailingOutDir, { recursive: true });
+  const validTrailingExtErrors = [];
+  const validTrailingExtracted = await parser.extractToDirectory(
+    trailingValidKeyPath,
+    validTrailingOutDir,
+    validTrailingAssets,
+    { onExtractionError: err => validTrailingExtErrors.push(err) }
+  );
+  assert.equal(validTrailingExtErrors.length, 0);
+  assert.equal(validTrailingExtracted.length, 1);
+  assert.deepEqual(fs.readFileSync(validTrailingExtracted[0].extractedPath), fullImage);
 });

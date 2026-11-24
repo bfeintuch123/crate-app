@@ -383,6 +383,11 @@ test('direct presentation extraction still accepts zipPath-only asset metadata',
     const outputDir = path.join(tmpRoot, 'out');
     const zipPath = 'ppt/media/image.png';
     fs.writeFileSync(archivePath, 'small archive fixture');
+    unzipListing = [
+      'Archive: project.pptx',
+      `${String(600).padStart(9)}  01-01-2026 12:00  ${zipPath}`,
+      '',
+    ].join('\n');
     unzipExtractData.set(zipPath, Buffer.alloc(600, 65));
 
     const extracted = await new PowerPointParser().extractToDirectory(
@@ -395,6 +400,7 @@ test('direct presentation extraction still accepts zipPath-only asset metadata',
     assert.equal(fs.statSync(extracted[0].extractedPath).size, 600);
     assert.equal(unzipExtractCalls, 1);
   } finally {
+    unzipListing = '';
     unzipExtractData = new Map();
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -414,6 +420,12 @@ test('presentation extraction converts child output overflow into an admission f
     fs.writeFileSync(archivePath, 'small archive fixture');
     fs.mkdirSync(outputDir);
     fs.writeFileSync(path.join(outputDir, 'keep.txt'), 'pre-existing');
+    unzipListing = [
+      'Archive: project.pptx',
+      `${String(600).padStart(9)}  01-01-2026 12:00  ${firstZipPath}`,
+      `${String(600).padStart(9)}  01-01-2026 12:00  ${secondZipPath}`,
+      '',
+    ].join('\n');
     unzipExtractData.set(firstZipPath, Buffer.alloc(600, 65));
     unzipExtractErrors.set(secondZipPath, overflow);
 
@@ -434,6 +446,7 @@ test('presentation extraction converts child output overflow into an admission f
     assert.deepEqual(fs.readdirSync(outputDir), ['keep.txt']);
     assert.equal(fs.readFileSync(path.join(outputDir, 'keep.txt'), 'utf8'), 'pre-existing');
   } finally {
+    unzipListing = '';
     unzipExtractData = new Map();
     unzipExtractErrors = new Map();
     fs.rmSync(tmpRoot, { recursive: true, force: true });

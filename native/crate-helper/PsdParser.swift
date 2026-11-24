@@ -58,7 +58,7 @@ enum PsdParser {
         }
 
         func readU8(end: Int64) throws -> UInt8 {
-            if offset + 1 > end { throw HelperError("psd_framing_bounds") }
+            if end - offset < 1 { throw HelperError("psd_framing_bounds") }
             try ensureBuffered(1)
             let v = buf[Int(offset - bufStart)]
             offset += 1
@@ -66,7 +66,7 @@ enum PsdParser {
         }
 
         func readU16(end: Int64) throws -> UInt16 {
-            if offset + 2 > end { throw HelperError("psd_framing_bounds") }
+            if end - offset < 2 { throw HelperError("psd_framing_bounds") }
             try ensureBuffered(2)
             let i = Int(offset - bufStart)
             offset += 2
@@ -78,7 +78,7 @@ enum PsdParser {
         }
 
         func readU32(end: Int64) throws -> UInt32 {
-            if offset + 4 > end { throw HelperError("psd_framing_bounds") }
+            if end - offset < 4 { throw HelperError("psd_framing_bounds") }
             try ensureBuffered(4)
             let i = Int(offset - bufStart)
             offset += 4
@@ -682,7 +682,7 @@ enum PsdParser {
             }
             try reader.seek(to: layerInfoEnd)
             let pad = (layerInfoEnd - layerStart) % 2
-            if pad > 0 && reader.offset + pad <= maskSectionEnd {
+            if pad > 0 && pad <= maskSectionEnd - reader.offset {
                 try reader.skip(pad, end: maskSectionEnd)
             }
             if reader.offset < maskSectionEnd {
