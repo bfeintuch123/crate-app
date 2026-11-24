@@ -4,6 +4,7 @@ const assert = require('./bounded-assert');
 const { spawnSync } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const debug = require('debug');
@@ -5640,6 +5641,320 @@ function codesignStrictRequirement(filePath) {
   ], { env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' }, encoding: 'utf8' });
 }
 
+const NATIVE_DIGEST_HEX_RE = /^[a-f0-9]{64}$/u;
+const NATIVE_DIAG_ENV = () => ({
+  // Mirrors scripts/verify-macos-release-app.js runCommand() environment on the failure-only diagnostic path.
+  GIT_CONFIG_GLOBAL: '/dev/null',
+  GIT_CONFIG_NOSYSTEM: '1',
+  GIT_CONFIG_SYSTEM: '/dev/null',
+  GIT_NO_REPLACE_OBJECTS: '1',
+  GIT_OPTIONAL_LOCKS: '0',
+  HOME: process.env.HOME || '/var/empty',
+  LANG: 'C',
+  LC_ALL: 'C',
+  PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
+  TMPDIR: process.env.TMPDIR || os.tmpdir(),
+});
+
+function sanitizeDiagnosticText(raw, extraPaths = [], maxChars = 600) {
+  let text = String(raw ?? '');
+  const replacements = [];
+  const addPath = (candidate, token) => {
+    if (typeof candidate !== 'string' || !candidate) return;
+    replacements.push([candidate, token]);
+    try {
+      const real = fs.realpathSync(candidate);
+      if (real && real !== candidate) replacements.push([real, token]);
+    } catch (_) {
+      // ignore unavailable path
+    }
+    if (candidate.startsWith('/var/')) replacements.push([`/private${candidate}`, token]);
+    if (candidate.startsWith('/private/var/')) replacements.push([candidate.slice('/private'.length), token]);
+  };
+  for (const [candidate, token] of extraPaths) addPath(candidate, token);
+  addPath(process.env.TMPDIR, '<tmp>');
+  addPath(os.tmpdir(), '<tmp>');
+  addPath(ROOT, '<repo>');
+  addPath(process.env.HOME, '<home>');
+  addPath(os.homedir(), '<home>');
+  replacements.sort((left, right) => right[0].length - left[0].length);
+  for (const [needle, token] of replacements) {
+    if (needle.length >= 2) text = text.split(needle).join(token);
+  }
+  text = text
+    .replace(/\/(?:private\/)?var\/folders\/[^\s:'"]+/gu, '<tmp>')
+    .replace(/\/Users\/[^/\s:'"]+/gu, '<home>')
+    .replace(/[\r\n\t]+/gu, ' ')
+    .replace(/[^\x20-\x7e]/gu, '?')
+    .trim();
+  if (text.length > maxChars) {
+    return `${text.slice(0, maxChars)}...(+${text.length - maxChars} chars)`;
+  }
+  return text;
+}
+
+function formatPackedMachOVersion(packed) {
+  return `${(packed >>> 16) & 0xffff}.${(packed >>> 8) & 0xff}.${packed & 0xff}`;
+}
+
+function summarizeMachOLayout(bytes) {
+  if (!Buffer.isBuffer(bytes) || bytes.length < 32) {
+    return { valid: false, size: Buffer.isBuffer(bytes) ? bytes.length : null };
+  }
+  const magic = bytes.readUInt32LE(0);
+  const ncmds = bytes.readUInt32LE(16);
+  const sizeofcmds = bytes.readUInt32LE(20);
+  const flags = bytes.readUInt32LE(24);
+  if (magic !== 0xfeedfacf || 32 + sizeofcmds > bytes.length) {
+    return { valid: false, size: bytes.length, magic: `0x${magic.toString(16)}`, ncmds, sizeofcmds };
+  }
+  const summary = {
+    valid: true,
+    size: bytes.length,
+    ncmds,
+    sizeofcmds,
+    flags: `0x${flags.toString(16)}`,
+    linkedit: null,
+    symtab: null,
+    dysymtab: null,
+    codeSignature: null,
+    functionStarts: null,
+    dataInCode: null,
+    exportsTrie: null,
+    chainedFixups: null,
+    buildVersion: null,
+  };
+  let offset = 32;
+  const cmdsEnd = 32 + sizeofcmds;
+  const maxCmds = Math.min(ncmds, 128);
+  for (let index = 0; index < maxCmds; index += 1) {
+    if (offset + 8 > cmdsEnd) break;
+    const cmd = bytes.readUInt32LE(offset);
+    const cmdsize = bytes.readUInt32LE(offset + 4);
+    if (cmdsize < 8 || offset + cmdsize > cmdsEnd) break;
+    if (cmd === 0x19 && cmdsize >= 72) {
+      const segname = bytes.subarray(offset + 8, offset + 24).toString('latin1').replace(/\0+$/u, '');
+      if (segname === '__LINKEDIT') {
+        const fileoff = Number(bytes.readBigUInt64LE(offset + 40));
+        const filesize = Number(bytes.readBigUInt64LE(offset + 48));
+        summary.linkedit = { fileoff, filesize, end: fileoff + filesize };
+      }
+    } else if (cmd === 0x02 && cmdsize >= 24) {
+      const symoff = bytes.readUInt32LE(offset + 8);
+      const nsyms = bytes.readUInt32LE(offset + 12);
+      const stroff = bytes.readUInt32LE(offset + 16);
+      const strsize = bytes.readUInt32LE(offset + 20);
+      const strEnd = stroff + strsize;
+      summary.symtab = { symoff, nsyms, stroff, strsize, strEnd, strEndMod16: strEnd % 16 };
+    } else if (cmd === 0x0b && cmdsize >= 64) {
+      summary.dysymtab = {
+        indirectsymoff: bytes.readUInt32LE(offset + 56),
+        nindirectsyms: bytes.readUInt32LE(offset + 60),
+      };
+    } else if (cmd === 0x1d && cmdsize >= 16) {
+      summary.codeSignature = { dataoff: bytes.readUInt32LE(offset + 8), datasize: bytes.readUInt32LE(offset + 12) };
+    } else if (cmd === 0x26 && cmdsize >= 16) {
+      summary.functionStarts = { dataoff: bytes.readUInt32LE(offset + 8), datasize: bytes.readUInt32LE(offset + 12) };
+    } else if (cmd === 0x29 && cmdsize >= 16) {
+      summary.dataInCode = { dataoff: bytes.readUInt32LE(offset + 8), datasize: bytes.readUInt32LE(offset + 12) };
+    } else if (cmd === 0x80000033 && cmdsize >= 16) {
+      summary.exportsTrie = { dataoff: bytes.readUInt32LE(offset + 8), datasize: bytes.readUInt32LE(offset + 12) };
+    } else if (cmd === 0x80000034 && cmdsize >= 16) {
+      summary.chainedFixups = { dataoff: bytes.readUInt32LE(offset + 8), datasize: bytes.readUInt32LE(offset + 12) };
+    } else if (cmd === 0x32 && cmdsize >= 24) {
+      const ntools = Math.min(bytes.readUInt32LE(offset + 20), 8);
+      const tools = [];
+      for (let toolIndex = 0; toolIndex < ntools; toolIndex += 1) {
+        const toolOffset = offset + 24 + toolIndex * 8;
+        if (toolOffset + 8 > offset + cmdsize) break;
+        tools.push({
+          tool: bytes.readUInt32LE(toolOffset),
+          version: formatPackedMachOVersion(bytes.readUInt32LE(toolOffset + 4)),
+        });
+      }
+      summary.buildVersion = {
+        platform: bytes.readUInt32LE(offset + 8),
+        minos: formatPackedMachOVersion(bytes.readUInt32LE(offset + 12)),
+        sdk: formatPackedMachOVersion(bytes.readUInt32LE(offset + 16)),
+        tools,
+      };
+    }
+    offset += cmdsize;
+  }
+  summary.derived = {
+    linkeditEndMinusStrEnd: summary.linkedit && summary.symtab ? summary.linkedit.end - summary.symtab.strEnd : null,
+    sigOffMinusStrEnd: summary.codeSignature && summary.symtab ? summary.codeSignature.dataoff - summary.symtab.strEnd : null,
+    fileSizeMinusLinkeditEnd: summary.linkedit ? summary.size - summary.linkedit.end : null,
+  };
+  return summary;
+}
+
+function fingerprintExecutable(filePath) {
+  if (typeof filePath !== 'string' || !filePath) return null;
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return null;
+    const data = fs.readFileSync(filePath);
+    return {
+      size: data.length,
+      sha256Prefix: crypto.createHash('sha256').update(data).digest('hex').slice(0, 16),
+    };
+  } catch (error) {
+    return { errorCode: error && error.code ? error.code : 'ERR_UNKNOWN' };
+  }
+}
+
+function collectDiagnosticToolProbe(command, args, env, extraPaths) {
+  const result = spawnSync(command, args, {
+    encoding: 'utf8',
+    env,
+    maxBuffer: 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 15000,
+  });
+  return {
+    tool: path.basename(command),
+    args,
+    status: result.status,
+    signal: result.signal,
+    errorCode: result.error && result.error.code ? result.error.code : null,
+    stdout: sanitizeDiagnosticText(result.stdout, extraPaths, 240),
+    stderr: sanitizeDiagnosticText(result.stderr, extraPaths, 240),
+  };
+}
+
+function emitCanonicalNativeDigestDiagnostics(t, label, bytes) {
+  const emit = payload => {
+    if (t && typeof t.diagnostic === 'function') {
+      t.diagnostic(`native-digest ${JSON.stringify(payload)}`);
+    }
+  };
+  try {
+    const env = NATIVE_DIAG_ENV();
+    const inputSummary = summarizeMachOLayout(bytes);
+    const inputSha256Prefix = Buffer.isBuffer(bytes)
+      ? crypto.createHash('sha256').update(bytes).digest('hex').slice(0, 16)
+      : null;
+    const stages = [];
+    const replayDigest = canonicalNativeDigestFromBytes(bytes, (command, args, options = {}) => {
+      const targetPath = Array.isArray(args) && args.length > 0 ? args[args.length - 1] : null;
+      const tempDir = typeof targetPath === 'string' ? path.dirname(targetPath) : null;
+      const extraPaths = tempDir ? [[tempDir, '<digest-tmp>']] : [];
+      let beforeLayout = null;
+      if (typeof targetPath === 'string') {
+        try {
+          beforeLayout = summarizeMachOLayout(fs.readFileSync(targetPath));
+        } catch (error) {
+          beforeLayout = { readErrorCode: error && error.code ? error.code : 'ERR_UNKNOWN' };
+        }
+      }
+      const result = spawnSync(command, args, {
+        encoding: 'utf8',
+        env,
+        input: options.input,
+        maxBuffer: 16 * 1024 * 1024,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        cwd: options.cwd,
+        timeout: 30000,
+      });
+      const ok = !result.error && result.status === 0;
+      let afterLayout = null;
+      if (typeof targetPath === 'string') {
+        try {
+          afterLayout = summarizeMachOLayout(fs.readFileSync(targetPath));
+        } catch (error) {
+          afterLayout = { readErrorCode: error && error.code ? error.code : 'ERR_UNKNOWN' };
+        }
+      }
+      const tool = path.basename(command);
+      const stage = tool === 'codesign' && Array.isArray(args) && args.includes('--remove-signature')
+        ? 'remove-signature'
+        : tool;
+      const sanitizedArgs = Array.isArray(args)
+        ? args.map((arg, index) => (index === args.length - 1 ? '<target>' : sanitizeDiagnosticText(arg, extraPaths, 120)))
+        : [];
+      const afterChanged = JSON.stringify(afterLayout) !== JSON.stringify(beforeLayout);
+      stages.push({
+        stage,
+        tool,
+        args: sanitizedArgs,
+        ok,
+        status: result.status,
+        signal: result.signal,
+        errorCode: result.error && result.error.code ? result.error.code : null,
+        stdout: sanitizeDiagnosticText(result.stdout, extraPaths, 600),
+        stderr: sanitizeDiagnosticText(result.stderr, extraPaths, 600),
+        before: beforeLayout,
+        after: afterChanged || !ok ? afterLayout : 'unchanged',
+      });
+      return {
+        ok,
+        stdout: result.stdout || '',
+        stderr: result.stderr || '',
+      };
+    });
+
+    emit({
+      event: 'summary',
+      label,
+      inputSha256Prefix,
+      replayReturnedNull: replayDigest === null,
+      replayDigestIsHex: NATIVE_DIGEST_HEX_RE.test(String(replayDigest)),
+      stageCount: stages.length,
+      envFlags: {
+        DEVELOPER_DIR: Boolean(process.env.DEVELOPER_DIR),
+        SDKROOT: Boolean(process.env.SDKROOT),
+        TOOLCHAINS: Boolean(process.env.TOOLCHAINS),
+      },
+      inputLayout: inputSummary,
+    });
+    for (const stageRecord of stages) {
+      emit({ event: 'stage', label, ...stageRecord });
+    }
+
+    const rawStripProbe = spawnSync('/usr/bin/xcrun', ['--find', 'strip'], {
+      encoding: 'utf8',
+      env,
+      maxBuffer: 256 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 15000,
+    });
+    const resolvedStripPath = !rawStripProbe.error && rawStripProbe.status === 0
+      ? String(rawStripProbe.stdout || '').trim()
+      : '';
+    emit({
+      event: 'toolchain',
+      label,
+      swVersProduct: collectDiagnosticToolProbe('/usr/bin/sw_vers', ['-productVersion'], env, []),
+      swVersBuild: collectDiagnosticToolProbe('/usr/bin/sw_vers', ['-buildVersion'], env, []),
+      swiftc: collectDiagnosticToolProbe('/usr/bin/swiftc', ['--version'], env, []),
+      xcodeSelect: collectDiagnosticToolProbe('/usr/bin/xcode-select', ['-p'], env, []),
+      xcodebuild: collectDiagnosticToolProbe('/usr/bin/xcodebuild', ['-version'], env, []),
+      xcrunStrip: {
+        tool: 'xcrun',
+        args: ['--find', 'strip'],
+        status: rawStripProbe.status,
+        signal: rawStripProbe.signal,
+        errorCode: rawStripProbe.error && rawStripProbe.error.code ? rawStripProbe.error.code : null,
+        stdout: sanitizeDiagnosticText(rawStripProbe.stdout, [], 240),
+        stderr: sanitizeDiagnosticText(rawStripProbe.stderr, [], 240),
+      },
+      xcrunLd: collectDiagnosticToolProbe('/usr/bin/xcrun', ['ld', '-v'], env, []),
+      fingerprints: {
+        codesign: fingerprintExecutable('/usr/bin/codesign'),
+        strip: fingerprintExecutable(resolvedStripPath),
+      },
+    });
+  } catch (error) {
+    emit({
+      event: 'diagnostic-error',
+      label,
+      errorName: error && error.name ? error.name : 'Error',
+      errorCode: error && error.code ? error.code : null,
+    });
+  }
+}
+
 test('native helper recipe matches the developer build script token for token', () => {
   const script = fs.readFileSync(path.join(ROOT, 'scripts', 'build-native-helper.sh'), 'utf8');
   assert.equal(script.includes('SRC_DIR="$ROOT_DIR/native/crate-helper"'), true);
@@ -5702,6 +6017,9 @@ test('canonical helper digest survives runtime re-signing but not a code byte ch
   fs.writeFileSync(helperPath, compiled, { mode: 0o755 });
 
   const compiledDigest = canonicalNativeDigestFromBytes(compiled);
+  if (!NATIVE_DIGEST_HEX_RE.test(String(compiledDigest))) {
+    emitCanonicalNativeDigestDiagnostics(t, 'compiled', compiled);
+  }
   assert.match(String(compiledDigest), /^[a-f0-9]{64}$/u);
   assert.notEqual(codesignStrictRequirement(helperPath).status, 0);
 
@@ -5718,7 +6036,11 @@ test('canonical helper digest survives runtime re-signing but not a code byte ch
   assert.equal(resigned.status, 0);
   const resignedBytes = fs.readFileSync(helperPath);
   assert.equal(resignedBytes.equals(compiled), false);
-  assert.equal(canonicalNativeDigestFromBytes(resignedBytes), compiledDigest);
+  const resignedDigest = canonicalNativeDigestFromBytes(resignedBytes);
+  if (!NATIVE_DIGEST_HEX_RE.test(String(resignedDigest))) {
+    emitCanonicalNativeDigestDiagnostics(t, 'resigned', resignedBytes);
+  }
+  assert.equal(resignedDigest, compiledDigest);
   assert.notEqual(codesignStrictRequirement(helperPath).status, 0);
 
   const unsignedPath = path.join(directory, 'unsigned');
@@ -5732,6 +6054,9 @@ test('canonical helper digest survives runtime re-signing but not a code byte ch
   const flipOffset = text.offset + Math.floor(text.size / 2);
   flipped[flipOffset] ^= 0x01;
   const flippedDigest = canonicalNativeDigestFromBytes(flipped);
+  if (!NATIVE_DIGEST_HEX_RE.test(String(flippedDigest))) {
+    emitCanonicalNativeDigestDiagnostics(t, 'flipped', flipped);
+  }
   assert.match(String(flippedDigest), /^[a-f0-9]{64}$/u);
   assert.notEqual(flippedDigest, compiledDigest);
 });
