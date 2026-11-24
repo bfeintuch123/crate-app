@@ -42,7 +42,7 @@ function buildSyntheticZip(entries) {
   const centralParts = [];
   let offset = 0;
   for (const entry of entries) {
-    const nameBuf = Buffer.from(entry.name, 'utf8');
+    const nameBuf = Buffer.isBuffer(entry.name) ? entry.name : Buffer.from(entry.name, 'utf8');
     const rawData = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data, 'utf8');
     const method = entry.deflate ? 8 : 0;
     const compData = method === 8 ? zlib.deflateRawSync(rawData) : rawData;
@@ -705,4 +705,84 @@ test('main.js behavioral IPC coalescing: preserves valid caller over later stale
   assert.equal(nonElectronEmitted.length, 2);
   assert.equal(nonElectronEmitted[1].channel, 'files:pending');
   assert.equal(nonElectronEmitted[1].payload.delta.changed, true);
+});
+
+test('Keynote (.key): safely rejects ambiguous or non-UTF-8 ZIP media entry names instead of silently omitting a member (A8)', async t => {
+  const { openZipArchive } = require('../parsers/zip-reader');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-keynote-a8-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const imgA = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(600, 0x41)]);
+  const imgB = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(600, 0x42)]);
+  const imgValid = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(600, 0x43)]);
+
+  // 1. Two distinct non-UTF-8 member names that both lossily decode to Data/photo-\uFFFD.jpg
+  const collidingKeyPath = path.join(dir, 'colliding-legacy.key');
+  const nameA = Buffer.concat([Buffer.from('Data/photo-'), Buffer.from([0x80]), Buffer.from('.jpg')]);
+  const nameB = Buffer.concat([Buffer.from('Data/photo-'), Buffer.from([0x81]), Buffer.from('.jpg')]);
+  fs.writeFileSync(collidingKeyPath, buildSyntheticZip([
+    { name: 'Data/valid-1001.jpg', data: imgValid },
+    { name: nameA, data: imgA },
+    { name: nameB, data: imgB },
+  ]));
+
+  const archive = openZipArchive(collidingKeyPath);
+  t.after(() => archive && archive.close());
+  assert.ok(archive);
+  assert.equal(archive.hasAmbiguousPath('Data/photo-\uFFFD.jpg'), true);
+  assert.equal(archive.findEntries('Data/photo-\uFFFD.jpg').every(e => e.nameValidUtf8 === false), true);
+
+  const inspectionErrors = [];
+  const parser = new PowerPointParser();
+  const discovered = await parser.extractAssets(collidingKeyPath, {
+    onInspectionError: err => inspectionErrors.push(err),
+  });
+  assert.equal(inspectionErrors.length, 1, 'ambiguous legacy Keynote entry names must report an inspection error');
+  assert.deepEqual(discovered, [], 'must not return a silently truncated asset list');
+
+  // Direct extractToDirectory with the collided decoded path must also refuse instead of extracting member A
+  const extractOutDir = path.join(dir, 'out-colliding');
+  fs.mkdirSync(extractOutDir, { recursive: true });
+  const extractionErrors = [];
+  const extracted = await parser.extractToDirectory(
+    collidingKeyPath,
+    extractOutDir,
+    [{ path: 'photo-\uFFFD.jpg', source: 'keynote-embedded', exists: true, zipPath: 'Data/photo-\uFFFD.jpg', size: imgA.length }],
+    { onExtractionError: err => extractionErrors.push(err) }
+  );
+  assert.equal(extractionErrors.length, 1, 'ambiguous direct extraction must report an extraction error');
+  assert.deepEqual(extracted, []);
+  assert.deepEqual(fs.readdirSync(extractOutDir), []);
+
+  // 2. Single non-UTF-8 legacy media name in Keynote is also safely rejected via inspection/extraction error
+  const singleLegacyKeyPath = path.join(dir, 'single-legacy.key');
+  const legacyName = Buffer.concat([Buffer.from('Data/caf'), Buffer.from([0x8e]), Buffer.from('-2001.jpg')]);
+  fs.writeFileSync(singleLegacyKeyPath, buildSyntheticZip([{ name: legacyName, data: imgA }]));
+  const singleErrors = [];
+  const singleDiscovered = await parser.extractAssets(singleLegacyKeyPath, {
+    onInspectionError: err => singleErrors.push(err),
+  });
+  assert.equal(singleErrors.length, 1);
+  assert.deepEqual(singleDiscovered, []);
+
+  // 3. Positive control: valid UTF-8 Keynote media (including non-ASCII UTF-8) extracts cleanly
+  const validUtf8KeyPath = path.join(dir, 'valid-utf8.key');
+  fs.writeFileSync(validUtf8KeyPath, buildSyntheticZip([
+    { name: 'Data/caf\u00e9-3001.jpg', data: imgValid },
+  ]));
+  const validInspErrors = [];
+  const validExtErrors = [];
+  const validAssets = await parser.extractAssets(validUtf8KeyPath, {
+    onInspectionError: err => validInspErrors.push(err),
+  });
+  assert.equal(validInspErrors.length, 0);
+  assert.equal(validAssets.length, 1);
+  const validOutDir = path.join(dir, 'out-valid');
+  fs.mkdirSync(validOutDir, { recursive: true });
+  const validExtracted = await parser.extractToDirectory(validUtf8KeyPath, validOutDir, validAssets, {
+    onExtractionError: err => validExtErrors.push(err),
+  });
+  assert.equal(validExtErrors.length, 0);
+  assert.equal(validExtracted.length, 1);
+  assert.deepEqual(fs.readFileSync(validExtracted[0].extractedPath), imgValid);
 });

@@ -72,10 +72,13 @@ async function getNativeRunningDesignApps(keywords, timeoutMs = 3000, { client: 
   const client = explicitClient || watcherNativeHelper || nativeHelper;
   if (!client) return null;
   const result = await client.runningApps(keywords, timeoutMs, { caseSensitive: true });
+  if (!result || !Array.isArray(result.apps)) {
+    throw new Error('incomplete native runningApps result');
+  }
   const pids = [];
   const pidToCmd = new Map();
   const filterKeywords = Array.isArray(keywords) ? keywords.filter(k => typeof k === 'string' && k.length > 0) : [];
-  for (const appInfo of (result && result.apps) || []) {
+  for (const appInfo of result.apps) {
     if (!Number.isInteger(appInfo.pid) || appInfo.pid <= 0) continue;
     const cmd = appInfo.command || appInfo.name || '';
     if (filterKeywords.length > 0 && !filterKeywords.some(kw => cmd.includes(kw))) continue;
@@ -117,7 +120,7 @@ function formatNativeOpenFilesAsLsofF(validPids, files) {
 
 async function pollNativeOpenFilesAsLsofF(validPids, timeoutMs = 12000, { client: explicitClient = null } = {}) {
   const client = explicitClient || watcherNativeHelper || nativeHelper;
-  if (!client) return null;
+  if (!client || !Array.isArray(validPids) || validPids.length === 0) return null;
   const response = await client.openFiles(validPids, [], timeoutMs);
   if (
     !response ||

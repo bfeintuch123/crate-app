@@ -156,8 +156,14 @@ function getUniqueKeynoteWildcardFallback(zipPath, assets) {
 
 async function extractArchiveEntryData(archivePath, zipPath, ext, assets, archive = null) {
   if (archive) {
+    if (typeof archive.hasAmbiguousPath === 'function' && archive.hasAmbiguousPath(zipPath)) {
+      throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
+    }
     const exactEntry = archive.findEntry(zipPath);
     if (exactEntry) {
+      if (ext === '.key' && exactEntry.nameValidUtf8 === false) {
+        throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
+      }
       try {
         const data = assertBufferWithinBudget(
           archive.readEntry(exactEntry, {
@@ -184,6 +190,12 @@ async function extractArchiveEntryData(archivePath, zipPath, ext, assets, archiv
       ));
       if (archiveMatches.length !== 1) {
         throw Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
+      }
+      if (
+        archiveMatches[0].nameValidUtf8 === false
+        || (typeof archive.hasAmbiguousPath === 'function' && archive.hasAmbiguousPath(archiveMatches[0].path))
+      ) {
+        throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
       }
       try {
         const data = assertBufferWithinBudget(
@@ -326,6 +338,14 @@ class PowerPointParser extends BaseParser {
 
           // Skip thumbnail variants (-small suffix)
           if (/-small(-\d{3,6})?\.[a-z]+$/i.test(entryName)) continue;
+        }
+
+        if (archive) {
+          const isAmbiguous = typeof archive.hasAmbiguousPath === 'function' && archive.hasAmbiguousPath(zipPath);
+          if (isAmbiguous || (ext === '.key' && entry.nameValidUtf8 === false)) {
+            assets.length = 0;
+            throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
+          }
         }
 
         this.appendAsset(assets, {

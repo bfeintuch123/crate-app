@@ -12,17 +12,33 @@ enum WatchOps {
     private static let maxJavascriptDateSeconds: Int64 = 8_640_000_000_000
     private static let maxVmRegionsPerPid = 16_384
 
-    static func runningApps(keywords: [String], caseSensitive: Bool = false) -> [[String: Any]] {
+    // Only EBADF (descriptor closed between PROC_PIDLISTFDS and lookup) and ENOENT
+    // (vnode unlinked/revoked) are benign per-fd absences; any other errno (e.g.
+    // EPERM, ENOMEM, ESRCH, EINVAL) leaves the PID's open-file inventory uncertain.
+    static func isBenignVnodeLookupErrno(_ err: Int32) -> Bool {
+        return err == EBADF || err == ENOENT
+    }
+
+    // On macOS XNU, PROC_PIDREGIONPATHINFO returns 0 with errno == EINVAL when the
+    // scan reaches the end of the process address space. Any other errno indicates
+    // an incomplete/failed VM region scan rather than confirmed exhaustion.
+    static func isNormalVmRegionEndErrno(_ err: Int32) -> Bool {
+        return err == EINVAL
+    }
+
+    static func runningApps(keywords: [String], caseSensitive: Bool = false) throws -> [[String: Any]] {
         let exactKeywords = keywords.filter { !$0.isEmpty }
         let lowerKeywords = exactKeywords.map { $0.lowercased() }
+        errno = 0
         let estimated = proc_listallpids(nil, 0)
-        guard estimated > 0 else { return [] }
+        guard estimated > 0 else { throw HelperError("proc_listallpids_failed") }
 
         var pids = [pid_t](repeating: 0, count: Int(estimated) + 128)
         let bufferBytes = Int32(pids.count * MemoryLayout<pid_t>.stride)
         // proc_listallpids takes buffer size in bytes and returns the NUMBER of PIDs filled (not bytes).
+        errno = 0
         let actualCount = proc_listallpids(&pids, bufferBytes)
-        guard actualCount > 0 else { return [] }
+        guard actualCount > 0 else { throw HelperError("proc_listallpids_failed") }
         let pidCount = min(Int(actualCount), pids.count)
 
         let pathBufSize = Int(MAXPATHLEN) * 4 // PROC_PIDPATHINFO_MAXSIZE
@@ -117,12 +133,23 @@ enum WatchOps {
                 continue
             }
 
+            var pidFailed = false
             for idx in 0..<actualCount {
                 let fdInfo = fds[idx]
                 if fdInfo.proc_fdtype != PROX_FDTYPE_VNODE { continue }
                 var vnodeInfo = vnode_fdinfowithpath()
+                errno = 0
                 let ret = proc_pidfdinfo(pid, fdInfo.proc_fd, PROC_PIDFDVNODEPATHINFO, &vnodeInfo, vnodeInfoSize)
-                if ret <= 0 { continue }
+                if ret <= 0 {
+                    let err = errno
+                    if isBenignVnodeLookupErrno(err) { continue }
+                    pidFailed = true
+                    break
+                }
+                if ret < vnodeInfoSize {
+                    pidFailed = true
+                    break
+                }
                 // Regular files only (VREG == 1)
                 if vnodeInfo.pvip.vip_vi.vi_type != 1 { continue }
 
@@ -133,15 +160,25 @@ enum WatchOps {
                 }
                 recordIfMatching(pid: pid, filePath: filePath, seenForPid: &seenForPid)
             }
+            if pidFailed {
+                failedPids.append(Int(pid))
+                continue
+            }
 
             // 2. Memory-mapped regular files (PROC_PIDREGIONPATHINFO) — matches lsof TXT/mapped vnodes
             var address: UInt64 = 0
             var vmScanExhausted = false
             for _ in 0..<maxVmRegionsPerPid {
                 var regionInfo = proc_regionwithpathinfo()
+                errno = 0
                 let ret = proc_pidinfo(pid, PROC_PIDREGIONPATHINFO, address, &regionInfo, regionInfoSize)
                 if ret <= 0 {
-                    vmScanExhausted = true
+                    let err = errno
+                    vmScanExhausted = isNormalVmRegionEndErrno(err)
+                    break
+                }
+                if ret < regionInfoSize {
+                    vmScanExhausted = false
                     break
                 }
                 if regionInfo.prp_vip.vip_vi.vi_type == 1 {

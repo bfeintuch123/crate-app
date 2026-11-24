@@ -131,8 +131,14 @@ struct CrateHelperMain {
         case "running_apps":
             let keywords = (req["keywords"] as? [String]) ?? []
             let caseSensitive = (req["caseSensitive"] as? Bool) ?? false
-            let apps = WatchOps.runningApps(keywords: keywords, caseSensitive: caseSensitive)
-            return ["id": reqId, "ok": true, "result": ["apps": apps]]
+            do {
+                let apps = try WatchOps.runningApps(keywords: keywords, caseSensitive: caseSensitive)
+                return ["id": reqId, "ok": true, "result": ["apps": apps]]
+            } catch let err as HelperError {
+                return ["id": reqId, "ok": false, "error": err.code]
+            } catch {
+                return ["id": reqId, "ok": false, "error": "running_apps_failed"]
+            }
 
         case "open_files":
             let rawPids = (req["pids"] as? [NSNumber]) ?? []

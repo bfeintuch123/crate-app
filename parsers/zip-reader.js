@@ -5,6 +5,7 @@
 // descriptor (O_NOFOLLOW) and inflates requested entries on demand with strict
 // maxOutputLength and CRC-32 verification. Never loads the full archive into RAM.
 
+const { isUtf8 } = require('node:buffer');
 const fs = require('node:fs');
 const zlib = require('node:zlib');
 const {
@@ -272,6 +273,7 @@ function openZipArchive(filePath, options = {}) {
       }
 
       const entryPath = nameBytes.toString('utf8');
+      const nameValidUtf8 = isUtf8(nameBytes);
       const entry = {
         path: entryPath,
         size: uncompressedSize,
@@ -281,6 +283,8 @@ function openZipArchive(filePath, options = {}) {
         crc32,
         localHeaderOffset,
         nameBytes: Buffer.from(nameBytes),
+        nameUtf8Flag: (flags & 0x0800) !== 0,
+        nameValidUtf8,
       };
       entries.push(entry);
       const existing = byPath.get(entryPath);
@@ -294,6 +298,12 @@ function openZipArchive(filePath, options = {}) {
     const handle = {
       entries,
       fileSize,
+      hasAmbiguousPath(targetPath) {
+        const matches = byPath.get(targetPath);
+        if (!matches || matches.length < 2) return false;
+        const first = matches[0].nameBytes;
+        return matches.some(item => !item.nameBytes.equals(first));
+      },
       findEntry(targetPath) {
         const matches = byPath.get(targetPath);
         return matches && matches.length > 0 ? matches[0] : null;

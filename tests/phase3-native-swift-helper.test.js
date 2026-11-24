@@ -1092,3 +1092,71 @@ test('Swift PdfAiParser charges failed FlateDecode attempts & produced bytes and
   assert.equal(unterminatedRes.incomplete, true);
   assert.ok(unterminatedRes.issues.includes('flate-endstream-unbounded'));
 });
+
+test('Native watcher bridge refuses uncertain open-file inventories and malformed runningApps results (A3/G-NB3)', async () => {
+  const bridge = require('../parsers/native-watcher-bridge');
+
+  // 1. Uncertain / incomplete openFiles responses MUST return null (never emit manufactured p<pid> absence headers)
+  const incompleteClient = {
+    openFiles: async () => ({ files: [], complete: false, failedPids: [1234] }),
+  };
+  assert.equal(await bridge.pollNativeOpenFilesAsLsofF([1234], 2000, { client: incompleteClient }), null);
+
+  const failedPidsClient = {
+    openFiles: async () => ({ files: [], complete: true, failedPids: [1234] }),
+  };
+  assert.equal(await bridge.pollNativeOpenFilesAsLsofF([1234], 2000, { client: failedPidsClient }), null);
+
+  const missingCompleteClient = {
+    openFiles: async () => ({ files: [], failedPids: [] }),
+  };
+  assert.equal(await bridge.pollNativeOpenFilesAsLsofF([1234], 2000, { client: missingCompleteClient }), null);
+
+  assert.equal(await bridge.pollNativeOpenFilesAsLsofF([], 2000, {
+    client: { openFiles: async () => ({ files: [], complete: true, failedPids: [] }) },
+  }), null);
+
+  // Positive control: explicitly complete empty inventory emits p<pid> so real scan-on-close works
+  const completeEmptyClient = {
+    openFiles: async () => ({ files: [], complete: true, failedPids: [] }),
+  };
+  assert.equal(await bridge.pollNativeOpenFilesAsLsofF([1234], 2000, { client: completeEmptyClient }), 'p1234');
+
+  // 2. Malformed or failed runningApps MUST reject (so main.js falls back to /bin/ps rather than assuming 0 apps)
+  await assert.rejects(
+    () => bridge.getNativeRunningDesignApps(['Illustrator'], 2000, { client: { runningApps: async () => ({}) } }),
+    /incomplete native runningApps result/
+  );
+  await assert.rejects(
+    () => bridge.getNativeRunningDesignApps(['Illustrator'], 2000, {
+      client: {
+        runningApps: async () => {
+          const err = new Error('proc_listallpids_failed');
+          err.code = 'proc_listallpids_failed';
+          throw err;
+        },
+      },
+    }),
+    /proc_listallpids_failed/
+  );
+});
+
+test('Swift WatchOps confirms complete=true on own PID (EINVAL VM end) and marks uninspectable PIDs incomplete (A3/G-NB3)', { skip: !hasNativeBinary }, async t => {
+  const bridge = require('../parsers/native-watcher-bridge');
+  const client = new NativeHelperClient(DEFAULT_BINARY_PATH);
+  t.after(() => client.shutdown());
+
+  // Own PID must succeed with complete=true (proving EINVAL VM-region end & full vnode/region sizes pass cleanly)
+  const selfOpen = await client.openFiles([process.pid], []);
+  assert.equal(selfOpen.complete, true, 'helper must report complete=true for own inspectable PID');
+  assert.deepEqual(selfOpen.failedPids, []);
+  const selfLsof = await bridge.pollNativeOpenFilesAsLsofF([process.pid], 3000, { client });
+  assert.ok(typeof selfLsof === 'string' && selfLsof.startsWith(`p${process.pid}`));
+
+  // Uninspectable PID (nonexistent PID 999999) must fail closed (complete=false) and bridge must return null for lsof fallback
+  const badOpen = await client.openFiles([process.pid, 999999], []);
+  assert.equal(badOpen.complete, false);
+  assert.ok(badOpen.failedPids.includes(999999));
+  const badLsof = await bridge.pollNativeOpenFilesAsLsofF([process.pid, 999999], 3000, { client });
+  assert.equal(badLsof, null, 'bridge must return null when any PID inventory is uncertain');
+});
