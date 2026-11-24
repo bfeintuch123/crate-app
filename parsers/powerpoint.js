@@ -154,6 +154,84 @@ function getUniqueKeynoteWildcardFallback(zipPath, assets) {
   };
 }
 
+function unzipPatternMatchesEntry(pattern, entryPath) {
+  if (typeof pattern !== 'string' || typeof entryPath !== 'string') return false;
+  if (pattern === entryPath) return true;
+  if (!/[*?[\]\\]/.test(pattern)) return false;
+
+  // Tokenize Info-ZIP /usr/bin/unzip wildcard syntax (*, ?, [...], \) and match
+  // with linear-time DP (no regex backtracking). Bracket expressions [...] are
+  // conservatively treated as matching either their literal text or any single char.
+  const tokens = [];
+  for (let i = 0; i < pattern.length; i += 1) {
+    const ch = pattern[i];
+    if (ch === '\\' && i + 1 < pattern.length) {
+      i += 1;
+      tokens.push({ type: 'char', value: pattern[i] });
+    } else if (ch === '*') {
+      if (tokens.length === 0 || tokens[tokens.length - 1].type !== 'star') {
+        tokens.push({ type: 'star' });
+      }
+    } else if (ch === '?') {
+      tokens.push({ type: 'any' });
+    } else if (ch === '[') {
+      const closeIdx = pattern.indexOf(']', i + 1);
+      if (closeIdx > i + 1) {
+        tokens.push({ type: 'bracket', literal: pattern.slice(i, closeIdx + 1) });
+        i = closeIdx;
+      } else {
+        tokens.push({ type: 'any' });
+      }
+    } else {
+      tokens.push({ type: 'char', value: ch });
+    }
+  }
+
+  const m = entryPath.length;
+  let dp = new Uint8Array(m + 1);
+  dp[0] = 1;
+  for (const tok of tokens) {
+    const next = new Uint8Array(m + 1);
+    if (tok.type === 'star') {
+      let seen = 0;
+      for (let j = 0; j <= m; j += 1) {
+        if (dp[j]) seen = 1;
+        next[j] = seen;
+      }
+    } else if (tok.type === 'any') {
+      for (let j = 0; j < m; j += 1) {
+        if (dp[j]) next[j + 1] = 1;
+      }
+    } else if (tok.type === 'bracket') {
+      const litLen = tok.literal.length;
+      for (let j = 0; j <= m; j += 1) {
+        if (!dp[j]) continue;
+        if (j < m) next[j + 1] = 1;
+        if (j + litLen <= m && entryPath.startsWith(tok.literal, j)) {
+          next[j + litLen] = 1;
+        }
+      }
+    } else {
+      for (let j = 0; j < m; j += 1) {
+        if (dp[j] && entryPath[j] === tok.value) next[j + 1] = 1;
+      }
+    }
+    dp = next;
+  }
+  return dp[m] === 1;
+}
+
+function countUnzipPatternMatches(entries, pattern) {
+  let count = 0;
+  for (const entry of entries || []) {
+    if (entry && typeof entry.path === 'string' && unzipPatternMatchesEntry(pattern, entry.path)) {
+      count += 1;
+      if (count >= 2) return count;
+    }
+  }
+  return count;
+}
+
 function buildListingPathIndex(entries) {
   const counts = new Map();
   for (const entry of entries) {
@@ -164,7 +242,7 @@ function buildListingPathIndex(entries) {
     entries,
     counts,
     hasAmbiguousPath(targetPath) {
-      return (counts.get(targetPath) || 0) >= 2;
+      return (counts.get(targetPath) || 0) >= 2 || countUnzipPatternMatches(entries, targetPath) >= 2;
     },
   };
 }
@@ -261,13 +339,21 @@ async function extractArchiveEntryData(archivePath, zipPath, ext, assets, archiv
     if (listingMatches.length !== 1) {
       throw Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
     }
-    if (fallbackListing.hasAmbiguousPath(listingMatches[0].path)) {
+    if (
+      fallbackListing.hasAmbiguousPath(listingMatches[0].path)
+      || countUnzipPatternMatches(fallbackListing.entries, fallback.wildcardPath) !== 1
+    ) {
       throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
     }
     const data = await readArchiveEntryData(archivePath, fallback.wildcardPath);
     return { data, outputTail: getKeynoteArchiveEntryOutputTail(zipPath, fallback.tail) || fallback.tail };
   }
 
+  // Unsupported-compression fall-through from an open in-process archive must
+  // still ensure /usr/bin/unzip -p matches strictly one member.
+  if (archive && countUnzipPatternMatches(archive.entries, zipPath) >= 2) {
+    throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
+  }
   try {
     const data = await readArchiveEntryData(archivePath, zipPath);
     return { data, outputTail: ext === '.key' ? getKeynoteArchiveEntryOutputTail(zipPath) : null };
@@ -276,6 +362,9 @@ async function extractArchiveEntryData(archivePath, zipPath, ext, assets, archiv
 
     const fallback = getUniqueKeynoteWildcardFallback(zipPath, assets);
     if (!fallback) throw exactError;
+    if (archive && countUnzipPatternMatches(archive.entries, fallback.wildcardPath) !== 1) {
+      throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
+    }
 
     const data = await readArchiveEntryData(archivePath, fallback.wildcardPath);
     return { data, outputTail: getKeynoteArchiveEntryOutputTail(zipPath, fallback.tail) || fallback.tail };

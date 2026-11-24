@@ -64,7 +64,7 @@ function buildSyntheticZip(entries) {
 
     const central = Buffer.alloc(46 + nameBuf.length);
     central.writeUInt32LE(0x02014b50, 0);
-    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(entry.unix ? ((3 << 8) | 20) : 20, 4);
     central.writeUInt16LE(20, 6);
     central.writeUInt16LE(0, 8);
     central.writeUInt16LE(method, 10);
@@ -969,4 +969,65 @@ test('Keynote (.key) & PPTX: reject duplicate identical-raw-name ZIP entries dur
   assert.equal(validTrailingExtErrors.length, 0);
   assert.equal(validTrailingExtracted.length, 1);
   assert.deepEqual(fs.readFileSync(validTrailingExtracted[0].extractedPath), fullImage);
+
+  // 5. Trailing-byte unzip fallback must also refuse wildcard-ambiguous names (e.g. non-UTF-8 '?' matching sibling, or literal '*')
+  const globSiblingKeyPath = path.join(dir, 'glob-sibling-trailing.key');
+  fs.writeFileSync(globSiblingKeyPath, Buffer.concat([
+    buildSyntheticZip([
+      { name: Buffer.concat([Buffer.from('Data/caf'), Buffer.from([0x8e]), Buffer.from('-2001.jpg')]), data: fullImage, unix: true },
+      { name: 'Data/cafe-2001.jpg', data: fullImage2, unix: true },
+    ]),
+    Buffer.from([0x00]),
+  ]));
+  assert.equal(openZipArchive(globSiblingKeyPath), null);
+
+  const globSibInspErrors = [];
+  const globSibDiscovered = await parser.extractAssets(globSiblingKeyPath, {
+    onInspectionError: err => globSibInspErrors.push(err),
+  });
+  assert.equal(globSibInspErrors.length, 1, 'non-UTF-8 ? name colliding with sibling under unzip glob must fail inspection');
+  assert.deepEqual(globSibDiscovered, []);
+
+  const globSibOutDir = path.join(dir, 'out-glob-sibling');
+  fs.mkdirSync(globSibOutDir, { recursive: true });
+  const globSibExtErrors = [];
+  const globSibExtracted = await parser.extractToDirectory(
+    globSiblingKeyPath,
+    globSibOutDir,
+    [{ path: 'caf?-2001.jpg', source: 'keynote-embedded', exists: true, zipPath: 'Data/caf?-2001.jpg', size: fullImage.length }],
+    { onExtractionError: err => globSibExtErrors.push(err) }
+  );
+  assert.equal(globSibExtErrors.length, 1, 'non-UTF-8 ? name colliding with sibling under unzip glob must fail extraction');
+  assert.deepEqual(globSibExtracted, []);
+  assert.deepEqual(fs.readdirSync(globSibOutDir), []);
+
+  const starNameKeyPath = path.join(dir, 'star-name-trailing.key');
+  fs.writeFileSync(starNameKeyPath, Buffer.concat([
+    buildSyntheticZip([
+      { name: 'Data/*.jpg', data: fullImage },
+      { name: 'Data/photo-3003.jpg', data: fullImage2 },
+    ]),
+    Buffer.from([0x00]),
+  ]));
+  assert.equal(openZipArchive(starNameKeyPath), null);
+
+  const starInspErrors = [];
+  const starDiscovered = await parser.extractAssets(starNameKeyPath, {
+    onInspectionError: err => starInspErrors.push(err),
+  });
+  assert.equal(starInspErrors.length, 1, 'literal wildcard entry name matching multiple files via unzip must fail inspection');
+  assert.deepEqual(starDiscovered, []);
+
+  const starOutDir = path.join(dir, 'out-star-name');
+  fs.mkdirSync(starOutDir, { recursive: true });
+  const starExtErrors = [];
+  const starExtracted = await parser.extractToDirectory(
+    starNameKeyPath,
+    starOutDir,
+    [{ path: '*.jpg', source: 'keynote-embedded', exists: true, zipPath: 'Data/*.jpg', size: fullImage.length }],
+    { onExtractionError: err => starExtErrors.push(err) }
+  );
+  assert.equal(starExtErrors.length, 1, 'literal wildcard entry name matching multiple files via unzip must fail extraction');
+  assert.deepEqual(starExtracted, []);
+  assert.deepEqual(fs.readdirSync(starOutDir), []);
 });
