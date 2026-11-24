@@ -14455,15 +14455,19 @@ tell application "Adobe Illustrator"
 end tell`;
 
 function psDoJavascriptAS(jsFilePath) {
-  return `tell application "Adobe Photoshop"
-  try
-    set jsFile to POSIX file "${jsFilePath}" as alias
-    set result to do javascript jsFile
-    return result
-  on error
-    return ""
-  end try
-end tell`;
+  return `if application "Adobe Photoshop" is running then
+  tell application "Adobe Photoshop"
+    try
+      set jsFile to POSIX file "${jsFilePath}" as alias
+      set result to do javascript jsFile
+      return result
+    on error
+      return ""
+    end try
+  end tell
+else
+  return ""
+end if`;
 }
 
 const SAFE_LIVE_APP_STATUS_CODES = new Set([
@@ -17035,7 +17039,7 @@ async function extractLinkedAssets(filePath, options = {}) {
           onOrdinaryScanLimit: options.onOrdinaryScanLimit,
           sourceBuffer: options.sourceBuffer,
           sourceText: options.sourceText,
-          inScanPhotoshopPaths: options.inScanPhotoshopPaths });
+          documentScopedOnly: options.documentScopedOnly === true });
       case '.indd':
       case '.idml':
         return await extractLinkedAssetsInDesign(filePath, { ...options, strict });
@@ -17134,18 +17138,12 @@ async function extractLinkedAssetsRegex(filePath, options = {}) {
  * AppleScript returns nothing.
  */
 async function extractLinkedAssetsPhotoshop(filePath, options = {}) {
-  // A dependable first scan must be scoped to this PSD. The live Photoshop
-  // script reports links from every open document, so baseline discovery
-  // delegates to the file-scoped ag-psd pass below instead.
+  // A dependable first scan or ownership-recording double-check must be scoped
+  // to this PSD. The live Photoshop script reports links from every open
+  // document, so baseline discovery (strict) delegates to the file-scoped
+  // ag-psd pass and document-scoped callers read only this PSD's own bytes.
   if (options.strict === true) return [];
-
-  if (Array.isArray(options.inScanPhotoshopPaths)) {
-    const results = [];
-    for (const p of options.inScanPhotoshopPaths) {
-      if (p === filePath) continue;
-      if (fs.existsSync(p)) results.push(p);
-    }
-    if (results.length > 0) return results;
+  if (options.documentScopedOnly === true) {
     return extractLinkedAssetsRegex(filePath, options);
   }
 
@@ -22135,39 +22133,29 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   const IN_SCAN_BUFFER_EXTENSIONS = new Set(['.ai', '.pdf', '.xd', '.indd', '.psd']);
   const inScanFileCache = new Map();
   let inScanFileCacheBytes = 0;
-  let inScanRunningAppsPromise = null;
-  let inScanPhotoshopPaths = null;
-  const getInScanRunningApps = async () => {
-    if (!inScanRunningAppsPromise) {
-      inScanRunningAppsPromise = (async () => {
-        if (canUseNativeProcessWatcher()) {
-          try {
-            const nativeApps = await nativeWatcherBridge.getNativeRunningDesignApps(
-              ['Figma', 'Adobe Photoshop', 'Adobe InDesign'],
-              3000
-            );
-            if (nativeApps && nativeApps.pidToCmd) {
-              return [...nativeApps.pidToCmd.entries()].map(([pid, cmd]) => ({ pid: String(pid), cmd }));
-            }
-          } catch (_) {}
+  const getInScanRunningApps = async (keywords = ['Figma', 'Adobe Photoshop', 'Adobe InDesign']) => {
+    if (canUseNativeProcessWatcher()) {
+      try {
+        const nativeApps = await nativeWatcherBridge.getNativeRunningDesignApps(keywords, 3000);
+        if (nativeApps && nativeApps.pidToCmd) {
+          return [...nativeApps.pidToCmd.entries()].map(([pid, cmd]) => ({ pid: String(pid), cmd }));
         }
-        try {
-          const { stdout: psOut } = await execAsync('/bin/ps ax -o pid= -o command= 2>/dev/null', {
-            timeout: 5000,
-            encoding: 'utf8',
-          });
-          const rows = [];
-          for (const line of psOut.trim().split('\n')) {
-            const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
-            if (m) rows.push({ pid: m[1], cmd: m[2] });
-          }
-          return rows;
-        } catch (_) {
-          return [];
-        }
-      })();
+      } catch (_) {}
     }
-    return inScanRunningAppsPromise;
+    try {
+      const { stdout: psOut } = await execAsync('/bin/ps ax -o pid= -o command= 2>/dev/null', {
+        timeout: 5000,
+        encoding: 'utf8',
+      });
+      const rows = [];
+      for (const line of psOut.trim().split('\n')) {
+        const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
+        if (m) rows.push({ pid: m[1], cmd: m[2] });
+      }
+      return rows;
+    } catch (_) {
+      return [];
+    }
   };
   const rememberInScanFileEntry = (key, entry) => {
     const existing = inScanFileCache.get(key);
@@ -22288,7 +22276,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   // v1.3.29: Live lsof pass at package time — captures .fig files currently open in Figma,
   // bypassing Spotlight indexing delay. Runs once synchronously before the scan loops.
   try {
-    const runningRows = await getInScanRunningApps();
+    const runningRows = await getInScanRunningApps(['Figma']);
     if (!operationCurrent()) return;
     const figmaPids = runningRows.filter(row => row.cmd.includes('Figma')).map(row => row.pid);
     if (figmaPids.length > 0) {
@@ -22609,7 +22597,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   // and regex fails because paths live in binary smart-object sections.
   // do javascript exposes embedded smart object paths via layer.smartObject.fileReference.
   try {
-    const runningRows = await getInScanRunningApps();
+    const runningRows = await getInScanRunningApps(['Adobe Photoshop']);
     if (!operationCurrent()) return;
     const psRunning = runningRows.some(row => row.cmd.toLowerCase().includes('adobe photoshop'));
 
@@ -22624,9 +22612,9 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
       ).catch(() => ({ stdout: '' }));
       if (!operationCurrent()) return;
 
-      inScanPhotoshopPaths = psPaths.trim() ? psPaths.split('\n').filter(Boolean) : [];
-      if (inScanPhotoshopPaths.length > 0) {
-        for (const trimmed of inScanPhotoshopPaths) {
+      const psPathList = psPaths.trim() ? psPaths.split('\n').filter(Boolean) : [];
+      if (psPathList.length > 0) {
+        for (const trimmed of psPathList) {
           if (isAutoCaptureExcludedPath(trimmed)) continue;
           const normalizedTrimmed = normalizeTrackedFilePath(trimmed);
           if (existingPaths.has(normalizedTrimmed) || pendingPaths.has(normalizedTrimmed)) continue;
@@ -22649,8 +22637,6 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
           newCount++;
         }
       }
-    } else {
-      inScanPhotoshopPaths = [];
     }
   } catch (e) {
     // do javascript failed or Photoshop not responding — fall through to regex
@@ -22700,28 +22686,32 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   // v2.2.7: AppleScript query to InDesign for linked files.
   // InDesign has excellent scripting support — query all links of each document.
   try {
-    const runningRows = await getInScanRunningApps();
+    const runningRows = await getInScanRunningApps(['Adobe InDesign']);
     if (!operationCurrent()) return;
     const inddRunning = runningRows.some(row => row.cmd.toLowerCase().includes('adobe indesign'));
 
     if (inddRunning) {
-      const inddAppleScript = `tell application "Adobe InDesign"
-  try
-    set pathList to {}
-    repeat with aDoc in every document
-      repeat with aLink in every link of aDoc
-        try
-          set filePath to POSIX path of (file path of aLink as alias)
-          set end of pathList to filePath
-        end try
+      const inddAppleScript = `if application "Adobe InDesign" is running then
+  tell application "Adobe InDesign"
+    try
+      set pathList to {}
+      repeat with aDoc in every document
+        repeat with aLink in every link of aDoc
+          try
+            set filePath to POSIX path of (file path of aLink as alias)
+            set end of pathList to filePath
+          end try
+        end repeat
       end repeat
-    end repeat
-    set AppleScript's text item delimiters to linefeed
-    return pathList as text
-  on error
-    return ""
-  end try
-end tell`;
+      set AppleScript's text item delimiters to linefeed
+      return pathList as text
+    on error
+      return ""
+    end try
+  end tell
+else
+  return ""
+end if`;
 
       const { stdout: inddPaths } = await runOsascriptInPrivateTemp(
         () => ({ 'crate-indd-scan.applescript': inddAppleScript }),
@@ -22862,7 +22852,7 @@ end tell`;
         if (!operationCurrent()) return null;
         const linkedPaths = await extractLinkedAssets(file.path, {
           ...(cachedFile && !cachedFile.tooLarge && cachedFile.buf ? { sourceBuffer: cachedFile.buf } : {}),
-          ...(Array.isArray(inScanPhotoshopPaths) ? { inScanPhotoshopPaths } : {}),
+          documentScopedOnly: true,
         });
         if (!operationCurrent()) return null;
         for (const lp of linkedPaths) {

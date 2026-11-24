@@ -1369,3 +1369,108 @@ test('Swift PsdParser accounts for all link records and rejects 64-bit size over
   );
   assert.equal((await client.ping()).pid, initialPid, 'helper session must stay alive after PSB channel sum bounds check');
 });
+
+test('Swift PdfAiParser isolates each stream dictionary and preserves Adler-32 trailing CR/LF bytes through Quick Package', { skip: !hasNativeBinary }, async t => {
+  const { packageMasterFile } = require('../parsers');
+  const workDir = fs.mkdtempSync(path.join(path.dirname(path.resolve(__dirname, '..')), 'crate-swift-ai-flate-'));
+  t.after(() => fs.rmSync(workDir, { recursive: true, force: true }));
+  const client = new NativeHelperClient(DEFAULT_BINARY_PATH);
+  t.after(() => client.shutdown());
+
+  function deflateWithTrailingByte(baseText, targetLastByte) {
+    for (let pad = 0; pad < 4096; pad += 1) {
+      const candidate = Buffer.from(`${baseText}%${'a'.repeat(pad)}\n`, 'utf8');
+      const compressed = zlib.deflateSync(candidate);
+      if (compressed[compressed.length - 1] === targetLastByte) {
+        return compressed;
+      }
+    }
+    throw new Error(`Could not find benign payload ending in 0x${targetLastByte.toString(16)}`);
+  }
+
+  // 1. Adjacent /Subtype /Image XObject + /ProcSet [/PDF /Text /ImageB /ImageC] in the
+  //    metadata stream's own dictionary must NOT suppress inflating the metadata stream,
+  //    while the genuine /Subtype /Image stream itself stays skipped.
+  const linkedHero = path.join(workDir, 'CompressedHero.png');
+  const heroBytes = Buffer.from('synthetic-hero-png-bytes-12345');
+  fs.writeFileSync(linkedHero, heroBytes);
+
+  const imageStreamBytes = zlib.deflateSync(
+    Buffer.from(`% /Users/synthetic/should-stay-skipped-image-stream.png\n`, 'utf8')
+  );
+  const metadataStreamBytes = zlib.deflateSync(
+    Buffer.from(`BT (${linkedHero}) Tj ET\n`, 'utf8')
+  );
+  const adjacentAiPath = path.join(workDir, 'AdjacentImageAndProcSet.ai');
+  fs.writeFileSync(adjacentAiPath, Buffer.concat([
+    Buffer.from('%PDF-1.6\n'),
+    Buffer.from(`1 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /Filter /FlateDecode /Length ${imageStreamBytes.length} >>\nstream\n`),
+    imageStreamBytes,
+    Buffer.from('\nendstream\nendobj\n'),
+    Buffer.from(
+      `2 0 obj\n<< /Type /XObject /Subtype /Form /Resources << /ProcSet [/PDF /Text /ImageB /ImageC] >> /Filter /FlateDecode /Length ${metadataStreamBytes.length} >>\nstream\n`
+    ),
+    metadataStreamBytes,
+    Buffer.from('\nendstream\nendobj\n%%EOF\n'),
+  ]));
+
+  const adjacentParsed = await client.parsePdfAi(adjacentAiPath, { decompressStreams: true });
+  assert.equal(adjacentParsed.incomplete, false);
+  assert.deepEqual(adjacentParsed.issues, []);
+  assert.ok(adjacentParsed.paths.includes(linkedHero), 'metadata stream after /Subtype /Image and with /ProcSet [/ImageB /ImageC] must be inflated');
+  assert.equal(
+    adjacentParsed.paths.includes('/Users/synthetic/should-stay-skipped-image-stream.png'),
+    false,
+    'genuine /Subtype /Image stream must remain skipped'
+  );
+
+  const adjacentOutDir = path.join(workDir, 'out-adjacent');
+  const adjacentPkg = await packageMasterFile(adjacentAiPath, adjacentOutDir);
+  assert.equal(adjacentPkg.assetsFound, 1);
+  assert.equal(adjacentPkg.assetsCopied, 1);
+  assert.deepEqual(adjacentPkg.assetsMissing, []);
+  const copiedHero = path.join(adjacentOutDir, 'CompressedHero.png');
+  assert.equal(fs.existsSync(copiedHero), true);
+  assert.deepEqual(fs.readFileSync(copiedHero), heroBytes);
+
+  // 2. Valid zlib streams whose Adler-32 checksum ends in 0x0A (LF) or 0x0D (CR),
+  //    tested with BOTH direct /Length and indirect /Length 99 0 R.
+  for (const [label, targetByte] of [['lf', 0x0a], ['cr', 0x0d]]) {
+    for (const lengthMode of ['direct', 'indirect']) {
+      const assetPath = path.join(workDir, `Checksum_${label}_${lengthMode}.png`);
+      const assetBytes = Buffer.from(`synthetic-${label}-${lengthMode}-bytes`);
+      fs.writeFileSync(assetPath, assetBytes);
+
+      const compressed = deflateWithTrailingByte(`BT (${assetPath}) Tj ET\n`, targetByte);
+      assert.equal(compressed[compressed.length - 1], targetByte);
+
+      const lengthField = lengthMode === 'direct' ? `/Length ${compressed.length}` : '/Length 99 0 R';
+      const aiPath = path.join(workDir, `Adler_${label}_${lengthMode}.ai`);
+      const parts = [
+        Buffer.from('%PDF-1.6\n'),
+        Buffer.from(`1 0 obj\n<< /Filter /FlateDecode ${lengthField} >>\nstream\n`),
+        compressed,
+        Buffer.from('\r\nendstream\nendobj\n'),
+      ];
+      if (lengthMode === 'indirect') {
+        parts.push(Buffer.from(`99 0 obj\n${compressed.length}\nendobj\n`));
+      }
+      parts.push(Buffer.from('%%EOF\n'));
+      fs.writeFileSync(aiPath, Buffer.concat(parts));
+
+      const parsed = await client.parsePdfAi(aiPath, { decompressStreams: true });
+      assert.equal(parsed.incomplete, false, `${label}/${lengthMode} must inflate cleanly without incomplete flag`);
+      assert.deepEqual(parsed.issues, [], `${label}/${lengthMode} must report zero issues`);
+      assert.ok(parsed.paths.includes(assetPath), `${label}/${lengthMode} must recover compressed-only link`);
+
+      const outDir = path.join(workDir, `out-${label}-${lengthMode}`);
+      const pkg = await packageMasterFile(aiPath, outDir);
+      assert.equal(pkg.assetsFound, 1, `${label}/${lengthMode} Quick Package must find compressed link`);
+      assert.equal(pkg.assetsCopied, 1, `${label}/${lengthMode} Quick Package must copy compressed link`);
+      assert.deepEqual(pkg.assetsMissing, []);
+      const copied = path.join(outDir, path.basename(assetPath));
+      assert.equal(fs.existsSync(copied), true);
+      assert.deepEqual(fs.readFileSync(copied), assetBytes);
+    }
+  }
+});

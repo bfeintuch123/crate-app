@@ -394,8 +394,13 @@ enum PdfAiParser {
     ) rethrows {
         let streamToken = Array("stream".utf8)
         let endstreamToken = Array("endstream".utf8)
-        let flateToken = Array("FlateDecode".utf8)
+        let endobjToken = Array("endobj".utf8)
+        let flateToken = Array("/FlateDecode".utf8)
+        let subtypeToken = Array("/Subtype".utf8)
         let imageToken = Array("/Image".utf8)
+        let lengthToken = Array("/Length".utf8)
+        let maxStreamDictLookback = 65536
+        let maxDirectStreamLength = 16 * 1024 * 1024
         let n = bytes.count
         var streamAttempts = 0
         var totalInflated = 0
@@ -406,22 +411,182 @@ enum PdfAiParser {
             if !issues.contains(code) { issues.append(code) }
         }
 
-        func containsSubsequence(_ range: Range<Int>, _ needle: [UInt8]) -> Bool {
-            let nl = needle.count
-            if range.count < nl { return false }
-            var p = range.lowerBound
-            let stop = range.upperBound - nl
-            while p <= stop {
-                if bytes[p] == needle[0] {
-                    var ok = true
-                    for k in 1..<nl {
-                        if bytes[p + k] != needle[k] { ok = false; break }
+        func isPdfWhitespace(_ b: UInt8) -> Bool {
+            return b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D || b == 0x00 || b == 0x0C
+        }
+
+        func isPdfDelimiterOrWhitespace(_ b: UInt8) -> Bool {
+            if isPdfWhitespace(b) { return true }
+            switch b {
+            case 0x28, 0x29, 0x3C, 0x3E, 0x5B, 0x5D, 0x7B, 0x7D, 0x2F, 0x25:
+                // ( ) < > [ ] { } / %
+                return true
+            default:
+                return false
+            }
+        }
+
+        func matchesAt(_ pos: Int, _ needle: [UInt8], limit: Int) -> Bool {
+            if pos < 0 || pos + needle.count > limit { return false }
+            for k in 0..<needle.count {
+                if bytes[pos + k] != needle[k] { return false }
+            }
+            return true
+        }
+
+        func findStreamDictionaryRange(before streamPos: Int) -> Range<Int>? {
+            var p = streamPos - 1
+            while p >= 0 && isPdfWhitespace(bytes[p]) {
+                p -= 1
+            }
+            guard p >= 1 && bytes[p] == 0x3E && bytes[p - 1] == 0x3E else { return nil }
+            let dictClose = p + 1
+            let floor = max(0, streamPos - maxStreamDictLookback)
+            var depth = 1
+            var q = p - 2
+            while q >= floor {
+                if bytes[q] == 0x3E && q > floor && bytes[q - 1] == 0x3E {
+                    depth += 1
+                    q -= 2
+                    continue
+                }
+                if bytes[q] == 0x3C && q > floor && bytes[q - 1] == 0x3C {
+                    depth -= 1
+                    if depth == 0 {
+                        return (q - 1)..<dictClose
                     }
-                    if ok { return true }
+                    q -= 2
+                    continue
+                }
+                if depth == 1 {
+                    if q >= floor + endobjToken.count - 1 &&
+                        matchesAt(q - endobjToken.count + 1, endobjToken, limit: dictClose) {
+                        return nil
+                    }
+                    if q >= floor + endstreamToken.count - 1 &&
+                        matchesAt(q - endstreamToken.count + 1, endstreamToken, limit: dictClose) {
+                        return nil
+                    }
+                }
+                q -= 1
+            }
+            return nil
+        }
+
+        func dictContainsName(_ range: Range<Int>, _ name: [UInt8]) -> Bool {
+            let nl = name.count
+            if range.count < nl + 4 { return false }
+            var p = range.lowerBound + 2
+            let limit = range.upperBound - 2
+            var depth = 0
+            while p < limit {
+                if p + 1 < limit && bytes[p] == 0x3C && bytes[p + 1] == 0x3C {
+                    depth += 1
+                    p += 2
+                    continue
+                }
+                if p + 1 < limit && bytes[p] == 0x3E && bytes[p + 1] == 0x3E {
+                    if depth > 0 { depth -= 1 }
+                    p += 2
+                    continue
+                }
+                if depth == 0 && matchesAt(p, name, limit: limit) {
+                    let after = p + nl
+                    if after == limit || isPdfDelimiterOrWhitespace(bytes[after]) {
+                        return true
+                    }
                 }
                 p += 1
             }
             return false
+        }
+
+        func dictHasImageSubtype(_ range: Range<Int>) -> Bool {
+            let sl = subtypeToken.count
+            if range.count < sl + imageToken.count + 4 { return false }
+            var p = range.lowerBound + 2
+            let limit = range.upperBound - 2
+            var depth = 0
+            while p < limit {
+                if p + 1 < limit && bytes[p] == 0x3C && bytes[p + 1] == 0x3C {
+                    depth += 1
+                    p += 2
+                    continue
+                }
+                if p + 1 < limit && bytes[p] == 0x3E && bytes[p + 1] == 0x3E {
+                    if depth > 0 { depth -= 1 }
+                    p += 2
+                    continue
+                }
+                if depth == 0 && matchesAt(p, subtypeToken, limit: limit) {
+                    var after = p + sl
+                    if after < limit && isPdfDelimiterOrWhitespace(bytes[after]) {
+                        while after < limit && isPdfWhitespace(bytes[after]) {
+                            after += 1
+                        }
+                        if matchesAt(after, imageToken, limit: limit) {
+                            let imgEnd = after + imageToken.count
+                            if imgEnd == limit || isPdfDelimiterOrWhitespace(bytes[imgEnd]) {
+                                return true
+                            }
+                        }
+                    }
+                }
+                p += 1
+            }
+            return false
+        }
+
+        func parseDirectStreamLength(_ range: Range<Int>) -> Int? {
+            let ll = lengthToken.count
+            if range.count < ll + 2 { return nil }
+            var p = range.lowerBound + 2 // skip outer "<<"
+            let limit = range.upperBound - 2 // before outer ">>"
+            var depth = 0
+            while p < limit {
+                if p + 1 < limit && bytes[p] == 0x3C && bytes[p + 1] == 0x3C {
+                    depth += 1
+                    p += 2
+                    continue
+                }
+                if p + 1 < limit && bytes[p] == 0x3E && bytes[p + 1] == 0x3E {
+                    if depth > 0 { depth -= 1 }
+                    p += 2
+                    continue
+                }
+                if depth == 0 && matchesAt(p, lengthToken, limit: limit) {
+                    var q = p + ll
+                    if q < limit && isPdfWhitespace(bytes[q]) {
+                        while q < limit && isPdfWhitespace(bytes[q]) { q += 1 }
+                        var val = 0
+                        var digits = 0
+                        while q < limit && bytes[q] >= 0x30 && bytes[q] <= 0x39 {
+                            let d = Int(bytes[q] - 0x30)
+                            if val > (maxDirectStreamLength - d) / 10 {
+                                val = -1
+                                break
+                            }
+                            val = val * 10 + d
+                            digits += 1
+                            q += 1
+                        }
+                        if digits > 0 && val > 0 {
+                            var nextTok = q
+                            while nextTok < limit && isPdfWhitespace(bytes[nextTok]) { nextTok += 1 }
+                            // Reject indirect references like "/Length 12 0 R"
+                            if nextTok < limit && bytes[nextTok] >= 0x30 && bytes[nextTok] <= 0x39 {
+                                p = nextTok
+                                continue
+                            }
+                            if q == limit || isPdfDelimiterOrWhitespace(bytes[q]) {
+                                return val
+                            }
+                        }
+                    }
+                }
+                p += 1
+            }
+            return nil
         }
 
         while i < n - 16 {
@@ -442,29 +607,56 @@ enum PdfAiParser {
                             dataStart += 2; validLineBreak = true
                         }
                     }
-                    if validLineBreak {
-                        // Inspect preceding PDF dictionary window (up to 512 bytes back)
-                        let dictStart = max(0, i - 512)
-                        let isFlate = containsSubsequence(dictStart..<i, flateToken)
-                        let isImage = containsSubsequence(dictStart..<i, imageToken)
-                        // Locate matching endstream without rescanning ranges already proven to contain none.
-                        var endPos = max(dataStart, noEndstreamBefore)
-                        let searchLimit = min(n - endstreamToken.count, dataStart + 16 * 1024 * 1024)
-                        var foundEnd = -1
-                        while endPos <= searchLimit {
-                            if bytes[endPos] == endstreamToken[0] {
-                                var m = true
-                                for k in 1..<endstreamToken.count {
-                                    if bytes[endPos + k] != endstreamToken[k] { m = false; break }
-                                }
-                                if m { foundEnd = endPos; break }
+                    if validLineBreak, let dictRange = findStreamDictionaryRange(before: i) {
+                        let isFlate = dictContainsName(dictRange, flateToken)
+                        let isImage = dictHasImageSubtype(dictRange)
+
+                        // Prefer validated direct /Length from this stream's own dictionary so
+                        // exact compressed bytes (including any trailing CR/LF checksum bytes)
+                        // are preserved without scanning inside compressed payload data.
+                        var compEnd = -1
+                        var endstreamEnd = -1
+                        if let directLen = parseDirectStreamLength(dictRange),
+                           directLen <= n - dataStart {
+                            let expectedEnd = dataStart + directLen
+                            var esPos = expectedEnd
+                            let esWsLimit = min(n, expectedEnd + 8)
+                            while esPos < esWsLimit && isPdfWhitespace(bytes[esPos]) {
+                                esPos += 1
                             }
-                            endPos += 1
+                            if matchesAt(esPos, endstreamToken, limit: n) {
+                                compEnd = expectedEnd
+                                endstreamEnd = esPos + endstreamToken.count
+                            }
                         }
-                        if foundEnd < 0 {
-                            noEndstreamBefore = max(noEndstreamBefore, searchLimit + 1)
+
+                        if compEnd < 0 {
+                            // Indirect or missing /Length: locate matching endstream without
+                            // rescanning ranges already proven to contain none, and pass the
+                            // unstripped range to zlib (which stops at Z_STREAM_END and ignores
+                            // trailing PDF EOL bytes without truncating Adler-32 checksum bytes).
+                            var endPos = max(dataStart, noEndstreamBefore)
+                            let searchLimit = min(n - endstreamToken.count, dataStart + maxDirectStreamLength)
+                            var foundEnd = -1
+                            while endPos <= searchLimit {
+                                if bytes[endPos] == endstreamToken[0] {
+                                    var m = true
+                                    for k in 1..<endstreamToken.count {
+                                        if bytes[endPos + k] != endstreamToken[k] { m = false; break }
+                                    }
+                                    if m { foundEnd = endPos; break }
+                                }
+                                endPos += 1
+                            }
+                            if foundEnd < 0 {
+                                noEndstreamBefore = max(noEndstreamBefore, searchLimit + 1)
+                            } else {
+                                compEnd = foundEnd
+                                endstreamEnd = foundEnd + endstreamToken.count
+                            }
                         }
-                        if foundEnd > dataStart {
+
+                        if compEnd >= dataStart && endstreamEnd > compEnd {
                             if isFlate && !isImage {
                                 if streamAttempts >= maxStreamsToInflate {
                                     recordIssue("flate-stream-count-limit")
@@ -473,10 +665,6 @@ enum PdfAiParser {
                                 if totalInflated >= maxTotalInflatedOut {
                                     recordIssue("flate-total-output-limit")
                                     break
-                                }
-                                var compEnd = foundEnd
-                                while compEnd > dataStart && (bytes[compEnd - 1] == 0x0A || bytes[compEnd - 1] == 0x0D) {
-                                    compEnd -= 1
                                 }
                                 let compLen = compEnd - dataStart
                                 if compLen > 2 {
@@ -500,7 +688,7 @@ enum PdfAiParser {
                                     }
                                 }
                             }
-                            i = foundEnd + endstreamToken.count
+                            i = endstreamEnd
                             continue
                         } else if isFlate && !isImage {
                             recordIssue("flate-endstream-unbounded")
