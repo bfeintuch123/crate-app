@@ -5654,10 +5654,12 @@ function buildSyntheticArm64MachO({
   codeSigDatasize = 64,
   truncateOriginalBytes = 0,
   trailingBytes = 0,
+  trailingFill = 0x00,
   linkeditOff = 4096,
   linkeditVmsize = 16384,
   linkeditNsects = 0,
   overrideLinkeditFilesize = null,
+  overrideLinkeditCmdSize = null,
   duplicateLinkedit = false,
   duplicateSymtab = false,
   duplicateDysymtab = false,
@@ -5667,12 +5669,16 @@ function buildSyntheticArm64MachO({
   textSectionNreloc = 0,
   textSectionReloff = 0,
   includeZerofillDataSegment = false,
+  extraDataSegment = null, // { fileoff, filesize, secOff, secSize }
   symtabNsyms = 1,
   symtabSymoff = null,
+  overrideSymtabStroff = null,
   overrideSymtabStrsize = null,
   dysymtabFields = null,
+  dysymtabCmdSize = 80,
   dyldInfoCmd = null, // 0x22 or 0x80000022
   dyldInfoFields = null,
+  dyldInfoCmdSize = 48,
   duplicateDyldInfo = false,
   linkeditDataEntries = null, // Array<{ cmd, off, size }>
   uuidCmdSize = 24,
@@ -5682,7 +5688,7 @@ function buildSyntheticArm64MachO({
   const effectiveTextFilesize = textFilesize !== null ? textFilesize : linkeditOff;
   const symOff = symtabSymoff !== null ? symtabSymoff : linkeditOff;
   const symSize = 16; // 1 nlist_64
-  const strOff = linkeditOff + symSize;
+  const strOff = overrideSymtabStroff !== null ? overrideSymtabStroff : linkeditOff + symSize;
   const targetAlignedEnd = linkeditOff + 256; // 4352 when linkeditOff === 4096 (always % 16 === 0)
   const targetUnalignedEnd = targetAlignedEnd - gapBytes;
   const strSize = overrideSymtabStrsize !== null ? overrideSymtabStrsize : Math.max(1, targetUnalignedEnd - strOff);
@@ -5737,9 +5743,27 @@ function buildSyntheticArm64MachO({
     commands.push(dataSeg);
   }
 
+  if (extraDataSegment) {
+    const dataSeg = Buffer.alloc(152, 0);
+    dataSeg.writeUInt32LE(0x19, 0);
+    dataSeg.writeUInt32LE(152, 4);
+    dataSeg.write('__DATA', 8, 'latin1');
+    dataSeg.writeBigUInt64LE(0x100004000n, 24);
+    dataSeg.writeBigUInt64LE(16384n, 32);
+    dataSeg.writeBigUInt64LE(BigInt(extraDataSegment.fileoff), 40);
+    dataSeg.writeBigUInt64LE(BigInt(extraDataSegment.filesize), 48);
+    dataSeg.writeUInt32LE(1, 64);
+    dataSeg.write('__data', 72, 'latin1');
+    dataSeg.write('__DATA', 88, 'latin1');
+    dataSeg.writeBigUInt64LE(BigInt(extraDataSegment.secSize), 72 + 40);
+    dataSeg.writeUInt32LE(extraDataSegment.secOff, 72 + 48);
+    dataSeg.writeUInt32LE(0, 72 + 64); // S_REGULAR
+    commands.push(dataSeg);
+  }
+
   const linkeditCmdOffset = 32 + commands.reduce((sum, cmd) => sum + cmd.length, 0);
   const makeLinkeditCmd = () => {
-    const size = 72 + linkeditNsects * 80;
+    const size = overrideLinkeditCmdSize !== null ? overrideLinkeditCmdSize : 72 + linkeditNsects * 80;
     const cmd = Buffer.alloc(size, 0);
     cmd.writeUInt32LE(0x19, 0);
     cmd.writeUInt32LE(size, 4);
@@ -5767,12 +5791,12 @@ function buildSyntheticArm64MachO({
   commands.push(makeSymtabCmd());
   if (duplicateSymtab) commands.push(makeSymtabCmd());
 
-  if (dysymtabFields !== null || duplicateDysymtab) {
+  if (dysymtabFields !== null || duplicateDysymtab || dysymtabCmdSize !== 80) {
     const count = duplicateDysymtab ? 2 : 1;
     for (let index = 0; index < count; index += 1) {
-      const dysym = Buffer.alloc(80, 0);
+      const dysym = Buffer.alloc(dysymtabCmdSize, 0);
       dysym.writeUInt32LE(0x0b, 0);
-      dysym.writeUInt32LE(80, 4);
+      dysym.writeUInt32LE(dysymtabCmdSize, 4);
       if (dysymtabFields) {
         const offsets = [
           ['tocoff', 32], ['ntoc', 36],
@@ -5783,18 +5807,20 @@ function buildSyntheticArm64MachO({
           ['locreloff', 72], ['nlocrel', 76],
         ];
         for (const [key, pos] of offsets) {
-          if (dysymtabFields[key] !== undefined) dysym.writeUInt32LE(dysymtabFields[key], pos);
+          if (dysymtabFields[key] !== undefined && pos + 4 <= dysymtabCmdSize) {
+            dysym.writeUInt32LE(dysymtabFields[key], pos);
+          }
         }
       }
       commands.push(dysym);
     }
   }
 
-  if (dyldInfoCmd !== null || dyldInfoFields !== null || duplicateDyldInfo) {
+  if (dyldInfoCmd !== null || dyldInfoFields !== null || duplicateDyldInfo || dyldInfoCmdSize !== 48) {
     const makeDyldInfo = cmdId => {
-      const cmd = Buffer.alloc(48, 0);
+      const cmd = Buffer.alloc(dyldInfoCmdSize, 0);
       cmd.writeUInt32LE(cmdId, 0);
-      cmd.writeUInt32LE(48, 4);
+      cmd.writeUInt32LE(dyldInfoCmdSize, 4);
       if (dyldInfoFields) {
         const offsets = [
           ['rebaseOff', 8], ['rebaseSize', 12],
@@ -5804,7 +5830,9 @@ function buildSyntheticArm64MachO({
           ['exportOff', 40], ['exportSize', 44],
         ];
         for (const [key, pos] of offsets) {
-          if (dyldInfoFields[key] !== undefined) cmd.writeUInt32LE(dyldInfoFields[key], pos);
+          if (dyldInfoFields[key] !== undefined && pos + 4 <= dyldInfoCmdSize) {
+            cmd.writeUInt32LE(dyldInfoFields[key], pos);
+          }
         }
       }
       return cmd;
@@ -5865,6 +5893,9 @@ function buildSyntheticArm64MachO({
   if (includeCodeSignature && sigOff + codeSigDatasize <= totalSize) {
     buffer.fill(0xaa, sigOff, sigOff + codeSigDatasize);
   }
+  if (trailingBytes > 0 && linkeditEnd + trailingBytes <= totalSize) {
+    buffer.fill(trailingFill, linkeditEnd, linkeditEnd + trailingBytes);
+  }
   return { buffer, linkeditCmdOffset, linkeditOff, linkeditFilesize, strOff, strSize, strEnd, sigOff };
 }
 
@@ -5911,16 +5942,16 @@ test('trimRemovedSignaturePadding trims provable 1..15-byte all-zero signature p
       { cmd: 0x29, off: 4112, size: 0 }, // zero-size cursor inside [linkeditOff, strEnd]
     ],
   };
-  for (const filetype of [2, 6, 8]) {
-    const s = buildSyntheticArm64MachO({ ...populatedLinkeditOpts, filetype, includeCodeSignature: true });
-    const r = buildSyntheticArm64MachO({ ...populatedLinkeditOpts, filetype, includeCodeSignature: false });
+  for (const [filetype, dyldInfoCmd] of [[2, 0x80000022], [6, 0x22], [8, 0x80000022]]) {
+    const s = buildSyntheticArm64MachO({ ...populatedLinkeditOpts, filetype, dyldInfoCmd, includeCodeSignature: true });
+    const r = buildSyntheticArm64MachO({ ...populatedLinkeditOpts, filetype, dyldInfoCmd, includeCodeSignature: false });
     const trimmed = trimRemovedSignaturePadding(s.buffer, r.buffer);
-    assert.notEqual(trimmed, r.buffer, `populated filetype ${filetype} should trim`);
+    assert.notEqual(trimmed, r.buffer, `populated filetype ${filetype} (dyld 0x${dyldInfoCmd.toString(16)}) should trim`);
     assert.equal(trimmed.length, r.strEnd);
   }
 });
 
-test('trimRemovedSignaturePadding fails closed on every single violated precondition without masking', () => {
+test('trimRemovedSignaturePadding fails closed on violated preconditions', () => {
   const signed8 = buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: true });
   const removed8 = buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false });
 
@@ -5931,7 +5962,8 @@ test('trimRemovedSignaturePadding fails closed on every single violated precondi
     return cmd;
   };
 
-  // Every case below isolates one specific guard so removing only that guard would cause an unexpected trim.
+  // Negative cases isolating each precondition (note: dataoff % 16 and linkedit.end % 16
+  // are structurally coupled via removedBytes.length === dataoff === linkedit.end and tested as a pair).
   const cases = [
     // --- Original-side header & LC_CODE_SIGNATURE guards ---
     ['already-unsigned original (no LC_CODE_SIGNATURE)', removed8.buffer, removed8.buffer],
@@ -5946,7 +5978,7 @@ test('trimRemovedSignaturePadding fails closed on every single violated precondi
       removed8.buffer,
     ],
     [
-      'original LC_CODE_SIGNATURE not 16-byte aligned',
+      '16-byte alignment violated on original dataoff / removed linkedit.end pair',
       buildSyntheticArm64MachO({
         gapBytes: 0,
         includeCodeSignature: true,
@@ -5958,6 +5990,21 @@ test('trimRemovedSignaturePadding fails closed on every single violated precondi
         includeCodeSignature: false,
         overrideSymtabStrsize: 4340 - 4112,
       }).buffer,
+    ],
+    [
+      'original wrong magic (32-bit) with valid LC_CODE_SIGNATURE at dataoff',
+      buildSyntheticArm64MachO({ magic: 0xfeedface, gapBytes: 8, includeCodeSignature: true }).buffer,
+      removed8.buffer,
+    ],
+    [
+      'original wrong magic (big-endian) with valid LC_CODE_SIGNATURE at dataoff',
+      buildSyntheticArm64MachO({ magic: 0xcffaedfe, gapBytes: 8, includeCodeSignature: true }).buffer,
+      removed8.buffer,
+    ],
+    [
+      'original wrong cputype (x86_64) with valid LC_CODE_SIGNATURE at dataoff',
+      buildSyntheticArm64MachO({ cputype: 0x01000007, gapBytes: 8, includeCodeSignature: true }).buffer,
+      removed8.buffer,
     ],
     [
       'disallowed filetype (MH_OBJECT=1) on both',
@@ -5976,7 +6023,7 @@ test('trimRemovedSignaturePadding fails closed on every single violated precondi
     ],
     [
       'original cmdsize not 8-byte aligned',
-      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: true, uuidCmdSize: 20 }).buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: true, uuidCmdSize: 28 }).buffer,
       removed8.buffer,
     ],
 
@@ -6010,14 +6057,24 @@ test('trimRemovedSignaturePadding fails closed on every single violated precondi
       buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, extraSizeofcmds: 8 }).buffer,
     ],
     [
-      'removed cmdsize not 8-byte aligned',
+      'removed cmdsize not 8-byte aligned (LC_UUID cmdsize 28 >= 24 min)',
       signed8.buffer,
-      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, uuidCmdSize: 20 }).buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, uuidCmdSize: 28 }).buffer,
     ],
     [
       'inline load command below minimum size (LC_UUID cmdsize 16 < 24)',
       signed8.buffer,
       buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, uuidCmdSize: 16 }).buffer,
+    ],
+    [
+      'LC_DYSYMTAB below minimum size (cmdsize 72 < 80)',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, extraCommands: [makeExtraCmd(0x0b, 72)] }).buffer,
+    ],
+    [
+      'LC_DYLD_INFO_ONLY below minimum size (cmdsize 40 < 48)',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, extraCommands: [makeExtraCmd(0x80000022, 40)] }).buffer,
     ],
     [
       'excluded LC_TWOLEVEL_HINTS (0x16)',
@@ -6047,28 +6104,52 @@ test('trimRemovedSignaturePadding fails closed on every single violated precondi
       buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, linkeditNsects: 1 }).buffer,
     ],
     [
+      '__LINKEDIT cmdsize does not match 72 + nsects * 80',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, overrideLinkeditCmdSize: 80 }).buffer,
+    ],
+    [
       '__LINKEDIT filesize > vmsize',
       signed8.buffer,
       buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, linkeditVmsize: 64 }).buffer,
     ],
     [
-      '__LINKEDIT fileoff overlaps load commands (fileoff < cmdsEnd)',
-      buildSyntheticArm64MachO({ gapBytes: 8, linkeditOff: 128, textFilesize: 128, textSectionOffset: 64, textSectionSize: 32, includeCodeSignature: true }).buffer,
-      buildSyntheticArm64MachO({ gapBytes: 8, linkeditOff: 128, textFilesize: 128, textSectionOffset: 64, textSectionSize: 32, includeCodeSignature: false }).buffer,
+      '__LINKEDIT vmsize exceeds Number.MAX_SAFE_INTEGER',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, linkeditVmsize: (1n << 54n) }).buffer,
     ],
     [
-      '__LINKEDIT ends before EOF while removedBytes.length === original dataoff',
+      '__LINKEDIT fileoff overlaps load commands (cmdsEnd > fileoff without corrupting header)',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, extraCommands: [makeExtraCmd(0x8000001c, 3800)] }).buffer,
+    ],
+    [
+      '__LINKEDIT ends 16 non-zero bytes before EOF while removedBytes.length === original dataoff',
       signed8.buffer,
       buildSyntheticArm64MachO({
         gapBytes: 8,
         includeCodeSignature: false,
-        overrideLinkeditFilesize: removed8.linkeditFilesize - 16,
+        overrideSymtabStrsize: removed8.strSize - 16,
+        trailingBytes: 16,
+        trailingFill: 0x77,
       }).buffer,
     ],
     [
       'another segment (__TEXT) overlaps __LINKEDIT',
       signed8.buffer,
       buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, textFilesize: 4112 }).buffer,
+    ],
+    [
+      'non-zerofill section starts before its segment fileoff',
+      signed8.buffer,
+      buildSyntheticArm64MachO({
+        gapBytes: 8,
+        includeCodeSignature: false,
+        textFilesize: 2048,
+        textSectionOffset: 1024,
+        textSectionSize: 64,
+        extraDataSegment: { fileoff: 2048, filesize: 2048, secOff: 1024, secSize: 64 },
+      }).buffer,
     ],
     [
       'non-zerofill section exceeds its segment bounds',
@@ -6122,14 +6203,41 @@ test('trimRemovedSignaturePadding fails closed on every single violated precondi
 
     // --- Symtab, linkedit range, cursor, and gap guards ---
     [
-      'LC_SYMTAB strsize === 0',
-      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: true, overrideSymtabStrsize: 0 }).buffer,
-      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, overrideSymtabStrsize: 0 }).buffer,
+      'LC_SYMTAB strsize === 0 at valid 16-byte-aligned length === original dataoff',
+      signed8.buffer,
+      buildSyntheticArm64MachO({
+        gapBytes: 8,
+        includeCodeSignature: false,
+        symtabNsyms: 0,
+        symtabSymoff: 0,
+        overrideSymtabStroff: removed8.strEnd,
+        overrideSymtabStrsize: 0,
+      }).buffer,
     ],
     [
       'LC_SYMTAB nsyms*16 extends past strEnd (to strEnd + 4, inside linkeditEnd)',
       signed8.buffer,
       buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, symtabSymoff: removed8.strEnd - 12, symtabNsyms: 1 }).buffer,
+    ],
+    [
+      'LC_SYMTAB zero-size symoff cursor past strEnd',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, symtabNsyms: 0, symtabSymoff: removed8.strEnd + 4 }).buffer,
+    ],
+    [
+      'LC_DYSYMTAB zero-size tocoff cursor past strEnd',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, dysymtabFields: { tocoff: removed8.strEnd + 4, ntoc: 0 } }).buffer,
+    ],
+    [
+      'LC_DYLD_INFO_ONLY zero-size rebaseOff cursor past strEnd',
+      signed8.buffer,
+      buildSyntheticArm64MachO({
+        gapBytes: 8,
+        includeCodeSignature: false,
+        dyldInfoCmd: 0x80000022,
+        dyldInfoFields: { rebaseOff: removed8.strEnd + 4, rebaseSize: 0 },
+      }).buffer,
     ],
     [
       'linkedit_data_command ends past strEnd (to strEnd + 4, so gap still 4 in 1..15)',
@@ -6194,11 +6302,11 @@ test('trimRemovedSignaturePadding fails closed on every single violated precondi
   ];
 
   // Every LC_DYSYMTAB table (all 6 offsets & exact element sizes: 8, 56, 4, 4, 8, 8) ending at strEnd + 2
-  // (where count * (elemSize - 1) <= strEnd while count * elemSize === strEnd + 2 < linkeditEnd).
+  // with count === 2 so count * (elemSize - 1) <= strEnd while count * elemSize === strEnd + 2 < linkeditEnd.
   const dysymtabOverrunSpecs = [
-    ['toc', 'tocoff', 'ntoc', 8, 2], // off = strEnd - 14 -> 2*8 = 16 -> strEnd+2; 2*7 = 14 <= strEnd
-    ['modtab', 'modtaboff', 'nmodtab', 56, 1], // off = strEnd - 54 -> 1*56 = 56 -> strEnd+2
-    ['extrefsym', 'extrefsymoff', 'nextrefsyms', 4, 2], // off = strEnd - 6 -> 2*4 = 8 -> strEnd+2
+    ['toc', 'tocoff', 'ntoc', 8, 2],
+    ['modtab', 'modtaboff', 'nmodtab', 56, 2],
+    ['extrefsym', 'extrefsymoff', 'nextrefsyms', 4, 2],
     ['indirectsym', 'indirectsymoff', 'nindirectsyms', 4, 2],
     ['extrel', 'extreloff', 'nextrel', 8, 2],
     ['locrel', 'locreloff', 'nlocrel', 8, 2],
