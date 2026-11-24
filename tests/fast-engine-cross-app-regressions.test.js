@@ -1124,4 +1124,30 @@ test('Keynote (.key) & PPTX: reject duplicate identical-raw-name ZIP entries dur
     'excessive wildcard-bearing entries on unzip fallback must fail closed with an admission error'
   );
   assert.ok(Date.now() - startedAt < 2000, 'bounded wildcard check must complete quickly without freezing');
+
+  // 9. Benign legacy Keynote compatibility: trailing-byte .key with bracketed media name
+  //    falls through from failed exact unzip read into the guarded unique-tail wildcard fallback
+  //    via both PowerPointParser and the user-facing packageMasterFile entry point.
+  const { packageMasterFile } = require('../parsers');
+  const benignBracketKeyPath = path.join(dir, 'Legacy Deck.key');
+  fs.writeFileSync(benignBracketKeyPath, Buffer.concat([
+    buildSyntheticZip([
+      { name: 'Data/shot [1] final-1001.png', data: fullImage, unix: true },
+      { name: 'Data/other-2002.jpg', data: fullImage2, unix: true },
+    ]),
+    Buffer.from([0x00]),
+  ]));
+  assert.equal(openZipArchive(benignBracketKeyPath), null);
+
+  const pkgOutDir = path.join(dir, 'out-benign-bracket-pkg');
+  const pkgResult = await packageMasterFile(benignBracketKeyPath, pkgOutDir);
+  assert.equal(pkgResult.assetsFound, 2);
+  assert.equal(pkgResult.assetsCopied, 2);
+  assert.deepEqual(pkgResult.assetsMissing, []);
+  const copiedFinal = path.join(pkgOutDir, 'Legacy Deck — final.png');
+  const copiedOther = path.join(pkgOutDir, 'Legacy Deck — other.jpg');
+  assert.equal(fs.existsSync(copiedFinal), true);
+  assert.equal(fs.existsSync(copiedOther), true);
+  assert.deepEqual(fs.readFileSync(copiedFinal), fullImage);
+  assert.deepEqual(fs.readFileSync(copiedOther), fullImage2);
 });

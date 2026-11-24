@@ -308,16 +308,28 @@ async function extractArchiveEntryData(
       throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
     }
     const exactCount = fallbackListing.counts.get(zipPath) || 0;
+    let exactError = null;
     if (exactCount === 1) {
-      const data = await readArchiveEntryData(archivePath, zipPath);
-      return { data, outputTail: ext === '.key' ? getKeynoteArchiveEntryOutputTail(zipPath) : null };
+      try {
+        const data = await readArchiveEntryData(archivePath, zipPath);
+        return { data, outputTail: ext === '.key' ? getKeynoteArchiveEntryOutputTail(zipPath) : null };
+      } catch (err) {
+        if (
+          ext !== '.key'
+          || isParserAdmissionError(err)
+          || err?.code === 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME'
+        ) {
+          throw err;
+        }
+        exactError = err;
+      }
     }
     if (ext !== '.key') {
       throw Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
     }
     const fallback = getUniqueKeynoteWildcardFallback(zipPath, assets);
     if (!fallback) {
-      throw Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
+      throw exactError || Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
     }
     const listingMatches = fallbackListing.entries.filter(entry => (
       entry.path.startsWith('Data/')
@@ -325,7 +337,7 @@ async function extractArchiveEntryData(
       && path.basename(entry.path).trim().endsWith(fallback.tail)
     ));
     if (listingMatches.length !== 1) {
-      throw Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
+      throw exactError || Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
     }
     if (
       fallbackListing.hasAmbiguousPath(listingMatches[0].path)
