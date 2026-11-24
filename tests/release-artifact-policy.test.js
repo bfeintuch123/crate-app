@@ -4,7 +4,6 @@ const assert = require('./bounded-assert');
 const { spawnSync } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const debug = require('debug');
@@ -63,6 +62,7 @@ const {
   packagedManifestMatchesSource,
   runCli,
   safeCliErrorMessage,
+  trimRemovedSignaturePadding,
   verifyAsarFileIntegrity,
   verifierSourceMatchesExpectedRevision,
 } = require('../scripts/verify-macos-release-app');
@@ -5641,319 +5641,312 @@ function codesignStrictRequirement(filePath) {
   ], { env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' }, encoding: 'utf8' });
 }
 
-const NATIVE_DIGEST_HEX_RE = /^[a-f0-9]{64}$/u;
-const NATIVE_DIAG_ENV = () => ({
-  // Mirrors scripts/verify-macos-release-app.js runCommand() environment on the failure-only diagnostic path.
-  GIT_CONFIG_GLOBAL: '/dev/null',
-  GIT_CONFIG_NOSYSTEM: '1',
-  GIT_CONFIG_SYSTEM: '/dev/null',
-  GIT_NO_REPLACE_OBJECTS: '1',
-  GIT_OPTIONAL_LOCKS: '0',
-  HOME: process.env.HOME || '/var/empty',
-  LANG: 'C',
-  LC_ALL: 'C',
-  PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
-  TMPDIR: process.env.TMPDIR || os.tmpdir(),
+function buildSyntheticArm64MachO({
+  magic = 0xfeedfacf,
+  cputype = 0x0100000c,
+  filetype = 2,
+  gapBytes = 8,
+  gapFill = 0x00,
+  includeCodeSignature = false,
+  codeSigDataoff = null,
+  codeSigDatasize = 64,
+  trailingBytes = 0,
+  linkeditVmsize = 16384,
+  linkeditNsects = 0,
+  duplicateLinkedit = false,
+  duplicateSymtab = false,
+  duplicateDysymtab = false,
+  extraCommand = null,
+  textSectionNreloc = 0,
+  textSectionReloff = 0,
+  functionStartsEndOffset = null,
+  overrideSymtabStrsize = null,
+} = {}) {
+  const linkeditOff = 4096;
+  const symOff = linkeditOff;
+  const symSize = 16; // 1 nlist_64
+  const strOff = symOff + symSize;
+  const targetUnalignedEnd = 4160 - gapBytes;
+  const strSize = overrideSymtabStrsize !== null ? overrideSymtabStrsize : Math.max(1, targetUnalignedEnd - strOff);
+  const strEnd = strOff + strSize;
+  const linkeditContentEnd = strEnd + gapBytes;
+  const sigOff = codeSigDataoff !== null ? codeSigDataoff : linkeditContentEnd;
+  const linkeditEnd = includeCodeSignature ? sigOff + codeSigDatasize : linkeditContentEnd;
+  const linkeditFilesize = linkeditEnd - linkeditOff;
+  const totalSize = linkeditEnd + trailingBytes;
+
+  const commands = [];
+  // __TEXT segment with one __text section (72 + 80 = 152 bytes)
+  const textSeg = Buffer.alloc(152, 0);
+  textSeg.writeUInt32LE(0x19, 0);
+  textSeg.writeUInt32LE(152, 4);
+  textSeg.write('__TEXT', 8, 'latin1');
+  textSeg.writeBigUInt64LE(0x100000000n, 24);
+  textSeg.writeBigUInt64LE(BigInt(linkeditOff), 32);
+  textSeg.writeBigUInt64LE(0n, 40);
+  textSeg.writeBigUInt64LE(BigInt(linkeditOff), 48);
+  textSeg.writeUInt32LE(1, 64); // nsects
+  textSeg.write('__text', 72, 'latin1');
+  textSeg.write('__TEXT', 88, 'latin1');
+  textSeg.writeBigUInt64LE(64n, 72 + 40); // size
+  textSeg.writeUInt32LE(2048, 72 + 48); // offset
+  textSeg.writeUInt32LE(textSectionReloff, 72 + 56);
+  textSeg.writeUInt32LE(textSectionNreloc, 72 + 60);
+  textSeg.writeUInt32LE(0x80000400, 72 + 64); // S_REGULAR | S_ATTR_PURE_INSTRUCTIONS
+  commands.push(textSeg);
+
+  const makeLinkeditCmd = () => {
+    const size = 72 + linkeditNsects * 80;
+    const cmd = Buffer.alloc(size, 0);
+    cmd.writeUInt32LE(0x19, 0);
+    cmd.writeUInt32LE(size, 4);
+    cmd.write('__LINKEDIT', 8, 'latin1');
+    cmd.writeBigUInt64LE(0x100004000n, 24);
+    cmd.writeBigUInt64LE(BigInt(linkeditVmsize), 32);
+    cmd.writeBigUInt64LE(BigInt(linkeditOff), 40);
+    cmd.writeBigUInt64LE(BigInt(linkeditFilesize), 48);
+    cmd.writeUInt32LE(linkeditNsects, 64);
+    return cmd;
+  };
+  commands.push(makeLinkeditCmd());
+  if (duplicateLinkedit) commands.push(makeLinkeditCmd());
+
+  const makeSymtabCmd = () => {
+    const cmd = Buffer.alloc(24, 0);
+    cmd.writeUInt32LE(0x02, 0);
+    cmd.writeUInt32LE(24, 4);
+    cmd.writeUInt32LE(symOff, 8);
+    cmd.writeUInt32LE(1, 12);
+    cmd.writeUInt32LE(strOff, 16);
+    cmd.writeUInt32LE(strSize, 20);
+    return cmd;
+  };
+  commands.push(makeSymtabCmd());
+  if (duplicateSymtab) commands.push(makeSymtabCmd());
+
+  if (duplicateDysymtab) {
+    for (let index = 0; index < 2; index += 1) {
+      const dysym = Buffer.alloc(80, 0);
+      dysym.writeUInt32LE(0x0b, 0);
+      dysym.writeUInt32LE(80, 4);
+      commands.push(dysym);
+    }
+  }
+
+  if (functionStartsEndOffset !== null) {
+    const fnCmd = Buffer.alloc(16, 0);
+    fnCmd.writeUInt32LE(0x26, 0);
+    fnCmd.writeUInt32LE(16, 4);
+    fnCmd.writeUInt32LE(linkeditOff, 8);
+    fnCmd.writeUInt32LE(functionStartsEndOffset - linkeditOff, 12);
+    commands.push(fnCmd);
+  }
+
+  const uuidCmd = Buffer.alloc(24, 0);
+  uuidCmd.writeUInt32LE(0x1b, 0);
+  uuidCmd.writeUInt32LE(24, 4);
+  commands.push(uuidCmd);
+
+  if (extraCommand) commands.push(extraCommand);
+
+  if (includeCodeSignature) {
+    const sigCmd = Buffer.alloc(16, 0);
+    sigCmd.writeUInt32LE(0x1d, 0);
+    sigCmd.writeUInt32LE(16, 4);
+    sigCmd.writeUInt32LE(sigOff, 8);
+    sigCmd.writeUInt32LE(codeSigDatasize, 12);
+    commands.push(sigCmd);
+  }
+
+  const cmdBlock = Buffer.concat(commands);
+  const buffer = Buffer.alloc(totalSize, 0);
+  buffer.writeUInt32LE(magic, 0);
+  buffer.writeUInt32LE(cputype, 4);
+  buffer.writeUInt32LE(0, 8);
+  buffer.writeUInt32LE(filetype, 12);
+  buffer.writeUInt32LE(commands.length, 16);
+  buffer.writeUInt32LE(cmdBlock.length, 20);
+  buffer.writeUInt32LE(0x00200085, 24);
+  cmdBlock.copy(buffer, 32);
+
+  // Fill synthetic __text and string table with non-zero bytes so truncation/corruption is obvious.
+  buffer.fill(0x55, 2048, 2048 + 64);
+  buffer.fill(0x41, strOff, strEnd);
+  if (gapBytes > 0) buffer.fill(gapFill, strEnd, strEnd + gapBytes);
+  if (includeCodeSignature) buffer.fill(0xaa, sigOff, sigOff + codeSigDatasize);
+  return { buffer, linkeditCmdOffset: 32 + textSeg.length, linkeditOff, linkeditFilesize, strEnd, sigOff };
+}
+
+test('trimRemovedSignaturePadding trims only provable 1..15-byte all-zero signature alignment padding', () => {
+  for (const gapBytes of [1, 8, 15]) {
+    const signed = buildSyntheticArm64MachO({ gapBytes, includeCodeSignature: true });
+    const removed = buildSyntheticArm64MachO({ gapBytes, includeCodeSignature: false });
+    const trimmed = trimRemovedSignaturePadding(signed.buffer, removed.buffer);
+    assert.notEqual(trimmed, removed.buffer, `gap ${gapBytes} should trim`);
+    assert.equal(trimmed.length, removed.strEnd);
+    assert.equal(
+      trimmed.readBigUInt64LE(removed.linkeditCmdOffset + 48),
+      BigInt(removed.linkeditFilesize - gapBytes)
+    );
+    assert.equal(trimmed.readBigUInt64LE(removed.linkeditCmdOffset + 32), 16384n);
+    const expected = Buffer.from(removed.buffer.subarray(0, removed.strEnd));
+    expected.writeBigUInt64LE(BigInt(removed.linkeditFilesize - gapBytes), removed.linkeditCmdOffset + 48);
+    assert.equal(trimmed.equals(expected), true);
+  }
 });
 
-function sanitizeDiagnosticText(raw, extraPaths = [], maxChars = 600) {
-  let text = String(raw ?? '');
-  const replacements = [];
-  const addPath = (candidate, token) => {
-    if (typeof candidate !== 'string' || !candidate) return;
-    replacements.push([candidate, token]);
-    try {
-      const real = fs.realpathSync(candidate);
-      if (real && real !== candidate) replacements.push([real, token]);
-    } catch (_) {
-      // ignore unavailable path
+test('trimRemovedSignaturePadding leaves ineligible, unsigned, tampered, or malformed inputs unchanged', () => {
+  const signed8 = buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: true }).buffer;
+  const removed8 = buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false }).buffer;
+
+  // Gap 0 (already aligned)
+  const signed0 = buildSyntheticArm64MachO({ gapBytes: 0, includeCodeSignature: true }).buffer;
+  const removed0 = buildSyntheticArm64MachO({ gapBytes: 0, includeCodeSignature: false }).buffer;
+  assert.equal(trimRemovedSignaturePadding(signed0, removed0), removed0);
+
+  // Gap >= 16
+  const signed16 = buildSyntheticArm64MachO({ gapBytes: 16, includeCodeSignature: true }).buffer;
+  const removed16 = buildSyntheticArm64MachO({ gapBytes: 16, includeCodeSignature: false }).buffer;
+  assert.equal(trimRemovedSignaturePadding(signed16, removed16), removed16);
+
+  // Non-zero byte in the 8-byte alignment gap
+  const removedNonZeroGap = buildSyntheticArm64MachO({ gapBytes: 8, gapFill: 0x01, includeCodeSignature: false }).buffer;
+  assert.equal(trimRemovedSignaturePadding(signed8, removedNonZeroGap), removedNonZeroGap);
+
+  // Already-unsigned input (no LC_CODE_SIGNATURE on originalBytes)
+  assert.equal(trimRemovedSignaturePadding(removed8, removed8), removed8);
+
+  // Original LC_CODE_SIGNATURE not 16-byte aligned
+  const unalignedSig = buildSyntheticArm64MachO({
+    gapBytes: 0,
+    includeCodeSignature: true,
+    codeSigDataoff: 4152,
+    overrideSymtabStrsize: 4148 - 4112,
+  }).buffer;
+  const removedAt4152 = buildSyntheticArm64MachO({
+    gapBytes: 4,
+    includeCodeSignature: false,
+    overrideSymtabStrsize: 4148 - 4112,
+  }).buffer;
+  assert.equal(trimRemovedSignaturePadding(unalignedSig, removedAt4152), removedAt4152);
+
+  // Removed length differs from original LC_CODE_SIGNATURE dataoff (e.g. already trimmed on newer macOS)
+  const alreadyTrimmed = trimRemovedSignaturePadding(signed8, removed8);
+  assert.equal(trimRemovedSignaturePadding(signed8, alreadyTrimmed), alreadyTrimmed);
+
+  // LC_CODE_SIGNATURE still present after removal
+  assert.equal(trimRemovedSignaturePadding(signed8, signed8), signed8);
+
+  // Trailing bytes after __LINKEDIT
+  const signedTrail = buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: true, trailingBytes: 0 }).buffer;
+  const removedTrail = buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, trailingBytes: 16 }).buffer;
+  assert.equal(trimRemovedSignaturePadding(signedTrail, removedTrail), removedTrail);
+
+  // Another linkedit range ends past strEnd
+  const removedRangePastStr = buildSyntheticArm64MachO({
+    gapBytes: 8,
+    includeCodeSignature: false,
+    functionStartsEndOffset: 4160,
+  }).buffer;
+  assert.equal(trimRemovedSignaturePadding(signed8, removedRangePastStr), removedRangePastStr);
+
+  // Excluded / unknown load commands: LC_NOTE (0x31), LC_ENCRYPTION_INFO_64 (0x2c), unknown (0x7fff)
+  for (const [cmdId, size] of [[0x31, 40], [0x2c, 24], [0x7fff, 16]]) {
+    const extra = Buffer.alloc(size, 0);
+    extra.writeUInt32LE(cmdId, 0);
+    extra.writeUInt32LE(size, 4);
+    const s = buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: true, extraCommand: extra }).buffer;
+    const r = buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, extraCommand: extra }).buffer;
+    assert.equal(trimRemovedSignaturePadding(s, r), r, `cmd 0x${cmdId.toString(16)} must not trim`);
+  }
+
+  // Duplicate __LINKEDIT, LC_SYMTAB, or LC_DYSYMTAB
+  for (const opts of [{ duplicateLinkedit: true }, { duplicateSymtab: true }, { duplicateDysymtab: true }]) {
+    const s = buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: true, ...opts }).buffer;
+    const r = buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, ...opts }).buffer;
+    assert.equal(trimRemovedSignaturePadding(s, r), r);
+  }
+
+  // Non-zero section relocations
+  const sRel = buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: true, textSectionNreloc: 1 }).buffer;
+  const rRel = buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, textSectionNreloc: 1 }).buffer;
+  assert.equal(trimRemovedSignaturePadding(sRel, rRel), rRel);
+
+  // Fat, 32-bit, big-endian, non-arm64, truncated, or malformed inputs never throw
+  for (const bad of [
+    Buffer.from([0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2]),
+    Buffer.from([0xbe, 0xba, 0xfe, 0xca, 0, 0, 0, 2]),
+    buildSyntheticArm64MachO({ magic: 0xfeedface, gapBytes: 8, includeCodeSignature: false }).buffer,
+    buildSyntheticArm64MachO({ magic: 0xcffaedfe, gapBytes: 8, includeCodeSignature: false }).buffer,
+    buildSyntheticArm64MachO({ cputype: 0x01000007, gapBytes: 8, includeCodeSignature: false }).buffer,
+    removed8.subarray(0, 20),
+    Buffer.alloc(0),
+  ]) {
+    assert.equal(trimRemovedSignaturePadding(signed8, bad), bad);
+    assert.equal(trimRemovedSignaturePadding(bad, removed8), removed8);
+  }
+  const overflowingCmds = Buffer.from(removed8);
+  overflowingCmds.writeUInt32LE(0xffffffff, 20);
+  assert.equal(trimRemovedSignaturePadding(signed8, overflowingCmds), overflowingCmds);
+  assert.equal(trimRemovedSignaturePadding(null, removed8), removed8);
+});
+
+test('canonicalNativeDigestFromBytes normalizes macOS 15 leftover signature padding while failing closed on non-zero or unsigned gaps', () => {
+  const signed8 = buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: true });
+  const removed8 = buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false });
+  const unpaddedTrimmed = trimRemovedSignaturePadding(signed8.buffer, removed8.buffer);
+  assert.notEqual(unpaddedTrimmed, removed8.buffer);
+
+  const strictStripAcceptsOnlyFilledLinkedit = filePath => {
+    const buf = fs.readFileSync(filePath);
+    const linkeditFilesize = Number(buf.readBigUInt64LE(removed8.linkeditCmdOffset + 48));
+    const linkeditEnd = removed8.linkeditOff + linkeditFilesize;
+    return linkeditEnd === removed8.strEnd && buf.length === removed8.strEnd;
+  };
+
+  // Emulate macOS 15 codesign --remove-signature (truncates only to dataoff, keeping 8 zero bytes) + strict strip -S.
+  const digestFromMacos15Removal = canonicalNativeDigestFromBytes(signed8.buffer, (command, args) => {
+    const target = args[args.length - 1];
+    if (command === '/usr/bin/codesign') {
+      fs.writeFileSync(target, removed8.buffer, { mode: 0o600 });
+      return { ok: true, stdout: '', stderr: '' };
     }
-    if (candidate.startsWith('/var/')) replacements.push([`/private${candidate}`, token]);
-    if (candidate.startsWith('/private/var/')) replacements.push([candidate.slice('/private'.length), token]);
-  };
-  for (const [candidate, token] of extraPaths) addPath(candidate, token);
-  addPath(process.env.TMPDIR, '<tmp>');
-  addPath(os.tmpdir(), '<tmp>');
-  addPath(ROOT, '<repo>');
-  addPath(process.env.HOME, '<home>');
-  addPath(os.homedir(), '<home>');
-  replacements.sort((left, right) => right[0].length - left[0].length);
-  for (const [needle, token] of replacements) {
-    if (needle.length >= 2) text = text.split(needle).join(token);
-  }
-  text = text
-    .replace(/\/(?:private\/)?var\/folders\/[^\s:'"]+/gu, '<tmp>')
-    .replace(/\/Users\/[^/\s:'"]+/gu, '<home>')
-    .replace(/[\r\n\t]+/gu, ' ')
-    .replace(/[^\x20-\x7e]/gu, '?')
-    .trim();
-  if (text.length > maxChars) {
-    return `${text.slice(0, maxChars)}...(+${text.length - maxChars} chars)`;
-  }
-  return text;
-}
-
-function formatPackedMachOVersion(packed) {
-  return `${(packed >>> 16) & 0xffff}.${(packed >>> 8) & 0xff}.${packed & 0xff}`;
-}
-
-function summarizeMachOLayout(bytes) {
-  if (!Buffer.isBuffer(bytes) || bytes.length < 32) {
-    return { valid: false, size: Buffer.isBuffer(bytes) ? bytes.length : null };
-  }
-  const magic = bytes.readUInt32LE(0);
-  const ncmds = bytes.readUInt32LE(16);
-  const sizeofcmds = bytes.readUInt32LE(20);
-  const flags = bytes.readUInt32LE(24);
-  if (magic !== 0xfeedfacf || 32 + sizeofcmds > bytes.length) {
-    return { valid: false, size: bytes.length, magic: `0x${magic.toString(16)}`, ncmds, sizeofcmds };
-  }
-  const summary = {
-    valid: true,
-    size: bytes.length,
-    ncmds,
-    sizeofcmds,
-    flags: `0x${flags.toString(16)}`,
-    linkedit: null,
-    symtab: null,
-    dysymtab: null,
-    codeSignature: null,
-    functionStarts: null,
-    dataInCode: null,
-    exportsTrie: null,
-    chainedFixups: null,
-    buildVersion: null,
-  };
-  let offset = 32;
-  const cmdsEnd = 32 + sizeofcmds;
-  const maxCmds = Math.min(ncmds, 128);
-  for (let index = 0; index < maxCmds; index += 1) {
-    if (offset + 8 > cmdsEnd) break;
-    const cmd = bytes.readUInt32LE(offset);
-    const cmdsize = bytes.readUInt32LE(offset + 4);
-    if (cmdsize < 8 || offset + cmdsize > cmdsEnd) break;
-    if (cmd === 0x19 && cmdsize >= 72) {
-      const segname = bytes.subarray(offset + 8, offset + 24).toString('latin1').replace(/\0+$/u, '');
-      if (segname === '__LINKEDIT') {
-        const fileoff = Number(bytes.readBigUInt64LE(offset + 40));
-        const filesize = Number(bytes.readBigUInt64LE(offset + 48));
-        summary.linkedit = { fileoff, filesize, end: fileoff + filesize };
-      }
-    } else if (cmd === 0x02 && cmdsize >= 24) {
-      const symoff = bytes.readUInt32LE(offset + 8);
-      const nsyms = bytes.readUInt32LE(offset + 12);
-      const stroff = bytes.readUInt32LE(offset + 16);
-      const strsize = bytes.readUInt32LE(offset + 20);
-      const strEnd = stroff + strsize;
-      summary.symtab = { symoff, nsyms, stroff, strsize, strEnd, strEndMod16: strEnd % 16 };
-    } else if (cmd === 0x0b && cmdsize >= 64) {
-      summary.dysymtab = {
-        indirectsymoff: bytes.readUInt32LE(offset + 56),
-        nindirectsyms: bytes.readUInt32LE(offset + 60),
-      };
-    } else if (cmd === 0x1d && cmdsize >= 16) {
-      summary.codeSignature = { dataoff: bytes.readUInt32LE(offset + 8), datasize: bytes.readUInt32LE(offset + 12) };
-    } else if (cmd === 0x26 && cmdsize >= 16) {
-      summary.functionStarts = { dataoff: bytes.readUInt32LE(offset + 8), datasize: bytes.readUInt32LE(offset + 12) };
-    } else if (cmd === 0x29 && cmdsize >= 16) {
-      summary.dataInCode = { dataoff: bytes.readUInt32LE(offset + 8), datasize: bytes.readUInt32LE(offset + 12) };
-    } else if (cmd === 0x80000033 && cmdsize >= 16) {
-      summary.exportsTrie = { dataoff: bytes.readUInt32LE(offset + 8), datasize: bytes.readUInt32LE(offset + 12) };
-    } else if (cmd === 0x80000034 && cmdsize >= 16) {
-      summary.chainedFixups = { dataoff: bytes.readUInt32LE(offset + 8), datasize: bytes.readUInt32LE(offset + 12) };
-    } else if (cmd === 0x32 && cmdsize >= 24) {
-      const ntools = Math.min(bytes.readUInt32LE(offset + 20), 8);
-      const tools = [];
-      for (let toolIndex = 0; toolIndex < ntools; toolIndex += 1) {
-        const toolOffset = offset + 24 + toolIndex * 8;
-        if (toolOffset + 8 > offset + cmdsize) break;
-        tools.push({
-          tool: bytes.readUInt32LE(toolOffset),
-          version: formatPackedMachOVersion(bytes.readUInt32LE(toolOffset + 4)),
-        });
-      }
-      summary.buildVersion = {
-        platform: bytes.readUInt32LE(offset + 8),
-        minos: formatPackedMachOVersion(bytes.readUInt32LE(offset + 12)),
-        sdk: formatPackedMachOVersion(bytes.readUInt32LE(offset + 16)),
-        tools,
-      };
+    if (command === '/usr/bin/strip') {
+      return { ok: strictStripAcceptsOnlyFilledLinkedit(target), stdout: '', stderr: '' };
     }
-    offset += cmdsize;
-  }
-  summary.derived = {
-    linkeditEndMinusStrEnd: summary.linkedit && summary.symtab ? summary.linkedit.end - summary.symtab.strEnd : null,
-    sigOffMinusStrEnd: summary.codeSignature && summary.symtab ? summary.codeSignature.dataoff - summary.symtab.strEnd : null,
-    fileSizeMinusLinkeditEnd: summary.linkedit ? summary.size - summary.linkedit.end : null,
-  };
-  return summary;
-}
-
-function fingerprintExecutable(filePath) {
-  if (typeof filePath !== 'string' || !filePath) return null;
-  try {
-    const stat = fs.statSync(filePath);
-    if (!stat.isFile()) return null;
-    const data = fs.readFileSync(filePath);
-    return {
-      size: data.length,
-      sha256Prefix: crypto.createHash('sha256').update(data).digest('hex').slice(0, 16),
-    };
-  } catch (error) {
-    return { errorCode: error && error.code ? error.code : 'ERR_UNKNOWN' };
-  }
-}
-
-function collectDiagnosticToolProbe(command, args, env, extraPaths) {
-  const result = spawnSync(command, args, {
-    encoding: 'utf8',
-    env,
-    maxBuffer: 1024 * 1024,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 15000,
+    return { ok: false, stdout: '', stderr: '' };
   });
-  return {
-    tool: path.basename(command),
-    args,
-    status: result.status,
-    signal: result.signal,
-    errorCode: result.error && result.error.code ? result.error.code : null,
-    stdout: sanitizeDiagnosticText(result.stdout, extraPaths, 240),
-    stderr: sanitizeDiagnosticText(result.stderr, extraPaths, 240),
-  };
-}
+  const expectedDigest = crypto.createHash('sha256').update(unpaddedTrimmed).digest('hex');
+  assert.equal(digestFromMacos15Removal, expectedDigest);
 
-function emitCanonicalNativeDigestDiagnostics(t, label, bytes) {
-  const emit = payload => {
-    if (t && typeof t.diagnostic === 'function') {
-      t.diagnostic(`native-digest ${JSON.stringify(payload)}`);
+  // Non-zero byte in the 8-byte gap is NOT trimmed -> strict strip rejects -> null.
+  const removedNonZero = buildSyntheticArm64MachO({ gapBytes: 8, gapFill: 0x01, includeCodeSignature: false });
+  const nonZeroGapDigest = canonicalNativeDigestFromBytes(signed8.buffer, (command, args) => {
+    const target = args[args.length - 1];
+    if (command === '/usr/bin/codesign') {
+      fs.writeFileSync(target, removedNonZero.buffer, { mode: 0o600 });
+      return { ok: true, stdout: '', stderr: '' };
     }
-  };
-  try {
-    const env = NATIVE_DIAG_ENV();
-    const inputSummary = summarizeMachOLayout(bytes);
-    const inputSha256Prefix = Buffer.isBuffer(bytes)
-      ? crypto.createHash('sha256').update(bytes).digest('hex').slice(0, 16)
-      : null;
-    const stages = [];
-    const replayDigest = canonicalNativeDigestFromBytes(bytes, (command, args, options = {}) => {
-      const targetPath = Array.isArray(args) && args.length > 0 ? args[args.length - 1] : null;
-      const tempDir = typeof targetPath === 'string' ? path.dirname(targetPath) : null;
-      const extraPaths = tempDir ? [[tempDir, '<digest-tmp>']] : [];
-      let beforeLayout = null;
-      if (typeof targetPath === 'string') {
-        try {
-          beforeLayout = summarizeMachOLayout(fs.readFileSync(targetPath));
-        } catch (error) {
-          beforeLayout = { readErrorCode: error && error.code ? error.code : 'ERR_UNKNOWN' };
-        }
-      }
-      const result = spawnSync(command, args, {
-        encoding: 'utf8',
-        env,
-        input: options.input,
-        maxBuffer: 16 * 1024 * 1024,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        cwd: options.cwd,
-        timeout: 30000,
-      });
-      const ok = !result.error && result.status === 0;
-      let afterLayout = null;
-      if (typeof targetPath === 'string') {
-        try {
-          afterLayout = summarizeMachOLayout(fs.readFileSync(targetPath));
-        } catch (error) {
-          afterLayout = { readErrorCode: error && error.code ? error.code : 'ERR_UNKNOWN' };
-        }
-      }
-      const tool = path.basename(command);
-      const stage = tool === 'codesign' && Array.isArray(args) && args.includes('--remove-signature')
-        ? 'remove-signature'
-        : tool;
-      const sanitizedArgs = Array.isArray(args)
-        ? args.map((arg, index) => (index === args.length - 1 ? '<target>' : sanitizeDiagnosticText(arg, extraPaths, 120)))
-        : [];
-      const afterChanged = JSON.stringify(afterLayout) !== JSON.stringify(beforeLayout);
-      stages.push({
-        stage,
-        tool,
-        args: sanitizedArgs,
-        ok,
-        status: result.status,
-        signal: result.signal,
-        errorCode: result.error && result.error.code ? result.error.code : null,
-        stdout: sanitizeDiagnosticText(result.stdout, extraPaths, 600),
-        stderr: sanitizeDiagnosticText(result.stderr, extraPaths, 600),
-        before: beforeLayout,
-        after: afterChanged || !ok ? afterLayout : 'unchanged',
-      });
-      return {
-        ok,
-        stdout: result.stdout || '',
-        stderr: result.stderr || '',
-      };
-    });
-
-    emit({
-      event: 'summary',
-      label,
-      inputSha256Prefix,
-      replayReturnedNull: replayDigest === null,
-      replayDigestIsHex: NATIVE_DIGEST_HEX_RE.test(String(replayDigest)),
-      stageCount: stages.length,
-      envFlags: {
-        DEVELOPER_DIR: Boolean(process.env.DEVELOPER_DIR),
-        SDKROOT: Boolean(process.env.SDKROOT),
-        TOOLCHAINS: Boolean(process.env.TOOLCHAINS),
-      },
-      inputLayout: inputSummary,
-    });
-    for (const stageRecord of stages) {
-      emit({ event: 'stage', label, ...stageRecord });
+    if (command === '/usr/bin/strip') {
+      return { ok: strictStripAcceptsOnlyFilledLinkedit(target), stdout: '', stderr: '' };
     }
+    return { ok: false, stdout: '', stderr: '' };
+  });
+  assert.equal(nonZeroGapDigest, null);
 
-    const rawStripProbe = spawnSync('/usr/bin/xcrun', ['--find', 'strip'], {
-      encoding: 'utf8',
-      env,
-      maxBuffer: 256 * 1024,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 15000,
-    });
-    const resolvedStripPath = !rawStripProbe.error && rawStripProbe.status === 0
-      ? String(rawStripProbe.stdout || '').trim()
-      : '';
-    emit({
-      event: 'toolchain',
-      label,
-      swVersProduct: collectDiagnosticToolProbe('/usr/bin/sw_vers', ['-productVersion'], env, []),
-      swVersBuild: collectDiagnosticToolProbe('/usr/bin/sw_vers', ['-buildVersion'], env, []),
-      swiftc: collectDiagnosticToolProbe('/usr/bin/swiftc', ['--version'], env, []),
-      xcodeSelect: collectDiagnosticToolProbe('/usr/bin/xcode-select', ['-p'], env, []),
-      xcodebuild: collectDiagnosticToolProbe('/usr/bin/xcodebuild', ['-version'], env, []),
-      xcrunStrip: {
-        tool: 'xcrun',
-        args: ['--find', 'strip'],
-        status: rawStripProbe.status,
-        signal: rawStripProbe.signal,
-        errorCode: rawStripProbe.error && rawStripProbe.error.code ? rawStripProbe.error.code : null,
-        stdout: sanitizeDiagnosticText(rawStripProbe.stdout, [], 240),
-        stderr: sanitizeDiagnosticText(rawStripProbe.stderr, [], 240),
-      },
-      xcrunLd: collectDiagnosticToolProbe('/usr/bin/xcrun', ['ld', '-v'], env, []),
-      fingerprints: {
-        codesign: fingerprintExecutable('/usr/bin/codesign'),
-        strip: fingerprintExecutable(resolvedStripPath),
-      },
-    });
-  } catch (error) {
-    emit({
-      event: 'diagnostic-error',
-      label,
-      errorName: error && error.name ? error.name : 'Error',
-      errorCode: error && error.code ? error.code : null,
-    });
-  }
-}
+  // Already-unsigned binary with 8 trailing zero bytes is NOT trimmed -> strict strip rejects -> null.
+  const unsignedPaddedDigest = canonicalNativeDigestFromBytes(removed8.buffer, (command, args) => {
+    const target = args[args.length - 1];
+    if (command === '/usr/bin/codesign') {
+      return { ok: true, stdout: '', stderr: '' };
+    }
+    if (command === '/usr/bin/strip') {
+      return { ok: strictStripAcceptsOnlyFilledLinkedit(target), stdout: '', stderr: '' };
+    }
+    return { ok: false, stdout: '', stderr: '' };
+  });
+  assert.equal(unsignedPaddedDigest, null);
+});
 
 test('native helper recipe matches the developer build script token for token', () => {
   const script = fs.readFileSync(path.join(ROOT, 'scripts', 'build-native-helper.sh'), 'utf8');
@@ -6017,9 +6010,6 @@ test('canonical helper digest survives runtime re-signing but not a code byte ch
   fs.writeFileSync(helperPath, compiled, { mode: 0o755 });
 
   const compiledDigest = canonicalNativeDigestFromBytes(compiled);
-  if (!NATIVE_DIGEST_HEX_RE.test(String(compiledDigest))) {
-    emitCanonicalNativeDigestDiagnostics(t, 'compiled', compiled);
-  }
   assert.match(String(compiledDigest), /^[a-f0-9]{64}$/u);
   assert.notEqual(codesignStrictRequirement(helperPath).status, 0);
 
@@ -6036,17 +6026,87 @@ test('canonical helper digest survives runtime re-signing but not a code byte ch
   assert.equal(resigned.status, 0);
   const resignedBytes = fs.readFileSync(helperPath);
   assert.equal(resignedBytes.equals(compiled), false);
-  const resignedDigest = canonicalNativeDigestFromBytes(resignedBytes);
-  if (!NATIVE_DIGEST_HEX_RE.test(String(resignedDigest))) {
-    emitCanonicalNativeDigestDiagnostics(t, 'resigned', resignedBytes);
-  }
-  assert.equal(resignedDigest, compiledDigest);
+  assert.equal(canonicalNativeDigestFromBytes(resignedBytes), compiledDigest);
   assert.notEqual(codesignStrictRequirement(helperPath).status, 0);
+
+  const largeSigPath = path.join(directory, 'crate-helper-large-sig');
+  fs.writeFileSync(largeSigPath, compiled, { mode: 0o755 });
+  const largeResigned = spawnSync('/usr/bin/codesign', [
+    '--force',
+    '--sign',
+    '-',
+    '--options',
+    'runtime',
+    '--signature-size',
+    '24000',
+    '--entitlements',
+    path.join(ROOT, 'entitlements.inherit.plist'),
+    largeSigPath,
+  ], { env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' }, encoding: 'utf8' });
+  assert.equal(largeResigned.status, 0);
+  const largeResignedBytes = fs.readFileSync(largeSigPath);
+  assert.equal(largeResignedBytes.length > compiled.length + 16384, true);
+  assert.equal(canonicalNativeDigestFromBytes(largeResignedBytes), compiledDigest);
+  assert.notEqual(codesignStrictRequirement(largeSigPath).status, 0);
 
   const unsignedPath = path.join(directory, 'unsigned');
   fs.writeFileSync(unsignedPath, compiled, { mode: 0o755 });
   assert.equal(spawnSync('/usr/bin/codesign', ['--remove-signature', unsignedPath]).status, 0);
   assert.notEqual(codesignStrictRequirement(unsignedPath).status, 0);
+
+  // When the compiled helper has alignment padding before LC_CODE_SIGNATURE (8 bytes at this revision),
+  // emulate macOS 15 codesign --remove-signature leaving those zero bytes and verify real /usr/bin/strip -S
+  // succeeds after trimRemovedSignaturePadding() and fails closed when a pad byte is non-zero.
+  const unsignedBytes = fs.readFileSync(unsignedPath);
+  let compiledSigOff = null;
+  let unsignedLinkeditCmdOff = null;
+  {
+    let off = 32;
+    const count = compiled.readUInt32LE(16);
+    for (let index = 0; index < count; index += 1) {
+      const cmd = compiled.readUInt32LE(off);
+      const size = compiled.readUInt32LE(off + 4);
+      if (cmd === 0x1d) compiledSigOff = compiled.readUInt32LE(off + 8);
+      off += size;
+    }
+    off = 32;
+    const uCount = unsignedBytes.readUInt32LE(16);
+    for (let index = 0; index < uCount; index += 1) {
+      const cmd = unsignedBytes.readUInt32LE(off);
+      const size = unsignedBytes.readUInt32LE(off + 4);
+      if (cmd === 0x19 && unsignedBytes.subarray(off + 8, off + 24).toString('latin1').replace(/\0+$/u, '') === '__LINKEDIT') {
+        unsignedLinkeditCmdOff = off;
+      }
+      off += size;
+    }
+  }
+  if (compiledSigOff !== null && unsignedLinkeditCmdOff !== null && compiledSigOff > unsignedBytes.length) {
+    const gap = compiledSigOff - unsignedBytes.length;
+    const makeMacos15Padded = fillByte => {
+      const padded = Buffer.concat([unsignedBytes, Buffer.alloc(gap, fillByte)]);
+      const oldFilesize = padded.readBigUInt64LE(unsignedLinkeditCmdOff + 48);
+      padded.writeBigUInt64LE(oldFilesize + BigInt(gap), unsignedLinkeditCmdOff + 48);
+      return padded;
+    };
+    const paddedZeros = makeMacos15Padded(0x00);
+    const paddedNonZero = makeMacos15Padded(0x01);
+    const runRealStrip = (command, args) => {
+      const result = spawnSync(command, args, {
+        encoding: 'utf8',
+        env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' },
+      });
+      return { ok: !result.error && result.status === 0, stdout: result.stdout || '', stderr: result.stderr || '' };
+    };
+    const emulatedRunner = paddedBuffer => (command, args) => {
+      if (command === '/usr/bin/codesign') {
+        fs.writeFileSync(args[args.length - 1], paddedBuffer, { mode: 0o600 });
+        return { ok: true, stdout: '', stderr: '' };
+      }
+      return runRealStrip(command, args);
+    };
+    assert.equal(canonicalNativeDigestFromBytes(compiled, emulatedRunner(paddedZeros)), compiledDigest);
+    assert.equal(canonicalNativeDigestFromBytes(compiled, emulatedRunner(paddedNonZero)), null);
+  }
 
   const text = machOTextSectionRange(compiled);
   assert.ok(text && text.size > 0);
@@ -6054,9 +6114,6 @@ test('canonical helper digest survives runtime re-signing but not a code byte ch
   const flipOffset = text.offset + Math.floor(text.size / 2);
   flipped[flipOffset] ^= 0x01;
   const flippedDigest = canonicalNativeDigestFromBytes(flipped);
-  if (!NATIVE_DIGEST_HEX_RE.test(String(flippedDigest))) {
-    emitCanonicalNativeDigestDiagnostics(t, 'flipped', flipped);
-  }
   assert.match(String(flippedDigest), /^[a-f0-9]{64}$/u);
   assert.notEqual(flippedDigest, compiledDigest);
 });
