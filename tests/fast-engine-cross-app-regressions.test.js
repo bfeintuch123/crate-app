@@ -707,7 +707,7 @@ test('main.js behavioral IPC coalescing: preserves valid caller over later stale
   assert.equal(nonElectronEmitted[1].payload.delta.changed, true);
 });
 
-test('Keynote (.key): safely rejects ambiguous or non-UTF-8 ZIP media entry names instead of silently omitting a member (A8)', async t => {
+test('Keynote (.key) & PPTX: safely reject colliding non-UTF-8 ZIP media entry names while preserving unambiguous legacy entries (A8)', async t => {
   const { openZipArchive } = require('../parsers/zip-reader');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-keynote-a8-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -754,7 +754,28 @@ test('Keynote (.key): safely rejects ambiguous or non-UTF-8 ZIP media entry name
   assert.deepEqual(extracted, []);
   assert.deepEqual(fs.readdirSync(extractOutDir), []);
 
-  // 2. Single non-UTF-8 legacy media name in Keynote is also safely rejected via inspection/extraction error
+  // Direct PPTX extraction with colliding non-UTF-8 media names must also refuse via hasAmbiguousPath
+  const collidingPptxPath = path.join(dir, 'colliding-legacy.pptx');
+  const pptNameA = Buffer.concat([Buffer.from('ppt/media/img-'), Buffer.from([0x80]), Buffer.from('.jpg')]);
+  const pptNameB = Buffer.concat([Buffer.from('ppt/media/img-'), Buffer.from([0x81]), Buffer.from('.jpg')]);
+  fs.writeFileSync(collidingPptxPath, buildSyntheticZip([
+    { name: pptNameA, data: imgA },
+    { name: pptNameB, data: imgB },
+  ]));
+  const pptOutDir = path.join(dir, 'out-colliding-pptx');
+  fs.mkdirSync(pptOutDir, { recursive: true });
+  const pptExtErrors = [];
+  const pptExtracted = await parser.extractToDirectory(
+    collidingPptxPath,
+    pptOutDir,
+    [{ path: 'img-\uFFFD.jpg', source: 'pptx-embedded', exists: true, zipPath: 'ppt/media/img-\uFFFD.jpg', size: imgA.length }],
+    { onExtractionError: err => pptExtErrors.push(err) }
+  );
+  assert.equal(pptExtErrors.length, 1, 'ambiguous PPTX direct extraction must report an extraction error');
+  assert.deepEqual(pptExtracted, []);
+  assert.deepEqual(fs.readdirSync(pptOutDir), []);
+
+  // 2. Unambiguous single non-UTF-8 legacy media name in Keynote is preserved and extracted cleanly
   const singleLegacyKeyPath = path.join(dir, 'single-legacy.key');
   const legacyName = Buffer.concat([Buffer.from('Data/caf'), Buffer.from([0x8e]), Buffer.from('-2001.jpg')]);
   fs.writeFileSync(singleLegacyKeyPath, buildSyntheticZip([{ name: legacyName, data: imgA }]));
@@ -762,8 +783,17 @@ test('Keynote (.key): safely rejects ambiguous or non-UTF-8 ZIP media entry name
   const singleDiscovered = await parser.extractAssets(singleLegacyKeyPath, {
     onInspectionError: err => singleErrors.push(err),
   });
-  assert.equal(singleErrors.length, 1);
-  assert.deepEqual(singleDiscovered, []);
+  assert.equal(singleErrors.length, 0);
+  assert.equal(singleDiscovered.length, 1);
+  const singleOutDir = path.join(dir, 'out-single-legacy');
+  fs.mkdirSync(singleOutDir, { recursive: true });
+  const singleExtErrors = [];
+  const singleExtracted = await parser.extractToDirectory(singleLegacyKeyPath, singleOutDir, singleDiscovered, {
+    onExtractionError: err => singleExtErrors.push(err),
+  });
+  assert.equal(singleExtErrors.length, 0);
+  assert.equal(singleExtracted.length, 1);
+  assert.deepEqual(fs.readFileSync(singleExtracted[0].extractedPath), imgA);
 
   // 3. Positive control: valid UTF-8 Keynote media (including non-ASCII UTF-8) extracts cleanly
   const validUtf8KeyPath = path.join(dir, 'valid-utf8.key');
