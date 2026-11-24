@@ -29,6 +29,17 @@ struct CrateHelperMain {
         }
     }
 
+    static func parsePositiveInt64(_ raw: Any) -> Int64? {
+        guard let num = raw as? NSNumber else { return nil }
+        if CFGetTypeID(num) == CFBooleanGetTypeID() { return nil }
+        let dbl = num.doubleValue
+        if !dbl.isFinite || dbl <= 0 || floor(dbl) != dbl || dbl > Double(Int64.max) {
+            return nil
+        }
+        let val = num.int64Value
+        return val > 0 ? val : nil
+    }
+
     static func dispatch(op: String, req: [String: Any], reqId: Any) -> [String: Any] {
         switch op {
         case "ping":
@@ -47,8 +58,19 @@ struct CrateHelperMain {
                 return ["id": reqId, "ok": false, "error": "missing_file_path"]
             }
             let includeDigest = (req["includeDigest"] as? Bool) ?? false
+            var maxFileBytes: Int64? = nil
+            if let rawMax = req["maxFileBytes"], !(rawMax is NSNull) {
+                guard let parsedMax = parsePositiveInt64(rawMax) else {
+                    return ["id": reqId, "ok": false, "error": "invalid_max_file_bytes"]
+                }
+                maxFileBytes = parsedMax
+            }
             do {
-                let result = try PsdParser.parse(filePath: filePath, includeDigest: includeDigest)
+                let result = try PsdParser.parse(
+                    filePath: filePath,
+                    includeDigest: includeDigest,
+                    maxFileBytes: maxFileBytes
+                )
                 return ["id": reqId, "ok": true, "result": result]
             } catch let err as HelperError {
                 return ["id": reqId, "ok": false, "error": err.code]
@@ -62,11 +84,19 @@ struct CrateHelperMain {
             }
             let includeDigest = (req["includeDigest"] as? Bool) ?? false
             let decompressStreams = (req["decompressStreams"] as? Bool) ?? true
+            var maxFileBytes: Int64? = nil
+            if let rawMax = req["maxFileBytes"], !(rawMax is NSNull) {
+                guard let parsedMax = parsePositiveInt64(rawMax) else {
+                    return ["id": reqId, "ok": false, "error": "invalid_max_file_bytes"]
+                }
+                maxFileBytes = parsedMax
+            }
             do {
                 let result = try PdfAiParser.parse(
                     filePath: filePath,
                     includeDigest: includeDigest,
-                    decompressStreams: decompressStreams
+                    decompressStreams: decompressStreams,
+                    maxFileBytes: maxFileBytes
                 )
                 return ["id": reqId, "ok": true, "result": result]
             } catch let err as HelperError {

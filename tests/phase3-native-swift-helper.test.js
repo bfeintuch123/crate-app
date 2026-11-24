@@ -981,3 +981,114 @@ test('Swift PdfAiParser enforces reference count & byte ceilings during scanning
     error => error && error.code === 'pdf_ai_reference_limit'
   );
 });
+
+test('Swift parsePdfAi and parsePsd enforce per-request maxFileBytes at fstat and reject invalid limits (N1)', { skip: !hasNativeBinary }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-swift-max-bytes-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const client = new NativeHelperClient(DEFAULT_BINARY_PATH);
+  t.after(() => client.shutdown());
+
+  // Benign ~1 KiB synthetic .ai and .psd fixtures
+  const aiPath = path.join(dir, 'sample.ai');
+  fs.writeFileSync(aiPath, `%PDF-1.6\n% ${'x'.repeat(1024)}\n/Users/synthetic-n1/a.png\n%%EOF\n`);
+  const psdBytes = agPsd.writePsdBuffer({
+    width: 4,
+    height: 4,
+    linkedFiles: [{
+      id: '66666666-6666-4666-8666-666666666666',
+      name: 'a.png',
+      childDocumentID: '',
+      linkedFile: {
+        fullPath: '/Users/synthetic-n1/a.png',
+        originalPath: '/Users/synthetic-n1/a.png',
+        relativePath: '',
+        name: 'a.png',
+        fileSize: 16,
+      },
+    }],
+  });
+  const psdPath = path.join(dir, 'sample.psd');
+  fs.writeFileSync(psdPath, Buffer.concat([psdBytes, Buffer.alloc(1024)]));
+
+  const aiSize = fs.statSync(aiPath).size;
+  const psdSize = fs.statSync(psdPath).size;
+  assert.ok(aiSize > 512 && psdSize > 512);
+
+  // Under-size limit rejected directly at fstat with typed code
+  await assert.rejects(
+    () => client.parsePdfAi(aiPath, { decompressStreams: true, maxFileBytes: 512 }),
+    error => error && error.code === 'pdf_ai_too_large'
+  );
+  await assert.rejects(
+    () => client.parsePsd(psdPath, { maxFileBytes: 512 }),
+    error => error && error.code === 'psd_too_large'
+  );
+
+  // Exact file size limit succeeds
+  const aiOk = await client.parsePdfAi(aiPath, { decompressStreams: true, maxFileBytes: aiSize });
+  assert.deepEqual(aiOk.paths, ['/Users/synthetic-n1/a.png']);
+  const psdOk = await client.parsePsd(psdPath, { maxFileBytes: psdSize });
+  assert.deepEqual(psdOk.linkedPaths, ['/Users/synthetic-n1/a.png']);
+
+  // Non-positive or non-integer maxFileBytes rejected explicitly (never treated as absent)
+  for (const badLimit of [0, -1, 1.5, true, '512']) {
+    await assert.rejects(
+      () => client.parsePdfAi(aiPath, { decompressStreams: true, maxFileBytes: badLimit }),
+      error => error && error.code === 'invalid_max_file_bytes'
+    );
+    await assert.rejects(
+      () => client.parsePsd(psdPath, { maxFileBytes: badLimit }),
+      error => error && error.code === 'invalid_max_file_bytes'
+    );
+  }
+});
+
+test('Swift PdfAiParser charges failed FlateDecode attempts & produced bytes and bounds unterminated stream scans (N2)', { skip: !hasNativeBinary }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-swift-flate-fail-budget-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const client = new NativeHelperClient(DEFAULT_BINARY_PATH);
+  t.after(() => client.shutdown());
+
+  // 1. >512 tiny invalid-zlib FlateDecode streams must charge streamAttempts and hit flate-stream-count-limit
+  const badStreamParts = [Buffer.from('%PDF-1.6\n')];
+  for (let i = 1; i <= 520; i += 1) {
+    badStreamParts.push(Buffer.from(`${i} 0 obj\n<< /Filter /FlateDecode /Length 8 >>\nstream\nnot-zlib\nendstream\nendobj\n`));
+  }
+  badStreamParts.push(Buffer.from('%%EOF\n'));
+  const badStreamsPath = path.join(dir, 'invalid-flate-count.ai');
+  fs.writeFileSync(badStreamsPath, Buffer.concat(badStreamParts));
+
+  const badCountRes = await client.parsePdfAi(badStreamsPath, { decompressStreams: true });
+  assert.equal(badCountRes.incomplete, true);
+  assert.equal(badCountRes.compressedStreamsScanned, 0, 'failed streams must not inflate compressedStreamsScanned');
+  assert.ok(badCountRes.issues.includes('flate-stream-budget-or-decode'));
+  assert.ok(badCountRes.issues.includes('flate-stream-count-limit'), 'failed attempts must still exhaust the 512-stream cap');
+
+  // 2. 10 benign streams that each expand slightly over 8 MiB must debit produced bytes on failure
+  //    and stop at flate-total-output-limit (64 MiB)
+  const nineMbSpacesCompressed = zlib.deflateSync(Buffer.alloc(9 * 1024 * 1024, 0x20));
+  const overOutParts = [Buffer.from('%PDF-1.6\n')];
+  for (let i = 1; i <= 10; i += 1) {
+    overOutParts.push(Buffer.from(`${i} 0 obj\n<< /Filter /FlateDecode /Length ${nineMbSpacesCompressed.length} >>\nstream\n`));
+    overOutParts.push(nineMbSpacesCompressed);
+    overOutParts.push(Buffer.from('\nendstream\nendobj\n'));
+  }
+  overOutParts.push(Buffer.from('%%EOF\n'));
+  const overOutPath = path.join(dir, 'over-output-flate.ai');
+  fs.writeFileSync(overOutPath, Buffer.concat(overOutParts));
+
+  const overOutRes = await client.parsePdfAi(overOutPath, { decompressStreams: true });
+  assert.equal(overOutRes.incomplete, true);
+  assert.equal(overOutRes.compressedStreamsScanned, 0);
+  assert.ok(overOutRes.issues.includes('flate-stream-budget-or-decode'));
+  assert.ok(overOutRes.issues.includes('flate-total-output-limit'), 'bytes produced before failure must exhaust the 64 MiB cap');
+
+  // 3. Repeated unterminated `stream\n` markers with no `endstream` complete in linear time (no O(N^2) rescan)
+  const unterminatedPath = path.join(dir, 'unterminated-streams.ai');
+  const repeatedTokens = Buffer.from('<< /Filter /FlateDecode >>\nstream\n'.repeat(30000));
+  fs.writeFileSync(unterminatedPath, Buffer.concat([Buffer.from('%PDF-1.6\n'), repeatedTokens, Buffer.from('\n%%EOF\n')]));
+
+  const unterminatedRes = await client.parsePdfAi(unterminatedPath, { decompressStreams: true });
+  assert.equal(unterminatedRes.incomplete, true);
+  assert.ok(unterminatedRes.issues.includes('flate-endstream-unbounded'));
+});

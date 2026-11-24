@@ -685,3 +685,136 @@ test('Illustrator Quick Package enforces raw repeat count & byte budgets during 
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
+
+test('Quick Package AI & PSD pass maxFileBytes to native helpers and enforce descriptor-size errors without fallback (N1)', async () => {
+  const { nativeHelper } = require('../parsers/native-helper');
+  const agPsd = require('ag-psd');
+  const tmpRoot = makeTempDir();
+  const origIsAvailable = nativeHelper.isAvailable;
+  const origParsePdfAi = nativeHelper.parsePdfAi;
+  const origParsePsd = nativeHelper.parsePsd;
+  try {
+    const aiPath = path.join(tmpRoot, 'tiny.ai');
+    fs.writeFileSync(aiPath, '/Users/crate-n1/ai-fallback.png\n');
+    const psdPath = path.join(tmpRoot, 'tiny.psd');
+    fs.writeFileSync(
+      psdPath,
+      agPsd.writePsdBuffer({
+        width: 1,
+        height: 1,
+        linkedFiles: [{
+          id: '55555555-5555-4555-8555-555555555555',
+          name: 'psd-fallback.png',
+          childDocumentID: '',
+          linkedFile: {
+            fullPath: '/Users/crate-n1/psd-fallback.png',
+            originalPath: '/Users/crate-n1/psd-fallback.png',
+            relativePath: '',
+            name: 'psd-fallback.png',
+            fileSize: 1,
+          },
+        }],
+      })
+    );
+
+    nativeHelper.isAvailable = () => true;
+
+    // 1. Both callers pass maxFileBytes === localParserFileBytes and map typed *_too_large to admissionError (no fallback)
+    let seenAiOpts = null;
+    nativeHelper.parsePdfAi = async (_file, opts) => {
+      seenAiOpts = opts;
+      const err = new Error('pdf_ai_too_large');
+      err.code = 'pdf_ai_too_large';
+      throw err;
+    };
+    await assert.rejects(
+      () => new AIParser().extractAssets(aiPath),
+      error => isParserAdmissionError(error)
+    );
+    assert.equal(seenAiOpts && seenAiOpts.maxFileBytes, ADMISSION_LIMITS.localParserFileBytes);
+
+    let seenPsdOpts = null;
+    nativeHelper.parsePsd = async (_file, opts) => {
+      seenPsdOpts = opts;
+      const err = new Error('psd_too_large');
+      err.code = 'psd_too_large';
+      throw err;
+    };
+    await assert.rejects(
+      () => new PSDParser().extractAssets(psdPath),
+      error => isParserAdmissionError(error)
+    );
+    assert.equal(seenPsdOpts && seenPsdOpts.maxFileBytes, ADMISSION_LIMITS.localParserFileBytes);
+
+    // 2. Oversized sourceIdentity.size returned from helper rejects with admissionError (no fallback)
+    nativeHelper.parsePdfAi = async () => ({
+      paths: ['/Users/crate-n1/should-not-accept.png'],
+      incomplete: false,
+      issues: [],
+      sourceIdentity: { size: ADMISSION_LIMITS.localParserFileBytes + 1 },
+    });
+    await assert.rejects(
+      () => new AIParser().extractAssets(aiPath),
+      error => isParserAdmissionError(error)
+    );
+
+    nativeHelper.parsePsd = async () => ({
+      linkedPaths: ['/Users/crate-n1/should-not-accept.png'],
+      mediaPaths: [],
+      incomplete: false,
+      issues: [],
+      sourceIdentity: { size: ADMISSION_LIMITS.localParserFileBytes + 1 },
+    });
+    await assert.rejects(
+      () => new PSDParser().extractAssets(psdPath),
+      error => isParserAdmissionError(error)
+    );
+
+    // 3. Exact at-limit sourceIdentity.size is accepted
+    nativeHelper.parsePdfAi = async () => ({
+      paths: ['/Users/crate-n1/at-limit.png'],
+      incomplete: false,
+      issues: [],
+      sourceIdentity: { size: ADMISSION_LIMITS.localParserFileBytes },
+    });
+    assert.deepEqual(await new AIParser().extractAssets(aiPath), [
+      { path: '/Users/crate-n1/at-limit.png', source: 'ai-regex', exists: false },
+    ]);
+
+    nativeHelper.parsePsd = async () => ({
+      linkedPaths: ['/Users/crate-n1/at-limit-psd.png'],
+      mediaPaths: [],
+      incomplete: false,
+      issues: [],
+      sourceIdentity: { size: ADMISSION_LIMITS.localParserFileBytes },
+    });
+    assert.deepEqual(await new PSDParser().extractAssets(psdPath), [
+      { path: '/Users/crate-n1/at-limit-psd.png', source: 'psd-smartobject', exists: false },
+    ]);
+
+    // 4. Missing sourceIdentity falls back cleanly to descriptor-bound JS reader (not mislabeled as too large)
+    nativeHelper.parsePdfAi = async () => ({
+      paths: ['/Users/crate-n1/unverified.png'],
+      incomplete: false,
+      issues: [],
+    });
+    assert.deepEqual(await new AIParser().extractAssets(aiPath), [
+      { path: '/Users/crate-n1/ai-fallback.png', source: 'ai-regex', exists: false },
+    ]);
+
+    nativeHelper.parsePsd = async () => ({
+      linkedPaths: ['/Users/crate-n1/unverified.png'],
+      mediaPaths: [],
+      incomplete: false,
+      issues: [],
+    });
+    assert.deepEqual(await new PSDParser().extractAssets(psdPath), [
+      { path: '/Users/crate-n1/psd-fallback.png', source: 'psd-smartobject', exists: false },
+    ]);
+  } finally {
+    nativeHelper.isAvailable = origIsAvailable;
+    nativeHelper.parsePdfAi = origParsePdfAi;
+    nativeHelper.parsePsd = origParsePsd;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});

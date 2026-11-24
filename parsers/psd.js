@@ -10,8 +10,8 @@ const { readPsd } = require('ag-psd');
 class PSDParser extends BaseParser {
   async extractAssets(filePath) {
     // Fast path: seek-based native Swift PSD/PSB metadata reader skips pixel data
-    // entirely, parsing even multi-hundred-MB PSD/PSB files in milliseconds.
-    // Enforce the standard local file budget on non-PSB / symlink guards first.
+    // entirely. Enforce the Quick Package 256 MiB file-size budget both before
+    // dispatch and on the helper's own fstat descriptor.
     // When ag-psd's readPsd has been wrapped by a dependency contract spy, fall
     // through to the ag-psd fallback so the spy can audit its options directly.
     if (nativeHelper.isAvailable() && readPsd.name === 'readPsd') {
@@ -23,9 +23,22 @@ class PSDParser extends BaseParser {
         throw admissionError('This design file is too large for Crate to inspect safely.');
       }
       try {
-        const parsed = await nativeHelper.parsePsd(filePath);
+        const parsed = await nativeHelper.parsePsd(filePath, {
+          maxFileBytes: ADMISSION_LIMITS.localParserFileBytes,
+        });
         if (parsed && (parsed.incomplete === true || (Array.isArray(parsed.issues) && parsed.issues.length > 0))) {
           throw new Error('psd_native_incomplete');
+        }
+        const reportedSize = parsed && parsed.sourceIdentity && parsed.sourceIdentity.size;
+        if (typeof reportedSize !== 'number') {
+          throw new Error('psd_native_missing_source_identity');
+        }
+        if (
+          !Number.isSafeInteger(reportedSize)
+          || reportedSize < 0
+          || reportedSize > ADMISSION_LIMITS.localParserFileBytes
+        ) {
+          throw admissionError('This design file is too large for Crate to inspect safely.');
         }
         const assets = [];
         for (const rawCandidate of [...(parsed.linkedPaths || []), ...(parsed.mediaPaths || [])]) {
@@ -36,6 +49,9 @@ class PSDParser extends BaseParser {
         }
         return this.deduplicateAssets(assets);
       } catch (err) {
+        if (err && err.code === 'psd_too_large') {
+          throw admissionError('This design file is too large for Crate to inspect safely.');
+        }
         if (err && (
           err.code === 'CRATE_PARSER_ADMISSION_LIMIT' ||
           err.code === 'Invalid layer size' ||

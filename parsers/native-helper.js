@@ -230,12 +230,20 @@ class NativeHelperClient {
     return this.call('ping');
   }
 
-  parsePsd(filePath, { includeDigest = false, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
-    return this.call('parse_psd', { filePath, includeDigest }, timeoutMs);
+  parsePsd(filePath, { includeDigest = false, maxFileBytes = null, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
+    const payload = { filePath, includeDigest };
+    if (maxFileBytes !== null && maxFileBytes !== undefined) {
+      payload.maxFileBytes = maxFileBytes;
+    }
+    return this.call('parse_psd', payload, timeoutMs);
   }
 
-  parsePdfAi(filePath, { includeDigest = false, decompressStreams = true, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
-    return this.call('parse_pdf_ai', { filePath, includeDigest, decompressStreams }, timeoutMs);
+  parsePdfAi(filePath, { includeDigest = false, decompressStreams = true, maxFileBytes = null, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
+    const payload = { filePath, includeDigest, decompressStreams };
+    if (maxFileBytes !== null && maxFileBytes !== undefined) {
+      payload.maxFileBytes = maxFileBytes;
+    }
+    return this.call('parse_pdf_ai', payload, timeoutMs);
   }
 
   sha256File(filePath, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {

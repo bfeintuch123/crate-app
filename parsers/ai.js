@@ -280,9 +280,23 @@ class AIParser extends BaseParser {
         throw admissionError('This design file is too large for Crate to inspect safely.');
       }
       try {
-        const parsed = await nativeHelper.parsePdfAi(filePath, { decompressStreams: true });
+        const parsed = await nativeHelper.parsePdfAi(filePath, {
+          decompressStreams: true,
+          maxFileBytes: ADMISSION_LIMITS.localParserFileBytes,
+        });
         if (parsed && (parsed.incomplete === true || (Array.isArray(parsed.issues) && parsed.issues.length > 0))) {
           throw new Error('pdf_ai_native_incomplete');
+        }
+        const reportedSize = parsed && parsed.sourceIdentity && parsed.sourceIdentity.size;
+        if (typeof reportedSize !== 'number') {
+          throw new Error('pdf_ai_native_missing_source_identity');
+        }
+        if (
+          !Number.isSafeInteger(reportedSize)
+          || reportedSize < 0
+          || reportedSize > ADMISSION_LIMITS.localParserFileBytes
+        ) {
+          throw admissionError('This design file is too large for Crate to inspect safely.');
         }
         for (const linkedPath of (parsed && parsed.paths) || []) {
           if (!this.isUserPath(linkedPath) || !isSupportedQuickAiLinkedPath(linkedPath)) continue;
@@ -295,6 +309,9 @@ class AIParser extends BaseParser {
         }
         return this.deduplicateAssets(assets);
       } catch (err) {
+        if (err && err.code === 'pdf_ai_too_large') {
+          throw admissionError('This design file is too large for Crate to inspect safely.');
+        }
         if (err && err.code === 'pdf_ai_reference_limit') {
           throw admissionError(AI_REFERENCE_LIMIT_MESSAGE);
         }

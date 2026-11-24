@@ -309,7 +309,7 @@ enum PsdParser {
         }
     }
 
-    static func parse(filePath: String, includeDigest: Bool) throws -> [String: Any] {
+    static func parse(filePath: String, includeDigest: Bool, maxFileBytes: Int64? = nil) throws -> [String: Any] {
         let fd = Darwin.open(filePath, O_RDONLY | O_NOFOLLOW)
         if fd < 0 {
             if errno == ELOOP { throw HelperError("asset_baseline_source_symlink") }
@@ -322,6 +322,9 @@ enum PsdParser {
         if (st.st_mode & S_IFMT) != S_IFREG { throw HelperError("asset_baseline_source_not_file") }
 
         let fileSize = Int64(st.st_size)
+        if let limit = maxFileBytes, fileSize > limit {
+            throw HelperError("psd_too_large")
+        }
         let reader = SeekReader(fd: fd, fileSize: fileSize)
 
         // Section 1: File Header (26 bytes)

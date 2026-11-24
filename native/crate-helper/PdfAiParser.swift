@@ -11,7 +11,7 @@ import zlib
 //      Illustrator is closed!
 
 enum PdfAiParser {
-    private static let maxFileBytes: Int64 = 512 * 1024 * 1024
+    private static let maxFileBytes: Int64 = 256 * 1024 * 1024
     private static let maxSingleStreamOut = 8 * 1024 * 1024
     private static let maxTotalInflatedOut = 64 * 1024 * 1024
     private static let maxStreamsToInflate = 512
@@ -26,7 +26,12 @@ enum PdfAiParser {
     ]
     private static let maxPathLength = 4096
 
-    static func parse(filePath: String, includeDigest: Bool, decompressStreams: Bool) throws -> [String: Any] {
+    static func parse(
+        filePath: String,
+        includeDigest: Bool,
+        decompressStreams: Bool,
+        maxFileBytes: Int64? = nil
+    ) throws -> [String: Any] {
         let fd = Darwin.open(filePath, O_RDONLY | O_NOFOLLOW)
         if fd < 0 {
             if errno == ELOOP { throw HelperError("pdf_ai_symlink") }
@@ -38,7 +43,8 @@ enum PdfAiParser {
         if fstat(fd, &st) != 0 { throw HelperError("pdf_ai_stat_failed") }
         if (st.st_mode & S_IFMT) != S_IFREG { throw HelperError("pdf_ai_not_file") }
         let fileSize = Int64(st.st_size)
-        if fileSize > maxFileBytes { throw HelperError("pdf_ai_too_large") }
+        let effectiveMaxFileBytes = maxFileBytes.map { min($0, Self.maxFileBytes) } ?? Self.maxFileBytes
+        if fileSize > effectiveMaxFileBytes { throw HelperError("pdf_ai_too_large") }
 
         var data = Data(count: Int(fileSize))
         if fileSize > 0 {
@@ -391,7 +397,9 @@ enum PdfAiParser {
         let flateToken = Array("FlateDecode".utf8)
         let imageToken = Array("/Image".utf8)
         let n = bytes.count
+        var streamAttempts = 0
         var totalInflated = 0
+        var noEndstreamBefore = 0
         var i = 0
 
         func recordIssue(_ code: String) {
@@ -439,8 +447,8 @@ enum PdfAiParser {
                         let dictStart = max(0, i - 512)
                         let isFlate = containsSubsequence(dictStart..<i, flateToken)
                         let isImage = containsSubsequence(dictStart..<i, imageToken)
-                        // Locate matching endstream
-                        var endPos = dataStart
+                        // Locate matching endstream without rescanning ranges already proven to contain none.
+                        var endPos = max(dataStart, noEndstreamBefore)
                         let searchLimit = min(n - endstreamToken.count, dataStart + 16 * 1024 * 1024)
                         var foundEnd = -1
                         while endPos <= searchLimit {
@@ -453,9 +461,12 @@ enum PdfAiParser {
                             }
                             endPos += 1
                         }
+                        if foundEnd < 0 {
+                            noEndstreamBefore = max(noEndstreamBefore, searchLimit + 1)
+                        }
                         if foundEnd > dataStart {
                             if isFlate && !isImage {
-                                if streamsScanned >= maxStreamsToInflate {
+                                if streamAttempts >= maxStreamsToInflate {
                                     recordIssue("flate-stream-count-limit")
                                     break
                                 }
@@ -469,17 +480,23 @@ enum PdfAiParser {
                                 }
                                 let compLen = compEnd - dataStart
                                 if compLen > 2 {
+                                    streamAttempts += 1
                                     let budget = min(maxSingleStreamOut, maxTotalInflatedOut - totalInflated)
-                                    if let inflated = inflateZlibBounded(
+                                    let inflateResult = inflateZlibBounded(
                                         base: bytes.baseAddress!.advanced(by: dataStart),
                                         length: compLen,
                                         maxOut: budget
-                                    ) {
+                                    )
+                                    totalInflated += inflateResult.produced
+                                    if let inflated = inflateResult.data {
                                         streamsScanned += 1
-                                        totalInflated += inflated.count
                                         try onInflated(inflated)
                                     } else {
                                         recordIssue("flate-stream-budget-or-decode")
+                                    }
+                                    if totalInflated >= maxTotalInflatedOut {
+                                        recordIssue("flate-total-output-limit")
+                                        break
                                     }
                                 }
                             }
@@ -495,16 +512,17 @@ enum PdfAiParser {
         }
     }
 
-    private static func inflateZlibBounded(base: UnsafePointer<UInt8>, length: Int, maxOut: Int) -> Data? {
+    private static func inflateZlibBounded(base: UnsafePointer<UInt8>, length: Int, maxOut: Int) -> (data: Data?, produced: Int) {
         var stream = z_stream()
         stream.next_in = UnsafeMutablePointer(mutating: base)
         stream.avail_in = uInt(length)
 
         let initStatus = inflateInit_(&stream, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
-        if initStatus != Z_OK { return nil }
+        if initStatus != Z_OK { return (nil, 0) }
         defer { inflateEnd(&stream) }
 
         var output = Data()
+        var producedTotal = 0
         var chunk = [UInt8](repeating: 0, count: 65536)
         while true {
             let chunkLen = chunk.count
@@ -515,17 +533,18 @@ enum PdfAiParser {
             }
             let produced = chunkLen - Int(stream.avail_out)
             if produced > 0 {
-                if output.count + produced > maxOut { return nil }
+                producedTotal += produced
+                if producedTotal > maxOut { return (nil, producedTotal) }
                 output.append(chunk, count: produced)
             }
             if status == Z_STREAM_END {
-                return output
+                return (output, producedTotal)
             }
             if status != Z_OK {
-                return nil
+                return (nil, producedTotal)
             }
             if stream.avail_in == 0 && produced == 0 {
-                return nil
+                return (nil, producedTotal)
             }
         }
     }
