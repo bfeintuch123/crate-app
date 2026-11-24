@@ -26,6 +26,13 @@ enum WatchOps {
         return err == EINVAL
     }
 
+    // Only ESRCH (process exited or zombie between proc_listallpids and proc_pidpath)
+    // is a benign per-PID absence; any other errno leaves process discovery uncertain
+    // so callers fall back to /bin/ps.
+    static func isBenignPidPathErrno(_ err: Int32) -> Bool {
+        return err == ESRCH
+    }
+
     static func runningApps(keywords: [String], caseSensitive: Bool = false) throws -> [[String: Any]] {
         let exactKeywords = keywords.filter { !$0.isEmpty }
         let lowerKeywords = exactKeywords.map { $0.lowercased() }
@@ -33,13 +40,32 @@ enum WatchOps {
         let estimated = proc_listallpids(nil, 0)
         guard estimated > 0 else { throw HelperError("proc_listallpids_failed") }
 
-        var pids = [pid_t](repeating: 0, count: Int(estimated) + 128)
-        let bufferBytes = Int32(pids.count * MemoryLayout<pid_t>.stride)
-        // proc_listallpids takes buffer size in bytes and returns the NUMBER of PIDs filled (not bytes).
-        errno = 0
-        let actualCount = proc_listallpids(&pids, bufferBytes)
-        guard actualCount > 0 else { throw HelperError("proc_listallpids_failed") }
-        let pidCount = min(Int(actualCount), pids.count)
+        let pidStride = MemoryLayout<pid_t>.stride
+        var allocCount = max(Int(estimated) + 128, 256)
+        var pids: [pid_t] = []
+        var pidCount = 0
+        var listComplete = false
+        for _ in 0..<4 {
+            let (byteCount, byteOverflow) = allocCount.multipliedReportingOverflow(by: pidStride)
+            guard !byteOverflow, byteCount > 0, byteCount <= Int(Int32.max) else {
+                throw HelperError("proc_listallpids_failed")
+            }
+            pids = [pid_t](repeating: 0, count: allocCount)
+            // proc_listallpids takes buffer size in bytes and returns the NUMBER of PIDs filled (not bytes).
+            errno = 0
+            let actualCount = proc_listallpids(&pids, Int32(byteCount))
+            guard actualCount > 0 else { throw HelperError("proc_listallpids_failed") }
+            if Int(actualCount) >= pids.count {
+                let (nextCount, countOverflow) = allocCount.multipliedReportingOverflow(by: 2)
+                if countOverflow { throw HelperError("proc_listallpids_failed") }
+                allocCount = nextCount
+                continue
+            }
+            pidCount = Int(actualCount)
+            listComplete = true
+            break
+        }
+        guard listComplete else { throw HelperError("proc_listallpids_failed") }
 
         let pathBufSize = Int(MAXPATHLEN) * 4 // PROC_PIDPATHINFO_MAXSIZE
         var pathBuf = [CChar](repeating: 0, count: pathBufSize)
@@ -48,8 +74,13 @@ enum WatchOps {
         for idx in 0..<pidCount {
             let pid = pids[idx]
             guard pid > 0 else { continue }
+            errno = 0
             let pathLen = proc_pidpath(pid, &pathBuf, UInt32(pathBufSize))
-            if pathLen <= 0 { continue }
+            if pathLen <= 0 {
+                let err = errno
+                if isBenignPidPathErrno(err) { continue }
+                throw HelperError("proc_pidpath_failed")
+            }
             let command = String(cString: pathBuf)
             if command.isEmpty { continue }
             let name = (command as NSString).lastPathComponent
@@ -189,9 +220,19 @@ enum WatchOps {
                     }
                     recordIfMatching(pid: pid, filePath: filePath, seenForPid: &seenForPid)
                 }
-                let nextAddress = regionInfo.prp_prinfo.pri_address &+ regionInfo.prp_prinfo.pri_size
-                if nextAddress <= address {
+                let regionStart = regionInfo.prp_prinfo.pri_address
+                let regionSize = regionInfo.prp_prinfo.pri_size
+                if regionSize == 0 {
+                    vmScanExhausted = false
+                    break
+                }
+                let (nextAddress, overflow) = regionStart.addingReportingOverflow(regionSize)
+                if overflow {
                     vmScanExhausted = true
+                    break
+                }
+                if nextAddress <= address {
+                    vmScanExhausted = false
                     break
                 }
                 address = nextAddress

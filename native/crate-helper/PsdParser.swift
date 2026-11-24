@@ -141,7 +141,7 @@ enum PsdParser {
 
         func readSection32(end: Int64) throws -> Int64 {
             let size = Int64(try readU32(end: end))
-            if offset + size > end { throw HelperError("psd_framing_bounds") }
+            if size < 0 || size > end - offset { throw HelperError("psd_framing_bounds") }
             return offset + size
         }
 
@@ -351,6 +351,13 @@ enum PsdParser {
         var issues: [String] = []
         var blockCount = 0
         var layerTotal = 0
+        var recordCount = 0
+
+        func appendIssue(_ code: String) {
+            if !issues.contains(code) {
+                issues.append(code)
+            }
+        }
 
         func normalizeLocalPath(_ raw: String?) -> String? {
             guard let raw = raw else { return nil }
@@ -421,12 +428,13 @@ enum PsdParser {
 
         func parseLinkBlock(end: Int64, carrier: String, layerIndex: Int?) throws {
             while reader.offset < end {
-                if linkedRecords.count + embeddedRecords.count >= maxRecords {
+                recordCount += 1
+                if recordCount > maxRecords {
                     throw HelperError("psd_coverage_limit")
                 }
                 let size = try reader.readU64(end: end)
+                if size < 0 || size > end - reader.offset { throw HelperError("psd_framing_bounds") }
                 let recordEnd = reader.offset + size
-                if recordEnd > end { throw HelperError("psd_framing_bounds") }
                 let type = try reader.readAscii(4, end: recordEnd)
                 let recVersion = try reader.readU32(end: recordEnd)
                 let idLen = Int(try reader.readU8(end: recordEnd))
@@ -456,10 +464,10 @@ enum PsdParser {
                     }
 
                     if hasOpenDesc == 1 {
-                        do { try readDescriptorFromStream() } catch { issues.append("open-descriptor-error") }
+                        do { try readDescriptorFromStream() } catch { appendIssue("open-descriptor-error") }
                     }
                     if type == "liFE" {
-                        do { try readDescriptorFromStream() } catch { issues.append("link-descriptor-error") }
+                        do { try readDescriptorFromStream() } catch { appendIssue("link-descriptor-error") }
                         if recVersion > 3 { try reader.skip(16, end: recordEnd) }
                         let extFileSize = try reader.readU64(end: recordEnd)
                         let normalizedFullPath = normalizeLocalPath(fullPath)
@@ -480,8 +488,11 @@ enum PsdParser {
                         ])
                     } else if type == "liFD" {
                         let dataOffset = reader.offset
+                        if dataSize < 0 || dataSize > recordEnd - dataOffset {
+                            throw HelperError("psd_framing_bounds")
+                        }
                         // Seek straight past embedded file payload without reading it into RAM!
-                        try reader.seek(to: min(recordEnd, dataOffset + dataSize))
+                        try reader.seek(to: dataOffset + dataSize)
                         embeddedRecords.append([
                             "carrier": carrier,
                             "layerIndex": layerIndex as Any,
@@ -504,12 +515,12 @@ enum PsdParser {
                         ])
                     }
                 } else {
-                    issues.append("unsupported-link-form")
+                    appendIssue("unsupported-link-form")
                 }
 
                 try reader.seek(to: recordEnd)
                 let pad = (4 - (size % 4)) % 4
-                if pad > 0 && reader.offset + pad <= end {
+                if pad > 0 && pad <= end - reader.offset {
                     try reader.skip(pad, end: end)
                 }
             }
@@ -528,27 +539,27 @@ enum PsdParser {
                 if blockCount > maxBlocks { throw HelperError("psd_coverage_limit") }
                 let blockSig = try reader.readAscii(4, end: end)
                 if blockSig != "8BIM" && blockSig != "8B64" {
-                    issues.append("unsupported-additional-signature")
+                    appendIssue("unsupported-additional-signature")
                     break
                 }
                 let key = try reader.readAscii(4, end: end)
                 let uses64 = (blockSig == "8B64")
                 let blockSize = uses64 ? try reader.readU64(end: end) : Int64(try reader.readU32(end: end))
+                if blockSize < 0 || blockSize > end - reader.offset { throw HelperError("psd_framing_bounds") }
                 let blockEnd = reader.offset + blockSize
-                if blockSize < 0 || blockEnd > end { throw HelperError("psd_framing_bounds") }
 
                 if key == "lnk2" || key == "lnk3" || key == "lnkD" || key == "lnkE" {
                     try parseLinkBlock(end: blockEnd, carrier: key, layerIndex: layerIndex)
                 } else if key == "PxSc" {
                     if blockSize > Int64(maxDescriptorBytes) {
-                        if !issues.contains("oversized-pxsc-descriptor") { issues.append("oversized-pxsc-descriptor") }
+                        appendIssue("oversized-pxsc-descriptor")
                     } else {
                         let raw = try reader.readBytes(Int(blockSize), end: blockEnd)
                         var dr = DescriptorReader(bytes: raw)
                         if let desc = try? dr.readVersionAndDescriptor() {
                             walkMediaDescriptor(desc: desc, carrier: "PxSc")
                         } else {
-                            if !issues.contains("unreadable-pxsc-descriptor") { issues.append("unreadable-pxsc-descriptor") }
+                            appendIssue("unreadable-pxsc-descriptor")
                         }
                     }
                 } else if key == "Layr" || key == "Lr16" || key == "Lr32" {
@@ -558,14 +569,14 @@ enum PsdParser {
                 // Seek straight past block payload (skipping any pixel/effect/unknown data)!
                 try reader.seek(to: blockEnd)
                 let pad = blockSize % 2
-                if pad > 0 && reader.offset + pad <= end {
+                if pad > 0 && pad <= end - reader.offset {
                     try reader.skip(pad, end: end)
                 }
             }
         }
 
         func parseLayerInfo(layerEnd: Int64, depth: Int) throws {
-            if reader.offset + 2 > layerEnd { return }
+            if layerEnd - reader.offset < 2 { return }
             let rawCount = try reader.readI16(end: layerEnd)
             let count = abs(Int(rawCount))
             layerTotal += count
@@ -588,7 +599,10 @@ enum PsdParser {
                 for _ in 0..<chCount {
                     try reader.skip(2, end: layerEnd) // channel id
                     let chLen = isPsb ? try reader.readU64(end: layerEnd) : Int64(try reader.readU32(end: layerEnd))
-                    if chLen < 0 { throw HelperError("psd_framing_bounds") }
+                    let remaining = layerEnd - reader.offset
+                    if chLen < 0 || totalChannelBytes > remaining || chLen > remaining - totalChannelBytes {
+                        throw HelperError("psd_framing_bounds")
+                    }
                     totalChannelBytes += chLen
                 }
                 let blendSig = try reader.readAscii(4, end: layerEnd)
@@ -635,8 +649,8 @@ enum PsdParser {
             let namePad = (nameLen + 1) % 2
             try reader.skip(Int64(nameLen + namePad), end: resourcesEnd)
             let resSize = Int64(try reader.readU32(end: resourcesEnd))
+            if resSize < 0 || resSize > resourcesEnd - reader.offset { throw HelperError("psd_framing_bounds") }
             let resEnd = reader.offset + resSize
-            if resSize < 0 || resEnd > resourcesEnd { throw HelperError("psd_framing_bounds") }
             if resId == 1075 {
                 if resSize > Int64(maxDescriptorBytes) {
                     if !issues.contains("oversized-resource-1075") { issues.append("oversized-resource-1075") }

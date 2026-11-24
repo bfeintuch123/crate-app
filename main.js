@@ -88,10 +88,12 @@ const { REGEX_SOURCE_EXTENSIONS } = require('./parsers/add-files-regex-worker');
 const { extractLinkedAssetPaths } = require('./parsers/linked-asset-matcher');
 const { decodeXMLPath, fileUriToPath, normalizePsdExternalPath } = require('./parsers/xml-path');
 let CrateSqliteStore = null;
+let crateSqliteStoreLoadError = null;
 try {
   ({ CrateSqliteStore } = require('./parsers/sqlite-store'));
-} catch (_) {
+} catch (err) {
   CrateSqliteStore = null;
+  crateSqliteStoreLoadError = err;
 }
 let nativeWatcherBridge = null;
 try {
@@ -9016,6 +9018,37 @@ if (gotLock) {
           throw sqliteMigrationErr;
         }
       }
+    } else if (isRealElectronStore) {
+      const sqliteArtifacts = ['crate-state.sqlite', 'crate-state.sqlite-wal', 'crate-state.sqlite-shm'];
+      let hasExistingSqliteState = false;
+      let sqliteStatCheckFailed = false;
+      for (const fileName of sqliteArtifacts) {
+        try {
+          fs.lstatSync(path.join(localStorePaths.userDataRealPath, fileName));
+          hasExistingSqliteState = true;
+          break;
+        } catch (statErr) {
+          if (!statErr || statErr.code !== 'ENOENT') {
+            sqliteStatCheckFailed = true;
+            break;
+          }
+        }
+      }
+      if (hasExistingSqliteState || sqliteStatCheckFailed) {
+        const loadErr = typeof crateSqliteStoreLoadError !== 'undefined' ? crateSqliteStoreLoadError : null;
+        const errCode = loadErr && typeof loadErr.code === 'string'
+          ? loadErr.code.replace(/[^A-Za-z0-9_.-]/g, '')
+          : (loadErr && typeof loadErr.name === 'string'
+            ? loadErr.name.replace(/[^A-Za-z0-9_.-]/g, '')
+            : 'unavailable');
+        console.warn(
+          `[crate][fast-engine] sqlite-store-load-failed ` +
+          `reason=${sqliteStatCheckFailed ? 'stat-check-failed' : 'existing-sqlite-state'} ` +
+          `code=${errCode}`
+        );
+        throw new Error('Crate could not secure local settings storage.');
+      }
+      store = candidateStore;
     } else {
       store = candidateStore;
     }

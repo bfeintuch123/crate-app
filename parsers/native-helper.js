@@ -10,7 +10,8 @@ const path = require('node:path');
 
 const DEV_BINARY_PATH = path.resolve(__dirname, '..', 'native', 'bin', 'crate-helper');
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
-const MAX_STDOUT_LINE_CHARS = 64 * 1024 * 1024;
+const MAX_STDOUT_LINE_BYTES = 64 * 1024 * 1024;
+const MAX_STDOUT_LINE_CHARS = MAX_STDOUT_LINE_BYTES;
 
 function isExecutableRegularFile(candidatePath) {
   if (typeof candidatePath !== 'string' || !path.isAbsolute(candidatePath)) return false;
@@ -51,12 +52,16 @@ function resolveNativeHelperBinaryPath(explicitPath = null) {
 const DEFAULT_BINARY_PATH = resolveNativeHelperBinaryPath();
 
 class NativeHelperClient {
-  constructor(binaryPath = null, { maxStdoutLineChars = MAX_STDOUT_LINE_CHARS } = {}) {
+  constructor(binaryPath = null, { maxStdoutLineBytes = null, maxStdoutLineChars = null } = {}) {
     this.explicitBinaryPath = binaryPath;
     this.binaryPath = resolveNativeHelperBinaryPath(binaryPath);
-    this.maxStdoutLineChars = Number.isInteger(maxStdoutLineChars) && maxStdoutLineChars > 0
-      ? maxStdoutLineChars
-      : MAX_STDOUT_LINE_CHARS;
+    const requestedLimit = maxStdoutLineBytes !== null && maxStdoutLineBytes !== undefined
+      ? maxStdoutLineBytes
+      : maxStdoutLineChars;
+    this.maxStdoutLineBytes = Number.isInteger(requestedLimit) && requestedLimit > 0
+      ? requestedLimit
+      : MAX_STDOUT_LINE_BYTES;
+    this.maxStdoutLineChars = this.maxStdoutLineBytes;
     this.session = null;
     this.nextId = 1;
   }
@@ -97,48 +102,61 @@ class NativeHelperClient {
 
     const session = {
       child,
-      buffer: '',
+      chunks: [],
+      bufferBytes: 0,
       pending: new Map(),
       disposing: false,
       terminated: false,
     };
 
-    child.stdout.setEncoding('utf8');
-    const maxLineChars = this.maxStdoutLineChars;
+    const maxLineBytes = this.maxStdoutLineBytes;
     child.stdout.on('data', chunk => {
       if (session.terminated) return;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8');
       let start = 0;
-      let nl = chunk.indexOf('\n', start);
+      let nl = buf.indexOf(0x0a, start);
       while (nl >= 0) {
         const pieceLen = nl - start;
-        if (session.buffer.length + pieceLen > maxLineChars) {
-          session.buffer = '';
+        if (session.bufferBytes + pieceLen > maxLineBytes) {
+          session.chunks = [];
+          session.bufferBytes = 0;
           session.disposing = true;
           try { child.kill(); } catch (_) {}
           onTerminate('native_helper_response_too_large');
           return;
         }
-        const line = (session.buffer + chunk.slice(start, nl)).trim();
-        session.buffer = '';
+        const piece = start === 0 && nl === buf.length ? buf : buf.subarray(start, nl);
+        const lineBuf = session.chunks.length > 0
+          ? Buffer.concat([...session.chunks, piece], session.bufferBytes + pieceLen)
+          : piece;
+        session.chunks = [];
+        session.bufferBytes = 0;
+        const line = lineBuf.toString('utf8').trim();
         if (line) this._handleLine(session, line);
         if (session.terminated) return;
         start = nl + 1;
-        nl = chunk.indexOf('\n', start);
+        nl = buf.indexOf(0x0a, start);
       }
-      const tail = start === 0 ? chunk : chunk.slice(start);
-      if (session.buffer.length + tail.length > maxLineChars) {
-        session.buffer = '';
-        session.disposing = true;
-        try { child.kill(); } catch (_) {}
-        onTerminate('native_helper_response_too_large');
-        return;
+      const tailLen = buf.length - start;
+      if (tailLen > 0) {
+        if (session.bufferBytes + tailLen > maxLineBytes) {
+          session.chunks = [];
+          session.bufferBytes = 0;
+          session.disposing = true;
+          try { child.kill(); } catch (_) {}
+          onTerminate('native_helper_response_too_large');
+          return;
+        }
+        session.chunks.push(start === 0 ? buf : buf.subarray(start));
+        session.bufferBytes += tailLen;
       }
-      session.buffer += tail;
     });
 
     const onTerminate = reason => {
       if (session.terminated) return;
       session.terminated = true;
+      session.chunks = [];
+      session.bufferBytes = 0;
       if (this.session === session) this.session = null;
       for (const [id, entry] of [...session.pending.entries()]) {
         clearTimeout(entry.timer);
@@ -304,6 +322,7 @@ const packageClient = new NativeHelperClient();
 module.exports = {
   DEFAULT_BINARY_PATH,
   DEV_BINARY_PATH,
+  MAX_STDOUT_LINE_BYTES,
   MAX_STDOUT_LINE_CHARS,
   NativeHelperClient,
   isExecutableRegularFile,

@@ -389,3 +389,89 @@ test('main.js startup falls back to JSON only on CRATE_LEGACY_MIGRATION_INVALID_
   assert.match(failClosedRes.localStoreStartupError.message, /could not secure local settings storage/);
   assert.ok(failClosedRes.marks.includes('store-preflight-failed'));
 });
+
+test('main.js startup fails closed instead of reopening stale legacy JSON when migrated SQLite store cannot load (A-B3)', t => {
+  const vm = require('node:vm');
+  const mainSource = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const startMarker = 'let localStorePaths = null;';
+  const endMarker = '// One-time migration: update old naming template format to new one';
+  const startIdx = mainSource.indexOf(startMarker);
+  const endIdx = mainSource.indexOf(endMarker);
+  assert.ok(startIdx > 0 && endIdx > startIdx, 'must locate main.js startup store initialization block');
+  const initSnippet = mainSource.slice(startIdx, endIdx);
+
+  function runStartupWithoutSqlite(userData, loadErr = null) {
+    const warnings = [];
+    const marks = [];
+    const configPath = path.join(userData, 'config.json');
+    const context = {
+      fs,
+      path,
+      console: { warn: msg => warnings.push(String(msg)) },
+      gotLock: true,
+      Store,
+      CrateSqliteStore: null,
+      crateSqliteStoreLoadError: loadErr,
+      OWNER_ONLY_FILE_MODE: 0o600,
+      DEFAULT_NAMING_TEMPLATE: '{ProjectName}',
+      PACKAGE_OUTPUT_LAYOUT_MODES: { BY_EXTENSION: 'by-extension-v1' },
+      getNextMonthReset: () => '2026-12-01',
+      app: { getPath: () => userData },
+      startupPhaseJournal: { mark: m => marks.push(m) },
+      preflightLocalStorePaths: () => ({ userDataRealPath: userData, configPath }),
+      hardenLocalStorePermissions: () => true,
+      validateLocalStoreShape: candidate => {
+        if (!Array.isArray(candidate.get('projects', null))) throw new Error('invalid shape');
+      },
+      migrateSettings: () => {},
+    };
+    vm.runInNewContext(
+      `${initSnippet}\nthis.__result = { store, localStoreStartupError };`,
+      context
+    );
+    return { ...context.__result, warnings, marks };
+  }
+
+  // Case 1: Migrated profile (crate-state.sqlite exists) + SQLite module load failure -> fail closed, never reopen stale JSON
+  const migratedDir = makeUserDataDir(t);
+  const legacyStore = new Store({
+    cwd: migratedDir,
+    configFileMode: 0o600,
+    defaults: {
+      projects: [],
+      settings: { namingTemplate: '{ProjectName}', notifications: true },
+      usage: { packagesThisMonth: 0, resetDate: '2026-12-01' },
+    },
+  });
+  legacyStore.set('projects', [{ id: 'stale-legacy-project', name: 'Stale Legacy', files: [] }]);
+  const sqlite = new CrateSqliteStore({ userDataRealPath: migratedDir });
+  sqlite.migrateFromLegacyStore(legacyStore);
+  sqlite.set('projects', [{ id: 'current-sqlite-project', name: 'Current SQLite', files: [] }]);
+  sqlite.close();
+  const legacySnapshot = fs.readFileSync(legacyStore.path, 'utf8');
+
+  const loadErr = Object.assign(new Error(`failed loading from ${migratedDir}`), { code: 'ERR_SQLITE_LOAD' });
+  const failRes = runStartupWithoutSqlite(migratedDir, loadErr);
+  assert.equal(failRes.store, null, 'must fail closed instead of silently reopening stale legacy JSON');
+  assert.ok(failRes.localStoreStartupError && /could not secure local settings storage/.test(failRes.localStoreStartupError.message));
+  assert.ok(failRes.marks.includes('store-preflight-failed'));
+  assert.equal(failRes.warnings.length, 1);
+  assert.ok(failRes.warnings[0].includes('sqlite-store-load-failed'));
+  assert.ok(failRes.warnings[0].includes('code=ERR_SQLITE_LOAD'));
+  assert.equal(failRes.warnings[0].includes(migratedDir), false, 'warning must not leak userData path');
+  assert.equal(fs.readFileSync(legacyStore.path, 'utf8'), legacySnapshot, 'legacy JSON must remain untouched');
+
+  // Case 2: WAL-only leftover artifact with SQLite unavailable -> also fail closed
+  const walOnlyDir = makeUserDataDir(t);
+  fs.writeFileSync(path.join(walOnlyDir, `${SQLITE_FILENAME}-wal`), '');
+  const walFailRes = runStartupWithoutSqlite(walOnlyDir, loadErr);
+  assert.equal(walFailRes.store, null, 'WAL artifact without SQLite loader must fail closed');
+  assert.ok(walFailRes.marks.includes('store-preflight-failed'));
+
+  // Case 3: Fresh/unmigrated profile (no crate-state.sqlite*) keeps existing safe JSON fallback
+  const freshDir = makeUserDataDir(t);
+  const freshRes = runStartupWithoutSqlite(freshDir, loadErr);
+  assert.equal(freshRes.localStoreStartupError, null);
+  assert.ok(freshRes.store && typeof freshRes.store.openInEditor === 'function', 'unmigrated profile keeps JSON fallback');
+  assert.equal(freshRes.warnings.length, 0);
+});

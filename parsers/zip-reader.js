@@ -300,9 +300,7 @@ function openZipArchive(filePath, options = {}) {
       fileSize,
       hasAmbiguousPath(targetPath) {
         const matches = byPath.get(targetPath);
-        if (!matches || matches.length < 2) return false;
-        const first = matches[0].nameBytes;
-        return matches.some(item => !item.nameBytes.equals(first));
+        return Boolean(matches && matches.length >= 2);
       },
       findEntry(targetPath) {
         const matches = byPath.get(targetPath);

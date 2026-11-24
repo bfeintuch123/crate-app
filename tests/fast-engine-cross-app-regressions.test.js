@@ -816,3 +816,76 @@ test('Keynote (.key) & PPTX: safely reject colliding non-UTF-8 ZIP media entry n
   assert.equal(validExtracted.length, 1);
   assert.deepEqual(fs.readFileSync(validExtracted[0].extractedPath), imgValid);
 });
+
+test('Keynote (.key) & PPTX: reject duplicate identical-raw-name ZIP entries during inspection and extraction (A-B1)', async t => {
+  const { openZipArchive } = require('../parsers/zip-reader');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-zip-dup-name-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const placeholder = Buffer.alloc(120, 0x30); // < 500B (skipped during inspection loop)
+  const fullImage = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(600, 0x44)]);
+  const parser = new PowerPointParser();
+
+  // 1. Keynote archive with two identical-raw-name Data/photo-1001.jpg entries (<500B then >=500B)
+  const dupKeyPath = path.join(dir, 'duplicate-entry.key');
+  fs.writeFileSync(dupKeyPath, buildSyntheticZip([
+    { name: 'Data/photo-1001.jpg', data: placeholder },
+    { name: 'Data/photo-1001.jpg', data: fullImage },
+  ]));
+
+  const keyArchive = openZipArchive(dupKeyPath);
+  t.after(() => keyArchive && keyArchive.close());
+  assert.ok(keyArchive);
+  assert.equal(keyArchive.hasAmbiguousPath('Data/photo-1001.jpg'), true);
+
+  const keyInspErrors = [];
+  const keyDiscovered = await parser.extractAssets(dupKeyPath, {
+    onInspectionError: err => keyInspErrors.push(err),
+  });
+  assert.equal(keyInspErrors.length, 1, 'duplicate Keynote entry name must fail inspection');
+  assert.deepEqual(keyDiscovered, []);
+
+  const keyOutDir = path.join(dir, 'out-dup-key');
+  fs.mkdirSync(keyOutDir, { recursive: true });
+  const keyExtErrors = [];
+  const keyExtracted = await parser.extractToDirectory(
+    dupKeyPath,
+    keyOutDir,
+    [{ path: 'photo-1001.jpg', source: 'keynote-embedded', exists: true, zipPath: 'Data/photo-1001.jpg', size: fullImage.length }],
+    { onExtractionError: err => keyExtErrors.push(err) }
+  );
+  assert.equal(keyExtErrors.length, 1, 'duplicate Keynote entry name must fail direct extraction');
+  assert.deepEqual(keyExtracted, []);
+  assert.deepEqual(fs.readdirSync(keyOutDir), []);
+
+  // 2. PPTX archive with two identical-raw-name ppt/media/image1.jpg entries (<500B then >=500B)
+  const dupPptxPath = path.join(dir, 'duplicate-entry.pptx');
+  fs.writeFileSync(dupPptxPath, buildSyntheticZip([
+    { name: 'ppt/media/image1.jpg', data: placeholder },
+    { name: 'ppt/media/image1.jpg', data: fullImage },
+  ]));
+
+  const pptArchive = openZipArchive(dupPptxPath);
+  t.after(() => pptArchive && pptArchive.close());
+  assert.ok(pptArchive);
+  assert.equal(pptArchive.hasAmbiguousPath('ppt/media/image1.jpg'), true);
+
+  await assert.rejects(
+    () => parser.extractAssets(dupPptxPath),
+    err => err && err.code === 'package_relationship_invalid',
+    'duplicate PPTX entry name must be rejected during inspection'
+  );
+
+  const pptOutDir = path.join(dir, 'out-dup-pptx');
+  fs.mkdirSync(pptOutDir, { recursive: true });
+  const pptExtErrors = [];
+  const pptExtracted = await parser.extractToDirectory(
+    dupPptxPath,
+    pptOutDir,
+    [{ path: 'image1.jpg', source: 'pptx-embedded', exists: true, zipPath: 'ppt/media/image1.jpg', size: fullImage.length }],
+    { onExtractionError: err => pptExtErrors.push(err) }
+  );
+  assert.equal(pptExtErrors.length, 1, 'duplicate PPTX entry name must fail direct extraction');
+  assert.deepEqual(pptExtracted, []);
+  assert.deepEqual(fs.readdirSync(pptOutDir), []);
+});

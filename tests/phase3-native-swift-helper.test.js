@@ -1159,4 +1159,213 @@ test('Swift WatchOps confirms complete=true on own PID (EINVAL VM end) and marks
   assert.ok(badOpen.failedPids.includes(999999));
   const badLsof = await bridge.pollNativeOpenFilesAsLsofF([process.pid, 999999], 3000, { client });
   assert.equal(badLsof, null, 'bridge must return null when any PID inventory is uncertain');
+
+  // Live runningApps succeeds cleanly on ordinary macOS state and includes current process PID
+  const liveApps = await client.runningApps([], 3000, { caseSensitive: true });
+  assert.ok(Array.isArray(liveApps.apps) && liveApps.apps.length > 0);
+  assert.ok(liveApps.apps.some(app => app.pid === process.pid), 'runningApps must include current test process');
+
+  // Bridge rejects on proc_pidpath_failed so main.js falls back to /bin/ps
+  await assert.rejects(
+    () => bridge.getNativeRunningDesignApps(['Illustrator'], 2000, {
+      client: {
+        runningApps: async () => {
+          const err = new Error('proc_pidpath_failed');
+          err.code = 'proc_pidpath_failed';
+          throw err;
+        },
+      },
+    }),
+    /proc_pidpath_failed/
+  );
+});
+
+test('NativeHelperClient enforces stdout line limit in UTF-8 wire bytes and reassembles split multibyte chunks (A-B6)', { skip: process.platform !== 'darwin' }, async t => {
+  const prevDisable = process.env.CRATE_DISABLE_NATIVE_HELPER;
+  delete process.env.CRATE_DISABLE_NATIVE_HELPER;
+  t.after(() => {
+    if (prevDisable === undefined) delete process.env.CRATE_DISABLE_NATIVE_HELPER;
+    else process.env.CRATE_DISABLE_NATIVE_HELPER = prevDisable;
+  });
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-helper-utf8-cap-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  // 1. 40 x '€' (3 UTF-8 bytes each = 120 bytes, only 40 UTF-16 code units) exceeds maxStdoutLineBytes=100
+  const overHelper = path.join(dir, 'multibyte-over.js');
+  fs.writeFileSync(
+    overHelper,
+    `#!${process.execPath}\n` +
+    `process.stdin.once('data', () => {\n` +
+    `  const line = JSON.stringify({ id: 1, ok: true, result: { text: '€'.repeat(40) } }) + '\\n';\n` +
+    `  process.stdout.write(Buffer.from(line, 'utf8'));\n` +
+    `});\n`,
+    { mode: 0o755 }
+  );
+  const overClient = new NativeHelperClient(overHelper, { maxStdoutLineBytes: 100 });
+  t.after(() => overClient.shutdown());
+  await assert.rejects(() => overClient.ping(), /native_helper_response_too_large/);
+  assert.equal(overClient.session, null);
+
+  // 2. Positive control: multibyte UTF-8 response split mid-codepoint across two stdout writes reassembles cleanly
+  const splitHelper = path.join(dir, 'multibyte-split.js');
+  fs.writeFileSync(
+    splitHelper,
+    `#!${process.execPath}\n` +
+    `process.stdin.once('data', () => {\n` +
+    `  const raw = Buffer.from(JSON.stringify({ id: 1, ok: true, result: { label: 'café-€-🎨' } }) + '\\n', 'utf8');\n` +
+    `  const mid = raw.indexOf(0xe2) + 1; // split inside 3-byte '€'\n` +
+    `  process.stdout.write(raw.subarray(0, mid));\n` +
+    `  setTimeout(() => process.stdout.write(raw.subarray(mid)), 15);\n` +
+    `});\n`,
+    { mode: 0o755 }
+  );
+  const splitClient = new NativeHelperClient(splitHelper, { maxStdoutLineBytes: 256 });
+  t.after(() => splitClient.shutdown());
+  const res = await splitClient.ping();
+  assert.equal(res.label, 'café-€-🎨');
+});
+
+test('Swift PsdParser accounts for all link records and rejects 64-bit size overflows without crashing helper (A-B4/A-B5)', { skip: !hasNativeBinary }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-swift-psd-bounds-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const client = new NativeHelperClient(DEFAULT_BINARY_PATH);
+  t.after(() => client.shutdown());
+  const initialPid = (await client.ping()).pid;
+  assert.ok(Number.isInteger(initialPid) && initialPid > 0);
+
+  function buildPsdWithLinkBlock(recordsBuf, { isPsb = false } = {}) {
+    const header = Buffer.alloc(26);
+    header.write('8BPS', 0, 'ascii');
+    header.writeUInt16BE(isPsb ? 2 : 1, 4);
+    header.writeUInt16BE(3, 12);
+    header.writeUInt32BE(2, 14);
+    header.writeUInt32BE(2, 18);
+    header.writeUInt16BE(8, 22);
+    header.writeUInt16BE(3, 24);
+    const colorLen = Buffer.alloc(4);
+    const resLen = Buffer.alloc(4);
+    const lnkHead = Buffer.alloc(12);
+    lnkHead.write('8BIM', 0, 'ascii');
+    lnkHead.write('lnk2', 4, 'ascii');
+    lnkHead.writeUInt32BE(recordsBuf.length, 8);
+    const lnkPad = (recordsBuf.length % 2) === 1 ? Buffer.alloc(1) : Buffer.alloc(0);
+    const layerInfoLen = Buffer.alloc(isPsb ? 8 : 4);
+    const globalMaskLen = Buffer.alloc(4);
+    const maskBody = Buffer.concat([layerInfoLen, globalMaskLen, lnkHead, recordsBuf, lnkPad]);
+    const maskLen = Buffer.alloc(isPsb ? 8 : 4);
+    if (isPsb) maskLen.writeBigUInt64BE(BigInt(maskBody.length), 0);
+    else maskLen.writeUInt32BE(maskBody.length, 0);
+    return Buffer.concat([header, colorLen, resLen, maskLen, maskBody, Buffer.alloc(2 + 2 * 2 * 3)]);
+  }
+
+  function makeUnsupportedLinkRecord() {
+    // 8B size (= 9) + 4B type ('xxxx') + 4B version + 1B idLen (0) + 3B 4-byte alignment padding
+    const rec = Buffer.alloc(8 + 9 + 3);
+    rec.writeBigUInt64BE(9n, 0);
+    rec.write('xxxx', 8, 'ascii');
+    rec.writeUInt32BE(1, 12);
+    rec.writeUInt8(0, 16);
+    return rec;
+  }
+
+  // 1. Repeated unsupported link records deduplicate 'unsupported-link-form'
+  const fewUnsupportedPath = path.join(dir, 'few-unsupported.psd');
+  fs.writeFileSync(fewUnsupportedPath, buildPsdWithLinkBlock(Buffer.concat(Array.from({ length: 10 }, makeUnsupportedLinkRecord))));
+  const fewRes = await client.parsePsd(fewUnsupportedPath);
+  assert.equal(fewRes.incomplete, true);
+  assert.deepEqual(fewRes.issues.filter(i => i === 'unsupported-link-form'), ['unsupported-link-form']);
+
+  // 2. >8,192 unsupported link records hit psd_coverage_limit (A-B4)
+  const overRecordsPath = path.join(dir, 'over-8192-unsupported.psd');
+  const oneRec = makeUnsupportedLinkRecord();
+  const manyBuf = Buffer.alloc(oneRec.length * 8193);
+  for (let i = 0; i < 8193; i += 1) oneRec.copy(manyBuf, i * oneRec.length);
+  fs.writeFileSync(overRecordsPath, buildPsdWithLinkBlock(manyBuf));
+  await assert.rejects(
+    () => client.parsePsd(overRecordsPath),
+    err => err && err.code === 'psd_coverage_limit'
+  );
+
+  // 3. Overflow-boundary link record size (Int64.max) -> psd_framing_bounds without crashing helper (A-B5)
+  const overflowRec = Buffer.alloc(16);
+  overflowRec.writeBigUInt64BE(0x7fffffffffffffffn, 0);
+  const overflowRecPath = path.join(dir, 'overflow-record-size.psd');
+  fs.writeFileSync(overflowRecPath, buildPsdWithLinkBlock(overflowRec));
+  await assert.rejects(
+    () => client.parsePsd(overflowRecPath),
+    err => err && err.code === 'psd_framing_bounds'
+  );
+  assert.equal((await client.ping()).pid, initialPid, 'helper session must stay alive after recordEnd bounds check');
+
+  // 4. liFD embedded dataSize exceeding recordEnd (both Int64.max and finite excess) -> psd_framing_bounds (A-B5)
+  for (const [label, badDataSize] of [['max', 0x7fffffffffffffffn], ['excess', 64n]]) {
+    // body: 4B 'liFD' + 4B ver(1) + 1B idLen(0) + 4B fileNameUnits(0) + 8B type/creator + 8B dataSize + 1B hasOpenDesc(0) = 30B
+    const body = Buffer.alloc(30);
+    body.write('liFD', 0, 'ascii');
+    body.writeUInt32BE(1, 4);
+    body.writeUInt8(0, 8);
+    body.writeUInt32BE(0, 9);
+    body.writeBigUInt64BE(badDataSize, 21);
+    body.writeUInt8(0, 29);
+    const sizeBuf = Buffer.alloc(8);
+    sizeBuf.writeBigUInt64BE(BigInt(body.length), 0);
+    const lifdPath = path.join(dir, `lifd-bounds-${label}.psd`);
+    fs.writeFileSync(lifdPath, buildPsdWithLinkBlock(Buffer.concat([sizeBuf, body, Buffer.alloc(2)])));
+    await assert.rejects(
+      () => client.parsePsd(lifdPath),
+      err => err && err.code === 'psd_framing_bounds'
+    );
+    assert.equal((await client.ping()).pid, initialPid, `helper session must stay alive after liFD ${label} check`);
+  }
+
+  // 5. 8B64 additional layer block with Int64.max blockSize -> psd_framing_bounds without crashing helper (A-B5)
+  const bad8b64 = Buffer.alloc(16);
+  bad8b64.write('8B64', 0, 'ascii');
+  bad8b64.write('lnk2', 4, 'ascii');
+  bad8b64.writeBigUInt64BE(0x7fffffffffffffffn, 8);
+  const header8b64 = Buffer.alloc(26);
+  header8b64.write('8BPS', 0, 'ascii');
+  header8b64.writeUInt16BE(2, 4); // PSB
+  header8b64.writeUInt16BE(3, 12);
+  header8b64.writeUInt32BE(2, 14);
+  header8b64.writeUInt32BE(2, 18);
+  header8b64.writeUInt16BE(8, 22);
+  header8b64.writeUInt16BE(3, 24);
+  const maskBody8b64 = Buffer.concat([Buffer.alloc(8), Buffer.alloc(4), bad8b64]);
+  const maskLen8b64 = Buffer.alloc(8);
+  maskLen8b64.writeBigUInt64BE(BigInt(maskBody8b64.length), 0);
+  const bad8b64Path = path.join(dir, 'overflow-8b64.psb');
+  fs.writeFileSync(bad8b64Path, Buffer.concat([header8b64, Buffer.alloc(4), Buffer.alloc(4), maskLen8b64, maskBody8b64, Buffer.alloc(14)]));
+  await assert.rejects(
+    () => client.parsePsd(bad8b64Path),
+    err => err && err.code === 'psd_framing_bounds'
+  );
+  assert.equal((await client.ping()).pid, initialPid, 'helper session must stay alive after 8B64 bounds check');
+
+  // 6. PSB parseLayerInfo channel lengths summing past Int64.max -> psd_framing_bounds without crashing helper (A-B5)
+  // Layer info body: 2B count (1) + 16B rect (0,0,2,2) + 2B chCount (2) + 2*(2B id + 8B len=0x4000000000000000)
+  const layerInfoBody = Buffer.alloc(2 + 16 + 2 + 20);
+  layerInfoBody.writeInt16BE(1, 0);
+  layerInfoBody.writeInt32BE(0, 2);
+  layerInfoBody.writeInt32BE(0, 6);
+  layerInfoBody.writeInt32BE(2, 10);
+  layerInfoBody.writeInt32BE(2, 14);
+  layerInfoBody.writeUInt16BE(2, 18);
+  layerInfoBody.writeInt16BE(0, 20);
+  layerInfoBody.writeBigUInt64BE(0x4000000000000000n, 22);
+  layerInfoBody.writeInt16BE(1, 30);
+  layerInfoBody.writeBigUInt64BE(0x4000000000000000n, 32);
+  const liLen = Buffer.alloc(8);
+  liLen.writeBigUInt64BE(BigInt(layerInfoBody.length), 0);
+  const maskBodyCh = Buffer.concat([liLen, layerInfoBody, Buffer.alloc(4)]);
+  const maskLenCh = Buffer.alloc(8);
+  maskLenCh.writeBigUInt64BE(BigInt(maskBodyCh.length), 0);
+  const badChPath = path.join(dir, 'overflow-psb-channels.psb');
+  fs.writeFileSync(badChPath, Buffer.concat([header8b64, Buffer.alloc(4), Buffer.alloc(4), maskLenCh, maskBodyCh, Buffer.alloc(14)]));
+  await assert.rejects(
+    () => client.parsePsd(badChPath),
+    err => err && err.code === 'psd_framing_bounds'
+  );
+  assert.equal((await client.ping()).pid, initialPid, 'helper session must stay alive after PSB channel sum bounds check');
 });
