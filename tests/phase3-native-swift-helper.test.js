@@ -1693,4 +1693,21 @@ test('Swift PdfAiParser isolates each stream dictionary and preserves Adler-32 t
     Array.isArray(unterminatedImageParsed.issues) && unterminatedImageParsed.issues.includes('flate-endstream-unbounded'),
     'unterminated image stream must emit flate-endstream-unbounded'
   );
+
+  // Ambiguous uninflated stream boundary followed by a later stream's endstream (or containing
+  // raw `endstream` bytes) must fail closed rather than silently skipping a later metadata stream.
+  const ambiguousImageBeforeMetaPath = path.join(workDir, 'AmbiguousImageBeforeMetadata.ai');
+  fs.writeFileSync(ambiguousImageBeforeMetaPath, Buffer.concat([
+    Buffer.from('%PDF-1.6\n1 0 obj\n<< /Type /XObject /Subtype /Image /Length 99 0 R >>\nstream\n'),
+    Buffer.from('binary-image-data-missing-terminator\n'),
+    Buffer.from(`2 0 obj\n<< /Filter /FlateDecode /Length ${afterLargeImageCompressed.length} >>\nstream\n`),
+    afterLargeImageCompressed,
+    Buffer.from('\nendstream\nendobj\n%%EOF\n'),
+  ]));
+  const ambiguousImageParsed = await client.parsePdfAi(ambiguousImageBeforeMetaPath, { decompressStreams: true });
+  assert.equal(ambiguousImageParsed.incomplete, true, 'image stream without validated direct /Length must fail closed');
+  assert.ok(
+    Array.isArray(ambiguousImageParsed.issues) && ambiguousImageParsed.issues.includes('flate-endstream-unbounded'),
+    'ambiguous uninflated stream boundary must emit flate-endstream-unbounded'
+  );
 });

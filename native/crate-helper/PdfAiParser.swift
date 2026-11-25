@@ -762,6 +762,7 @@ enum PdfAiParser {
                         // are preserved without scanning inside compressed payload data.
                         var compEnd = -1
                         var endstreamEnd = -1
+                        var usedValidatedDirectLength = false
                         if let directLen = dictInfo.directLength,
                            directLen <= n - dataStart {
                             let expectedEnd = dataStart + directLen
@@ -773,16 +774,25 @@ enum PdfAiParser {
                             if matchesAt(esPos, endstreamToken, limit: n) {
                                 compEnd = expectedEnd
                                 endstreamEnd = esPos + endstreamToken.count
+                                usedValidatedDirectLength = true
                             }
                         }
 
+                        if !usedValidatedDirectLength && !(isFlate && !isImage) {
+                            // Uninflated stream (e.g. /Subtype /Image or non-Flate binary stream)
+                            // without a validated direct /Length: raw endstream search is ambiguous
+                            // against binary payload bytes or a later stream's terminator. Fail closed.
+                            recordIssue("flate-endstream-unbounded")
+                            break streamScanLoop
+                        }
+
                         if compEnd < 0 {
-                            // Indirect or missing /Length: locate matching endstream without
-                            // rescanning ranges already proven to contain none, and pass the
-                            // unstripped range to zlib (which stops at Z_STREAM_END and ignores
-                            // trailing PDF EOL bytes without truncating Adler-32 checksum bytes).
+                            // Flate non-image stream with indirect/missing/mismatched /Length:
+                            // locate matching endstream without rescanning ranges proven to contain
+                            // none, and pass the unstripped range to zlib (which stops at Z_STREAM_END
+                            // and lets us verify only trailing PDF whitespace precedes endstream).
                             var endPos = max(dataStart, noEndstreamBefore)
-                            let searchLimit = n - endstreamToken.count
+                            let searchLimit = min(n - endstreamToken.count, dataStart + maxFlateCompressedBytes + 8)
                             var foundEnd = -1
                             while endPos <= searchLimit {
                                 if bytes[endPos] == endstreamToken[0] {
@@ -813,7 +823,7 @@ enum PdfAiParser {
                                     break streamScanLoop
                                 }
                                 let compLen = compEnd - dataStart
-                                if compLen > maxFlateCompressedBytes {
+                                if compLen > maxFlateCompressedBytes + (usedValidatedDirectLength ? 0 : 8) {
                                     streamAttempts += 1
                                     recordIssue("flate-stream-budget-or-decode")
                                 } else if compLen > 2 {
@@ -826,6 +836,21 @@ enum PdfAiParser {
                                     )
                                     totalInflated += inflateResult.produced
                                     if let inflated = inflateResult.data {
+                                        if !usedValidatedDirectLength {
+                                            let tailStart = dataStart + inflateResult.consumed
+                                            var tailOk = (compEnd - tailStart) <= 8
+                                            if tailOk {
+                                                for k in tailStart..<compEnd {
+                                                    if !isPdfWhitespace(bytes[k]) {
+                                                        tailOk = false
+                                                        break
+                                                    }
+                                                }
+                                            }
+                                            if !tailOk {
+                                                recordIssue("flate-endstream-unbounded")
+                                            }
+                                        }
                                         streamsScanned += 1
                                         try onInflated(inflated)
                                     } else {
@@ -840,8 +865,8 @@ enum PdfAiParser {
                             p = endstreamEnd
                             continue streamScanLoop
                         } else {
-                            // Unbounded stream boundary (image, Flate, or other binary stream):
-                            // fail closed rather than tokenizing raw binary stream payload bytes.
+                            // Unbounded stream boundary: fail closed rather than tokenizing
+                            // raw binary stream payload bytes.
                             recordIssue("flate-endstream-unbounded")
                             break streamScanLoop
                         }
@@ -864,13 +889,13 @@ enum PdfAiParser {
         }
     }
 
-    private static func inflateZlibBounded(base: UnsafePointer<UInt8>, length: Int, maxOut: Int) -> (data: Data?, produced: Int) {
+    private static func inflateZlibBounded(base: UnsafePointer<UInt8>, length: Int, maxOut: Int) -> (data: Data?, produced: Int, consumed: Int) {
         var stream = z_stream()
         stream.next_in = UnsafeMutablePointer(mutating: base)
         stream.avail_in = uInt(length)
 
         let initStatus = inflateInit_(&stream, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
-        if initStatus != Z_OK { return (nil, 0) }
+        if initStatus != Z_OK { return (nil, 0, 0) }
         defer { inflateEnd(&stream) }
 
         var output = Data()
@@ -884,19 +909,20 @@ enum PdfAiParser {
                 return zlib.inflate(&stream, Z_NO_FLUSH)
             }
             let produced = chunkLen - Int(stream.avail_out)
+            let consumed = length - Int(stream.avail_in)
             if produced > 0 {
                 producedTotal += produced
-                if producedTotal > maxOut { return (nil, producedTotal) }
+                if producedTotal > maxOut { return (nil, producedTotal, consumed) }
                 output.append(chunk, count: produced)
             }
             if status == Z_STREAM_END {
-                return (output, producedTotal)
+                return (output, producedTotal, consumed)
             }
             if status != Z_OK {
-                return (nil, producedTotal)
+                return (nil, producedTotal, consumed)
             }
             if stream.avail_in == 0 && produced == 0 {
-                return (nil, producedTotal)
+                return (nil, producedTotal, consumed)
             }
         }
     }
