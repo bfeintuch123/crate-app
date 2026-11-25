@@ -1473,4 +1473,47 @@ test('Swift PdfAiParser isolates each stream dictionary and preserves Adler-32 t
       assert.deepEqual(fs.readFileSync(copied), assetBytes);
     }
   }
+
+  // 3. Dictionary token variants & fallback:
+  //    - /Subtype/Image without space remains skipped
+  //    - /Filter [/FlateDecode] array form is inflated
+  //    - Incorrect direct /Length safely falls back to unstripped endstream scan
+  const arrayAsset = path.join(workDir, 'ArrayFilterHero.png');
+  const arrayAssetBytes = Buffer.from('synthetic-array-filter-bytes');
+  fs.writeFileSync(arrayAsset, arrayAssetBytes);
+  const arrayCompressed = deflateWithTrailingByte(`BT (${arrayAsset}) Tj ET\n`, 0x0a);
+  const compactImageStream = zlib.deflateSync(Buffer.from('% /Users/synthetic/compact-image-skip.png\n', 'utf8'));
+  const variantsAiPath = path.join(workDir, 'DictVariantsAndFallback.ai');
+  fs.writeFileSync(variantsAiPath, Buffer.concat([
+    Buffer.from('%PDF-1.6\n'),
+    Buffer.from(`1 0 obj\n<< /Type/XObject/Subtype/Image/Filter/FlateDecode/Length ${compactImageStream.length} >>\nstream\n`),
+    compactImageStream,
+    Buffer.from('\nendstream\nendobj\n'),
+    Buffer.from(`2 0 obj\n<< /Filter [/FlateDecode] /Length ${arrayCompressed.length + 7} >>\nstream\n`),
+    arrayCompressed,
+    Buffer.from('\nendstream\nendobj\n%%EOF\n'),
+  ]));
+  const variantsParsed = await client.parsePdfAi(variantsAiPath, { decompressStreams: true });
+  assert.equal(variantsParsed.incomplete, false);
+  assert.deepEqual(variantsParsed.issues, []);
+  assert.ok(variantsParsed.paths.includes(arrayAsset), '/Filter [/FlateDecode] with wrong direct /Length must fall back cleanly');
+  assert.equal(variantsParsed.paths.includes('/Users/synthetic/compact-image-skip.png'), false, '/Subtype/Image without space must remain skipped');
+
+  // 4. Unisolated stream dictionaries fail closed with flate-stream-dict-unbounded
+  //    and stay strictly linear-time even on repeated >>stream\n sequences.
+  const repeatedUnboundedPath = path.join(workDir, 'RepeatedUnboundedDict.ai');
+  fs.writeFileSync(repeatedUnboundedPath, Buffer.concat([
+    Buffer.from('%PDF-1.6\n'),
+    Buffer.from('>>stream\n'.repeat(50000), 'ascii'),
+    Buffer.from('%%EOF\n'),
+  ]));
+  const t0 = Date.now();
+  const unboundedParsed = await client.parsePdfAi(repeatedUnboundedPath, { decompressStreams: true });
+  const elapsedMs = Date.now() - t0;
+  assert.equal(unboundedParsed.incomplete, true, 'unisolated stream dictionary must mark result incomplete for fail-closed JS fallback');
+  assert.ok(
+    Array.isArray(unboundedParsed.issues) && unboundedParsed.issues.includes('flate-stream-dict-unbounded'),
+    'unisolated stream dictionary must emit flate-stream-dict-unbounded'
+  );
+  assert.ok(elapsedMs < 2000, `repeated >>stream\\n lookback must stay linear-time (took ${elapsedMs}ms)`);
 });

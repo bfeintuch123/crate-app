@@ -400,12 +400,20 @@ enum PdfAiParser {
         let imageToken = Array("/Image".utf8)
         let lengthToken = Array("/Length".utf8)
         let maxStreamDictLookback = 65536
+        let maxDictNestingDepth = 32
         let maxDirectStreamLength = 16 * 1024 * 1024
         let n = bytes.count
         var streamAttempts = 0
         var totalInflated = 0
         var noEndstreamBefore = 0
+        var noDictBefore = 0
         var i = 0
+
+        enum StreamDictLookup {
+            case notAStream
+            case found(Range<Int>)
+            case unbounded
+        }
 
         func recordIssue(_ code: String) {
             if !issues.contains(code) { issues.append(code) }
@@ -434,26 +442,29 @@ enum PdfAiParser {
             return true
         }
 
-        func findStreamDictionaryRange(before streamPos: Int) -> Range<Int>? {
+        func findStreamDictionaryRange(before streamPos: Int) -> StreamDictLookup {
             var p = streamPos - 1
-            while p >= 0 && isPdfWhitespace(bytes[p]) {
+            while p >= noDictBefore && isPdfWhitespace(bytes[p]) {
                 p -= 1
             }
-            guard p >= 1 && bytes[p] == 0x3E && bytes[p - 1] == 0x3E else { return nil }
+            guard p >= noDictBefore + 1 && bytes[p] == 0x3E && bytes[p - 1] == 0x3E else { return .notAStream }
             let dictClose = p + 1
-            let floor = max(0, streamPos - maxStreamDictLookback)
+            let floor = max(noDictBefore, streamPos - maxStreamDictLookback)
             var depth = 1
             var q = p - 2
             while q >= floor {
                 if bytes[q] == 0x3E && q > floor && bytes[q - 1] == 0x3E {
                     depth += 1
+                    if depth > maxDictNestingDepth {
+                        return .unbounded
+                    }
                     q -= 2
                     continue
                 }
                 if bytes[q] == 0x3C && q > floor && bytes[q - 1] == 0x3C {
                     depth -= 1
                     if depth == 0 {
-                        return (q - 1)..<dictClose
+                        return .found((q - 1)..<dictClose)
                     }
                     q -= 2
                     continue
@@ -461,16 +472,16 @@ enum PdfAiParser {
                 if depth == 1 {
                     if q >= floor + endobjToken.count - 1 &&
                         matchesAt(q - endobjToken.count + 1, endobjToken, limit: dictClose) {
-                        return nil
+                        return .unbounded
                     }
                     if q >= floor + endstreamToken.count - 1 &&
                         matchesAt(q - endstreamToken.count + 1, endstreamToken, limit: dictClose) {
-                        return nil
+                        return .unbounded
                     }
                 }
                 q -= 1
             }
-            return nil
+            return .unbounded
         }
 
         func dictContainsName(_ range: Range<Int>, _ name: [UInt8]) -> Bool {
@@ -589,7 +600,7 @@ enum PdfAiParser {
             return nil
         }
 
-        while i < n - 16 {
+        streamScanLoop: while i < n - 16 {
             // Match "stream" followed by \n or \r\n (and NOT preceded by "end")
             if bytes[i] == streamToken[0] && i + 7 < n {
                 var ok = true
@@ -607,91 +618,101 @@ enum PdfAiParser {
                             dataStart += 2; validLineBreak = true
                         }
                     }
-                    if validLineBreak, let dictRange = findStreamDictionaryRange(before: i) {
-                        let isFlate = dictContainsName(dictRange, flateToken)
-                        let isImage = dictHasImageSubtype(dictRange)
+                    if validLineBreak {
+                        switch findStreamDictionaryRange(before: i) {
+                        case .notAStream:
+                            break
+                        case .unbounded:
+                            noDictBefore = max(noDictBefore, dataStart)
+                            recordIssue("flate-stream-dict-unbounded")
+                        case .found(let dictRange):
+                            noDictBefore = max(noDictBefore, dataStart)
+                            let isFlate = dictContainsName(dictRange, flateToken)
+                            let isImage = dictHasImageSubtype(dictRange)
 
-                        // Prefer validated direct /Length from this stream's own dictionary so
-                        // exact compressed bytes (including any trailing CR/LF checksum bytes)
-                        // are preserved without scanning inside compressed payload data.
-                        var compEnd = -1
-                        var endstreamEnd = -1
-                        if let directLen = parseDirectStreamLength(dictRange),
-                           directLen <= n - dataStart {
-                            let expectedEnd = dataStart + directLen
-                            var esPos = expectedEnd
-                            let esWsLimit = min(n, expectedEnd + 8)
-                            while esPos < esWsLimit && isPdfWhitespace(bytes[esPos]) {
-                                esPos += 1
+                            // Prefer validated direct /Length from this stream's own dictionary so
+                            // exact compressed bytes (including any trailing CR/LF checksum bytes)
+                            // are preserved without scanning inside compressed payload data.
+                            var compEnd = -1
+                            var endstreamEnd = -1
+                            if let directLen = parseDirectStreamLength(dictRange),
+                               directLen <= n - dataStart {
+                                let expectedEnd = dataStart + directLen
+                                var esPos = expectedEnd
+                                let esWsLimit = min(n, expectedEnd + 8)
+                                while esPos < esWsLimit && isPdfWhitespace(bytes[esPos]) {
+                                    esPos += 1
+                                }
+                                if matchesAt(esPos, endstreamToken, limit: n) {
+                                    compEnd = expectedEnd
+                                    endstreamEnd = esPos + endstreamToken.count
+                                }
                             }
-                            if matchesAt(esPos, endstreamToken, limit: n) {
-                                compEnd = expectedEnd
-                                endstreamEnd = esPos + endstreamToken.count
-                            }
-                        }
 
-                        if compEnd < 0 {
-                            // Indirect or missing /Length: locate matching endstream without
-                            // rescanning ranges already proven to contain none, and pass the
-                            // unstripped range to zlib (which stops at Z_STREAM_END and ignores
-                            // trailing PDF EOL bytes without truncating Adler-32 checksum bytes).
-                            var endPos = max(dataStart, noEndstreamBefore)
-                            let searchLimit = min(n - endstreamToken.count, dataStart + maxDirectStreamLength)
-                            var foundEnd = -1
-                            while endPos <= searchLimit {
-                                if bytes[endPos] == endstreamToken[0] {
-                                    var m = true
-                                    for k in 1..<endstreamToken.count {
-                                        if bytes[endPos + k] != endstreamToken[k] { m = false; break }
+                            if compEnd < 0 {
+                                // Indirect or missing /Length: locate matching endstream without
+                                // rescanning ranges already proven to contain none, and pass the
+                                // unstripped range to zlib (which stops at Z_STREAM_END and ignores
+                                // trailing PDF EOL bytes without truncating Adler-32 checksum bytes).
+                                var endPos = max(dataStart, noEndstreamBefore)
+                                let searchLimit = min(n - endstreamToken.count, dataStart + maxDirectStreamLength)
+                                var foundEnd = -1
+                                while endPos <= searchLimit {
+                                    if bytes[endPos] == endstreamToken[0] {
+                                        var m = true
+                                        for k in 1..<endstreamToken.count {
+                                            if bytes[endPos + k] != endstreamToken[k] { m = false; break }
+                                        }
+                                        if m { foundEnd = endPos; break }
                                     }
-                                    if m { foundEnd = endPos; break }
+                                    endPos += 1
                                 }
-                                endPos += 1
+                                if foundEnd < 0 {
+                                    noEndstreamBefore = max(noEndstreamBefore, searchLimit + 1)
+                                } else {
+                                    compEnd = foundEnd
+                                    endstreamEnd = foundEnd + endstreamToken.count
+                                }
                             }
-                            if foundEnd < 0 {
-                                noEndstreamBefore = max(noEndstreamBefore, searchLimit + 1)
-                            } else {
-                                compEnd = foundEnd
-                                endstreamEnd = foundEnd + endstreamToken.count
-                            }
-                        }
 
-                        if compEnd >= dataStart && endstreamEnd > compEnd {
-                            if isFlate && !isImage {
-                                if streamAttempts >= maxStreamsToInflate {
-                                    recordIssue("flate-stream-count-limit")
-                                    break
-                                }
-                                if totalInflated >= maxTotalInflatedOut {
-                                    recordIssue("flate-total-output-limit")
-                                    break
-                                }
-                                let compLen = compEnd - dataStart
-                                if compLen > 2 {
-                                    streamAttempts += 1
-                                    let budget = min(maxSingleStreamOut, maxTotalInflatedOut - totalInflated)
-                                    let inflateResult = inflateZlibBounded(
-                                        base: bytes.baseAddress!.advanced(by: dataStart),
-                                        length: compLen,
-                                        maxOut: budget
-                                    )
-                                    totalInflated += inflateResult.produced
-                                    if let inflated = inflateResult.data {
-                                        streamsScanned += 1
-                                        try onInflated(inflated)
-                                    } else {
-                                        recordIssue("flate-stream-budget-or-decode")
+                            if compEnd >= dataStart && endstreamEnd > compEnd {
+                                noDictBefore = max(noDictBefore, endstreamEnd)
+                                if isFlate && !isImage {
+                                    if streamAttempts >= maxStreamsToInflate {
+                                        recordIssue("flate-stream-count-limit")
+                                        break streamScanLoop
                                     }
                                     if totalInflated >= maxTotalInflatedOut {
                                         recordIssue("flate-total-output-limit")
-                                        break
+                                        break streamScanLoop
+                                    }
+                                    let compLen = compEnd - dataStart
+                                    if compLen > 2 {
+                                        streamAttempts += 1
+                                        let budget = min(maxSingleStreamOut, maxTotalInflatedOut - totalInflated)
+                                        let inflateResult = inflateZlibBounded(
+                                            base: bytes.baseAddress!.advanced(by: dataStart),
+                                            length: compLen,
+                                            maxOut: budget
+                                        )
+                                        totalInflated += inflateResult.produced
+                                        if let inflated = inflateResult.data {
+                                            streamsScanned += 1
+                                            try onInflated(inflated)
+                                        } else {
+                                            recordIssue("flate-stream-budget-or-decode")
+                                        }
+                                        if totalInflated >= maxTotalInflatedOut {
+                                            recordIssue("flate-total-output-limit")
+                                            break streamScanLoop
+                                        }
                                     }
                                 }
+                                i = endstreamEnd
+                                continue streamScanLoop
+                            } else if isFlate && !isImage {
+                                recordIssue("flate-endstream-unbounded")
                             }
-                            i = endstreamEnd
-                            continue
-                        } else if isFlate && !isImage {
-                            recordIssue("flate-endstream-unbounded")
                         }
                     }
                 }
