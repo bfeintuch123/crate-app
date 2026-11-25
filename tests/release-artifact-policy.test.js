@@ -27,13 +27,21 @@ const {
   EXPECTED_HELPER_INFO_KEYS,
   EXPECTED_MAIN_INFO_KEYS,
   EXPECTED_MAIN_ENTITLEMENTS,
+  EXPECTED_NATIVE_HELPER_REQUIREMENT,
   EXPECTED_PRIVACY_USAGE_KEYS,
+  NATIVE_HELPER_IDENTIFIER,
+  NATIVE_HELPER_SOURCE_DIR,
+  NATIVE_HELPER_SOURCE_FILES,
+  NATIVE_HELPER_SWIFTC_ARGS,
   PUBLIC_APP_ID,
   PUBLIC_TEAM_ID,
   SAFE_GIT_ARGUMENT_PREFIX,
   SOURCE_BOUND_ENTRIES,
   authenticateVerifierToolchain,
+  canonicalNativeDigestFromBytes,
   collectElectronRuntimeEvidence,
+  collectNativeHelperEvidence,
+  compileNativeHelper,
   collectReachableProductionLockPaths,
   collectReachableVerifierToolLockPaths,
   collectReleaseEvidence,
@@ -46,6 +54,7 @@ const {
   installedPackageMatchesLockArchive,
   inspectAppArchitectures,
   inspectBundleLayout,
+  nativeHelperDeveloperIdRequirement,
   npmCacheContentPath,
   parseCliArguments,
   parseCodeSignatureMetadata,
@@ -53,6 +62,7 @@ const {
   packagedManifestMatchesSource,
   runCli,
   safeCliErrorMessage,
+  trimRemovedSignaturePadding,
   verifyAsarFileIntegrity,
   verifierSourceMatchesExpectedRevision,
 } = require('../scripts/verify-macos-release-app');
@@ -61,6 +71,7 @@ const {
   runBootstrap,
   sourceFilesMatchRevision,
 } = require('../scripts/run-macos-release-proof');
+const { verifyPackagedAppContents } = require('../scripts/verify-app-contents');
 
 const ROOT = path.join(__dirname, '..');
 const SAFE_INTEGRITY = `sha512-${Buffer.alloc(64, 7).toString('base64')}`;
@@ -152,6 +163,7 @@ const REVIEWED_SOURCE_BOUND_ENTRIES = Object.freeze([
   'renderer/styles.css',
   'assets/tray-icon.png',
   'parsers/admission-budgets.js',
+  'parsers/adobe-push-bridge.js',
   'parsers/aftereffects.js',
   'parsers/ai.js',
   'parsers/add-files-operation.js',
@@ -166,16 +178,22 @@ const REVIEWED_SOURCE_BOUND_ENTRIES = Object.freeze([
   'parsers/font-release-catalog.js',
   'parsers/indesign.js',
   'parsers/index.js',
+  'parsers/ipc-delta-bridge.js',
   'parsers/linked-asset-matcher.js',
+  'parsers/native-helper.js',
+  'parsers/native-watcher-bridge.js',
   'parsers/ooxml-links.js',
   'parsers/xml-path.js',
   'parsers/package-safety.js',
   'parsers/package-transaction-worker.js',
   'parsers/powerpoint.js',
   'parsers/premiere.js',
+  'parsers/project-state-machine.js',
   'parsers/psd.js',
+  'parsers/sqlite-store.js',
   'parsers/working-source-recovery-core.js',
   'parsers/working-source-witness.js',
+  'parsers/zip-reader.js',
 ]);
 const REVIEWED_EXTERNAL_SOURCE_BOUND_ENTRIES = Object.freeze([
   Object.freeze({
@@ -294,10 +312,25 @@ function createFixtureGitRunner(sourceRoot, revision = 'b'.repeat(40), options =
     if (args[0] === 'status') {
       return { ok: true, stdout: options.status || '', stderr: '' };
     }
+    if (args[0] === 'ls-tree' && args[1] === '--name-only') {
+      const directory = args[args.length - 1].replace(/\/$/u, '');
+      const names = fs.readdirSync(path.join(canonicalRoot, ...directory.split('/')))
+        .filter(name => !(options.omittedTreeNames || []).includes(name))
+        .concat(options.extraTreeNames || [])
+        .sort();
+      return {
+        ok: true,
+        stdout: names.map(name => `${directory}/${name}\n`).join(''),
+        stderr: '',
+      };
+    }
     if (args[0] === 'ls-tree') {
       const entry = args[args.length - 1];
-      const bytes = fs.readFileSync(path.join(canonicalRoot, ...entry.split('/')));
-      const mode = options.symlinkEntry === entry ? '120000' : '100644';
+      const committedBytes = options.committedBytes && options.committedBytes[entry];
+      const bytes = committedBytes || fs.readFileSync(path.join(canonicalRoot, ...entry.split('/')));
+      const mode = options.symlinkEntry === entry
+        ? '120000'
+        : options.executableEntry === entry ? '100755' : '100644';
       return {
         ok: true,
         stdout: `${mode} blob ${gitBlobOid(bytes)}\t${entry}\n`,
@@ -581,6 +614,35 @@ function safeNestedBundle(name) {
   };
 }
 
+// Synthetic header bytes only; never executed.
+function syntheticNativeHelperBytes(marker = 'packaged') {
+  const bytes = Buffer.alloc(96, 0);
+  bytes.writeUInt32LE(0xfeedfacf, 0);
+  bytes.writeUInt32LE(0x0100000c, 4);
+  bytes.writeUInt32LE(0, 8);
+  bytes.writeUInt32LE(2, 12);
+  Buffer.from(marker, 'utf8').copy(bytes, 32);
+  return bytes;
+}
+
+function writeNativeHelperResource(resourcesPath, bytes = syntheticNativeHelperBytes(), mode = 0o755) {
+  const helperPath = path.join(resourcesPath, 'native', 'crate-helper');
+  fs.mkdirSync(path.dirname(helperPath), { recursive: true });
+  fs.writeFileSync(helperPath, bytes);
+  fs.chmodSync(helperPath, mode);
+  return helperPath;
+}
+
+function safeNativeHelper() {
+  return {
+    resourceValid: true,
+    signature: safeNestedSignature('crate-helper'),
+    strictRequirementValid: true,
+    entitlements: Object.fromEntries(EXPECTED_HELPER_ENTITLEMENTS.map(key => [key, true])),
+    sourceBound: true,
+  };
+}
+
 function safeEvidence(version = packageJson.version) {
   return {
     artifactPath: '/Users/example/private-builds/Crate.app',
@@ -639,6 +701,7 @@ function safeEvidence(version = packageJson.version) {
       revision: 'b'.repeat(40),
       entryCount: SOURCE_BOUND_ENTRIES.length + EXTERNAL_SOURCE_BOUND_ENTRIES.length,
     },
+    nativeHelper: safeNativeHelper(),
     electronRuntime: {
       valid: true,
       lockedVersion: '42.9.0',
@@ -692,6 +755,7 @@ test('signed release evidence passes only with the complete security policy', ()
   assert.equal(result.proof.counts.helperApps, 4);
   assert.equal(result.proof.counts.nestedCodeBundles, 8);
   assert.equal(result.proof.checks.architecture, 'pass');
+  assert.equal(result.proof.checks.nativeHelper, 'pass');
   assert.equal(result.proof.counts.machOBinaries, 12);
 });
 
@@ -817,6 +881,7 @@ test('bundle layout requires the configured executable and exact resource entry 
       'updaterCacheDirName: crate-app-updater\n'
     );
     fs.writeFileSync(path.join(contentsPath, 'PkgInfo'), 'APPL????');
+    writeNativeHelperResource(path.join(contentsPath, 'Resources'));
     assert.equal(inspectBundleLayout(appPath, 'Crate').valid, true);
 
     fs.rmSync(path.join(contentsPath, 'CodeResources'));
@@ -876,9 +941,420 @@ test('bundle layout requires the configured executable and exact resource entry 
     assert.equal(inspectBundleLayout(appPath, 'Crate').valid, false);
     fs.rmSync(unexpectedResourcePath);
 
+    const nativePath = path.join(contentsPath, 'Resources', 'native');
+    const helperPath = path.join(nativePath, 'crate-helper');
+    const resetNative = () => {
+      fs.rmSync(nativePath, { recursive: true, force: true });
+      writeNativeHelperResource(path.join(contentsPath, 'Resources'));
+      assert.equal(inspectBundleLayout(appPath, 'Crate').valid, true);
+    };
+    const fatHelper = syntheticNativeHelperBytes();
+    fatHelper.writeUInt32BE(0xcafebabe, 0);
+    const x86Helper = syntheticNativeHelperBytes();
+    x86Helper.writeUInt32LE(0x01000007, 4);
+    const arm64eHelper = syntheticNativeHelperBytes();
+    arm64eHelper.writeUInt32LE(2, 8);
+    const dylibHelper = syntheticNativeHelperBytes();
+    dylibHelper.writeUInt32LE(6, 12);
+    for (const [label, mutate] of [
+      ['missing native', () => fs.rmSync(nativePath, { recursive: true })],
+      ['missing helper', () => fs.rmSync(helperPath)],
+      ['native file', () => {
+        fs.rmSync(nativePath, { recursive: true });
+        fs.writeFileSync(nativePath, syntheticNativeHelperBytes());
+      }],
+      ['extra sibling file', () => fs.writeFileSync(path.join(nativePath, 'extra'), 'fixture')],
+      ['extra sibling directory', () => fs.mkdirSync(path.join(nativePath, 'extra'))],
+      ['Finder metadata sibling', () => fs.writeFileSync(path.join(nativePath, '.DS_Store'), 'fixture')],
+      ['symlinked native', () => {
+        const realNative = path.join(fixtureRoot, 'real-native');
+        fs.renameSync(nativePath, realNative);
+        fs.symlinkSync(realNative, nativePath);
+      }],
+      ['symlinked helper', () => {
+        const realHelper = path.join(fixtureRoot, 'real-helper');
+        fs.renameSync(helperPath, realHelper);
+        fs.symlinkSync(realHelper, helperPath);
+      }],
+      ['helper directory', () => {
+        fs.rmSync(helperPath);
+        fs.mkdirSync(helperPath);
+      }],
+      ['mode 0644', () => fs.chmodSync(helperPath, 0o644)],
+      ['mode 04755', () => fs.chmodSync(helperPath, 0o4755)],
+      ['x86_64 helper', () => fs.writeFileSync(helperPath, x86Helper)],
+      ['fat helper', () => fs.writeFileSync(helperPath, fatHelper)],
+      ['arm64e helper', () => fs.writeFileSync(helperPath, arm64eHelper)],
+      ['dylib helper', () => fs.writeFileSync(helperPath, dylibHelper)],
+      ['script helper', () => fs.writeFileSync(helperPath, '#!/bin/sh\nexit 0\n'.padEnd(64, ' '))],
+      ['empty helper', () => fs.writeFileSync(helperPath, '')],
+      ['31-byte helper', () => fs.writeFileSync(helperPath, syntheticNativeHelperBytes().subarray(0, 31))],
+    ]) {
+      mutate();
+      assert.equal(inspectBundleLayout(appPath, 'Crate').valid, false, label);
+      fs.rmSync(path.join(fixtureRoot, 'real-native'), { recursive: true, force: true });
+      fs.rmSync(path.join(fixtureRoot, 'real-helper'), { force: true });
+      resetNative();
+    }
+
     assert.equal(inspectBundleLayout(appPath, 'Renamed').valid, false);
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+const NATIVE_HELPER_FAILURES = Object.freeze({
+  resource: 'Bundled native helper is missing or not approved.',
+  signature: 'Bundled native helper signature policy changed.',
+  entitlements: 'Bundled native helper entitlements do not match the approved policy.',
+  source: 'Bundled native helper does not match the committed Swift sources.',
+});
+
+test('release evidence requires the source-bound Developer ID native helper', () => {
+  const passing = evaluateReleaseEvidence(safeEvidence(), releaseOptions());
+  assert.equal(passing.ok, true);
+  assert.equal(passing.proof.checks.nativeHelper, 'pass');
+
+  for (const [label, mutate, expected] of [
+    ['resource rejected', helper => { helper.resourceValid = false; }, [NATIVE_HELPER_FAILURES.resource]],
+    ['invalid signature', helper => { helper.signature.valid = false; }, [NATIVE_HELPER_FAILURES.signature]],
+    ['wrong identifier', helper => { helper.signature.identifier = 'com.crate.app.helper'; }, [NATIVE_HELPER_FAILURES.signature]],
+    ['wrong team', helper => { helper.signature.teamIdentifier = 'OTHERTEAM1'; }, [NATIVE_HELPER_FAILURES.signature]],
+    ['missing Developer ID authority', helper => {
+      helper.signature.authorities = ['Apple Development: Local Developer'];
+    }, [NATIVE_HELPER_FAILURES.signature]],
+    ['no hardened runtime', helper => { helper.signature.hardenedRuntime = false; }, [NATIVE_HELPER_FAILURES.signature]],
+    ['no secure timestamp', helper => { helper.signature.timestamped = false; }, [NATIVE_HELPER_FAILURES.signature]],
+    ['missing code fingerprint', helper => { delete helper.signature.codeDirectoryHash; }, [NATIVE_HELPER_FAILURES.signature]],
+    ['missing signature', helper => { helper.signature = null; }, [NATIVE_HELPER_FAILURES.signature]],
+    ['strict requirement rejected', helper => { helper.strictRequirementValid = false; }, [NATIVE_HELPER_FAILURES.signature]],
+    ['strict requirement truthy non-boolean', helper => { helper.strictRequirementValid = 'true'; }, [NATIVE_HELPER_FAILURES.signature]],
+    ['missing entitlement', helper => {
+      delete helper.entitlements['com.apple.security.cs.allow-jit'];
+    }, [NATIVE_HELPER_FAILURES.entitlements]],
+    ['extra entitlement', helper => {
+      helper.entitlements['com.apple.security.automation.apple-events'] = true;
+    }, [NATIVE_HELPER_FAILURES.entitlements]],
+    ['false entitlement value', helper => {
+      helper.entitlements['com.apple.security.cs.allow-jit'] = false;
+    }, [NATIVE_HELPER_FAILURES.entitlements]],
+    ['missing entitlements', helper => { helper.entitlements = null; }, [NATIVE_HELPER_FAILURES.entitlements]],
+    ['not source bound', helper => { helper.sourceBound = false; }, [NATIVE_HELPER_FAILURES.source]],
+    ['source bound truthy non-boolean', helper => { helper.sourceBound = 1; }, [NATIVE_HELPER_FAILURES.source]],
+  ]) {
+    const evidence = safeEvidence();
+    mutate(evidence.nativeHelper);
+    const result = evaluateReleaseEvidence(evidence, releaseOptions());
+    assert.equal(result.ok, false, label);
+    assert.deepEqual(result.failures, expected, label);
+    assert.equal(result.proof.checks.nativeHelper, 'fail', label);
+    assert.equal(result.proof.releaseReady, false, label);
+  }
+
+  for (const [label, value] of [
+    ['absent', undefined],
+    ['null', null],
+    ['string', 'valid'],
+    ['array', [safeNativeHelper()]],
+  ]) {
+    const evidence = safeEvidence();
+    if (value === undefined) delete evidence.nativeHelper;
+    else evidence.nativeHelper = value;
+    const result = evaluateReleaseEvidence(evidence, releaseOptions());
+    assert.deepEqual(result.failures, [
+      NATIVE_HELPER_FAILURES.resource,
+      NATIVE_HELPER_FAILURES.signature,
+      NATIVE_HELPER_FAILURES.entitlements,
+      NATIVE_HELPER_FAILURES.source,
+    ], label);
+    assert.equal(result.proof.checks.nativeHelper, 'fail', label);
+  }
+
+  const hostile = safeEvidence();
+  hostile.nativeHelper.signature.identifier = '/Users/private/native/crate-helper';
+  const hostileProof = JSON.stringify(evaluateReleaseEvidence(hostile, releaseOptions()).proof);
+  assert.equal(hostileProof.includes('/Users/private'), false);
+  assert.equal(hostileProof.includes('Private Signer Name'), false);
+});
+
+test('native helper Developer ID requirement pins the identifier, Apple anchor, Developer ID intermediate, and team', () => {
+  assert.equal(NATIVE_HELPER_IDENTIFIER, 'crate-helper');
+  assert.equal(
+    EXPECTED_NATIVE_HELPER_REQUIREMENT,
+    'identifier "crate-helper" and anchor apple generic and ' +
+      'certificate 1[field.1.2.840.113635.100.6.2.6] exists and ' +
+      'certificate leaf[field.1.2.840.113635.100.6.1.13] exists and ' +
+      'certificate leaf[subject.OU] = "YY7WDMUFWJ"'
+  );
+  assert.equal(nativeHelperDeveloperIdRequirement(PUBLIC_TEAM_ID), EXPECTED_NATIVE_HELPER_REQUIREMENT);
+  assert.equal(
+    nativeHelperDeveloperIdRequirement('ABCDE12345').endsWith('certificate leaf[subject.OU] = "ABCDE12345"'),
+    true
+  );
+  for (const invalid of ['', 'yy7wdmufwj', 'TOO-SHORT', 'YY7WDMUFWJ" or true', null]) {
+    assert.equal(nativeHelperDeveloperIdRequirement(invalid), null);
+  }
+});
+
+function nativeHelperSourceFixture(fixtureRoot) {
+  const sourceRoot = path.join(fixtureRoot, 'source');
+  const sourceBytes = {};
+  for (const name of NATIVE_HELPER_SOURCE_FILES) {
+    const sourcePath = path.join(sourceRoot, ...NATIVE_HELPER_SOURCE_DIR.split('/'), name);
+    fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+    sourceBytes[name] = Buffer.from(`// synthetic Swift source ${name}\n`);
+    fs.writeFileSync(sourcePath, sourceBytes[name]);
+  }
+  const appPath = path.join(fixtureRoot, 'Crate.app');
+  const packagedBytes = syntheticNativeHelperBytes('packaged-helper');
+  const helperPath = writeNativeHelperResource(
+    path.join(appPath, 'Contents', 'Resources'),
+    packagedBytes
+  );
+  return { appPath, helperPath, packagedBytes, sourceBytes, sourceRoot };
+}
+
+function nativeHelperCommandRunner(sourceRoot, gitOptions = {}, behavior = {}) {
+  const gitRunner = createFixtureGitRunner(sourceRoot, 'b'.repeat(40), gitOptions);
+  const calls = [];
+  const runner = (command, args, options = {}) => {
+    calls.push({ command, args: [...args] });
+    if (command === '/usr/bin/git') return gitRunner(command, args, options);
+    if (command === '/usr/bin/codesign' && args[0] === '-dv') {
+      return { ok: true, stdout: '', stderr: signedMetadata(NATIVE_HELPER_IDENTIFIER, 'e') };
+    }
+    if (command === '/usr/bin/codesign' && args.includes('--entitlements')) {
+      return {
+        ok: true,
+        stdout: '<?xml version="1.0"?><plist><dict><key>helper-entitlements</key><true/></dict></plist>',
+        stderr: '',
+      };
+    }
+    if (command === '/usr/bin/codesign' && behavior.rejectStrictRequirement &&
+        args.includes(`-R=${EXPECTED_NATIVE_HELPER_REQUIREMENT}`)) {
+      return { ok: false, stdout: '', stderr: '' };
+    }
+    if (command === '/usr/bin/codesign' || command === '/usr/bin/strip') {
+      return { ok: true, stdout: '', stderr: '' };
+    }
+    if (command === '/usr/bin/plutil' && options.input) {
+      return {
+        ok: true,
+        stdout: JSON.stringify(Object.fromEntries(EXPECTED_HELPER_ENTITLEMENTS.map(key => [key, true]))),
+        stderr: '',
+      };
+    }
+    return { ok: false, stdout: '', stderr: '' };
+  };
+  return { calls, runner };
+}
+
+test('native helper evidence binds packaged bytes to a rebuild of the exact committed Swift blobs', () => {
+  const fixtureRoot = fs.mkdtempSync('/tmp/crate-native-evidence-');
+  try {
+    const fixture = nativeHelperSourceFixture(fixtureRoot);
+    const canonicalSourceRoot = fs.realpathSync(fixture.sourceRoot);
+    const revision = 'b'.repeat(40);
+    const compilerCalls = [];
+    const matchingCompiler = (sources, options) => {
+      compilerCalls.push({ sources, options });
+      return Buffer.from(fixture.packagedBytes);
+    };
+    const collect = (gitOptions = {}, options = {}, behavior = {}) => {
+      const { calls, runner } = nativeHelperCommandRunner(canonicalSourceRoot, gitOptions, behavior);
+      const evidence = collectNativeHelperEvidence(
+        fixture.appPath,
+        canonicalSourceRoot,
+        options.revision === undefined ? revision : options.revision,
+        runner,
+        {
+          expectedTeamId: PUBLIC_TEAM_ID,
+          nativeHelperCompiler: Object.hasOwn(options, 'compiler') ? options.compiler : matchingCompiler,
+        }
+      );
+      return { calls, evidence, runner };
+    };
+
+    const accepted = collect();
+    assert.equal(accepted.evidence.resourceValid, true);
+    assert.equal(accepted.evidence.strictRequirementValid, true);
+    assert.equal(accepted.evidence.sourceBound, true);
+    assert.equal(accepted.evidence.signature.valid, true);
+    assert.equal(accepted.evidence.signature.identifier, NATIVE_HELPER_IDENTIFIER);
+    assert.deepEqual(
+      Object.keys(accepted.evidence.entitlements).sort(),
+      [...EXPECTED_HELPER_ENTITLEMENTS]
+    );
+    const acceptedReport = evaluateReleaseEvidence(
+      { ...safeEvidence(), nativeHelper: accepted.evidence },
+      releaseOptions()
+    );
+    assert.deepEqual(acceptedReport.failures, []);
+    assert.equal(compilerCalls.length, 1);
+    assert.deepEqual(Object.keys(compilerCalls[0].sources), [...NATIVE_HELPER_SOURCE_FILES]);
+    for (const name of NATIVE_HELPER_SOURCE_FILES) {
+      assert.equal(compilerCalls[0].sources[name].equals(fixture.sourceBytes[name]), true);
+    }
+    assert.equal(compilerCalls[0].options.commandRunner, accepted.runner);
+    assert.deepEqual(
+      accepted.calls.filter(call => call.args.includes(`-R=${EXPECTED_NATIVE_HELPER_REQUIREMENT}`)),
+      [{
+        command: '/usr/bin/codesign',
+        args: ['--verify', '--strict', '--verbose=4', `-R=${EXPECTED_NATIVE_HELPER_REQUIREMENT}`, fixture.helperPath],
+      }]
+    );
+    const listingCall = accepted.calls.find(call => call.command === '/usr/bin/git' &&
+      call.args.includes('--name-only'));
+    assert.deepEqual(listingCall.args, [
+      ...SAFE_GIT_ARGUMENT_PREFIX,
+      'ls-tree',
+      '--name-only',
+      revision,
+      '--',
+      `${NATIVE_HELPER_SOURCE_DIR}/`,
+    ]);
+
+    const strictRejected = collect({}, {}, { rejectStrictRequirement: true });
+    assert.equal(strictRejected.evidence.strictRequirementValid, false);
+    assert.equal(strictRejected.evidence.sourceBound, true);
+
+    compilerCalls.length = 0;
+    const sourceEntry = `${NATIVE_HELPER_SOURCE_DIR}/main.swift`;
+    for (const [label, gitOptions, options] of [
+      ['changed source byte', {
+        committedBytes: { [sourceEntry]: Buffer.from('// synthetic Swift source main.swifT\n') },
+      }, {}],
+      ['extra tree entry', { extraTreeNames: ['Extra.swift'] }, {}],
+      ['missing tree entry', { omittedTreeNames: ['WatchOps.swift'] }, {}],
+      ['symlink tree entry', { symlinkEntry: sourceEntry }, {}],
+      ['executable tree entry', { executableEntry: sourceEntry }, {}],
+      ['invalid revision', {}, { revision: '' }],
+    ]) {
+      const result = collect(gitOptions, options);
+      assert.equal(result.evidence.resourceValid, true, label);
+      assert.equal(result.evidence.sourceBound, false, label);
+    }
+    assert.equal(compilerCalls.length, 0);
+
+    for (const [label, compiler] of [
+      ['null compiler result', () => null],
+      ['different rebuilt bytes', () => syntheticNativeHelperBytes('different-helper')],
+      ['throwing compiler', () => { throw new Error('synthetic compiler failure'); }],
+      ['non-buffer compiler result', () => 'packaged-helper'],
+    ]) {
+      assert.equal(collect({}, { compiler }).evidence.sourceBound, false, label);
+    }
+
+    const extraSourcePath = path.join(canonicalSourceRoot, NATIVE_HELPER_SOURCE_DIR, 'Extra.swift');
+    fs.writeFileSync(extraSourcePath, '// synthetic extra source\n');
+    assert.equal(collect().evidence.sourceBound, false);
+    fs.rmSync(extraSourcePath);
+
+    const sourceDirectory = path.join(canonicalSourceRoot, ...NATIVE_HELPER_SOURCE_DIR.split('/'));
+    const realSourceDirectory = path.join(fixtureRoot, 'real-swift-sources');
+    fs.renameSync(sourceDirectory, realSourceDirectory);
+    fs.symlinkSync(realSourceDirectory, sourceDirectory);
+    assert.equal(collect().evidence.sourceBound, false);
+    fs.unlinkSync(sourceDirectory);
+    fs.renameSync(realSourceDirectory, sourceDirectory);
+    assert.equal(collect().evidence.sourceBound, true);
+
+    fs.chmodSync(fixture.helperPath, 0o644);
+    const rejectedResource = collect();
+    assert.deepEqual(rejectedResource.evidence, {
+      resourceValid: false,
+      signature: null,
+      strictRequirementValid: false,
+      entitlements: null,
+      sourceBound: false,
+    });
+    assert.equal(rejectedResource.calls.length, 0);
+
+    const injected = { ...safeNativeHelper(), sourceBound: false };
+    const injectedEvidence = collectNativeHelperEvidence(fixture.appPath, canonicalSourceRoot, revision, () => {
+      throw new Error('injected evidence must not run commands');
+    }, { nativeHelperEvidence: injected });
+    assert.deepEqual(injectedEvidence, injected);
+    assert.notEqual(injectedEvidence, injected);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('native helper compiler stages exact private sources and accepts only a thin arm64 executable', () => {
+  const sources = Object.fromEntries(NATIVE_HELPER_SOURCE_FILES.map(name => [
+    name,
+    Buffer.from(`// synthetic compiler input ${name}\n`),
+  ]));
+  const observed = [];
+  const runnerWriting = output => (command, args, options) => {
+    const outputPath = args[args.length - 1];
+    const temporaryRoot = path.dirname(path.dirname(outputPath));
+    const sourcePaths = args.slice(NATIVE_HELPER_SWIFTC_ARGS.length, -2);
+    observed.push({
+      command,
+      args: [...args],
+      cwd: options && options.cwd,
+      temporaryRoot,
+      rootMode: fs.lstatSync(temporaryRoot).mode & 0o777,
+      outputDirectoryMode: fs.lstatSync(path.dirname(outputPath)).mode & 0o777,
+      sources: sourcePaths.map(sourcePath => ({
+        name: path.basename(sourcePath),
+        parent: path.dirname(sourcePath),
+        mode: fs.lstatSync(sourcePath).mode & 0o777,
+        bytes: fs.readFileSync(sourcePath),
+      })),
+    });
+    if (output === null) return { ok: false, stdout: '', stderr: '' };
+    fs.writeFileSync(outputPath, output);
+    return { ok: true, stdout: '', stderr: '' };
+  };
+
+  const executable = syntheticNativeHelperBytes('compiled');
+  const compiled = compileNativeHelper(sources, { commandRunner: runnerWriting(executable) });
+  assert.equal(Buffer.isBuffer(compiled) && compiled.equals(executable), true);
+  const [call] = observed;
+  assert.equal(call.command, '/usr/bin/swiftc');
+  assert.deepEqual(call.args.slice(0, NATIVE_HELPER_SWIFTC_ARGS.length), [...NATIVE_HELPER_SWIFTC_ARGS]);
+  assert.deepEqual(call.args.slice(-2), ['-o', path.join(call.temporaryRoot, 'out', 'crate-helper')]);
+  assert.equal(call.cwd, call.temporaryRoot);
+  assert.equal(call.rootMode, 0o700);
+  assert.equal(call.outputDirectoryMode, 0o700);
+  assert.deepEqual(call.sources.map(source => source.name), [...NATIVE_HELPER_SOURCE_FILES]);
+  for (const source of call.sources) {
+    assert.equal(source.parent, call.temporaryRoot);
+    assert.equal(source.mode, 0o600);
+    assert.equal(source.bytes.equals(sources[source.name]), true);
+  }
+  assert.equal(fs.existsSync(call.temporaryRoot), false);
+
+  const x86 = syntheticNativeHelperBytes('compiled');
+  x86.writeUInt32LE(0x01000007, 4);
+  for (const [label, output] of [
+    ['failed compiler', null],
+    ['x86_64 output', x86],
+    ['short output', executable.subarray(0, 31)],
+  ]) {
+    observed.length = 0;
+    assert.equal(compileNativeHelper(sources, { commandRunner: runnerWriting(output) }), null, label);
+    assert.equal(observed.length, 1, label);
+    assert.equal(fs.existsSync(observed[0].temporaryRoot), false, label);
+  }
+
+  const missing = { ...sources };
+  delete missing['WatchOps.swift'];
+  const extra = { ...sources, 'Extra.swift': Buffer.from('// extra\n') };
+  const nonBuffer = { ...sources, 'main.swift': '// string source\n' };
+  for (const [label, input] of [
+    ['missing source', missing],
+    ['extra source', extra],
+    ['non-buffer source', nonBuffer],
+    ['null input', null],
+    ['array input', [...NATIVE_HELPER_SOURCE_FILES]],
+  ]) {
+    observed.length = 0;
+    assert.equal(compileNativeHelper(input, { commandRunner: runnerWriting(executable) }), null, label);
+    assert.equal(observed.length, 0, label);
   }
 });
 
@@ -3146,6 +3622,11 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
     );
     fs.writeFileSync(path.join(contentsPath, 'PkgInfo'), 'APPL????');
     fs.chmodSync(path.join(contentsPath, 'MacOS', executableName), 0o755);
+    const nativeHelperBytes = syntheticNativeHelperBytes('collector-helper');
+    const nativeHelperPath = writeNativeHelperResource(
+      path.join(contentsPath, 'Resources'),
+      nativeHelperBytes
+    );
     const helperNames = [
       'Crate Helper.app',
       'Crate Helper (GPU).app',
@@ -3176,6 +3657,16 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
       fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
       fs.writeFileSync(sourcePath, 'fixture');
     }
+    for (const name of NATIVE_HELPER_SOURCE_FILES) {
+      const sourcePath = path.join(sourceRoot, ...NATIVE_HELPER_SOURCE_DIR.split('/'), name);
+      fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+      fs.writeFileSync(sourcePath, `// synthetic collector Swift source ${name}\n`);
+    }
+    const nativeHelperCompilations = [];
+    const nativeHelperCompiler = sources => {
+      nativeHelperCompilations.push(Object.keys(sources));
+      return Buffer.from(nativeHelperBytes);
+    };
     const sourceManifest = {
       dependencies: { 'runtime-dep': '^1.0.0' },
       description: 'safe',
@@ -3249,6 +3740,7 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
       'Mantle.framework': 'com.electron.mantle',
       'ReactiveObjC.framework': 'com.electron.reactive',
       'Squirrel.framework': 'com.github.Squirrel',
+      'crate-helper': NATIVE_HELPER_IDENTIFIER,
     };
     const gitRunner = createFixtureGitRunner(sourceRoot);
     const commandCalls = [];
@@ -3278,7 +3770,9 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
       }
       if (command === '/usr/bin/codesign' && args.includes('--entitlements')) {
         const marker = target === appPath ? 'main-entitlements' :
-          target.endsWith('.app') ? 'helper-entitlements' : 'framework-entitlements';
+          target.endsWith('.app') || target === nativeHelperPath
+            ? 'helper-entitlements'
+            : 'framework-entitlements';
         return {
           ok: true,
           stdout: `<?xml version="1.0"?><plist><dict><key>${marker}</key><true/></dict></plist>`,
@@ -3291,7 +3785,7 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
         return { ok: true, stdout: '', stderr: signedMetadata(identifier, 'd') };
       }
       if (command === '/usr/bin/codesign' || command === '/usr/sbin/spctl' ||
-          command === '/usr/bin/xcrun') {
+          command === '/usr/bin/xcrun' || command === '/usr/bin/strip') {
         return { ok: true, stdout: '', stderr: '' };
       }
       return { ok: false, stdout: '', stderr: '' };
@@ -3309,6 +3803,7 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
       createAppSnapshot: passThroughAppSnapshot,
       expectedExecutableName: executableName,
       getFuseWire: async () => fuseWire,
+      nativeHelperCompiler,
       inspectArchitectures: () => ({
         valid: true,
         expected: EXPECTED_ARCHITECTURE,
@@ -3326,6 +3821,15 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
     assert.equal(evidence.artifactStable, true);
     assert.equal(evidence.helpers.length, 4);
     assert.equal(evidence.nestedBundles.length, 4);
+    assert.deepEqual(evidence.nativeHelper.signature, {
+      valid: true,
+      ...parseCodeSignatureMetadata(signedMetadata(NATIVE_HELPER_IDENTIFIER, 'd')),
+    });
+    assert.equal(evidence.nativeHelper.resourceValid, true);
+    assert.equal(evidence.nativeHelper.strictRequirementValid, true);
+    assert.equal(evidence.nativeHelper.sourceBound, true);
+    assert.deepEqual(nativeHelperCompilations, [[...NATIVE_HELPER_SOURCE_FILES]]);
+    assert.deepEqual(evaluateReleaseEvidence(evidence, releaseOptions()).failures, []);
     assert.equal(evaluateReleaseEvidence(evidence, releaseOptions()).ok, true);
 
     const recordedCommandCallCount = commandCalls.length;
@@ -3337,6 +3841,7 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
       createAppSnapshot: passThroughAppSnapshot,
       expectedExecutableName: executableName,
       getFuseWire: async () => disabledWasmWire,
+      nativeHelperCompiler,
       inspectArchitectures: () => ({
         valid: true,
         expected: EXPECTED_ARCHITECTURE,
@@ -3362,11 +3867,18 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
       call.command === '/usr/bin/codesign' &&
       call.args.some(argument => argument.startsWith('-R=anchor apple generic'))
     ));
-    assert.equal(trustRequirementCalls.length, 10);
+    assert.equal(trustRequirementCalls.length, 11);
     assert.equal(trustRequirementCalls.every(call => call.args.some(argument => (
       argument.includes('field.1.2.840.113635.100.6.1.13') &&
       argument.includes(`subject.OU] = "${PUBLIC_TEAM_ID}"`)
     ))), true);
+    assert.deepEqual(commandCalls.filter(call => (
+      call.command === '/usr/bin/codesign' &&
+      call.args.includes(`-R=${EXPECTED_NATIVE_HELPER_REQUIREMENT}`)
+    )), [{
+      command: '/usr/bin/codesign',
+      args: ['--verify', '--strict', '--verbose=4', `-R=${EXPECTED_NATIVE_HELPER_REQUIREMENT}`, nativeHelperPath],
+    }]);
     assert.deepEqual(commandCalls.filter(call => (
       call.command === '/usr/sbin/spctl' || call.command === '/usr/bin/xcrun'
     )), [
@@ -3450,6 +3962,75 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
     assert.equal(failedTrust.failures.includes('Code signature verification failed.'), true);
     assert.equal(failedTrust.failures.includes('Helper app signature policy changed.'), true);
     assert.equal(failedTrust.failures.includes('Nested code-signature policy changed.'), true);
+    assert.equal(failedTrust.failures.includes(NATIVE_HELPER_FAILURES.signature), true);
+
+    const nativeOptions = {
+      archiveVerifier: () => true,
+      asar,
+      commandRunner,
+      createAppSnapshot: passThroughAppSnapshot,
+      expectedExecutableName: executableName,
+      getFuseWire: async () => fuseWire,
+      inspectArchitectures: () => ({
+        valid: true,
+        expected: EXPECTED_ARCHITECTURE,
+        main: [EXPECTED_ARCHITECTURE],
+        machOBinaryCount: 12,
+      }),
+      nativeHelperCompiler,
+      requireNotarization: true,
+      sourceRoot,
+      expectedRevision: 'b'.repeat(40),
+      verifyVerifierSource: () => true,
+      verifyElectronRuntime: () => electronRuntime,
+      verifyPackagedContents: () => ({ asarEntryCount: 100, unpackedEntryCount: 10 }),
+    };
+    const rebuiltMismatch = await collectReleaseEvidence(appPath, {
+      ...nativeOptions,
+      nativeHelperCompiler: () => syntheticNativeHelperBytes('different-helper'),
+    });
+    assert.equal(rebuiltMismatch.nativeHelper.sourceBound, false);
+    assert.deepEqual(
+      evaluateReleaseEvidence(rebuiltMismatch, releaseOptions()).failures,
+      [NATIVE_HELPER_FAILURES.source]
+    );
+
+    let checkoutDrifted = false;
+    const driftedCheckout = await collectReleaseEvidence(appPath, {
+      ...nativeOptions,
+      commandRunner(command, args, options) {
+        const gitArgs = normalizeFixtureGitArgs(args);
+        if (checkoutDrifted && command === '/usr/bin/git' && gitArgs[0] === 'status') {
+          return { ok: true, stdout: ` M ${NATIVE_HELPER_SOURCE_DIR}/main.swift\n`, stderr: '' };
+        }
+        return commandRunner(command, args, options);
+      },
+      nativeHelperCompiler(sources) {
+        checkoutDrifted = true;
+        return nativeHelperCompiler(sources);
+      },
+    });
+    assert.equal(checkoutDrifted, true);
+    assert.equal(driftedCheckout.nativeHelper.sourceBound, false);
+    assert.equal(driftedCheckout.sourceBinding.releaseSourceClean, false);
+    assert.equal(
+      evaluateReleaseEvidence(driftedCheckout, releaseOptions()).failures.includes(
+        NATIVE_HELPER_FAILURES.source
+      ),
+      true
+    );
+
+    fs.chmodSync(nativeHelperPath, 0o644);
+    const rejectedHelper = await collectReleaseEvidence(appPath, nativeOptions);
+    assert.equal(rejectedHelper.bundleLayout.valid, false);
+    assert.equal(rejectedHelper.nativeHelper.resourceValid, false);
+    assert.equal(
+      evaluateReleaseEvidence(rejectedHelper, releaseOptions()).failures.includes(
+        NATIVE_HELPER_FAILURES.resource
+      ),
+      true
+    );
+    fs.chmodSync(nativeHelperPath, 0o755);
 
     const originalAppPath = `${appPath}.original`;
     const replacedEvidence = await collectReleaseEvidence(appPath, {
@@ -5004,4 +5585,1121 @@ test('CODEOWNERS declares Crate review ownership for sensitive release-policy fi
   ]) {
     assert.equal(ownersByPath.get(protectedPath), '@bfeintuch123');
   }
+});
+
+const REAL_SWIFT_TOOLCHAIN_SKIP = process.platform !== 'darwin' || !fs.existsSync('/usr/bin/swiftc')
+  ? 'requires macOS with /usr/bin/swiftc'
+  : false;
+let cachedCompiledNativeHelper = null;
+
+function repositoryNativeHelperSources() {
+  return Object.fromEntries(NATIVE_HELPER_SOURCE_FILES.map(name => [
+    name,
+    fs.readFileSync(path.join(ROOT, ...NATIVE_HELPER_SOURCE_DIR.split('/'), name)),
+  ]));
+}
+
+function compileRepositoryNativeHelper() {
+  if (!cachedCompiledNativeHelper) {
+    cachedCompiledNativeHelper = compileNativeHelper(repositoryNativeHelperSources());
+    assert.equal(Buffer.isBuffer(cachedCompiledNativeHelper), true);
+  }
+  return cachedCompiledNativeHelper;
+}
+
+function machOTextSectionRange(bytes) {
+  const commandCount = bytes.readUInt32LE(16);
+  let offset = 32;
+  for (let index = 0; index < commandCount; index += 1) {
+    const command = bytes.readUInt32LE(offset);
+    const size = bytes.readUInt32LE(offset + 4);
+    if (command === 0x19) {
+      const sectionCount = bytes.readUInt32LE(offset + 64);
+      for (let section = 0; section < sectionCount; section += 1) {
+        const sectionOffset = offset + 72 + section * 80;
+        const name = bytes.subarray(sectionOffset, sectionOffset + 16).toString('latin1').replace(/\0+$/u, '');
+        const segment = bytes.subarray(sectionOffset + 16, sectionOffset + 32).toString('latin1').replace(/\0+$/u, '');
+        if (segment === '__TEXT' && name === '__text') {
+          return {
+            offset: bytes.readUInt32LE(sectionOffset + 48),
+            size: Number(bytes.readBigUInt64LE(sectionOffset + 40)),
+          };
+        }
+      }
+    }
+    offset += size;
+  }
+  return null;
+}
+
+function codesignStrictRequirement(filePath) {
+  return spawnSync('/usr/bin/codesign', [
+    '--verify',
+    '--strict',
+    `-R=${EXPECTED_NATIVE_HELPER_REQUIREMENT}`,
+    filePath,
+  ], { env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' }, encoding: 'utf8' });
+}
+
+function buildSyntheticArm64MachO({
+  magic = 0xfeedfacf,
+  cputype = 0x0100000c,
+  filetype = 2,
+  gapBytes = 8,
+  gapFill = 0x00,
+  gapLastByte = null,
+  includeCodeSignature = false,
+  duplicateCodeSignature = false,
+  codeSigDataoff = null,
+  codeSigDatasize = 64,
+  truncateOriginalBytes = 0,
+  trailingBytes = 0,
+  trailingFill = 0x00,
+  linkeditOff = 4096,
+  linkeditVmsize = 16384,
+  linkeditNsects = 0,
+  overrideLinkeditFilesize = null,
+  overrideLinkeditCmdSize = null,
+  duplicateLinkedit = false,
+  duplicateSymtab = false,
+  duplicateDysymtab = false,
+  textFilesize = null,
+  textSectionSize = 64,
+  textSectionOffset = 2048,
+  textSectionNreloc = 0,
+  textSectionReloff = 0,
+  includeZerofillDataSegment = false,
+  extraDataSegment = null, // { fileoff, filesize, secOff, secSize }
+  symtabNsyms = 1,
+  symtabSymoff = null,
+  overrideSymtabStroff = null,
+  overrideSymtabStrsize = null,
+  dysymtabFields = null,
+  dysymtabCmdSize = 80,
+  dyldInfoCmd = null, // 0x22 or 0x80000022
+  dyldInfoFields = null,
+  dyldInfoCmdSize = 48,
+  duplicateDyldInfo = false,
+  linkeditDataEntries = null, // Array<{ cmd, off, size }>
+  uuidCmdSize = 24,
+  extraCommands = [],
+  extraSizeofcmds = 0,
+} = {}) {
+  const effectiveTextFilesize = textFilesize !== null ? textFilesize : linkeditOff;
+  const symOff = symtabSymoff !== null ? symtabSymoff : linkeditOff;
+  const symSize = 16; // 1 nlist_64
+  const strOff = overrideSymtabStroff !== null ? overrideSymtabStroff : linkeditOff + symSize;
+  const targetAlignedEnd = linkeditOff + 256; // 4352 when linkeditOff === 4096 (always % 16 === 0)
+  const targetUnalignedEnd = targetAlignedEnd - gapBytes;
+  const strSize = overrideSymtabStrsize !== null ? overrideSymtabStrsize : Math.max(1, targetUnalignedEnd - strOff);
+  const strEnd = strOff + strSize;
+  const linkeditContentEnd = strEnd + gapBytes;
+  const sigOff = codeSigDataoff !== null ? codeSigDataoff : linkeditContentEnd;
+  const linkeditEnd = includeCodeSignature ? sigOff + codeSigDatasize : linkeditContentEnd;
+  const linkeditFilesize = overrideLinkeditFilesize !== null ? overrideLinkeditFilesize : linkeditEnd - linkeditOff;
+  const totalSize = Math.max(32, linkeditEnd + trailingBytes - truncateOriginalBytes);
+
+  const commands = [];
+  // __TEXT segment with one __text section (72 + 80 = 152 bytes)
+  const textSeg = Buffer.alloc(152, 0);
+  textSeg.writeUInt32LE(0x19, 0);
+  textSeg.writeUInt32LE(152, 4);
+  textSeg.write('__TEXT', 8, 'latin1');
+  textSeg.writeBigUInt64LE(0x100000000n, 24);
+  textSeg.writeBigUInt64LE(BigInt(Math.max(effectiveTextFilesize, 4096)), 32);
+  textSeg.writeBigUInt64LE(0n, 40);
+  textSeg.writeBigUInt64LE(BigInt(effectiveTextFilesize), 48);
+  textSeg.writeUInt32LE(1, 64); // nsects
+  textSeg.write('__text', 72, 'latin1');
+  textSeg.write('__TEXT', 88, 'latin1');
+  textSeg.writeBigUInt64LE(BigInt(textSectionSize), 72 + 40);
+  textSeg.writeUInt32LE(textSectionOffset, 72 + 48);
+  textSeg.writeUInt32LE(textSectionReloff, 72 + 56);
+  textSeg.writeUInt32LE(textSectionNreloc, 72 + 60);
+  textSeg.writeUInt32LE(0x80000400, 72 + 64); // S_REGULAR | S_ATTR_PURE_INSTRUCTIONS
+  commands.push(textSeg);
+
+  if (includeZerofillDataSegment) {
+    // __DATA segment with S_ZEROFILL (0x01), S_GB_ZEROFILL (0x0c), S_THREAD_LOCAL_ZEROFILL (0x12)
+    // whose section sizes exceed segment filesize (0) and have file offset 0.
+    const zerofillTypes = [0x01, 0x0c, 0x12];
+    const dataSeg = Buffer.alloc(72 + zerofillTypes.length * 80, 0);
+    dataSeg.writeUInt32LE(0x19, 0);
+    dataSeg.writeUInt32LE(dataSeg.length, 4);
+    dataSeg.write('__DATA', 8, 'latin1');
+    dataSeg.writeBigUInt64LE(0x100004000n, 24);
+    dataSeg.writeBigUInt64LE(16384n, 32);
+    dataSeg.writeBigUInt64LE(BigInt(linkeditOff), 40);
+    dataSeg.writeBigUInt64LE(0n, 48); // filesize === 0
+    dataSeg.writeUInt32LE(zerofillTypes.length, 64);
+    zerofillTypes.forEach((secType, idx) => {
+      const secOff = 72 + idx * 80;
+      dataSeg.write(`__bss${idx}`, secOff, 'latin1');
+      dataSeg.write('__DATA', secOff + 16, 'latin1');
+      dataSeg.writeBigUInt64LE(4096n, secOff + 40);
+      dataSeg.writeUInt32LE(0, secOff + 48);
+      dataSeg.writeUInt32LE(secType, secOff + 64);
+    });
+    commands.push(dataSeg);
+  }
+
+  if (extraDataSegment) {
+    const dataSeg = Buffer.alloc(152, 0);
+    dataSeg.writeUInt32LE(0x19, 0);
+    dataSeg.writeUInt32LE(152, 4);
+    dataSeg.write('__DATA', 8, 'latin1');
+    dataSeg.writeBigUInt64LE(0x100004000n, 24);
+    dataSeg.writeBigUInt64LE(16384n, 32);
+    dataSeg.writeBigUInt64LE(BigInt(extraDataSegment.fileoff), 40);
+    dataSeg.writeBigUInt64LE(BigInt(extraDataSegment.filesize), 48);
+    dataSeg.writeUInt32LE(1, 64);
+    dataSeg.write('__data', 72, 'latin1');
+    dataSeg.write('__DATA', 88, 'latin1');
+    dataSeg.writeBigUInt64LE(BigInt(extraDataSegment.secSize), 72 + 40);
+    dataSeg.writeUInt32LE(extraDataSegment.secOff, 72 + 48);
+    dataSeg.writeUInt32LE(0, 72 + 64); // S_REGULAR
+    commands.push(dataSeg);
+  }
+
+  const linkeditCmdOffset = 32 + commands.reduce((sum, cmd) => sum + cmd.length, 0);
+  const makeLinkeditCmd = () => {
+    const size = overrideLinkeditCmdSize !== null ? overrideLinkeditCmdSize : 72 + linkeditNsects * 80;
+    const cmd = Buffer.alloc(size, 0);
+    cmd.writeUInt32LE(0x19, 0);
+    cmd.writeUInt32LE(size, 4);
+    cmd.write('__LINKEDIT', 8, 'latin1');
+    cmd.writeBigUInt64LE(0x100008000n, 24);
+    cmd.writeBigUInt64LE(BigInt(linkeditVmsize), 32);
+    cmd.writeBigUInt64LE(BigInt(linkeditOff), 40);
+    cmd.writeBigUInt64LE(BigInt(linkeditFilesize), 48);
+    cmd.writeUInt32LE(linkeditNsects, 64);
+    return cmd;
+  };
+  commands.push(makeLinkeditCmd());
+  if (duplicateLinkedit) commands.push(makeLinkeditCmd());
+
+  const makeSymtabCmd = () => {
+    const cmd = Buffer.alloc(24, 0);
+    cmd.writeUInt32LE(0x02, 0);
+    cmd.writeUInt32LE(24, 4);
+    cmd.writeUInt32LE(symOff, 8);
+    cmd.writeUInt32LE(symtabNsyms, 12);
+    cmd.writeUInt32LE(strOff, 16);
+    cmd.writeUInt32LE(strSize, 20);
+    return cmd;
+  };
+  commands.push(makeSymtabCmd());
+  if (duplicateSymtab) commands.push(makeSymtabCmd());
+
+  if (dysymtabFields !== null || duplicateDysymtab || dysymtabCmdSize !== 80) {
+    const count = duplicateDysymtab ? 2 : 1;
+    for (let index = 0; index < count; index += 1) {
+      const dysym = Buffer.alloc(dysymtabCmdSize, 0);
+      dysym.writeUInt32LE(0x0b, 0);
+      dysym.writeUInt32LE(dysymtabCmdSize, 4);
+      if (dysymtabFields) {
+        const offsets = [
+          ['tocoff', 32], ['ntoc', 36],
+          ['modtaboff', 40], ['nmodtab', 44],
+          ['extrefsymoff', 48], ['nextrefsyms', 52],
+          ['indirectsymoff', 56], ['nindirectsyms', 60],
+          ['extreloff', 64], ['nextrel', 68],
+          ['locreloff', 72], ['nlocrel', 76],
+        ];
+        for (const [key, pos] of offsets) {
+          if (dysymtabFields[key] !== undefined && pos + 4 <= dysymtabCmdSize) {
+            dysym.writeUInt32LE(dysymtabFields[key], pos);
+          }
+        }
+      }
+      commands.push(dysym);
+    }
+  }
+
+  if (dyldInfoCmd !== null || dyldInfoFields !== null || duplicateDyldInfo || dyldInfoCmdSize !== 48) {
+    const makeDyldInfo = cmdId => {
+      const cmd = Buffer.alloc(dyldInfoCmdSize, 0);
+      cmd.writeUInt32LE(cmdId, 0);
+      cmd.writeUInt32LE(dyldInfoCmdSize, 4);
+      if (dyldInfoFields) {
+        const offsets = [
+          ['rebaseOff', 8], ['rebaseSize', 12],
+          ['bindOff', 16], ['bindSize', 20],
+          ['weakBindOff', 24], ['weakBindSize', 28],
+          ['lazyBindOff', 32], ['lazyBindSize', 36],
+          ['exportOff', 40], ['exportSize', 44],
+        ];
+        for (const [key, pos] of offsets) {
+          if (dyldInfoFields[key] !== undefined && pos + 4 <= dyldInfoCmdSize) {
+            cmd.writeUInt32LE(dyldInfoFields[key], pos);
+          }
+        }
+      }
+      return cmd;
+    };
+    const primaryCmd = dyldInfoCmd !== null ? dyldInfoCmd : 0x80000022;
+    commands.push(makeDyldInfo(primaryCmd));
+    if (duplicateDyldInfo) commands.push(makeDyldInfo(primaryCmd === 0x80000022 ? 0x22 : 0x80000022));
+  }
+
+  if (Array.isArray(linkeditDataEntries)) {
+    for (const entry of linkeditDataEntries) {
+      const cmd = Buffer.alloc(16, 0);
+      cmd.writeUInt32LE(entry.cmd, 0);
+      cmd.writeUInt32LE(16, 4);
+      cmd.writeUInt32LE(entry.off, 8);
+      cmd.writeUInt32LE(entry.size, 12);
+      commands.push(cmd);
+    }
+  }
+
+  const uuidCmd = Buffer.alloc(uuidCmdSize, 0);
+  uuidCmd.writeUInt32LE(0x1b, 0);
+  uuidCmd.writeUInt32LE(uuidCmdSize, 4);
+  commands.push(uuidCmd);
+
+  for (const extra of extraCommands) commands.push(extra);
+
+  if (includeCodeSignature) {
+    const sigCount = duplicateCodeSignature ? 2 : 1;
+    for (let index = 0; index < sigCount; index += 1) {
+      const sigCmd = Buffer.alloc(16, 0);
+      sigCmd.writeUInt32LE(0x1d, 0);
+      sigCmd.writeUInt32LE(16, 4);
+      sigCmd.writeUInt32LE(sigOff, 8);
+      sigCmd.writeUInt32LE(codeSigDatasize, 12);
+      commands.push(sigCmd);
+    }
+  }
+
+  const cmdBlock = Buffer.concat(commands);
+  const buffer = Buffer.alloc(totalSize, 0);
+  buffer.writeUInt32LE(magic, 0);
+  buffer.writeUInt32LE(cputype, 4);
+  buffer.writeUInt32LE(0, 8);
+  buffer.writeUInt32LE(filetype, 12);
+  buffer.writeUInt32LE(commands.length, 16);
+  buffer.writeUInt32LE(cmdBlock.length + extraSizeofcmds, 20);
+  buffer.writeUInt32LE(0x00200085, 24);
+  cmdBlock.copy(buffer, 32, 0, Math.min(cmdBlock.length, Math.max(0, totalSize - 32)));
+
+  // Fill synthetic __text and string table with non-zero bytes so truncation/corruption is obvious.
+  if (2048 + 64 <= totalSize) buffer.fill(0x55, 2048, 2048 + 64);
+  if (strSize > 0 && strEnd <= totalSize) buffer.fill(0x41, strOff, strEnd);
+  if (gapBytes > 0 && strEnd + gapBytes <= totalSize) {
+    buffer.fill(gapFill, strEnd, strEnd + gapBytes);
+    if (gapLastByte !== null) buffer[strEnd + gapBytes - 1] = gapLastByte;
+  }
+  if (includeCodeSignature && sigOff + codeSigDatasize <= totalSize) {
+    buffer.fill(0xaa, sigOff, sigOff + codeSigDatasize);
+  }
+  if (trailingBytes > 0 && linkeditEnd + trailingBytes <= totalSize) {
+    buffer.fill(trailingFill, linkeditEnd, linkeditEnd + trailingBytes);
+  }
+  return { buffer, linkeditCmdOffset, linkeditOff, linkeditFilesize, strOff, strSize, strEnd, sigOff };
+}
+
+test('trimRemovedSignaturePadding trims provable 1..15-byte all-zero signature padding across valid layouts', () => {
+  for (const gapBytes of [1, 8, 15]) {
+    const signed = buildSyntheticArm64MachO({ gapBytes, includeCodeSignature: true });
+    const removed = buildSyntheticArm64MachO({ gapBytes, includeCodeSignature: false });
+    const trimmed = trimRemovedSignaturePadding(signed.buffer, removed.buffer);
+    assert.notEqual(trimmed, removed.buffer, `gap ${gapBytes} should trim`);
+    assert.equal(trimmed.length, removed.strEnd);
+    assert.equal(
+      trimmed.readBigUInt64LE(removed.linkeditCmdOffset + 48),
+      BigInt(removed.linkeditFilesize - gapBytes)
+    );
+    assert.equal(trimmed.readBigUInt64LE(removed.linkeditCmdOffset + 32), 16384n);
+    const expected = Buffer.from(removed.buffer.subarray(0, removed.strEnd));
+    expected.writeBigUInt64LE(BigInt(removed.linkeditFilesize - gapBytes), removed.linkeditCmdOffset + 48);
+    assert.equal(trimmed.equals(expected), true);
+  }
+
+  // Allowed filetypes (MH_DYLIB=6, MH_BUNDLE=8), zerofill sections, populated LC_DYSYMTAB (all 6 tables),
+  // populated LC_DYLD_INFO_ONLY (all 5 tables), and zero-size LC_DATA_IN_CODE cursor inside __LINKEDIT.
+  const populatedLinkeditOpts = {
+    gapBytes: 8,
+    includeZerofillDataSegment: true,
+    dysymtabFields: {
+      tocoff: 4096, ntoc: 1, // 8 bytes
+      modtaboff: 4104, nmodtab: 1, // 56 bytes
+      extrefsymoff: 4160, nextrefsyms: 2, // 8 bytes
+      indirectsymoff: 4168, nindirectsyms: 2, // 8 bytes
+      extreloff: 4176, nextrel: 1, // 8 bytes
+      locreloff: 4184, nlocrel: 1, // 8 bytes (ends 4192 <= strEnd 4344)
+    },
+    dyldInfoCmd: 0x80000022,
+    dyldInfoFields: {
+      rebaseOff: 4096, rebaseSize: 8,
+      bindOff: 4104, bindSize: 8,
+      weakBindOff: 4112, weakBindSize: 8,
+      lazyBindOff: 4120, lazyBindSize: 8,
+      exportOff: 4128, exportSize: 16,
+    },
+    linkeditDataEntries: [
+      { cmd: 0x26, off: 4096, size: 16 },
+      { cmd: 0x29, off: 4112, size: 0 }, // zero-size cursor inside [linkeditOff, strEnd]
+    ],
+  };
+  for (const [filetype, dyldInfoCmd] of [[2, 0x80000022], [6, 0x22], [8, 0x80000022]]) {
+    const s = buildSyntheticArm64MachO({ ...populatedLinkeditOpts, filetype, dyldInfoCmd, includeCodeSignature: true });
+    const r = buildSyntheticArm64MachO({ ...populatedLinkeditOpts, filetype, dyldInfoCmd, includeCodeSignature: false });
+    const trimmed = trimRemovedSignaturePadding(s.buffer, r.buffer);
+    assert.notEqual(trimmed, r.buffer, `populated filetype ${filetype} (dyld 0x${dyldInfoCmd.toString(16)}) should trim`);
+    assert.equal(trimmed.length, r.strEnd);
+  }
+});
+
+test('trimRemovedSignaturePadding fails closed on violated preconditions', () => {
+  const signed8 = buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: true });
+  const removed8 = buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false });
+
+  const makeExtraCmd = (cmdId, size) => {
+    const cmd = Buffer.alloc(size, 0);
+    cmd.writeUInt32LE(cmdId, 0);
+    cmd.writeUInt32LE(size, 4);
+    return cmd;
+  };
+
+  // Negative cases isolating each precondition (note: dataoff % 16 and linkedit.end % 16
+  // are structurally coupled via removedBytes.length === dataoff === linkedit.end and tested as a pair).
+  const cases = [
+    // --- Original-side header & LC_CODE_SIGNATURE guards ---
+    ['already-unsigned original (no LC_CODE_SIGNATURE)', removed8.buffer, removed8.buffer],
+    [
+      'duplicate LC_CODE_SIGNATURE in original',
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: true, duplicateCodeSignature: true }).buffer,
+      removed8.buffer,
+    ],
+    [
+      'original LC_CODE_SIGNATURE extends past EOF',
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: true, truncateOriginalBytes: 16 }).buffer,
+      removed8.buffer,
+    ],
+    [
+      '16-byte alignment violated on original dataoff / removed linkedit.end pair',
+      buildSyntheticArm64MachO({
+        gapBytes: 0,
+        includeCodeSignature: true,
+        codeSigDataoff: 4344,
+        overrideSymtabStrsize: 4340 - 4112,
+      }).buffer,
+      buildSyntheticArm64MachO({
+        gapBytes: 4,
+        includeCodeSignature: false,
+        overrideSymtabStrsize: 4340 - 4112,
+      }).buffer,
+    ],
+    [
+      'original wrong magic (32-bit) with valid LC_CODE_SIGNATURE at dataoff',
+      buildSyntheticArm64MachO({ magic: 0xfeedface, gapBytes: 8, includeCodeSignature: true }).buffer,
+      removed8.buffer,
+    ],
+    [
+      'original wrong magic (big-endian) with valid LC_CODE_SIGNATURE at dataoff',
+      buildSyntheticArm64MachO({ magic: 0xcffaedfe, gapBytes: 8, includeCodeSignature: true }).buffer,
+      removed8.buffer,
+    ],
+    [
+      'original wrong cputype (x86_64) with valid LC_CODE_SIGNATURE at dataoff',
+      buildSyntheticArm64MachO({ cputype: 0x01000007, gapBytes: 8, includeCodeSignature: true }).buffer,
+      removed8.buffer,
+    ],
+    [
+      'disallowed filetype (MH_OBJECT=1) on both',
+      buildSyntheticArm64MachO({ gapBytes: 8, filetype: 1, includeCodeSignature: true }).buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, filetype: 1, includeCodeSignature: false }).buffer,
+    ],
+    [
+      'filetype mismatch between original (EXECUTE=2) and removed (DYLIB=6)',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, filetype: 6, includeCodeSignature: false }).buffer,
+    ],
+    [
+      'original sizeofcmds does not equal sum of cmdsizes',
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: true, extraSizeofcmds: 8 }).buffer,
+      removed8.buffer,
+    ],
+    [
+      'original cmdsize not 8-byte aligned',
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: true, uuidCmdSize: 28 }).buffer,
+      removed8.buffer,
+    ],
+
+    // --- Removed-side exact-cut, header, and allowlist guards ---
+    [
+      'removed length shorter than original dataoff (already trimmed on newer macOS)',
+      signed8.buffer,
+      trimRemovedSignaturePadding(signed8.buffer, removed8.buffer),
+    ],
+    [
+      'removed length longer than original dataoff (16 bytes longer, still valid EOF)',
+      signed8.buffer,
+      buildSyntheticArm64MachO({
+        gapBytes: 8,
+        includeCodeSignature: false,
+        overrideSymtabStrsize: removed8.strSize + 16,
+      }).buffer,
+    ],
+    [
+      'LC_CODE_SIGNATURE still present in removed bytes at exact length === original dataoff',
+      signed8.buffer,
+      buildSyntheticArm64MachO({
+        gapBytes: 8,
+        includeCodeSignature: true,
+        codeSigDatasize: 0,
+      }).buffer,
+    ],
+    [
+      'removed sizeofcmds does not equal sum of cmdsizes',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, extraSizeofcmds: 8 }).buffer,
+    ],
+    [
+      'removed cmdsize not 8-byte aligned (LC_UUID cmdsize 28 >= 24 min)',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, uuidCmdSize: 28 }).buffer,
+    ],
+    [
+      'inline load command below minimum size (LC_UUID cmdsize 16 < 24)',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, uuidCmdSize: 16 }).buffer,
+    ],
+    [
+      'LC_DYSYMTAB below minimum size (cmdsize 72 < 80)',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, extraCommands: [makeExtraCmd(0x0b, 72)] }).buffer,
+    ],
+    [
+      'LC_DYLD_INFO_ONLY below minimum size (cmdsize 40 < 48)',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, extraCommands: [makeExtraCmd(0x80000022, 40)] }).buffer,
+    ],
+    [
+      'excluded LC_TWOLEVEL_HINTS (0x16)',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, extraCommands: [makeExtraCmd(0x16, 16)] }).buffer,
+    ],
+    [
+      'excluded LC_ENCRYPTION_INFO_64 (0x2c)',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, extraCommands: [makeExtraCmd(0x2c, 24)] }).buffer,
+    ],
+    [
+      'excluded LC_NOTE (0x31)',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, extraCommands: [makeExtraCmd(0x31, 40)] }).buffer,
+    ],
+    [
+      'unknown load command (0x7fff)',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, extraCommands: [makeExtraCmd(0x7fff, 16)] }).buffer,
+    ],
+
+    // --- __LINKEDIT & segment/section guards ---
+    [
+      '__LINKEDIT has non-zero nsects',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, linkeditNsects: 1 }).buffer,
+    ],
+    [
+      '__LINKEDIT cmdsize does not match 72 + nsects * 80',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, overrideLinkeditCmdSize: 80 }).buffer,
+    ],
+    [
+      '__LINKEDIT filesize > vmsize',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, linkeditVmsize: 64 }).buffer,
+    ],
+    [
+      '__LINKEDIT vmsize exceeds Number.MAX_SAFE_INTEGER',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, linkeditVmsize: (1n << 54n) }).buffer,
+    ],
+    [
+      '__LINKEDIT fileoff overlaps load commands (cmdsEnd > fileoff without corrupting header)',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, extraCommands: [makeExtraCmd(0x8000001c, 3800)] }).buffer,
+    ],
+    [
+      '__LINKEDIT ends 16 non-zero bytes before EOF while removedBytes.length === original dataoff',
+      signed8.buffer,
+      buildSyntheticArm64MachO({
+        gapBytes: 8,
+        includeCodeSignature: false,
+        overrideSymtabStrsize: removed8.strSize - 16,
+        trailingBytes: 16,
+        trailingFill: 0x77,
+      }).buffer,
+    ],
+    [
+      'another segment (__TEXT) overlaps __LINKEDIT',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, textFilesize: 4112 }).buffer,
+    ],
+    [
+      'non-zerofill section starts before its segment fileoff',
+      signed8.buffer,
+      buildSyntheticArm64MachO({
+        gapBytes: 8,
+        includeCodeSignature: false,
+        textFilesize: 2048,
+        textSectionOffset: 1024,
+        textSectionSize: 64,
+        extraDataSegment: { fileoff: 2048, filesize: 2048, secOff: 1024, secSize: 64 },
+      }).buffer,
+    ],
+    [
+      'non-zerofill section exceeds its segment bounds',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, textSectionOffset: 4080, textSectionSize: 64 }).buffer,
+    ],
+    [
+      'section has non-zero nreloc',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, textSectionNreloc: 1 }).buffer,
+    ],
+    [
+      'section has non-zero reloff with nreloc === 0',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, textSectionReloff: 16, textSectionNreloc: 0 }).buffer,
+    ],
+
+    // --- Duplicate load-command guards ---
+    [
+      'duplicate __LINKEDIT',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, duplicateLinkedit: true }).buffer,
+    ],
+    [
+      'duplicate LC_SYMTAB',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, duplicateSymtab: true }).buffer,
+    ],
+    [
+      'duplicate LC_DYSYMTAB',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, duplicateDysymtab: true }).buffer,
+    ],
+    [
+      'duplicate LC_DYLD_INFO / LC_DYLD_INFO_ONLY',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, duplicateDyldInfo: true }).buffer,
+    ],
+    [
+      'duplicate linkedit_data_command (LC_FUNCTION_STARTS)',
+      signed8.buffer,
+      buildSyntheticArm64MachO({
+        gapBytes: 8,
+        includeCodeSignature: false,
+        linkeditDataEntries: [
+          { cmd: 0x26, off: 4096, size: 8 },
+          { cmd: 0x26, off: 4104, size: 8 },
+        ],
+      }).buffer,
+    ],
+
+    // --- Symtab, linkedit range, cursor, and gap guards ---
+    [
+      'LC_SYMTAB strsize === 0 at valid 16-byte-aligned length === original dataoff',
+      signed8.buffer,
+      buildSyntheticArm64MachO({
+        gapBytes: 8,
+        includeCodeSignature: false,
+        symtabNsyms: 0,
+        symtabSymoff: 0,
+        overrideSymtabStroff: removed8.strEnd,
+        overrideSymtabStrsize: 0,
+      }).buffer,
+    ],
+    [
+      'LC_SYMTAB nsyms*16 extends past strEnd (to strEnd + 4, inside linkeditEnd)',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, symtabSymoff: removed8.strEnd - 12, symtabNsyms: 1 }).buffer,
+    ],
+    [
+      'LC_SYMTAB zero-size symoff cursor past strEnd',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, symtabNsyms: 0, symtabSymoff: removed8.strEnd + 4 }).buffer,
+    ],
+    [
+      'LC_DYSYMTAB zero-size tocoff cursor past strEnd',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false, dysymtabFields: { tocoff: removed8.strEnd + 4, ntoc: 0 } }).buffer,
+    ],
+    [
+      'LC_DYLD_INFO_ONLY zero-size rebaseOff cursor past strEnd',
+      signed8.buffer,
+      buildSyntheticArm64MachO({
+        gapBytes: 8,
+        includeCodeSignature: false,
+        dyldInfoCmd: 0x80000022,
+        dyldInfoFields: { rebaseOff: removed8.strEnd + 4, rebaseSize: 0 },
+      }).buffer,
+    ],
+    [
+      'linkedit_data_command ends past strEnd (to strEnd + 4, so gap still 4 in 1..15)',
+      signed8.buffer,
+      buildSyntheticArm64MachO({
+        gapBytes: 8,
+        includeCodeSignature: false,
+        linkeditDataEntries: [{ cmd: 0x26, off: 4096, size: removed8.strEnd + 4 - 4096 }],
+      }).buffer,
+    ],
+    [
+      'linkedit_data_command starts before __LINKEDIT fileoff',
+      signed8.buffer,
+      buildSyntheticArm64MachO({
+        gapBytes: 8,
+        includeCodeSignature: false,
+        linkeditDataEntries: [{ cmd: 0x26, off: 4088, size: 16 }],
+      }).buffer,
+    ],
+    [
+      'zero-size linkedit cursor before __LINKEDIT fileoff',
+      signed8.buffer,
+      buildSyntheticArm64MachO({
+        gapBytes: 8,
+        includeCodeSignature: false,
+        linkeditDataEntries: [{ cmd: 0x29, off: 4088, size: 0 }],
+      }).buffer,
+    ],
+    [
+      'zero-size linkedit cursor past strEnd',
+      signed8.buffer,
+      buildSyntheticArm64MachO({
+        gapBytes: 8,
+        includeCodeSignature: false,
+        linkeditDataEntries: [{ cmd: 0x29, off: removed8.strEnd + 4, size: 0 }],
+      }).buffer,
+    ],
+    [
+      'gap 0 (already 16-byte aligned)',
+      buildSyntheticArm64MachO({ gapBytes: 0, includeCodeSignature: true }).buffer,
+      buildSyntheticArm64MachO({ gapBytes: 0, includeCodeSignature: false }).buffer,
+    ],
+    [
+      'gap >= 16',
+      buildSyntheticArm64MachO({ gapBytes: 16, includeCodeSignature: true }).buffer,
+      buildSyntheticArm64MachO({ gapBytes: 16, includeCodeSignature: false }).buffer,
+    ],
+    [
+      'non-zero byte only in first byte of 8-byte gap',
+      signed8.buffer,
+      (() => {
+        const b = Buffer.from(removed8.buffer);
+        b[removed8.strEnd] = 0x01;
+        return b;
+      })(),
+    ],
+    [
+      'non-zero byte only in last byte of 8-byte gap',
+      signed8.buffer,
+      buildSyntheticArm64MachO({ gapBytes: 8, gapFill: 0x00, gapLastByte: 0x01, includeCodeSignature: false }).buffer,
+    ],
+  ];
+
+  // Every LC_DYSYMTAB table (all 6 offsets & exact element sizes: 8, 56, 4, 4, 8, 8) ending at strEnd + 2
+  // with count === 2 so count * (elemSize - 1) <= strEnd while count * elemSize === strEnd + 2 < linkeditEnd.
+  const dysymtabOverrunSpecs = [
+    ['toc', 'tocoff', 'ntoc', 8, 2],
+    ['modtab', 'modtaboff', 'nmodtab', 56, 2],
+    ['extrefsym', 'extrefsymoff', 'nextrefsyms', 4, 2],
+    ['indirectsym', 'indirectsymoff', 'nindirectsyms', 4, 2],
+    ['extrel', 'extreloff', 'nextrel', 8, 2],
+    ['locrel', 'locreloff', 'nlocrel', 8, 2],
+  ];
+  for (const [name, offKey, countKey, elemSize, count] of dysymtabOverrunSpecs) {
+    const startOff = removed8.strEnd + 2 - count * elemSize;
+    cases.push([
+      `LC_DYSYMTAB ${name} (*${elemSize}) ends past strEnd`,
+      signed8.buffer,
+      buildSyntheticArm64MachO({
+        gapBytes: 8,
+        includeCodeSignature: false,
+        dysymtabFields: { [offKey]: startOff, [countKey]: count },
+      }).buffer,
+    ]);
+  }
+
+  // Every LC_DYLD_INFO_ONLY range (all 5 offsets/sizes) ending at strEnd + 4.
+  const dyldInfoOverrunSpecs = [
+    ['rebase', 'rebaseOff', 'rebaseSize'],
+    ['bind', 'bindOff', 'bindSize'],
+    ['weak_bind', 'weakBindOff', 'weakBindSize'],
+    ['lazy_bind', 'lazyBindOff', 'lazyBindSize'],
+    ['export', 'exportOff', 'exportSize'],
+  ];
+  for (const [name, offKey, sizeKey] of dyldInfoOverrunSpecs) {
+    cases.push([
+      `LC_DYLD_INFO_ONLY ${name} ends past strEnd`,
+      signed8.buffer,
+      buildSyntheticArm64MachO({
+        gapBytes: 8,
+        includeCodeSignature: false,
+        dyldInfoCmd: 0x80000022,
+        dyldInfoFields: { [offKey]: 4096, [sizeKey]: removed8.strEnd + 4 - 4096 },
+      }).buffer,
+    ]);
+  }
+
+  for (const [label, original, removed] of cases) {
+    assert.equal(trimRemovedSignaturePadding(original, removed), removed, `must not trim: ${label}`);
+  }
+
+  // Fat, 32-bit, big-endian, non-arm64, truncated, or malformed inputs never throw
+  for (const bad of [
+    Buffer.from([0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2]),
+    Buffer.from([0xbe, 0xba, 0xfe, 0xca, 0, 0, 0, 2]),
+    buildSyntheticArm64MachO({ magic: 0xfeedface, gapBytes: 8, includeCodeSignature: false }).buffer,
+    buildSyntheticArm64MachO({ magic: 0xcffaedfe, gapBytes: 8, includeCodeSignature: false }).buffer,
+    buildSyntheticArm64MachO({ cputype: 0x01000007, gapBytes: 8, includeCodeSignature: false }).buffer,
+    removed8.buffer.subarray(0, 20),
+    Buffer.alloc(0),
+  ]) {
+    assert.equal(trimRemovedSignaturePadding(signed8.buffer, bad), bad);
+    assert.equal(trimRemovedSignaturePadding(bad, removed8.buffer), removed8.buffer);
+  }
+  const overflowingCmds = Buffer.from(removed8.buffer);
+  overflowingCmds.writeUInt32LE(0xffffffff, 20);
+  assert.equal(trimRemovedSignaturePadding(signed8.buffer, overflowingCmds), overflowingCmds);
+  assert.equal(trimRemovedSignaturePadding(null, removed8.buffer), removed8.buffer);
+});
+
+test('canonicalNativeDigestFromBytes normalizes macOS 15 leftover signature padding while failing closed on non-zero or unsigned gaps', () => {
+  const signed8 = buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: true });
+  const removed8 = buildSyntheticArm64MachO({ gapBytes: 8, includeCodeSignature: false });
+  const unpaddedTrimmed = trimRemovedSignaturePadding(signed8.buffer, removed8.buffer);
+  assert.notEqual(unpaddedTrimmed, removed8.buffer);
+
+  const strictStripAcceptsOnlyFilledLinkedit = filePath => {
+    const buf = fs.readFileSync(filePath);
+    const linkeditFilesize = Number(buf.readBigUInt64LE(removed8.linkeditCmdOffset + 48));
+    const linkeditEnd = removed8.linkeditOff + linkeditFilesize;
+    return linkeditEnd === removed8.strEnd && buf.length === removed8.strEnd;
+  };
+
+  // Emulate macOS 15 codesign --remove-signature (truncates only to dataoff, keeping 8 zero bytes) + strict strip -S.
+  const digestFromMacos15Removal = canonicalNativeDigestFromBytes(signed8.buffer, (command, args) => {
+    const target = args[args.length - 1];
+    if (command === '/usr/bin/codesign') {
+      fs.writeFileSync(target, removed8.buffer, { mode: 0o600 });
+      return { ok: true, stdout: '', stderr: '' };
+    }
+    if (command === '/usr/bin/strip') {
+      return { ok: strictStripAcceptsOnlyFilledLinkedit(target), stdout: '', stderr: '' };
+    }
+    return { ok: false, stdout: '', stderr: '' };
+  });
+  const expectedDigest = crypto.createHash('sha256').update(unpaddedTrimmed).digest('hex');
+  assert.equal(digestFromMacos15Removal, expectedDigest);
+
+  // Non-zero byte ONLY at the last byte of the 8-byte gap is NOT trimmed -> strict strip rejects -> null.
+  const removedNonZero = buildSyntheticArm64MachO({
+    gapBytes: 8,
+    gapFill: 0x00,
+    gapLastByte: 0x01,
+    includeCodeSignature: false,
+  });
+  const nonZeroGapDigest = canonicalNativeDigestFromBytes(signed8.buffer, (command, args) => {
+    const target = args[args.length - 1];
+    if (command === '/usr/bin/codesign') {
+      fs.writeFileSync(target, removedNonZero.buffer, { mode: 0o600 });
+      return { ok: true, stdout: '', stderr: '' };
+    }
+    if (command === '/usr/bin/strip') {
+      return { ok: strictStripAcceptsOnlyFilledLinkedit(target), stdout: '', stderr: '' };
+    }
+    return { ok: false, stdout: '', stderr: '' };
+  });
+  assert.equal(nonZeroGapDigest, null);
+
+  // Already-unsigned binary with 8 trailing zero bytes is NOT trimmed -> strict strip rejects -> null.
+  const unsignedPaddedDigest = canonicalNativeDigestFromBytes(removed8.buffer, (command, args) => {
+    const target = args[args.length - 1];
+    if (command === '/usr/bin/codesign') {
+      return { ok: true, stdout: '', stderr: '' };
+    }
+    if (command === '/usr/bin/strip') {
+      return { ok: strictStripAcceptsOnlyFilledLinkedit(target), stdout: '', stderr: '' };
+    }
+    return { ok: false, stdout: '', stderr: '' };
+  });
+  assert.equal(unsignedPaddedDigest, null);
+});
+
+test('native helper recipe matches the developer build script token for token', () => {
+  const script = fs.readFileSync(path.join(ROOT, 'scripts', 'build-native-helper.sh'), 'utf8');
+  assert.equal(script.includes('SRC_DIR="$ROOT_DIR/native/crate-helper"'), true);
+  assert.equal(NATIVE_HELPER_SOURCE_DIR, 'native/crate-helper');
+  const invocation = script.match(/\/usr\/bin\/swiftc \\\n([\s\S]*?)\n\s*-o "\$OUT_BIN"\n/u);
+  assert.ok(invocation);
+  const tokens = invocation[1].replace(/\s*\\$/u, '').split(/\\\n/u)
+    .flatMap(line => line.trim().split(/\s+/u)).filter(Boolean);
+  const firstSource = tokens.findIndex(token => token.startsWith('"$SRC_DIR/'));
+  assert.deepEqual(tokens.slice(0, firstSource), [...NATIVE_HELPER_SWIFTC_ARGS]);
+  assert.deepEqual(
+    tokens.slice(firstSource).map(token => token.replace(/^"\$SRC_DIR\//u, '').replace(/"$/u, '')),
+    [...NATIVE_HELPER_SOURCE_FILES]
+  );
+  assert.deepEqual(
+    fs.readdirSync(path.join(ROOT, ...NATIVE_HELPER_SOURCE_DIR.split('/'))).sort(),
+    [...NATIVE_HELPER_SOURCE_FILES].sort()
+  );
+});
+
+test('real Swift toolchain rebuilds the committed helper byte-identically from different private directories', {
+  skip: REAL_SWIFT_TOOLCHAIN_SKIP,
+}, t => {
+  const parent = fs.realpathSync(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'crate-native-determinism-')));
+  t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+  const firstTemp = path.join(parent, 'a');
+  const secondTemp = path.join(parent, 'a-considerably-longer-private-directory-name');
+  fs.mkdirSync(firstTemp, { mode: 0o700 });
+  fs.mkdirSync(secondTemp, { mode: 0o700 });
+  const originalTmpdir = process.env.TMPDIR;
+  const sources = repositoryNativeHelperSources();
+  let first;
+  let second;
+  try {
+    process.env.TMPDIR = firstTemp;
+    first = compileNativeHelper(sources);
+    process.env.TMPDIR = secondTemp;
+    second = compileNativeHelper(sources);
+  } finally {
+    if (originalTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmpdir;
+  }
+  assert.equal(Buffer.isBuffer(first) && Buffer.isBuffer(second), true);
+  assert.equal(first.equals(second), true);
+  assert.equal(first.readUInt32LE(0), 0xfeedfacf);
+  assert.equal(first.readUInt32LE(4), 0x0100000c);
+  assert.equal(first.readUInt32LE(12), 2);
+  assert.deepEqual(fs.readdirSync(firstTemp), []);
+  assert.deepEqual(fs.readdirSync(secondTemp), []);
+  cachedCompiledNativeHelper = first;
+});
+
+test('canonical helper digest survives runtime re-signing but not a code byte change or a trust downgrade', {
+  skip: REAL_SWIFT_TOOLCHAIN_SKIP,
+}, t => {
+  const compiled = compileRepositoryNativeHelper();
+  const directory = fs.realpathSync(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'crate-native-digest-')));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const helperPath = path.join(directory, 'crate-helper');
+  fs.writeFileSync(helperPath, compiled, { mode: 0o755 });
+
+  const compiledDigest = canonicalNativeDigestFromBytes(compiled);
+  assert.match(String(compiledDigest), /^[a-f0-9]{64}$/u);
+  assert.notEqual(codesignStrictRequirement(helperPath).status, 0);
+
+  const resigned = spawnSync('/usr/bin/codesign', [
+    '--force',
+    '--sign',
+    '-',
+    '--options',
+    'runtime',
+    '--entitlements',
+    path.join(ROOT, 'entitlements.inherit.plist'),
+    helperPath,
+  ], { env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' }, encoding: 'utf8' });
+  assert.equal(resigned.status, 0);
+  const resignedBytes = fs.readFileSync(helperPath);
+  assert.equal(resignedBytes.equals(compiled), false);
+  assert.equal(canonicalNativeDigestFromBytes(resignedBytes), compiledDigest);
+  assert.notEqual(codesignStrictRequirement(helperPath).status, 0);
+
+  const largeSigPath = path.join(directory, 'crate-helper-large-sig');
+  fs.writeFileSync(largeSigPath, compiled, { mode: 0o755 });
+  const largeResigned = spawnSync('/usr/bin/codesign', [
+    '--force',
+    '--sign',
+    '-',
+    '--options',
+    'runtime',
+    '--signature-size',
+    '24000',
+    '--entitlements',
+    path.join(ROOT, 'entitlements.inherit.plist'),
+    largeSigPath,
+  ], { env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' }, encoding: 'utf8' });
+  assert.equal(largeResigned.status, 0);
+  const largeResignedBytes = fs.readFileSync(largeSigPath);
+  assert.equal(largeResignedBytes.length > compiled.length + 16384, true);
+  assert.equal(canonicalNativeDigestFromBytes(largeResignedBytes), compiledDigest);
+  assert.notEqual(codesignStrictRequirement(largeSigPath).status, 0);
+
+  const unsignedPath = path.join(directory, 'unsigned');
+  fs.writeFileSync(unsignedPath, compiled, { mode: 0o755 });
+  assert.equal(spawnSync('/usr/bin/codesign', ['--remove-signature', unsignedPath]).status, 0);
+  assert.notEqual(codesignStrictRequirement(unsignedPath).status, 0);
+
+  // When the compiled helper has alignment padding before LC_CODE_SIGNATURE (8 bytes at this revision),
+  // emulate macOS 15 codesign --remove-signature leaving those zero bytes and verify real /usr/bin/strip -S
+  // succeeds after trimRemovedSignaturePadding() and fails closed when a pad byte is non-zero.
+  const unsignedBytes = fs.readFileSync(unsignedPath);
+  let compiledSigOff = null;
+  let unsignedLinkeditCmdOff = null;
+  {
+    let off = 32;
+    const count = compiled.readUInt32LE(16);
+    for (let index = 0; index < count; index += 1) {
+      const cmd = compiled.readUInt32LE(off);
+      const size = compiled.readUInt32LE(off + 4);
+      if (cmd === 0x1d) compiledSigOff = compiled.readUInt32LE(off + 8);
+      off += size;
+    }
+    off = 32;
+    const uCount = unsignedBytes.readUInt32LE(16);
+    for (let index = 0; index < uCount; index += 1) {
+      const cmd = unsignedBytes.readUInt32LE(off);
+      const size = unsignedBytes.readUInt32LE(off + 4);
+      if (cmd === 0x19 && unsignedBytes.subarray(off + 8, off + 24).toString('latin1').replace(/\0+$/u, '') === '__LINKEDIT') {
+        unsignedLinkeditCmdOff = off;
+      }
+      off += size;
+    }
+  }
+  if (compiledSigOff !== null && unsignedLinkeditCmdOff !== null && compiledSigOff > unsignedBytes.length) {
+    // Runs on hosts where real codesign --remove-signature already trims alignment padding (e.g. macOS 27);
+    // on macOS 15, real codesign retains the gap so compiledDigest above exercises the live path directly.
+    const gap = compiledSigOff - unsignedBytes.length;
+    assert.ok(gap >= 1 && gap <= 15);
+    const makeMacos15Padded = fillLastByte => {
+      const padded = Buffer.concat([unsignedBytes, Buffer.alloc(gap, 0x00)]);
+      if (fillLastByte !== 0x00) padded[padded.length - 1] = fillLastByte;
+      const oldFilesize = padded.readBigUInt64LE(unsignedLinkeditCmdOff + 48);
+      padded.writeBigUInt64LE(oldFilesize + BigInt(gap), unsignedLinkeditCmdOff + 48);
+      return padded;
+    };
+    const paddedZeros = makeMacos15Padded(0x00);
+    const paddedNonZero = makeMacos15Padded(0x01);
+    const runRealStrip = (command, args) => {
+      const result = spawnSync(command, args, {
+        encoding: 'utf8',
+        env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' },
+      });
+      return { ok: !result.error && result.status === 0, stdout: result.stdout || '', stderr: result.stderr || '' };
+    };
+    const emulatedRunner = paddedBuffer => (command, args) => {
+      if (command === '/usr/bin/codesign') {
+        fs.writeFileSync(args[args.length - 1], paddedBuffer, { mode: 0o600 });
+        return { ok: true, stdout: '', stderr: '' };
+      }
+      return runRealStrip(command, args);
+    };
+    assert.equal(canonicalNativeDigestFromBytes(compiled, emulatedRunner(paddedZeros)), compiledDigest);
+    assert.equal(canonicalNativeDigestFromBytes(compiled, emulatedRunner(paddedNonZero)), null);
+  }
+
+  const text = machOTextSectionRange(compiled);
+  assert.ok(text && text.size > 0);
+  const flipped = Buffer.from(compiled);
+  const flipOffset = text.offset + Math.floor(text.size / 2);
+  flipped[flipOffset] ^= 0x01;
+  const flippedDigest = canonicalNativeDigestFromBytes(flipped);
+  assert.match(String(flippedDigest), /^[a-f0-9]{64}$/u);
+  assert.notEqual(flippedDigest, compiledDigest);
+});
+
+async function probeBundledNativeHelper(t, resourcesPath) {
+  const {
+    NativeHelperClient,
+    resolveNativeHelperBinaryPath,
+  } = require('../parsers/native-helper');
+  const originalResourcesPath = Object.getOwnPropertyDescriptor(process, 'resourcesPath');
+  const originalDisable = process.env.CRATE_DISABLE_NATIVE_HELPER;
+  t.after(() => {
+    if (originalResourcesPath) Object.defineProperty(process, 'resourcesPath', originalResourcesPath);
+    else delete process.resourcesPath;
+    if (originalDisable === undefined) delete process.env.CRATE_DISABLE_NATIVE_HELPER;
+    else process.env.CRATE_DISABLE_NATIVE_HELPER = originalDisable;
+  });
+  delete process.env.CRATE_DISABLE_NATIVE_HELPER;
+  Object.defineProperty(process, 'resourcesPath', {
+    configurable: true,
+    enumerable: true,
+    value: resourcesPath,
+    writable: true,
+  });
+  const expectedPath = path.join(resourcesPath, 'native', 'crate-helper');
+  assert.equal(resolveNativeHelperBinaryPath(), expectedPath);
+
+  const client = new NativeHelperClient();
+  t.after(() => client.shutdown());
+  assert.equal(client.binaryPath, expectedPath);
+  const pong = await client.ping();
+  assert.equal(pong.version, 1);
+  assert.equal(pong.arch, 'arm64');
+  assert.equal(pong.pid, client.child.pid);
+
+  const directory = fs.realpathSync(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'crate-native-probe-')));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const syntheticPath = path.join(directory, 'synthetic-input.bin');
+  const syntheticBytes = crypto.randomBytes(256 * 1024 + 17);
+  fs.writeFileSync(syntheticPath, syntheticBytes);
+  const digest = await client.sha256File(syntheticPath);
+  assert.equal(digest.sha256, crypto.createHash('sha256').update(syntheticBytes).digest('hex'));
+  assert.equal(digest.size, syntheticBytes.length);
+
+  process.env.CRATE_DISABLE_NATIVE_HELPER = '1';
+  const disabled = new NativeHelperClient();
+  await assert.rejects(async () => disabled.ping(), /native_helper_unavailable/u);
+  assert.equal(disabled.child, null);
+}
+
+test('packaged helper location resolves and answers the runtime probe', {
+  skip: REAL_SWIFT_TOOLCHAIN_SKIP,
+}, async t => {
+  const fixtureRoot = fs.realpathSync(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'crate-native-runtime-')));
+  t.after(() => fs.rmSync(fixtureRoot, { recursive: true, force: true }));
+  const resourcesPath = path.join(fixtureRoot, 'Fixture.app', 'Contents', 'Resources');
+  writeNativeHelperResource(resourcesPath, compileRepositoryNativeHelper());
+  await probeBundledNativeHelper(t, resourcesPath);
+});
+
+const SIGNED_APP_UNDER_TEST = process.env.CRATE_SIGNED_APP_UNDER_TEST;
+const SIGNED_APP_SKIP = typeof SIGNED_APP_UNDER_TEST === 'string' && path.isAbsolute(SIGNED_APP_UNDER_TEST) &&
+  SIGNED_APP_UNDER_TEST.endsWith('.app') && process.platform === 'darwin'
+  ? false
+  : 'set CRATE_SIGNED_APP_UNDER_TEST to an absolute signed Crate.app path';
+
+test('signed candidate bundles the source-bound Developer ID native helper', {
+  skip: SIGNED_APP_SKIP,
+}, async t => {
+  const appPath = SIGNED_APP_UNDER_TEST;
+  const contents = verifyPackagedAppContents(appPath);
+  assert.ok(contents.asarEntryCount > 0);
+  const revision = spawnSync('/usr/bin/git', ['rev-parse', '--verify', 'HEAD^{commit}'], {
+    cwd: ROOT,
+    encoding: 'utf8',
+    env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' },
+  });
+  assert.equal(revision.status, 0);
+  const evidence = collectNativeHelperEvidence(
+    appPath,
+    fs.realpathSync(ROOT),
+    revision.stdout.trim(),
+    undefined,
+    { expectedTeamId: PUBLIC_TEAM_ID }
+  );
+  assert.equal(evidence.resourceValid, true);
+  assert.equal(evidence.strictRequirementValid, true);
+  assert.equal(evidence.signature.valid, true);
+  assert.equal(evidence.signature.identifier, NATIVE_HELPER_IDENTIFIER);
+  assert.equal(evidence.signature.teamIdentifier, PUBLIC_TEAM_ID);
+  assert.equal(evidence.signature.hardenedRuntime, true);
+  assert.equal(evidence.signature.timestamped, true);
+  assert.equal(evidence.sourceBound, true);
+  assert.deepEqual(
+    evaluateReleaseEvidence({ ...safeEvidence(), nativeHelper: evidence }, releaseOptions()).failures,
+    []
+  );
+  assert.equal(
+    codesignStrictRequirement(path.join(appPath, 'Contents', 'Resources', 'native', 'crate-helper')).status,
+    0
+  );
+  await probeBundledNativeHelper(t, path.join(appPath, 'Contents', 'Resources'));
 });

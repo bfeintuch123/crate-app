@@ -235,6 +235,8 @@ test('other shared formats agree on a simple single link inside both stacks\' po
   fs.writeFileSync(presentPsdLink, 'synthetic linked asset');
   const rows = [
     ['.ai', `${S}/linked.png`, [`${S}/linked.png`]],
+    ['.ai', `${S}/a.png ${S}/b.png`, [`${S}/a.png`, `${S}/b.png`]],
+    ['.ai', '/Volumes/crate-synthetic/linked.png', ['/Volumes/crate-synthetic/linked.png']],
     ['.indd', `${S}/linked.tif`, [`${S}/linked.tif`]],
     ['.pptx', `file://${S}/linked.png`, [`${S}/linked.png`]],
     ['.psd', presentPsdLink, [presentPsdLink]],
@@ -249,18 +251,12 @@ test('other shared formats agree on a simple single link inside both stacks\' po
 // Differences this PR deliberately leaves in place. Each row pins both stacks'
 // current output so a change to either one fails here and must be reviewed.
 const KNOWN_DIFFERENCES = [
-  { id: 'ai-greedy-vs-lazy', ext: '.ai', input: `${S}/a.png ${S}/b.png`,
-    watching: [`${S}/a.png`, `${S}/b.png`], quick: [`${S}/a.png ${S}/b.png`],
-    reason: 'greedy versus lazy matching: Quick Package runs one greedy match across the space' },
   { id: 'ai-font-extension', ext: '.ai', input: `${S}/Brand.woff2`,
     watching: [`${S}/Brand.woff2`], quick: [],
-    reason: 'different extension lists: Quick Package AI has no font or video extensions' },
+    reason: 'different extension lists: Quick Package AI does not copy web-font extensions (.woff2/.woff)' },
   { id: 'ai-psb-extension', ext: '.ai', input: `${S}/Smart.psb`,
     watching: [], quick: [`${S}/Smart.psb`],
     reason: 'different extension lists: only Quick Package AI lists .psb' },
-  { id: 'ai-volumes-root', ext: '.ai', input: '/Volumes/crate-synthetic/linked.png',
-    watching: ['/Volumes/crate-synthetic/linked.png'], quick: [],
-    reason: 'different roots: Quick Package AI matches /Users/ only' },
   { id: 'indd-greedy-vs-lazy', ext: '.indd', input: `${S}/a.png ${S}/b.png`,
     watching: [`${S}/a.png`, `${S}/b.png`], quick: [`${S}/a.png ${S}/b.png`],
     reason: 'greedy versus lazy matching in the binary InDesign scan' },
@@ -361,4 +357,94 @@ test('Quick Package IDML checks existence at most once per distinct path while a
   // The memo is per extraction: a second extraction checks again.
   await parser.extractAssets(file);
   assert.equal(checked.length, 4);
+});
+
+test('Quick Package Illustrator unified O(N) grammar matches across helper ON and OFF for edge cases, base names, and web-font exclusion', async t => {
+  const { nativeHelper } = require('../parsers/native-helper');
+  const dir = tempDir(t);
+  const longPath = `/Users/synthetic/${'a'.repeat(4100)}/hero.png`;
+  const cases = [
+    { name: 'psb', input: `${S}/Smart.psb`, expected: [`${S}/Smart.psb`] },
+    { name: 'multi', input: `${S}/a.png ${S}/b.png`, expected: [`${S}/a.png`, `${S}/b.png`] },
+    { name: 'volumes', input: '/Volumes/crate-synthetic/linked.png', expected: ['/Volumes/crate-synthetic/linked.png'] },
+    { name: 'volumes-nested-users', input: '/Volumes/StudioNAS/Users/alice/hero.png', expected: ['/Volumes/StudioNAS/Users/alice/hero.png'] },
+    { name: 'woff2-excluded', input: `${S}/Brand.woff2`, expected: [] },
+    { name: 'woff2-then-volumes', input: `${S}/Brand.woff2 /Volumes/Studio/hero.png`, expected: ['/Volumes/Studio/hero.png'] },
+    { name: 'dotted-home-ai', input: '/Users/sam.ainsworth/Documents/logo.png', expected: ['/Users/sam.ainsworth/Documents/logo.png'] },
+    { name: 'dotted-home-fig', input: '/Users/ana.figueroa/Work/hero.jpg', expected: ['/Users/ana.figueroa/Work/hero.jpg'] },
+    { name: 'mid-path-ai-folder', input: '/Users/me/Client.ai files/hero.png', expected: ['/Users/me/Client.ai files/hero.png'] },
+    { name: 'double-ext', input: '/Users/me/shot.psd.png', expected: ['/Users/me/shot.psd.png'] },
+    { name: 'mid-path-mp4', input: '/Users/me/Movie.mp4 stills/frame.png', expected: ['/Users/me/Movie.mp4 stills/frame.png'] },
+    { name: 'mid-path-woff2', input: '/Users/me/Brand.woff2.png', expected: ['/Users/me/Brand.woff2.png'] },
+    { name: 'mid-path-ttf', input: '/Users/a/b.ttf and c.png', expected: ['/Users/a/b.ttf and c.png'] },
+    { name: 'reject-partial-pngx', input: '/Users/me/a.pngx', expected: [] },
+    { name: 'reject-partial-aif', input: '/Users/me/x.aif', expected: [] },
+    { name: 'reject-pipe-delimiter', input: '/Users/me/a|b.png', expected: [] },
+    { name: 'reject-star-delimiter', input: '/Users/me/a*b.png', expected: [] },
+    { name: 'reject-question-delimiter', input: '/Users/me/a?b.png', expected: [] },
+    { name: 'reject-over-4096', input: longPath, expected: [] },
+    { name: 'xmp-mid-path-ai', input: '<stRef:filePath>/Users/me/Client.ai files/hero.png</stRef:filePath>', expected: ['/Users/me/Client.ai files/hero.png'] },
+    { name: 'xmp-link-resource-uri', input: 'LinkResourceURI="file:///Users/me/a%20b.png"', expected: ['/Users/me/a%20b.png', '/Users/me/a b.png'] },
+    { name: 'inner-lowercase-users-dir', input: '/Users/me/Projects/users/avatar.png', expected: ['/Users/me/Projects/users/avatar.png'] },
+    { name: 'inner-backup-users-dir', input: '/Users/me/Old Mac/Users/jane/logo.png', expected: ['/Users/me/Old Mac/Users/jane/logo.png'] },
+    { name: 'inner-home-backup-users-dir', input: '/Users/me/Backup/Users/me/Documents/logo.png', expected: ['/Users/me/Backup/Users/me/Documents/logo.png'] },
+    { name: 'inner-volumes-dir', input: '/Users/me/Client/Volumes/hero.png', expected: ['/Users/me/Client/Volumes/hero.png'] },
+    { name: 'inner-volumes-archive-dir', input: '/Users/me/Volumes/Archive/logo.png', expected: ['/Users/me/Volumes/Archive/logo.png'] },
+    { name: 'inner-paren-before-users-dir', input: '/Users/me/Archive (old)/Users/jo/a.png', expected: ['/Users/me/Archive (old)/Users/jo/a.png'] },
+    { name: 'adjacent-pdf-strings-paren', input: '(/Users/a/1.png)(/Users/b/2.png)', expected: ['/Users/a/1.png', '/Users/b/2.png'] },
+    { name: 'non-utf8-macroman-byte', input: Buffer.concat([Buffer.from('/Users/me/caf'), Buffer.from([0x8e]), Buffer.from('.png')]), expected: ['/Users/me/caf\uFFFD.png'] },
+  ];
+  const prevDisable = process.env.CRATE_DISABLE_NATIVE_HELPER;
+  t.after(() => {
+    if (prevDisable === undefined) delete process.env.CRATE_DISABLE_NATIVE_HELPER;
+    else process.env.CRATE_DISABLE_NATIVE_HELPER = prevDisable;
+  });
+
+  // Always exercise helper OFF (forced JS fallback)
+  process.env.CRATE_DISABLE_NATIVE_HELPER = '1';
+  const offByCase = new Map();
+  for (const tc of cases) {
+    const file = Buffer.isBuffer(tc.input)
+      ? (() => {
+          const p = path.join(dir, `${tc.name}.ai`);
+          fs.writeFileSync(p, Buffer.concat([Buffer.from('%PDF-1.5\n'), tc.input, Buffer.from('\n%%EOF\n')]));
+          return p;
+        })()
+      : build(dir, '.ai', tc.input);
+    const offPaths = (await quick(AIParser, file)).map(a => a.path);
+    assert.deepEqual(offPaths, tc.expected, `${tc.name} (helper OFF)`);
+    offByCase.set(tc.name, offPaths);
+  }
+
+  // Exercise helper ON in an explicit subtest so helper-OFF runs report a visible skip
+  if (prevDisable === undefined) delete process.env.CRATE_DISABLE_NATIVE_HELPER;
+  else process.env.CRATE_DISABLE_NATIVE_HELPER = prevDisable;
+  await t.test('helper ON matches helper OFF', { skip: !nativeHelper.isAvailable() }, async () => {
+    for (const tc of cases) {
+      const file = Buffer.isBuffer(tc.input)
+        ? path.join(dir, `${tc.name}.ai`)
+        : build(dir, '.ai', tc.input);
+      const onPaths = (await quick(AIParser, file)).map(a => a.path);
+      assert.deepEqual(onPaths, tc.expected, `${tc.name} (helper ON)`);
+      assert.deepEqual(onPaths, offByCase.get(tc.name), `${tc.name} (ON == OFF parity)`);
+    }
+  });
+});
+
+test('Quick Package Illustrator fallback stays strictly linear O(N) on pathological repeated /Users/ runs', async t => {
+  const dir = tempDir(t);
+  const prevDisable = process.env.CRATE_DISABLE_NATIVE_HELPER;
+  process.env.CRATE_DISABLE_NATIVE_HELPER = '1';
+  t.after(() => {
+    if (prevDisable === undefined) delete process.env.CRATE_DISABLE_NATIVE_HELPER;
+    else process.env.CRATE_DISABLE_NATIVE_HELPER = prevDisable;
+  });
+  // 256 KB delimiter-free run of repeated /Users/ (took >2,200 ms with quadratic rescanning)
+  const pathological = '/Users/'.repeat(36500);
+  const file = build(dir, '.ai', pathological);
+  const startedAt = Date.now();
+  const assets = await quick(AIParser, file);
+  const elapsedMs = Date.now() - startedAt;
+  assert.deepEqual(assets, []);
+  assert.ok(elapsedMs < 500, `expected linear O(N) scan under 500ms, got ${elapsedMs}ms`);
 });

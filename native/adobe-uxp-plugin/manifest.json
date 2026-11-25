@@ -1,0 +1,29 @@
+{
+  "id": "com.crate.adobe.companion",
+  "name": "Crate Companion Push Bridge",
+  "version": "1.0.0",
+  "main": "index.js",
+  "manifestVersion": 5,
+  "host": [
+    {
+      "app": "PS",
+      "minVersion": "24.0.0"
+    },
+    {
+      "app": "ID",
+      "minVersion": "19.0.0"
+    }
+  ],
+  "entrypoints": [
+    {
+      "type": "command",
+      "id": "crateSyncNow",
+      "label": {
+        "default": "Sync Active Document to Crate"
+      }
+    }
+  ],
+  "requiredPermissions": {
+    "localFileSystem": "request"
+  }
+}
