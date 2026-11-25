@@ -1652,4 +1652,45 @@ test('Swift PdfAiParser isolates each stream dictionary and preserves Adler-32 t
     Array.isArray(singleUnfinishedParsed.issues) && singleUnfinishedParsed.issues.includes('flate-stream-dict-unbounded'),
     'single unfinished dictionary at stream candidate must emit flate-stream-dict-unbounded'
   );
+
+  // 7. Large (>16 MiB) valid /Subtype /Image stream containing binary '(' bytes is skipped
+  //    via its file-bounded direct /Length without corrupting lexical state for a following
+  //    compressed metadata stream; an unterminated image stream fails closed before payload lexing.
+  const afterLargeImageAsset = path.join(workDir, 'AfterLargeImageHero.png');
+  const afterLargeImageBytes = Buffer.from('synthetic-after-large-image-png');
+  fs.writeFileSync(afterLargeImageAsset, afterLargeImageBytes);
+  const afterLargeImageCompressed = zlib.deflateSync(Buffer.from(`BT (${afterLargeImageAsset}) Tj ET\n`, 'utf8'));
+  const largeImageLen = 17 * 1024 * 1024;
+  const largeImageAiPath = path.join(workDir, 'LargeImageBeforeMetadata.ai');
+  fs.writeFileSync(largeImageAiPath, Buffer.concat([
+    Buffer.from('%PDF-1.6\n'),
+    Buffer.from(`1 0 obj\n<< /Type /XObject /Subtype /Image /Width 4096 /Height 4096 /Length ${largeImageLen} >>\nstream\n`),
+    Buffer.alloc(largeImageLen, 0x28), // binary '(' bytes must never enter PDF tokenization
+    Buffer.from('\nendstream\nendobj\n'),
+    Buffer.from(`2 0 obj\n<< /Filter /FlateDecode /Length ${afterLargeImageCompressed.length} >>\nstream\n`),
+    afterLargeImageCompressed,
+    Buffer.from('\nendstream\nendobj\n%%EOF\n'),
+  ]));
+  const largeImageParsed = await client.parsePdfAi(largeImageAiPath, { decompressStreams: true });
+  assert.equal(largeImageParsed.incomplete, false, '>16 MiB image stream with valid direct /Length must skip cleanly');
+  assert.deepEqual(largeImageParsed.issues, []);
+  assert.ok(largeImageParsed.paths.includes(afterLargeImageAsset));
+  const largeImageOutDir = path.join(workDir, 'out-large-image');
+  const largeImagePkg = await packageMasterFile(largeImageAiPath, largeImageOutDir);
+  assert.equal(largeImagePkg.assetsFound, 1);
+  assert.equal(largeImagePkg.assetsCopied, 1);
+  assert.deepEqual(fs.readFileSync(path.join(largeImageOutDir, 'AfterLargeImageHero.png')), afterLargeImageBytes);
+
+  const unterminatedImagePath = path.join(workDir, 'UnterminatedImageStream.ai');
+  fs.writeFileSync(unterminatedImagePath, Buffer.concat([
+    Buffer.from('%PDF-1.6\n1 0 obj\n<< /Type /XObject /Subtype /Image /Length 100 >>\nstream\n'),
+    Buffer.alloc(64, 0x28),
+    Buffer.from('\n%%EOF\n'),
+  ]));
+  const unterminatedImageParsed = await client.parsePdfAi(unterminatedImagePath, { decompressStreams: true });
+  assert.equal(unterminatedImageParsed.incomplete, true, 'unterminated image stream must fail closed before payload lexing');
+  assert.ok(
+    Array.isArray(unterminatedImageParsed.issues) && unterminatedImageParsed.issues.includes('flate-endstream-unbounded'),
+    'unterminated image stream must emit flate-endstream-unbounded'
+  );
 });

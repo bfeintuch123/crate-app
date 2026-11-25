@@ -400,7 +400,7 @@ enum PdfAiParser {
         let lengthToken = Array("/Length".utf8)
         let maxStreamDictBytes = 65536
         let maxDictNestingDepth = 32
-        let maxDirectStreamLength = 16 * 1024 * 1024
+        let maxFlateCompressedBytes = 16 * 1024 * 1024
         let n = bytes.count
         var streamAttempts = 0
         var totalInflated = 0
@@ -560,7 +560,7 @@ enum PdfAiParser {
                             var digits = 0
                             while q < limit && bytes[q] >= 0x30 && bytes[q] <= 0x39 {
                                 let d = Int(bytes[q] - 0x30)
-                                if val > (maxDirectStreamLength - d) / 10 {
+                                if val > (n - d) / 10 {
                                     val = -1
                                     break
                                 }
@@ -782,7 +782,7 @@ enum PdfAiParser {
                             // unstripped range to zlib (which stops at Z_STREAM_END and ignores
                             // trailing PDF EOL bytes without truncating Adler-32 checksum bytes).
                             var endPos = max(dataStart, noEndstreamBefore)
-                            let searchLimit = min(n - endstreamToken.count, dataStart + maxDirectStreamLength)
+                            let searchLimit = n - endstreamToken.count
                             var foundEnd = -1
                             while endPos <= searchLimit {
                                 if bytes[endPos] == endstreamToken[0] {
@@ -813,7 +813,10 @@ enum PdfAiParser {
                                     break streamScanLoop
                                 }
                                 let compLen = compEnd - dataStart
-                                if compLen > 2 {
+                                if compLen > maxFlateCompressedBytes {
+                                    streamAttempts += 1
+                                    recordIssue("flate-stream-budget-or-decode")
+                                } else if compLen > 2 {
                                     streamAttempts += 1
                                     let budget = min(maxSingleStreamOut, maxTotalInflatedOut - totalInflated)
                                     let inflateResult = inflateZlibBounded(
@@ -836,11 +839,12 @@ enum PdfAiParser {
                             }
                             p = endstreamEnd
                             continue streamScanLoop
-                        } else if isFlate && !isImage {
+                        } else {
+                            // Unbounded stream boundary (image, Flate, or other binary stream):
+                            // fail closed rather than tokenizing raw binary stream payload bytes.
                             recordIssue("flate-endstream-unbounded")
+                            break streamScanLoop
                         }
-                        p = dataStart
-                        continue streamScanLoop
                     }
                     if !tokenAfterLastClosedDict && malformedDictBeforeStream {
                         recordIssue("flate-stream-dict-unbounded")
