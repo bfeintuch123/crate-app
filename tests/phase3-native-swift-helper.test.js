@@ -1710,4 +1710,109 @@ test('Swift PdfAiParser isolates each stream dictionary and preserves Adler-32 t
     Array.isArray(ambiguousImageParsed.issues) && ambiguousImageParsed.issues.includes('flate-endstream-unbounded'),
     'ambiguous uninflated stream boundary must emit flate-endstream-unbounded'
   );
+
+  // 8. Valid empty PDF streams (/Length 0), withholding unvalidated fallback stream results,
+  //    and enforcing exact 16 MiB compressed-input bound after decoding:
+  //    8a. Valid unfiltered /Length 0 streams (with EOL and immediate endstream) before a
+  //        compressed metadata stream must not block Quick Package from copying later links.
+  const afterEmptyAsset = path.join(workDir, 'AfterEmptyStreamHero.png');
+  const afterEmptyBytes = Buffer.from('synthetic-after-empty-stream-png');
+  fs.writeFileSync(afterEmptyAsset, afterEmptyBytes);
+  const afterEmptyCompressed = zlib.deflateSync(Buffer.from(`BT (${afterEmptyAsset}) Tj ET\n`, 'utf8'));
+  const emptyStreamsAiPath = path.join(workDir, 'ValidEmptyStreamsBeforeMetadata.ai');
+  fs.writeFileSync(emptyStreamsAiPath, Buffer.concat([
+    Buffer.from('%PDF-1.6\n'),
+    Buffer.from('1 0 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n'),
+    Buffer.from('2 0 obj\n<< /Length 0 >>\nstream\nendstream\nendobj\n'),
+    Buffer.from(`3 0 obj\n<< /Filter /FlateDecode /Length ${afterEmptyCompressed.length} >>\nstream\n`),
+    afterEmptyCompressed,
+    Buffer.from('\nendstream\nendobj\n%%EOF\n'),
+  ]));
+  const emptyStreamsParsed = await client.parsePdfAi(emptyStreamsAiPath, { decompressStreams: true });
+  assert.equal(emptyStreamsParsed.incomplete, false, 'valid /Length 0 streams must skip cleanly');
+  assert.deepEqual(emptyStreamsParsed.issues, []);
+  assert.ok(emptyStreamsParsed.paths.includes(afterEmptyAsset));
+  const emptyStreamsOutDir = path.join(workDir, 'out-empty-streams');
+  const emptyStreamsPkg = await packageMasterFile(emptyStreamsAiPath, emptyStreamsOutDir);
+  assert.equal(emptyStreamsPkg.assetsFound, 1);
+  assert.equal(emptyStreamsPkg.assetsCopied, 1);
+  assert.deepEqual(fs.readFileSync(path.join(emptyStreamsOutDir, 'AfterEmptyStreamHero.png')), afterEmptyBytes);
+
+  //    8b. Indirect-length Flate stream with non-whitespace data between Z_STREAM_END and
+  //        endstream must record flate-endstream-unbounded and withhold its decoded output
+  //        (compressedStreamsScanned === 0, path not published).
+  const withheldPath = path.join(workDir, 'WithheldOnFailedBoundary.png');
+  const withheldCompressed = zlib.deflateSync(Buffer.from(`BT (${withheldPath}) Tj ET\n`, 'utf8'));
+  const badTailAiPath = path.join(workDir, 'FallbackBadTailWithheld.ai');
+  fs.writeFileSync(badTailAiPath, Buffer.concat([
+    Buffer.from('%PDF-1.6\n1 0 obj\n<< /Filter /FlateDecode /Length 99 0 R >>\nstream\n'),
+    withheldCompressed,
+    Buffer.from('TRAILING-NON-WHITESPACE\nendstream\nendobj\n%%EOF\n'),
+  ]));
+  const badTailParsed = await client.parsePdfAi(badTailAiPath, { decompressStreams: true });
+  assert.equal(badTailParsed.incomplete, true, 'failed fallback boundary validation must mark result incomplete');
+  assert.ok(
+    Array.isArray(badTailParsed.issues) && badTailParsed.issues.includes('flate-endstream-unbounded'),
+    'failed fallback boundary validation must emit flate-endstream-unbounded'
+  );
+  assert.equal(badTailParsed.compressedStreamsScanned, 0, 'failed boundary check must withhold stream publication');
+  assert.equal(badTailParsed.paths.includes(withheldPath), false, 'failed boundary check must not publish unvalidated stream paths');
+
+  //    8c. Fallback Flate stream whose consumed compressed bytes exceed 16 MiB (even within
+  //        the 16 MiB + 8 whitespace search allowance) must enforce the exact 16 MiB cap
+  //        after decoding and withhold publication.
+  function buildValidZlibWithExactCompressedSize(payloadText, targetMinBytes) {
+    const payload = Buffer.from(payloadText, 'utf8');
+    // RFC 1950 header (2B: 0x78 0x01) + N empty RFC 1951 stored blocks (5B each: 00 00 00 ff ff,
+    // byte-aligned) + final compressed deflate block (BFINAL=1, no plaintext path) + 4B Adler-32.
+    const compressedFinal = zlib.deflateRawSync(payload);
+    assert.equal(compressedFinal.includes(Buffer.from('/Users/')), false, 'final block must be compressed-only');
+    const fixedBytes = 2 + compressedFinal.length + 4;
+    const emptyBlocks = Math.ceil(Math.max(0, targetMinBytes - fixedBytes) / 5);
+    const out = Buffer.alloc(fixedBytes + emptyBlocks * 5);
+    out[0] = 0x78;
+    out[1] = 0x01;
+    let off = 2;
+    for (let b = 0; b < emptyBlocks; b += 1) {
+      out[off] = 0x00;
+      out[off + 1] = 0x00;
+      out[off + 2] = 0x00;
+      out[off + 3] = 0xff;
+      out[off + 4] = 0xff;
+      off += 5;
+    }
+    compressedFinal.copy(out, off);
+    off += compressedFinal.length;
+    // Standard Adler-32 over payload
+    let s1 = 1;
+    let s2 = 0;
+    for (let idx = 0; idx < payload.length; idx += 1) {
+      s1 = (s1 + payload[idx]) % 65521;
+      s2 = (s2 + s1) % 65521;
+    }
+    out.writeUInt32BE((((s2 << 16) | s1) >>> 0), off);
+    assert.equal(zlib.inflateSync(out).toString('utf8'), payloadText, 'fixture must be valid RFC 1950 zlib');
+    return out;
+  }
+
+  const over16mPath = '/Users/synthetic/over-16mib-compressed-input.png';
+  const over16mZlib = buildValidZlibWithExactCompressedSize(`BT (${over16mPath}) Tj ET\n`, 16 * 1024 * 1024 + 1);
+  assert.ok(
+    over16mZlib.length > 16 * 1024 * 1024 && over16mZlib.length <= 16 * 1024 * 1024 + 8,
+    `expected compressed size in (16MiB, 16MiB+8], got ${over16mZlib.length}`
+  );
+  const over16mAiPath = path.join(workDir, 'FallbackOver16MiBCompressed.ai');
+  fs.writeFileSync(over16mAiPath, Buffer.concat([
+    Buffer.from('%PDF-1.6\n1 0 obj\n<< /Filter /FlateDecode /Length 99 0 R >>\nstream\n'),
+    over16mZlib,
+    Buffer.from('\nendstream\nendobj\n%%EOF\n'),
+  ]));
+  const over16mParsed = await client.parsePdfAi(over16mAiPath, { decompressStreams: true });
+  assert.equal(over16mParsed.incomplete, true, 'fallback stream exceeding 16 MiB compressed input must fail closed');
+  assert.ok(
+    Array.isArray(over16mParsed.issues) && over16mParsed.issues.includes('flate-stream-budget-or-decode'),
+    'fallback stream exceeding 16 MiB compressed input must emit flate-stream-budget-or-decode'
+  );
+  assert.equal(over16mParsed.compressedStreamsScanned, 0, 'over-16MiB compressed stream must withhold publication');
+  assert.equal(over16mParsed.paths.includes(over16mPath), false, 'over-16MiB compressed stream must not publish paths');
 });

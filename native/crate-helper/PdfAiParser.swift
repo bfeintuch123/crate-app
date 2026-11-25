@@ -568,7 +568,7 @@ enum PdfAiParser {
                                 digits += 1
                                 q += 1
                             }
-                            if digits > 0 && val > 0 && (q == limit || isPdfDelimiterOrWhitespace(bytes[q])) {
+                            if digits > 0 && val >= 0 && (q == limit || isPdfDelimiterOrWhitespace(bytes[q])) {
                                 let nextTok = skipWsAndComments(q, limit: limit)
                                 // Reject indirect references like `/Length 12 0 R`
                                 if !(nextTok < limit && bytes[nextTok] >= 0x30 && bytes[nextTok] <= 0x39) {
@@ -836,23 +836,29 @@ enum PdfAiParser {
                                     )
                                     totalInflated += inflateResult.produced
                                     if let inflated = inflateResult.data {
+                                        var boundaryOk = true
                                         if !usedValidatedDirectLength {
                                             let tailStart = dataStart + inflateResult.consumed
-                                            var tailOk = (compEnd - tailStart) <= 8
-                                            if tailOk {
+                                            boundaryOk = (compEnd - tailStart) <= 8
+                                            if boundaryOk {
                                                 for k in tailStart..<compEnd {
                                                     if !isPdfWhitespace(bytes[k]) {
-                                                        tailOk = false
+                                                        boundaryOk = false
                                                         break
                                                     }
                                                 }
                                             }
-                                            if !tailOk {
-                                                recordIssue("flate-endstream-unbounded")
-                                            }
                                         }
-                                        streamsScanned += 1
-                                        try onInflated(inflated)
+                                        if !boundaryOk {
+                                            recordIssue("flate-endstream-unbounded")
+                                            break streamScanLoop
+                                        }
+                                        if inflateResult.consumed > maxFlateCompressedBytes {
+                                            recordIssue("flate-stream-budget-or-decode")
+                                        } else {
+                                            streamsScanned += 1
+                                            try onInflated(inflated)
+                                        }
                                     } else {
                                         recordIssue("flate-stream-budget-or-decode")
                                     }
