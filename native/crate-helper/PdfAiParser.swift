@@ -398,24 +398,13 @@ enum PdfAiParser {
         let subtypeToken = Array("/Subtype".utf8)
         let imageToken = Array("/Image".utf8)
         let lengthToken = Array("/Length".utf8)
-        let maxStreamDictLookback = 65536
+        let maxStreamDictBytes = 65536
         let maxDictNestingDepth = 32
-        let maxInOpenContainerSkips = 4
         let maxDirectStreamLength = 16 * 1024 * 1024
         let n = bytes.count
         var streamAttempts = 0
         var totalInflated = 0
         var noEndstreamBefore = 0
-        var noDictBefore = 0
-        var inOpenContainerSkips = 0
-        var i = 0
-
-        enum StreamDictLookup {
-            case notAStream
-            case inOpenContainer
-            case found(Range<Int>)
-            case unbounded
-        }
 
         func recordIssue(_ code: String) {
             if !issues.contains(code) { issues.append(code) }
@@ -469,151 +458,6 @@ enum PdfAiParser {
                 break
             }
             return q
-        }
-
-        // Lex forward over `windowStart..<streamPos`, properly skipping PDF literal
-        // strings `(...)` (with `\` escapes & balanced nested parens), hex strings
-        // `<...>` (distinct from `<<`/`>>`, including `<...>>>`), and `%...` comments
-        // ending on CR, LF, or CRLF. Because `noDictBefore` advances monotonically on
-        // resolved/non-open positions, total work stays strictly O(N).
-        func findStreamDictionaryRange(before streamPos: Int) -> StreamDictLookup {
-            let windowStart = max(noDictBefore, streamPos - maxStreamDictLookback)
-            var p = windowStart
-            var dictDepth = 0
-            var outerDictStart = -1
-            var depthOverflow = false
-            var lastClosedTopDict: Range<Int>? = nil
-            var tokenAfterLastClosedDict = false
-            var malformedNearEnd = false
-            var endedInComment = false
-            var endedInString = false
-
-            while p < streamPos {
-                let b = bytes[p]
-                if isPdfWhitespace(b) {
-                    p += 1
-                    continue
-                }
-                if b == 0x25 { // '%' comment ending on CR, LF, or CRLF
-                    p += 1
-                    while p < streamPos && bytes[p] != 0x0A && bytes[p] != 0x0D {
-                        p += 1
-                    }
-                    if p == streamPos {
-                        endedInComment = true
-                        break
-                    }
-                    if bytes[p] == 0x0D && p + 1 < streamPos && bytes[p + 1] == 0x0A {
-                        p += 2
-                    } else {
-                        p += 1
-                    }
-                    continue
-                }
-                if b == 0x28 { // '(' literal string
-                    if dictDepth == 0 {
-                        tokenAfterLastClosedDict = true
-                        malformedNearEnd = false
-                    }
-                    var parenDepth = 1
-                    p += 1
-                    while p < streamPos && parenDepth > 0 {
-                        let c = bytes[p]
-                        if c == 0x5C { // '\'
-                            p += (p + 1 < streamPos) ? 2 : 1
-                        } else if c == 0x28 {
-                            parenDepth += 1
-                            p += 1
-                        } else if c == 0x29 {
-                            parenDepth -= 1
-                            p += 1
-                        } else {
-                            p += 1
-                        }
-                    }
-                    if parenDepth > 0 {
-                        endedInString = true
-                        break
-                    }
-                    continue
-                }
-                if b == 0x3C && p + 1 < streamPos && bytes[p + 1] == 0x3C {
-                    if dictDepth == 0 {
-                        outerDictStart = p
-                        depthOverflow = false
-                        tokenAfterLastClosedDict = true
-                        malformedNearEnd = false
-                    }
-                    dictDepth += 1
-                    if dictDepth > maxDictNestingDepth {
-                        depthOverflow = true
-                    }
-                    p += 2
-                    continue
-                }
-                if b == 0x3C { // hex string `<...>` (single `<`, closes on single `>`)
-                    if dictDepth == 0 {
-                        tokenAfterLastClosedDict = true
-                        malformedNearEnd = false
-                    }
-                    p += 1
-                    while p < streamPos && bytes[p] != 0x3E {
-                        p += 1
-                    }
-                    if p < streamPos && bytes[p] == 0x3E {
-                        p += 1
-                    } else {
-                        endedInString = true
-                        break
-                    }
-                    continue
-                }
-                if b == 0x3E && p + 1 < streamPos && bytes[p + 1] == 0x3E {
-                    if dictDepth > 0 {
-                        dictDepth -= 1
-                        if dictDepth == 0 {
-                            if depthOverflow {
-                                lastClosedTopDict = nil
-                                malformedNearEnd = true
-                                tokenAfterLastClosedDict = false
-                            } else {
-                                lastClosedTopDict = outerDictStart..<(p + 2)
-                                malformedNearEnd = false
-                                tokenAfterLastClosedDict = false
-                            }
-                        }
-                    } else {
-                        lastClosedTopDict = nil
-                        malformedNearEnd = true
-                        tokenAfterLastClosedDict = false
-                    }
-                    p += 2
-                    continue
-                }
-                if dictDepth == 0 {
-                    tokenAfterLastClosedDict = true
-                    malformedNearEnd = false
-                }
-                p += 1
-            }
-
-            if endedInComment {
-                return (dictDepth > 0 || (lastClosedTopDict != nil && !tokenAfterLastClosedDict))
-                    ? .inOpenContainer
-                    : .notAStream
-            }
-            if endedInString || dictDepth > 0 {
-                return .inOpenContainer
-            }
-            if !tokenAfterLastClosedDict {
-                if let dict = lastClosedTopDict {
-                    return .found(dict)
-                }
-                if malformedNearEnd {
-                    return .unbounded
-                }
-            }
-            return .notAStream
         }
 
         func inspectStreamDictionary(_ range: Range<Int>) -> (isFlate: Bool, isImage: Bool, directLength: Int?) {
@@ -743,130 +587,276 @@ enum PdfAiParser {
             return (isFlate, isImage, directLength)
         }
 
-        streamScanLoop: while i < n - 16 {
-            // Match "stream" preceded by PDF delimiter/whitespace and followed by \n or \r\n
-            if bytes[i] == streamToken[0] && i + 7 < n && (i == 0 || isPdfDelimiterOrWhitespace(bytes[i - 1])) {
-                var ok = true
-                for k in 1..<streamToken.count {
-                    if bytes[i + k] != streamToken[k] { ok = false; break }
+        // Single-pass monotonic forward lexical scan over the file. Carries dictionary,
+        // string, hex-string, and comment state forward without backward lookback windows
+        // or retry heuristics, guaranteeing strictly O(N) scanning and jumping over each
+        // resolved stream payload to `endstream`.
+        var p = 0
+        var dictDepth = 0
+        var outerDictStart = -1
+        var depthOverflow = false
+        var lastClosedTopDict: Range<Int>? = nil
+        var tokenAfterLastClosedDict = true
+        var malformedDictBeforeStream = false
+
+        streamScanLoop: while p < n {
+            let b = bytes[p]
+            if isPdfWhitespace(b) {
+                p += 1
+                continue
+            }
+            // PDF comment: `%` through CR, LF, or CRLF (ignored without disturbing preceding dict state)
+            if b == 0x25 {
+                p = skipWsAndComments(p, limit: n)
+                continue
+            }
+            // PDF literal string: `(` ... `)` with `\` escapes and balanced nested parens
+            if b == 0x28 {
+                if dictDepth == 0 {
+                    tokenAfterLastClosedDict = true
+                    malformedDictBeforeStream = false
                 }
-                if ok {
-                    var dataStart = i + 6
-                    var validLineBreak = false
-                    if bytes[dataStart] == 0x0A {
-                        dataStart += 1; validLineBreak = true
-                    } else if bytes[dataStart] == 0x0D && dataStart + 1 < n && bytes[dataStart + 1] == 0x0A {
-                        dataStart += 2; validLineBreak = true
+                var parenDepth = 1
+                var sawStreamInString = false
+                p += 1
+                while p < n && parenDepth > 0 {
+                    let c = bytes[p]
+                    if c == 0x5C {
+                        p += (p + 1 < n) ? 2 : 1
+                    } else if c == 0x28 {
+                        parenDepth += 1
+                        p += 1
+                    } else if c == 0x29 {
+                        parenDepth -= 1
+                        p += 1
+                    } else {
+                        if !sawStreamInString && c == streamToken[0] && matchesAt(p, streamToken, limit: n) {
+                            let after = p + streamToken.count
+                            if after < n && (bytes[after] == 0x0A || (bytes[after] == 0x0D && after + 1 < n && bytes[after + 1] == 0x0A)) {
+                                sawStreamInString = true
+                            }
+                        }
+                        p += 1
                     }
-                    if validLineBreak {
-                        switch findStreamDictionaryRange(before: i) {
-                        case .notAStream:
-                            noDictBefore = max(noDictBefore, dataStart)
-                        case .inOpenContainer:
-                            if inOpenContainerSkips < maxInOpenContainerSkips {
-                                inOpenContainerSkips += 1
-                            } else {
-                                noDictBefore = max(noDictBefore, dataStart)
-                                recordIssue("flate-stream-dict-unbounded")
-                            }
-                        case .unbounded:
-                            noDictBefore = max(noDictBefore, dataStart)
-                            recordIssue("flate-stream-dict-unbounded")
-                        case .found(let dictRange):
-                            inOpenContainerSkips = 0
-                            noDictBefore = max(noDictBefore, dataStart)
-                            let dictInfo = inspectStreamDictionary(dictRange)
-                            let isFlate = dictInfo.isFlate
-                            let isImage = dictInfo.isImage
+                }
+                if parenDepth > 0 && (dictDepth > 0 || sawStreamInString) {
+                    recordIssue("flate-stream-dict-unbounded")
+                }
+                continue
+            }
+            // Dictionary open `<<`
+            if b == 0x3C && p + 1 < n && bytes[p + 1] == 0x3C {
+                if dictDepth == 0 {
+                    outerDictStart = p
+                    depthOverflow = false
+                    tokenAfterLastClosedDict = true
+                    malformedDictBeforeStream = false
+                }
+                dictDepth += 1
+                if dictDepth > maxDictNestingDepth {
+                    depthOverflow = true
+                }
+                p += 2
+                continue
+            }
+            // Hex string `<...>` (single `<`, distinct from `<<`; closes on first single `>`)
+            if b == 0x3C {
+                if dictDepth == 0 {
+                    tokenAfterLastClosedDict = true
+                    malformedDictBeforeStream = false
+                }
+                p += 1
+                while p < n && bytes[p] != 0x3E {
+                    p += 1
+                }
+                if p < n && bytes[p] == 0x3E {
+                    p += 1
+                } else if dictDepth > 0 {
+                    recordIssue("flate-stream-dict-unbounded")
+                }
+                continue
+            }
+            // Dictionary close `>>`
+            if b == 0x3E && p + 1 < n && bytes[p + 1] == 0x3E {
+                if dictDepth > 0 {
+                    dictDepth -= 1
+                    if dictDepth == 0 {
+                        let dictClose = p + 2
+                        if depthOverflow || (dictClose - outerDictStart) > maxStreamDictBytes {
+                            lastClosedTopDict = nil
+                            malformedDictBeforeStream = true
+                            tokenAfterLastClosedDict = false
+                        } else {
+                            lastClosedTopDict = outerDictStart..<dictClose
+                            malformedDictBeforeStream = false
+                            tokenAfterLastClosedDict = false
+                        }
+                    }
+                } else {
+                    lastClosedTopDict = nil
+                    malformedDictBeforeStream = true
+                    tokenAfterLastClosedDict = false
+                }
+                p += 2
+                continue
+            }
+            // PDF name token `/...` (consume full name so `/stream\n` is never mistaken for `stream\n`)
+            if b == 0x2F {
+                if dictDepth == 0 {
+                    tokenAfterLastClosedDict = true
+                    malformedDictBeforeStream = false
+                }
+                p += 1
+                while p < n && !isPdfDelimiterOrWhitespace(bytes[p]) {
+                    p += 1
+                }
+                continue
+            }
+            // Other single-byte PDF delimiter (`[`, `]`, `{`, `}`, stray `)` / `>`)
+            if isPdfDelimiterOrWhitespace(b) {
+                if dictDepth == 0 {
+                    tokenAfterLastClosedDict = true
+                    malformedDictBeforeStream = false
+                }
+                p += 1
+                continue
+            }
 
-                            // Prefer validated direct /Length from this stream's own dictionary so
-                            // exact compressed bytes (including any trailing CR/LF checksum bytes)
-                            // are preserved without scanning inside compressed payload data.
-                            var compEnd = -1
-                            var endstreamEnd = -1
-                            if let directLen = dictInfo.directLength,
-                               directLen <= n - dataStart {
-                                let expectedEnd = dataStart + directLen
-                                var esPos = expectedEnd
-                                let esWsLimit = min(n, expectedEnd + 8)
-                                while esPos < esWsLimit && isPdfWhitespace(bytes[esPos]) {
-                                    esPos += 1
-                                }
-                                if matchesAt(esPos, endstreamToken, limit: n) {
-                                    compEnd = expectedEnd
-                                    endstreamEnd = esPos + endstreamToken.count
-                                }
-                            }
+            // Regular PDF token (keyword, number, identifier)
+            let tokStart = p
+            while p < n && !isPdfDelimiterOrWhitespace(bytes[p]) {
+                p += 1
+            }
+            let tokEnd = p
+            if tokEnd - tokStart == streamToken.count && matchesAt(tokStart, streamToken, limit: tokEnd) {
+                var dataStart = tokEnd
+                var validLineBreak = false
+                if dataStart < n && bytes[dataStart] == 0x0A {
+                    dataStart += 1; validLineBreak = true
+                } else if dataStart + 1 < n && bytes[dataStart] == 0x0D && bytes[dataStart + 1] == 0x0A {
+                    dataStart += 2; validLineBreak = true
+                }
+                if validLineBreak {
+                    if dictDepth > 0 {
+                        // Unclosed dictionary immediately at a stream candidate -> fail closed
+                        recordIssue("flate-stream-dict-unbounded")
+                        dictDepth = 0
+                        outerDictStart = -1
+                        depthOverflow = false
+                        lastClosedTopDict = nil
+                        malformedDictBeforeStream = false
+                        tokenAfterLastClosedDict = true
+                        p = dataStart
+                        continue streamScanLoop
+                    }
+                    if !tokenAfterLastClosedDict, let dictRange = lastClosedTopDict {
+                        lastClosedTopDict = nil
+                        malformedDictBeforeStream = false
+                        tokenAfterLastClosedDict = true
+                        let dictInfo = inspectStreamDictionary(dictRange)
+                        let isFlate = dictInfo.isFlate
+                        let isImage = dictInfo.isImage
 
-                            if compEnd < 0 {
-                                // Indirect or missing /Length: locate matching endstream without
-                                // rescanning ranges already proven to contain none, and pass the
-                                // unstripped range to zlib (which stops at Z_STREAM_END and ignores
-                                // trailing PDF EOL bytes without truncating Adler-32 checksum bytes).
-                                var endPos = max(dataStart, noEndstreamBefore)
-                                let searchLimit = min(n - endstreamToken.count, dataStart + maxDirectStreamLength)
-                                var foundEnd = -1
-                                while endPos <= searchLimit {
-                                    if bytes[endPos] == endstreamToken[0] {
-                                        var m = true
-                                        for k in 1..<endstreamToken.count {
-                                            if bytes[endPos + k] != endstreamToken[k] { m = false; break }
-                                        }
-                                        if m { foundEnd = endPos; break }
+                        // Prefer validated direct /Length from this stream's own dictionary so
+                        // exact compressed bytes (including any trailing CR/LF checksum bytes)
+                        // are preserved without scanning inside compressed payload data.
+                        var compEnd = -1
+                        var endstreamEnd = -1
+                        if let directLen = dictInfo.directLength,
+                           directLen <= n - dataStart {
+                            let expectedEnd = dataStart + directLen
+                            var esPos = expectedEnd
+                            let esWsLimit = min(n, expectedEnd + 8)
+                            while esPos < esWsLimit && isPdfWhitespace(bytes[esPos]) {
+                                esPos += 1
+                            }
+                            if matchesAt(esPos, endstreamToken, limit: n) {
+                                compEnd = expectedEnd
+                                endstreamEnd = esPos + endstreamToken.count
+                            }
+                        }
+
+                        if compEnd < 0 {
+                            // Indirect or missing /Length: locate matching endstream without
+                            // rescanning ranges already proven to contain none, and pass the
+                            // unstripped range to zlib (which stops at Z_STREAM_END and ignores
+                            // trailing PDF EOL bytes without truncating Adler-32 checksum bytes).
+                            var endPos = max(dataStart, noEndstreamBefore)
+                            let searchLimit = min(n - endstreamToken.count, dataStart + maxDirectStreamLength)
+                            var foundEnd = -1
+                            while endPos <= searchLimit {
+                                if bytes[endPos] == endstreamToken[0] {
+                                    var m = true
+                                    for k in 1..<endstreamToken.count {
+                                        if bytes[endPos + k] != endstreamToken[k] { m = false; break }
                                     }
-                                    endPos += 1
+                                    if m { foundEnd = endPos; break }
                                 }
-                                if foundEnd < 0 {
-                                    noEndstreamBefore = max(noEndstreamBefore, searchLimit + 1)
-                                } else {
-                                    compEnd = foundEnd
-                                    endstreamEnd = foundEnd + endstreamToken.count
-                                }
+                                endPos += 1
                             }
+                            if foundEnd < 0 {
+                                noEndstreamBefore = max(noEndstreamBefore, searchLimit + 1)
+                            } else {
+                                compEnd = foundEnd
+                                endstreamEnd = foundEnd + endstreamToken.count
+                            }
+                        }
 
-                            if compEnd >= dataStart && endstreamEnd > compEnd {
-                                noDictBefore = max(noDictBefore, endstreamEnd)
-                                if isFlate && !isImage {
-                                    if streamAttempts >= maxStreamsToInflate {
-                                        recordIssue("flate-stream-count-limit")
-                                        break streamScanLoop
+                        if compEnd >= dataStart && endstreamEnd > compEnd {
+                            if isFlate && !isImage {
+                                if streamAttempts >= maxStreamsToInflate {
+                                    recordIssue("flate-stream-count-limit")
+                                    break streamScanLoop
+                                }
+                                if totalInflated >= maxTotalInflatedOut {
+                                    recordIssue("flate-total-output-limit")
+                                    break streamScanLoop
+                                }
+                                let compLen = compEnd - dataStart
+                                if compLen > 2 {
+                                    streamAttempts += 1
+                                    let budget = min(maxSingleStreamOut, maxTotalInflatedOut - totalInflated)
+                                    let inflateResult = inflateZlibBounded(
+                                        base: bytes.baseAddress!.advanced(by: dataStart),
+                                        length: compLen,
+                                        maxOut: budget
+                                    )
+                                    totalInflated += inflateResult.produced
+                                    if let inflated = inflateResult.data {
+                                        streamsScanned += 1
+                                        try onInflated(inflated)
+                                    } else {
+                                        recordIssue("flate-stream-budget-or-decode")
                                     }
                                     if totalInflated >= maxTotalInflatedOut {
                                         recordIssue("flate-total-output-limit")
                                         break streamScanLoop
                                     }
-                                    let compLen = compEnd - dataStart
-                                    if compLen > 2 {
-                                        streamAttempts += 1
-                                        let budget = min(maxSingleStreamOut, maxTotalInflatedOut - totalInflated)
-                                        let inflateResult = inflateZlibBounded(
-                                            base: bytes.baseAddress!.advanced(by: dataStart),
-                                            length: compLen,
-                                            maxOut: budget
-                                        )
-                                        totalInflated += inflateResult.produced
-                                        if let inflated = inflateResult.data {
-                                            streamsScanned += 1
-                                            try onInflated(inflated)
-                                        } else {
-                                            recordIssue("flate-stream-budget-or-decode")
-                                        }
-                                        if totalInflated >= maxTotalInflatedOut {
-                                            recordIssue("flate-total-output-limit")
-                                            break streamScanLoop
-                                        }
-                                    }
                                 }
-                                i = endstreamEnd
-                                continue streamScanLoop
-                            } else if isFlate && !isImage {
-                                recordIssue("flate-endstream-unbounded")
                             }
+                            p = endstreamEnd
+                            continue streamScanLoop
+                        } else if isFlate && !isImage {
+                            recordIssue("flate-endstream-unbounded")
                         }
+                        p = dataStart
+                        continue streamScanLoop
+                    }
+                    if !tokenAfterLastClosedDict && malformedDictBeforeStream {
+                        recordIssue("flate-stream-dict-unbounded")
+                        lastClosedTopDict = nil
+                        malformedDictBeforeStream = false
+                        tokenAfterLastClosedDict = true
+                        p = dataStart
+                        continue streamScanLoop
                     }
                 }
             }
-            i += 1
+
+            if dictDepth == 0 {
+                tokenAfterLastClosedDict = true
+                malformedDictBeforeStream = false
+            }
         }
     }
 

@@ -1613,4 +1613,43 @@ test('Swift PdfAiParser isolates each stream dictionary and preserves Adler-32 t
     'repeated unclosed <<stream\\n must emit flate-stream-dict-unbounded'
   );
   assert.ok(openElapsedMs < 2000, `repeated <<stream\\n must stay linear-time (took ${openElapsedMs}ms)`);
+
+  // 6. Single-pass monotonic lexical state:
+  //    - Many comment lines ending in `stream` (> 4) plus >64 KiB whitespace between `>>` and `stream`
+  //      still recover and package the compressed-only PNG cleanly.
+  //    - A single unfinished dictionary at a stream candidate fails closed with flate-stream-dict-unbounded.
+  const manyCommentsAsset = path.join(workDir, 'ManyStreamCommentsHero.png');
+  const manyCommentsBytes = Buffer.from('synthetic-many-comments-png-bytes');
+  fs.writeFileSync(manyCommentsAsset, manyCommentsBytes);
+  const manyCommentsCompressed = zlib.deflateSync(Buffer.from(`BT (${manyCommentsAsset}) Tj ET\n`, 'utf8'));
+  const manyCommentsAiPath = path.join(workDir, 'ManyCommentsAndWideWhitespace.ai');
+  fs.writeFileSync(manyCommentsAiPath, Buffer.concat([
+    Buffer.from('%PDF-1.6\n'),
+    Buffer.from(`1 0 obj\n<< /Filter /FlateDecode /Length ${manyCommentsCompressed.length} >>\n`),
+    Buffer.from('% comment ending in stream\n'.repeat(8), 'ascii'),
+    Buffer.from(' '.repeat(70000) + '\nstream\n', 'ascii'),
+    manyCommentsCompressed,
+    Buffer.from('\nendstream\nendobj\n%%EOF\n'),
+  ]));
+  const manyCommentsParsed = await client.parsePdfAi(manyCommentsAiPath, { decompressStreams: true });
+  assert.equal(manyCommentsParsed.incomplete, false, '8 stream-ending comments + >64 KiB whitespace must parse completely');
+  assert.deepEqual(manyCommentsParsed.issues, []);
+  assert.ok(manyCommentsParsed.paths.includes(manyCommentsAsset));
+  const manyCommentsOutDir = path.join(workDir, 'out-many-comments');
+  const manyCommentsPkg = await packageMasterFile(manyCommentsAiPath, manyCommentsOutDir);
+  assert.equal(manyCommentsPkg.assetsFound, 1);
+  assert.equal(manyCommentsPkg.assetsCopied, 1);
+  assert.deepEqual(fs.readFileSync(path.join(manyCommentsOutDir, 'ManyStreamCommentsHero.png')), manyCommentsBytes);
+
+  const singleUnfinishedPath = path.join(workDir, 'SingleUnfinishedDict.ai');
+  fs.writeFileSync(singleUnfinishedPath, Buffer.concat([
+    Buffer.from('%PDF-1.6\n1 0 obj\n<< /Filter /FlateDecode /Length 10\nstream\n'),
+    Buffer.from('0123456789\nendstream\nendobj\n%%EOF\n'),
+  ]));
+  const singleUnfinishedParsed = await client.parsePdfAi(singleUnfinishedPath, { decompressStreams: true });
+  assert.equal(singleUnfinishedParsed.incomplete, true, 'single unfinished dictionary at stream candidate must fail closed');
+  assert.ok(
+    Array.isArray(singleUnfinishedParsed.issues) && singleUnfinishedParsed.issues.includes('flate-stream-dict-unbounded'),
+    'single unfinished dictionary at stream candidate must emit flate-stream-dict-unbounded'
+  );
 });
