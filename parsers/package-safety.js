@@ -433,7 +433,8 @@ function assertSafeCopySource(sourcePath) {
 function copyFileIntoPackage(sourcePath, destFolder, rawName, options = {}) {
   assertSafeCopySource(sourcePath);
   const finalPath = resolveUniquePackagePath(destFolder, rawName, options);
-  fs.copyFileSync(sourcePath, finalPath, fs.constants.COPYFILE_EXCL);
+  const copyFlags = fs.constants.COPYFILE_EXCL | (fs.constants.COPYFILE_FICLONE || 0);
+  fs.copyFileSync(sourcePath, finalPath, copyFlags);
   return finalPath;
 }
 

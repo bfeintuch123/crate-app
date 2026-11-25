@@ -86,7 +86,37 @@ const {
 const { runBoundedAddFilesScan } = require('./parsers/add-files-operation');
 const { REGEX_SOURCE_EXTENSIONS } = require('./parsers/add-files-regex-worker');
 const { extractLinkedAssetPaths } = require('./parsers/linked-asset-matcher');
-const { decodeXMLPath, fileUriToPath } = require('./parsers/xml-path');
+const { decodeXMLPath, fileUriToPath, normalizePsdExternalPath } = require('./parsers/xml-path');
+let CrateSqliteStore = null;
+let crateSqliteStoreLoadError = null;
+try {
+  ({ CrateSqliteStore } = require('./parsers/sqlite-store'));
+} catch (err) {
+  CrateSqliteStore = null;
+  crateSqliteStoreLoadError = err;
+}
+let nativeWatcherBridge = null;
+try {
+  nativeWatcherBridge = require('./parsers/native-watcher-bridge');
+} catch (_) {
+  nativeWatcherBridge = null;
+}
+const { ProjectIpcDeltaBridge } = require('./parsers/ipc-delta-bridge');
+const {
+  PROJECT_LIFECYCLE_EVENTS,
+  ProjectLifecycleController,
+  enforceSingleWatchingInvariant,
+} = require('./parsers/project-state-machine');
+const projectIpcDeltaBridge = new ProjectIpcDeltaBridge({
+  coalesceMs: (process.versions && process.versions.electron) ? 16 : 0,
+});
+const projectLifecycleController = new ProjectLifecycleController();
+const canUseNativeProcessWatcher = () => Boolean(
+  nativeWatcherBridge && nativeWatcherBridge.canUseNativeProcessWatcher(exec, execFile)
+);
+const canUseNativePackageClone = () => Boolean(
+  nativeWatcherBridge && nativeWatcherBridge.canUseNativePackageClone()
+);
 startupPhaseJournal.mark('dependencies-loaded');
 
 const PROVENANCE_MANIFEST_FILENAME = 'crate-provenance.json';
@@ -108,6 +138,7 @@ const activeAddFilesOperations = new Map();
 const pendingNativeAddFilesPickers = new Map();
 const CACHE_CLEANUP_BATCH_SIZE = 25;
 const CACHE_CLEANUP_RETRY_DELAYS_MS = [25, 100, 250];
+const RASTER_THUMBNAIL_STAT_CACHE_NAMESPACE = 'raster-thumbnail';
 const CRATE_PROJECT_CACHE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CRATE_CACHE_QUARANTINE_PATTERN = /^\.crate-cleanup-\d+-\d+-[0-9a-f]{12}$/i;
 const DEFAULT_NAMING_TEMPLATE = '{Project}_{Date}';
@@ -228,7 +259,14 @@ function initializeAccountSession() {
     const allowed = snapshot.canUseWorkspace;
     const identityChanged = accountWorkspaceId !== snapshot.identity?.id;
     const generationChanged = accountWorkspaceGeneration !== accountSession.generation;
-    if (!allowed || identityChanged || generationChanged) invalidateAllPackageReviews();
+    if (!allowed || identityChanged || generationChanged) {
+      projectIpcDeltaBridge.clearAll();
+      invalidateAllPackageReviews();
+      if (!allowed || identityChanged) {
+        clearFileVisualProjectCache();
+        try { store?.clearStatCache?.(); } catch (_) {}
+      }
+    }
     // An identity change while access had already lapsed (a sign-out, then a
     // sign-in) skips the block below, but still ends every Assets need save episode.
     if (identityChanged && !accountWorkspaceAllowed) closeNeedsSaveNotifications(null, { forgetSeen: true });
@@ -685,6 +723,14 @@ function parseMissingXattrPaths(stderr, filePaths) {
 }
 
 async function getBulkXattrLastUsedMs(filePaths) {
+  if (canUseNativeProcessWatcher()) {
+    try {
+      const nativeValues = await nativeWatcherBridge.readNativeLastUsedXattrs(filePaths, LAST_USED_XATTR_TIMEOUT_MS);
+      if (nativeValues) return nativeValues;
+    } catch (_) {
+      // Fall back to /usr/bin/xattr on any native helper failure.
+    }
+  }
   let stdout = '';
   let missingPaths = new Set();
   try {
@@ -4871,8 +4917,12 @@ function collectWorkingSourceScanEvidence(paths, inventory = null) {
   for (const ref of inventory?.references || []) {
     const raw = ref.rawPaths;
     // Preserve obligations even if the ordinary admission filter rejects them.
-    if (raw?.fullPath) add(raw.fullPath);
-    else issue('unresolved-declared-reference');
+    if (raw?.fullPath) {
+      const normalized = typeof normalizePsdExternalPath === 'function' ? normalizePsdExternalPath(raw.fullPath) : '';
+      add(normalized || raw.fullPath);
+    } else {
+      issue('unresolved-declared-reference');
+    }
   }
   for (const item of inventory?.unresolved || []) issue(typeof item?.reason === 'string' ? item.reason : 'unsupported-dependency-form');
   if (limited) {
@@ -6687,6 +6737,8 @@ function getFileVisualProjectCacheEpoch(projectId) {
   return fileVisualProjectCacheEpochs.get(projectId) || 0;
 }
 
+let rasterThumbnailCacheGeneration = 0;
+
 function clearFileVisualProjectCache(projectId = null) {
   // The epoch also invalidates workspace builders that are between their
   // asynchronous filesystem reads and cache publication. Array/object
@@ -6697,7 +6749,10 @@ function clearFileVisualProjectCache(projectId = null) {
     return;
   }
   fileVisualProjectCacheGeneration += 1;
+  rasterThumbnailCacheGeneration += 1;
   fileVisualProjectCache.clear();
+  if (typeof rasterThumbnailMemoryCache?.clear === 'function') rasterThumbnailMemoryCache.clear();
+  if (typeof embeddedPsdReviewCache?.clear === 'function') embeddedPsdReviewCache.clear();
 }
 
 function getCurrentFileVisualProjectCache(projectId, project) {
@@ -6858,7 +6913,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   const workspaceAccountGeneration = accountSession?.generation;
   await refreshWorkingSourceLocators(projectId);
   await refreshWorkingSourceVerification(projectId);
-  const project = getProjects().find(item => item && item.id === projectId);
+  const project = getProjectByIdFast(projectId);
   const scopedProject = project && getIllustratorScopedProjectView(project);
   if (!project || !scopedProject) return null;
   const projectFiles = project.files;
@@ -6874,7 +6929,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
 
   // Filtering can await source-session evidence. Revalidate the exact state
   // captured above before using its result or building presentation data.
-  const currentProjectAfterSelection = getProjects().find(item => item && item.id === projectId);
+  const currentProjectAfterSelection = getProjectByIdFast(projectId);
   const selectionProjectionIsFresh = (
     accountSession?.generation === workspaceAccountGeneration && accountSession?.canUseWorkspace() &&
     getActiveWatchingActivationToken(projectId) === workspaceActivationToken &&
@@ -6943,7 +6998,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   // in-flight workspace build from publishing or returning stale records
   // after a concurrent project update. Retry once so the renderer receives a
   // current snapshot; repeated churn fails closed instead of returning stale data.
-  const currentProject = getProjects().find(item => item.id === projectId);
+  const currentProject = getProjectByIdFast(projectId);
   const workspaceIsFresh = (
     accountSession?.generation === workspaceAccountGeneration && accountSession?.canUseWorkspace() &&
     getActiveWatchingActivationToken(projectId) === workspaceActivationToken &&
@@ -7359,15 +7414,62 @@ function runSerializedFileVisualRasterWork(task) {
   });
 }
 
-function getBoundedRasterThumbnail(projectId, file, visualRevision) {
+const MAX_RASTER_THUMBNAIL_MEMORY_CACHE_ENTRIES = 256;
+const rasterThumbnailMemoryCache = new Map();
+
+function getRasterThumbnailMemoryCacheKey(filePath, stat) {
+  if (typeof filePath !== 'string' || !stat) return null;
+  return `${filePath}\0${stat.dev}\0${stat.ino}\0${stat.size}\0${stat.mtimeNs}\0${stat.ctimeNs}`;
+}
+
+function rememberRasterThumbnail(cacheKey, dataUrl) {
+  if (!cacheKey || typeof dataUrl !== 'string') return;
+  rasterThumbnailMemoryCache.delete(cacheKey);
+  while (rasterThumbnailMemoryCache.size >= MAX_RASTER_THUMBNAIL_MEMORY_CACHE_ENTRIES) {
+    const oldest = rasterThumbnailMemoryCache.keys().next().value;
+    if (oldest === undefined) break;
+    rasterThumbnailMemoryCache.delete(oldest);
+  }
+  rasterThumbnailMemoryCache.set(cacheKey, dataUrl);
+}
+
+function getBoundedRasterThumbnail(projectId, file, visualRevision, authGuard = null) {
+  const capturedCacheGeneration = rasterThumbnailCacheGeneration;
+  const capturedProjectEpoch = getFileVisualProjectCacheEpoch(projectId);
+  const canPublishThumbnail = () => {
+    if (rasterThumbnailCacheGeneration !== capturedCacheGeneration) return false;
+    if (getFileVisualProjectCacheEpoch(projectId) !== capturedProjectEpoch) return false;
+    if (typeof authGuard === 'function') {
+      try { authGuard(); } catch (_) { return false; }
+    } else if (accountSession && !accountSession.canUseWorkspace()) {
+      return false;
+    }
+    return true;
+  };
   return runSerializedFileVisualRasterWork(async () => {
+    if (!canPublishThumbnail()) return null;
     const source = await openPreflightedRasterSource(file.path);
     if (!source) return null;
     let snapshot = null;
     try {
+      if (!canPublishThumbnail()) return null;
       if (createProjectFileVisualRevisionFromStat(projectId, file, source.sourceStat) !== visualRevision) {
         return { stale: true };
       }
+      const hasStatCacheStore = typeof store?.getStatCache === 'function';
+      const memoryKey = hasStatCacheStore ? getRasterThumbnailMemoryCacheKey(file.path, source.sourceStat) : null;
+      const cachedMemory = memoryKey ? rasterThumbnailMemoryCache.get(memoryKey) : null;
+      const cachedPersisted = (cachedMemory || !hasStatCacheStore)
+        ? null
+        : store.getStatCache(RASTER_THUMBNAIL_STAT_CACHE_NAMESPACE, file.path, source.sourceStat);
+      const cachedDataUrl = cachedMemory || (cachedPersisted && typeof cachedPersisted.dataUrl === 'string' ? cachedPersisted.dataUrl : null);
+      if (cachedDataUrl) {
+        const descriptorStat = await source.handle.stat({ bigint: true });
+        if (!sameOpenFileStat(source.sourceStat, descriptorStat) || !canPublishThumbnail()) return null;
+        if (!cachedMemory && memoryKey) rememberRasterThumbnail(memoryKey, cachedDataUrl);
+        return cachedDataUrl;
+      }
+
       const ext = (file.ext || path.extname(file.path || '')).toLowerCase();
       snapshot = await createPrivateFileVisualSnapshot(source, ext);
       if (!snapshot) return null;
@@ -7383,9 +7485,15 @@ function getBoundedRasterThumbnail(projectId, file, visualRevision) {
         !sameOpenFileStat(source.sourceStat, descriptorStat) ||
         snapshotPathStat.isSymbolicLink() ||
         !sameOpenFileStat(snapshot.stat, snapshotStat) ||
-        !sameOpenFileStat(snapshotStat, snapshotPathStat)
+        !sameOpenFileStat(snapshotStat, snapshotPathStat) ||
+        !canPublishThumbnail()
       ) return null;
-      return encodeBoundedFileVisual(thumbnail);
+      const encoded = encodeBoundedFileVisual(thumbnail);
+      if (encoded && canPublishThumbnail()) {
+        if (memoryKey) rememberRasterThumbnail(memoryKey, encoded);
+        store?.setStatCache?.(RASTER_THUMBNAIL_STAT_CACHE_NAMESPACE, file.path, source.sourceStat, { dataUrl: encoded });
+      }
+      return encoded;
     } catch (_) {
       return null;
     } finally {
@@ -7403,17 +7511,34 @@ function getProjectOwnedFileVisualRequestError({
   requestProject,
   requestFile,
 }) {
-  const storedProjects = typeof projectId === 'string' ? store.get('projects', []) : [];
-  const currentProject = Array.isArray(storedProjects)
-    ? storedProjects.find(item => item && item.id === projectId)
-    : null;
+  const usesPerProjectStore = typeof store?.getProjectById === 'function';
+  let currentProject = null;
+  if (typeof projectId === 'string') {
+    if (usesPerProjectStore) {
+      currentProject = store.getProjectById(projectId);
+    } else {
+      const storedProjects = store.get('projects', []);
+      currentProject = Array.isArray(storedProjects)
+        ? storedProjects.find(item => item && item.id === projectId)
+        : null;
+    }
+  }
   if (!currentProject) return { error: 'not_found' };
   const currentFile = resolveProjectOwnedFileVisualRecord(projectId, visualIdentity, currentProject);
   if (!currentFile) return { error: 'not_found' };
+  const identityChanged = usesPerProjectStore
+    ? (
+      currentProject.id !== requestProject?.id ||
+      currentFile.name !== requestFile?.name ||
+      currentFile.path !== requestFile?.path ||
+      currentFile.addedAt !== requestFile?.addedAt ||
+      currentFile.assetOrigin !== requestFile?.assetOrigin ||
+      currentFile.projectRole !== requestFile?.projectRole
+    )
+    : (currentProject !== requestProject || currentFile !== requestFile);
   if (
     getFileVisualProjectCacheEpoch(projectId) !== requestEpoch ||
-    currentProject !== requestProject ||
-    currentFile !== requestFile ||
+    identityChanged ||
     createProjectFileVisualIdentity(projectId, currentFile) !== visualIdentity
   ) return { error: 'stale_visual' };
 
@@ -7455,7 +7580,8 @@ async function getProjectOwnedFileVisual(projectId, visualIdentity, visualRevisi
     typeof file.path === 'string' && path.isAbsolute(file.path) &&
     typeof nativeImage.createThumbnailFromPath === 'function'
   ) {
-    const dataUrl = await getBoundedRasterThumbnail(projectId, file, visualRevision);
+    const authGuard = accountSession ? captureAccountAuthorization() : null;
+    const dataUrl = await getBoundedRasterThumbnail(projectId, file, visualRevision, authGuard);
     const rasterRequestError = getProjectOwnedFileVisualRequestError(request);
     if (rasterRequestError) return rasterRequestError;
     if (dataUrl?.stale) return { error: 'stale_visual' };
@@ -8811,49 +8937,129 @@ if (!gotLock) {
 let localStorePaths = null;
 let localStoreStartupError = null;
 let store = null;
-startupPhaseJournal.mark('store-preflight-start');
-try {
-  localStorePaths = preflightLocalStorePaths(app.getPath('userData'));
-  startupPhaseJournal.mark('store-path-preflight-complete');
-  const candidateStore = new Store({
-    cwd: localStorePaths.userDataRealPath,
-    configFileMode: OWNER_ONLY_FILE_MODE,
-    defaults: {
-      projects: [],
-      settings: {
-        namingTemplate: DEFAULT_NAMING_TEMPLATE,
-        notifications: true,
-        existingAssetsNotifications: true,
-        needsSaveNotifications: true,
-        includeDiagnosticReport: false,
-        showPackageDetails: true,
-        packageOutputLayoutMode: PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
-      },
-      usage: {
-        packagesThisMonth: 0,
-        resetDate: getNextMonthReset()
+if (gotLock) {
+  startupPhaseJournal.mark('store-preflight-start');
+  try {
+    localStorePaths = preflightLocalStorePaths(app.getPath('userData'));
+    startupPhaseJournal.mark('store-path-preflight-complete');
+    const candidateStore = new Store({
+      cwd: localStorePaths.userDataRealPath,
+      configFileMode: OWNER_ONLY_FILE_MODE,
+      defaults: {
+        projects: [],
+        settings: {
+          namingTemplate: DEFAULT_NAMING_TEMPLATE,
+          notifications: true,
+          existingAssetsNotifications: true,
+          needsSaveNotifications: true,
+          includeDiagnosticReport: false,
+          showPackageDetails: true,
+          packageOutputLayoutMode: PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
+        },
+        usage: {
+          packagesThisMonth: 0,
+          resetDate: getNextMonthReset()
+        }
       }
+    });
+    startupPhaseJournal.mark('store-constructor-complete');
+    if (
+      typeof candidateStore.path !== 'string' ||
+      fs.realpathSync.native(candidateStore.path) !== fs.realpathSync.native(localStorePaths.configPath) ||
+      !hardenLocalStorePermissions(candidateStore.path, localStorePaths.userDataRealPath)
+    ) {
+      throw new Error('Crate could not secure local settings storage.');
     }
-  });
-  startupPhaseJournal.mark('store-constructor-complete');
-  if (
-    typeof candidateStore.path !== 'string' ||
-    fs.realpathSync.native(candidateStore.path) !== fs.realpathSync.native(localStorePaths.configPath) ||
-    !hardenLocalStorePermissions(candidateStore.path, localStorePaths.userDataRealPath)
-  ) {
-    throw new Error('Crate could not secure local settings storage.');
+    startupPhaseJournal.mark('store-path-security-complete');
+    validateLocalStoreShape(candidateStore);
+    startupPhaseJournal.mark('store-shape-validation-complete');
+    const isRealElectronStore = (
+      typeof candidateStore.openInEditor === 'function' &&
+      typeof candidateStore.onDidChange === 'function'
+    );
+    if (isRealElectronStore && CrateSqliteStore) {
+      let sqliteStore = null;
+      try {
+        sqliteStore = new CrateSqliteStore({
+          userDataRealPath: localStorePaths.userDataRealPath,
+          defaults: {
+            projects: [],
+            settings: {
+              namingTemplate: DEFAULT_NAMING_TEMPLATE,
+              notifications: true,
+              existingAssetsNotifications: true,
+              needsSaveNotifications: true,
+              includeDiagnosticReport: false,
+              showPackageDetails: true,
+              packageOutputLayoutMode: PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
+            },
+            usage: {
+              packagesThisMonth: 0,
+              resetDate: getNextMonthReset()
+            }
+          }
+        });
+        sqliteStore.migrateFromLegacyStore(candidateStore);
+        validateLocalStoreShape(sqliteStore);
+        store = sqliteStore;
+      } catch (sqliteMigrationErr) {
+        if (sqliteStore) {
+          try { sqliteStore.close(); } catch (_) {}
+        }
+        if (sqliteMigrationErr && sqliteMigrationErr.code === 'CRATE_LEGACY_MIGRATION_INVALID_PROJECTS') {
+          console.warn(
+            `[crate][fast-engine] sqlite-migration-skipped reason=invalid-legacy-projects ` +
+            `legacyCount=${Number(sqliteMigrationErr.legacyCount) || 0} ` +
+            `invalidEntries=${Number(sqliteMigrationErr.invalidEntries) || 0} ` +
+            `duplicateIds=${Number(sqliteMigrationErr.duplicateIds) || 0}`
+          );
+          store = candidateStore;
+        } else {
+          throw sqliteMigrationErr;
+        }
+      }
+    } else if (isRealElectronStore) {
+      const sqliteArtifacts = ['crate-state.sqlite', 'crate-state.sqlite-wal', 'crate-state.sqlite-shm'];
+      let hasExistingSqliteState = false;
+      let sqliteStatCheckFailed = false;
+      for (const fileName of sqliteArtifacts) {
+        try {
+          fs.lstatSync(path.join(localStorePaths.userDataRealPath, fileName));
+          hasExistingSqliteState = true;
+          break;
+        } catch (statErr) {
+          if (!statErr || statErr.code !== 'ENOENT') {
+            sqliteStatCheckFailed = true;
+            break;
+          }
+        }
+      }
+      if (hasExistingSqliteState || sqliteStatCheckFailed) {
+        const loadErr = typeof crateSqliteStoreLoadError !== 'undefined' ? crateSqliteStoreLoadError : null;
+        const errCode = loadErr && typeof loadErr.code === 'string'
+          ? loadErr.code.replace(/[^A-Za-z0-9_.-]/g, '')
+          : (loadErr && typeof loadErr.name === 'string'
+            ? loadErr.name.replace(/[^A-Za-z0-9_.-]/g, '')
+            : 'unavailable');
+        console.warn(
+          `[crate][fast-engine] sqlite-store-load-failed ` +
+          `reason=${sqliteStatCheckFailed ? 'stat-check-failed' : 'existing-sqlite-state'} ` +
+          `code=${errCode}`
+        );
+        throw new Error('Crate could not secure local settings storage.');
+      }
+      store = candidateStore;
+    } else {
+      store = candidateStore;
+    }
+    migrateSettings();
+    startupPhaseJournal.mark('store-migrations-complete');
+    startupPhaseJournal.mark('store-preflight-complete');
+  } catch (_) {
+    store = null;
+    localStoreStartupError = new Error('Crate could not secure local settings storage.');
+    startupPhaseJournal.mark('store-preflight-failed');
   }
-  startupPhaseJournal.mark('store-path-security-complete');
-  validateLocalStoreShape(candidateStore);
-  startupPhaseJournal.mark('store-shape-validation-complete');
-  store = candidateStore;
-  migrateSettings();
-  startupPhaseJournal.mark('store-migrations-complete');
-  startupPhaseJournal.mark('store-preflight-complete');
-} catch (_) {
-  store = null;
-  localStoreStartupError = new Error('Crate could not secure local settings storage.');
-  startupPhaseJournal.mark('store-preflight-failed');
 }
 
 // One-time migration: update old naming template format to new one
@@ -10500,9 +10706,30 @@ function isDiagnosticManifestDestinationSafe(destFolder, relativePath = path.joi
 
 // FIX 1 (C1): Atomic store helper — prevents read-mutate-write race conditions
 function mutateProject(projectId, fn, { persistIfChanged = false, trustResultChanged = false, packageStageContext = false } = {}) {
-  const projects = getProjects();
-  const project = projects.find(p => p.id === projectId);
-  if (!project) return null;
+  const canUseSingleProjectPath = (
+    typeof store?.getProjectById === 'function' &&
+    typeof store?.upsertProject === 'function' &&
+    typeof fn === 'function' &&
+    fn.length <= 1
+  );
+  let projects = null;
+  let project = null;
+  if (canUseSingleProjectPath) {
+    project = store.getProjectById(projectId);
+    if (!project) return null;
+    let readNormalized = false;
+    if (migrateProjectFigmaLinkPrivacy(project)) readNormalized = true;
+    if (clearPersistedCurrentSessionFilesystemEvidence(project)) readNormalized = true;
+    if (normalizeProjectAssetReviewState(project)) readNormalized = true;
+    if (readNormalized) {
+      clearFileVisualProjectCache(projectId);
+      store.upsertProject(project);
+    }
+  } else {
+    projects = getProjects();
+    project = projects.find(p => p.id === projectId);
+    if (!project) return null;
+  }
   const heldPsdMembers = capturePsdReceiptHeldMembers(project);
   if (typeof clearFileVisualProjectCache === 'function') clearFileVisualProjectCache(projectId);
   // Background observers can legitimately return changed:false after running
@@ -10515,7 +10742,7 @@ function mutateProject(projectId, fn, { persistIfChanged = false, trustResultCha
   if (persistIfChanged && !trustResultChanged) {
     try { before = JSON.stringify(project); } catch (_) { before = null; }
   }
-  const result = fn(project, projects);
+  const result = canUseSingleProjectPath ? fn(project) : fn(project, projects);
   const resultChanged = !!(result && result.changed === true);
   if (!persistIfChanged || !trustResultChanged || resultChanged) {
     normalizeAutoCaptureProjectState(project, packageStageContext ? createLiveObservedFileStageContext(project) : null);
@@ -10530,7 +10757,11 @@ function mutateProject(projectId, fn, { persistIfChanged = false, trustResultCha
     try { shouldPersist = before === null || JSON.stringify(project) !== before; } catch (_) { shouldPersist = true; }
   }
   if (shouldPersist) {
-    store.set('projects', projects);
+    if (canUseSingleProjectPath) {
+      store.upsertProject(project);
+    } else {
+      store.set('projects', projects);
+    }
     scheduleNeedsSaveNotificationSync(projectId);
   }
   return result;
@@ -11301,6 +11532,28 @@ let mainWindowHiddenShowAttempts = 0;
 let mainWindowVisibleSinceStartup = false;
 let packageForegroundSuppressionUntil = 0;
 let mainWindowInitialDiagnosticsScheduled = false;
+// The one pending Package Review destination chooser, a sheet on its owner
+// window: { owner, abandoned }. See `projects:select-output`.
+let packageDestinationChooser = null;
+// Open inactivity prompt sheets per window, as a count.
+const inactivityPromptSheetWindows = new WeakMap();
+
+function isPackageDestinationSheetAttached(win) {
+  return !!win && !!packageDestinationChooser && packageDestinationChooser.owner === win;
+}
+
+// Marks the pending chooser's result as a cancel. `win` limits this to a
+// chooser on that window; `release` also frees the slot for a new chooser.
+function abandonPackageDestinationChooser(win, { release = false } = {}) {
+  const chooser = packageDestinationChooser;
+  if (!chooser || (win && chooser.owner !== win)) return;
+  chooser.abandoned = true;
+  if (release) packageDestinationChooser = null;
+}
+
+function hasInactivityPromptSheet(win) {
+  return !!win && (inactivityPromptSheetWindows.get(win) || 0) > 0;
+}
 
 function suppressPackageAutoForeground() {
   packageForegroundSuppressionUntil = Math.max(
@@ -11319,7 +11572,86 @@ function isPackageAutoForegroundSuppressed() {
 
 function sendToRenderer(channel, data) { if (trayWindow && !trayWindow.isDestroyed()) trayWindow.webContents.send(channel, data); }
 
-function sendProjectFileStateToRenderer(projectId, activationToken = null) { const current = () => isBoundWatchingActivationCurrent(projectId, activationToken), project = current() && getProjects().find(item => item && item.id === projectId); if (!project || !current()) return; syncAcceptedSourceWatchSubscriptions(projectId); const { files = [], pendingFiles = [] } = getIllustratorScopedProjectView(project); sendToRenderer('files:updated', { projectId, files }); if (current()) sendToRenderer('files:pending', { projectId, pendingFiles }); }
+function getProjectByIdFast(projectId) {
+  if (typeof projectId !== 'string' || !projectId) return null;
+  if (typeof store?.getProjectById === 'function' && typeof store?.upsertProject === 'function') {
+    const project = store.getProjectById(projectId);
+    if (!project) return null;
+    let changed = false;
+    if (migrateProjectFigmaLinkPrivacy(project)) changed = true;
+    if (clearPersistedCurrentSessionFilesystemEvidence(project)) changed = true;
+    if (normalizeProjectAssetReviewState(project)) changed = true;
+    if (changed) {
+      if (typeof clearFileVisualProjectCache === 'function') clearFileVisualProjectCache(projectId);
+      store.upsertProject(project);
+    }
+    return project;
+  }
+  return getProjects().find(item => item && item.id === projectId) || null;
+}
+
+function sendProjectFileStateToRenderer(projectId, activationToken = null) {
+  const assertAuthorized = accountSession ? captureAccountAuthorization() : null;
+  projectIpcDeltaBridge.scheduleCoalesced(projectId, {
+    activationToken,
+    assertAuthorized,
+    emitFn: ({ callers }) => {
+      const current = () => {
+        if (accountSession && !accountSession.canUseWorkspace()) return false;
+        return callers.some(caller => {
+          if (accountSession && typeof caller.assertAuthorized === 'function') {
+            try { caller.assertAuthorized(); } catch (_) { return false; }
+          }
+          return (
+            caller.activationToken === null ||
+            isBoundWatchingActivationCurrent(projectId, caller.activationToken)
+          );
+        });
+      };
+      const project = current() && getProjectByIdFast(projectId);
+      if (!project || !current()) return;
+      syncAcceptedSourceWatchSubscriptions(projectId);
+      const { files = [], pendingFiles = [] } = getIllustratorScopedProjectView(project);
+      if (!current()) return;
+      const isElectronRuntime = Boolean(process.versions && process.versions.electron);
+      const counts = { files: files.length, pending: pendingFiles.length };
+      // Coalesce burst notifications without suppressing unchanged-row refreshes
+      // (the renderer uses these events as refresh triggers), and omit unused
+      // full-row payloads over Electron IPC.
+      if (isElectronRuntime) {
+        const revision = projectIpcDeltaBridge.getRevision(projectId) + 1;
+        projectIpcDeltaBridge.projectState.set(projectId, { revision, filesSnap: null, pendingSnap: null });
+        sendToRenderer('files:updated', { projectId, revision, counts });
+        if (current()) {
+          sendToRenderer('files:pending', { projectId, revision, counts });
+        }
+        return;
+      }
+      const prevPendingSnap = projectIpcDeltaBridge.projectState.get(projectId)?.pendingSnap || null;
+      const update = projectIpcDeltaBridge.computeProjectUpdate(projectId, files, pendingFiles);
+      if (!update) return;
+      sendToRenderer('files:updated', {
+        projectId,
+        revision: update.revision,
+        delta: update.filesDelta,
+        counts: update.counts,
+        files,
+      });
+      if (current()) {
+        sendToRenderer('files:pending', {
+          projectId,
+          revision: update.revision,
+          delta: update.pendingDelta,
+          counts: update.counts,
+          pendingFiles,
+        });
+      } else {
+        const state = projectIpcDeltaBridge.projectState.get(projectId);
+        if (state) state.pendingSnap = prevPendingSnap;
+      }
+    },
+  });
+}
 
 function projectWatchActivityTime(project) {
   for (const value of [project && project.watchStartedAt, project && project.createdAt]) {
@@ -11459,14 +11791,19 @@ function activateSingleWatchingProject(projectId, settings, { preserveWatchStart
   const project = projects.find(item => item.id === projectId);
   if (!project) return null;
 
-  const pausedProjectIds = [];
-  for (const otherProject of projects) {
-    if (otherProject.id === projectId || otherProject.status !== 'watching') continue;
-    otherProject.status = 'paused';
-    pausedProjectIds.push(otherProject.id);
+  const { pausedProjectIds } = enforceSingleWatchingInvariant(projects, projectId);
+  for (const pausedProjectId of pausedProjectIds) {
+    const pausedProj = projects.find(item => item && item.id === pausedProjectId);
+    if (pausedProj) {
+      try { projectLifecycleController.transition(pausedProj, PROJECT_LIFECYCLE_EVENTS.PAUSE, { reason: 'displaced-by-activation' }); } catch (_) {}
+    }
   }
 
-  project.status = 'watching';
+  try {
+    projectLifecycleController.transition(project, PROJECT_LIFECYCLE_EVENTS.START_WATCHING, { reason: 'activate-watching' });
+  } catch (_) {
+    project.status = 'watching';
+  }
   if (!preserveWatchStartedAt || !project.watchStartedAt) {
     project.watchStartedAt = Date.now();
   }
@@ -11782,22 +12119,34 @@ const LAST_USED_POLL_MS = 10000;      // 10 seconds
 // Get PIDs of all running supported design apps so one project can span apps.
 // Uses `ps ax -o pid= -o command=` which gives full app paths (not truncated like lsof COMMAND).
 function getRunningDesignAppPids(callback) {
-  exec('/bin/ps ax -o pid= -o command= 2>/dev/null', { timeout: 5000 }, (err, stdout) => {
-    if (err && !stdout) { callback([], new Map()); return; }
-    const pids = [];
-    const pidToCmd = new Map(); // v2.5.3: PID → command string for lsof image filtering
-    for (const line of stdout.trim().split('\n')) {
-      const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
-      if (!m) continue;
-      const pid = parseInt(m[1]);
-      const cmd = m[2];
-      if (DESIGN_APP_PROCESS_KEYWORDS.some(kw => cmd.includes(kw))) {
-        pids.push(pid);
-        pidToCmd.set(pid, cmd);
+  const runLegacyPs = () => {
+    exec('/bin/ps ax -o pid= -o command= 2>/dev/null', { timeout: 5000 }, (err, stdout) => {
+      if (err && !stdout) { callback([], new Map()); return; }
+      const pids = [];
+      const pidToCmd = new Map(); // v2.5.3: PID → command string for lsof image filtering
+      for (const line of stdout.trim().split('\n')) {
+        const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
+        if (!m) continue;
+        const pid = parseInt(m[1]);
+        const cmd = m[2];
+        if (DESIGN_APP_PROCESS_KEYWORDS.some(kw => cmd.includes(kw))) {
+          pids.push(pid);
+          pidToCmd.set(pid, cmd);
+        }
       }
-    }
-    callback(pids, pidToCmd);
-  });
+      callback(pids, pidToCmd);
+    });
+  };
+  if (canUseNativeProcessWatcher()) {
+    nativeWatcherBridge.getNativeRunningDesignApps(DESIGN_APP_PROCESS_KEYWORDS, 3000)
+      .then(result => {
+        if (result) callback(result.pids, result.pidToCmd);
+        else runLegacyPs();
+      })
+      .catch(runLegacyPs);
+    return;
+  }
+  runLegacyPs();
 }
 
 // Poll lsof for a single watching project. Runs every LSOF_POLL_MS.
@@ -11841,7 +12190,7 @@ function pollLsofForProjectCore(projectId, activationToken = null, onComplete = 
     // v2.2.2: Include PID in lsof output for scan-on-open re-open detection.
     const cmd = `/usr/sbin/lsof -F ptn -p ${pidArg} 2>/dev/null`;
 
-    exec(cmd, { timeout: 12000 }, async (err, stdout) => {
+    const handleLsofOutput = async (err, stdout) => {
       const parserScans = [];
       try {
       const latestProject = getFreshActiveWatchingProject(projectId, activationToken);
@@ -12123,7 +12472,21 @@ function pollLsofForProjectCore(projectId, activationToken = null, onComplete = 
         if (parserScans.length > 0) await Promise.allSettled(parserScans);
         finishLsofPoll(projectId, onComplete);
       }
-    });
+    };
+
+    if (canUseNativeProcessWatcher()) {
+      nativeWatcherBridge.pollNativeOpenFilesAsLsofF(validPids, 12000)
+        .then(lsofText => {
+          if (typeof lsofText === 'string') return handleLsofOutput(null, lsofText);
+          exec(cmd, { timeout: 12000 }, handleLsofOutput);
+        })
+        .catch(() => {
+          exec(cmd, { timeout: 12000 }, handleLsofOutput);
+        });
+      return;
+    }
+
+    exec(cmd, { timeout: 12000 }, handleLsofOutput);
   });
 }
 
@@ -14094,15 +14457,19 @@ tell application "Adobe Illustrator"
 end tell`;
 
 function psDoJavascriptAS(jsFilePath) {
-  return `tell application "Adobe Photoshop"
-  try
-    set jsFile to POSIX file "${jsFilePath}" as alias
-    set result to do javascript jsFile
-    return result
-  on error
-    return ""
-  end try
-end tell`;
+  return `if application "Adobe Photoshop" is running then
+  tell application "Adobe Photoshop"
+    try
+      set jsFile to POSIX file "${jsFilePath}" as alias
+      set result to do javascript jsFile
+      return result
+    on error
+      return ""
+    end try
+  end tell
+else
+  return ""
+end if`;
 }
 
 const SAFE_LIVE_APP_STATUS_CODES = new Set([
@@ -14791,77 +15158,81 @@ async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], 
   return result;
 }
 
-const INDD_APPLESCRIPT = `tell application "Adobe InDesign"
-  set rowList to {}
-  try
-    set documentCount to 0
-    set expectedLinkCount to 0
-    set emittedLinkCount to 0
-    set queryErrorCount to 0
-    repeat with aDoc in every document
-      set documentCount to documentCount + 1
-      set docName to ""
-      set docPathText to ""
-      set docModified to "unknown"
-      set docCurrent to false
-      set documentLinkCount to 0
-      try
-        set docName to name of aDoc
-      on error
-        set queryErrorCount to queryErrorCount + 1
-      end try
-      try
-        set docModified to modified of aDoc
-      on error
-        set queryErrorCount to queryErrorCount + 1
-      end try
-      try
-        set docCurrent to (aDoc is active document)
-      on error
-        set queryErrorCount to queryErrorCount + 1
-      end try
-      try
-        set docPathValue to file path of aDoc
-        if docPathValue is not missing value then
-          set docPathText to POSIX path of (docPathValue as alias)
-          if docPathText ends with "/" then set docPathText to docPathText & docName
-        end if
-      on error
-        set queryErrorCount to queryErrorCount + 1
-      end try
-      try
-        set documentLinkCount to count of every link of aDoc
-      on error
-        set queryErrorCount to queryErrorCount + 1
-      end try
-      set expectedLinkCount to expectedLinkCount + documentLinkCount
-      set end of rowList to "DOC" & tab & docPathText & tab & docName & tab & (docModified as text) & tab & (docCurrent as text) & tab & (documentLinkCount as text)
-      repeat with aLink in every link of aDoc
+const INDD_APPLESCRIPT = `if application "Adobe InDesign" is running then
+  tell application "Adobe InDesign"
+    set rowList to {}
+    try
+      set documentCount to 0
+      set expectedLinkCount to 0
+      set emittedLinkCount to 0
+      set queryErrorCount to 0
+      repeat with aDoc in every document
+        set documentCount to documentCount + 1
+        set docName to ""
+        set docPathText to ""
+        set docModified to "unknown"
+        set docCurrent to false
+        set documentLinkCount to 0
         try
-          set fp to file path of aLink
-          if fp is not missing value then
-            set linkPathText to POSIX path of (fp as alias)
-            set end of rowList to "LINK" & tab & docPathText & tab & docName & tab & linkPathText & tab & (docModified as text) & tab & (docCurrent as text)
-            set emittedLinkCount to emittedLinkCount + 1
-          else
-            set queryErrorCount to queryErrorCount + 1
+          set docName to name of aDoc
+        on error
+          set queryErrorCount to queryErrorCount + 1
+        end try
+        try
+          set docModified to modified of aDoc
+        on error
+          set queryErrorCount to queryErrorCount + 1
+        end try
+        try
+          set docCurrent to (aDoc is active document)
+        on error
+          set queryErrorCount to queryErrorCount + 1
+        end try
+        try
+          set docPathValue to file path of aDoc
+          if docPathValue is not missing value then
+            set docPathText to POSIX path of (docPathValue as alias)
+            if docPathText ends with "/" then set docPathText to docPathText & docName
           end if
         on error
           set queryErrorCount to queryErrorCount + 1
         end try
+        try
+          set documentLinkCount to count of every link of aDoc
+        on error
+          set queryErrorCount to queryErrorCount + 1
+        end try
+        set expectedLinkCount to expectedLinkCount + documentLinkCount
+        set end of rowList to "DOC" & tab & docPathText & tab & docName & tab & (docModified as text) & tab & (docCurrent as text) & tab & (documentLinkCount as text)
+        repeat with aLink in every link of aDoc
+          try
+            set fp to file path of aLink
+            if fp is not missing value then
+              set linkPathText to POSIX path of (fp as alias)
+              set end of rowList to "LINK" & tab & docPathText & tab & docName & tab & linkPathText & tab & (docModified as text) & tab & (docCurrent as text)
+              set emittedLinkCount to emittedLinkCount + 1
+            else
+              set queryErrorCount to queryErrorCount + 1
+            end if
+          on error
+            set queryErrorCount to queryErrorCount + 1
+          end try
+        end repeat
       end repeat
-    end repeat
-  on error
-    set rowList to {"ERROR" & tab & "query-failed"}
-    set documentCount to 0
-    set expectedLinkCount to 0
-    set emittedLinkCount to 0
-    set queryErrorCount to 1
-  end try
-  set end of rowList to "END" & tab & (documentCount as text) & tab & (expectedLinkCount as text) & tab & (emittedLinkCount as text) & tab & (queryErrorCount as text)
-  set AppleScript's text item delimiters to linefeed
-  return rowList as text
-end tell`;
+    on error
+      set rowList to {"ERROR" & tab & "query-failed"}
+      set documentCount to 0
+      set expectedLinkCount to 0
+      set emittedLinkCount to 0
+      set queryErrorCount to 1
+    end try
+    set end of rowList to "END" & tab & (documentCount as text) & tab & (expectedLinkCount as text) & tab & (emittedLinkCount as text) & tab & (queryErrorCount as text)
+    set AppleScript's text item delimiters to linefeed
+    return rowList as text
+  end tell
+else
+  return ""
+end if`;
 
 function parseInDesignActiveSessionOutput(output) {
   const documents = [];
@@ -16243,16 +16614,33 @@ function runAddFilesWorker(workerPath, filePath, scanLease, options = {}) {
   if (!utilityProcess || typeof utilityProcess.fork !== 'function') {
     return Promise.reject(new Error(options.unavailableError || 'asset_baseline_worker_unavailable'));
   }
+  const pool = getAddFilesWorkerPool();
+  const requestId = ++pool.nextRequestId;
   return new Promise((resolve, reject) => {
     let child = null;
+    let reused = false;
     let settled = false;
+    let awaitingIdle = false;
     let terminationRequested = false;
     let removeCancelListener = () => {};
     let busy = false;
     let expectedSeq = 0;
     let exited;
+    let sessionDoneResolved = false;
+    const resolveSessionDone = () => {
+      if (sessionDoneResolved) return;
+      sessionDoneResolved = true;
+      exited();
+    };
     const exitPromise = new Promise(resolveExit => { exited = resolveExit; });
     options.consumer?.setWorkerExit(exitPromise);
+    const detachJobListeners = () => {
+      if (!child) return;
+      child.removeListener('message', onMessage);
+      child.removeListener('error', onError);
+      child.removeListener('exit', onExit);
+      child.removeListener('spawn', onSpawn);
+    };
     const stopChild = () => {
       terminationRequested = true;
       try { child?.kill(); } catch (_) {}
@@ -16261,50 +16649,79 @@ function runAddFilesWorker(workerPath, filePath, scanLease, options = {}) {
       if (settled) return;
       settled = true;
       removeCancelListener();
-      child?.removeAllListeners('message');
       if (error) {
+        awaitingIdle = false;
+        child?.removeListener('message', onMessage);
         stopChild();
         reject(error);
       } else {
+        if (!awaitingIdle) child?.removeListener('message', onMessage);
         resolve(value);
       }
     };
-    try {
-      child = utilityProcess.fork(workerPath, [], {
-        cwd: path.dirname(filePath),
-        env: {},
-        execArgv: [],
-        stdio: 'ignore',
-        serviceName: options.serviceName || 'Crate Add Files Parser',
-        allowLoadingUnsignedLibraries: false,
-        disclaim: false,
-      });
-    } catch (error) {
-      exited();
+    const onError = error => {
+      if (awaitingIdle) {
+        awaitingIdle = false;
+        detachJobListeners();
+        stopChild();
+        resolveSessionDone();
+        return;
+      }
       finish(error);
-      return;
-    }
-    child.on('error', error => finish(error));
-    child.once('exit', () => {
-      exited();
+    };
+    const onExit = () => {
+      awaitingIdle = false;
+      detachJobListeners();
+      resolveSessionDone();
       if (!settled && !options.consumer?.finalReceived) finish(new Error(options.exitedError || 'asset_baseline_worker_exited'));
-      child.removeAllListeners('error');
-      child.on('error', () => {}); // Observe late errors without retaining the scan.
-    });
-    child.once('spawn', () => {
+      if (child) {
+        child.removeAllListeners('error');
+        child.on('error', () => {}); // Observe late errors without retaining the scan.
+      }
+    };
+    const dispatchParse = () => {
       // A pre-spawn kill can return false because the child has no PID yet.
       if (terminationRequested) {
         stopChild();
         return;
       }
       if (!settled) {
-        try { child.postMessage({ type: 'parse', filePath, ...(options.consumer ? { sessionId: options.consumer.sessionId } : {}) }); }
-        catch (error) { finish(error); }
+        try {
+          child.postMessage({
+            type: 'parse',
+            filePath,
+            pooled: true,
+            requestId,
+            ...(options.consumer ? { sessionId: options.consumer.sessionId } : {}),
+          });
+        } catch (error) {
+          finish(error);
+        }
       }
-    });
-    child.on('message', message => {
-      if (settled || !message || typeof message !== 'object') return;
-      if (options.consumer && message.sessionId !== options.consumer.sessionId) return;
+    };
+    const onSpawn = () => dispatchParse();
+    const onMessage = message => {
+      if (!message || typeof message !== 'object') return;
+      if (awaitingIdle) {
+        if (options.consumer && message.type === 'session-idle' && message.sessionId === options.consumer.sessionId) {
+          awaitingIdle = false;
+          detachJobListeners();
+          releasePooledAddFilesWorker(workerPath, child);
+          resolveSessionDone();
+          return;
+        }
+        awaitingIdle = false;
+        detachJobListeners();
+        stopChild();
+        resolveSessionDone();
+        return;
+      }
+      if (settled) return;
+      if (options.consumer) {
+        if (message.sessionId !== options.consumer.sessionId) return;
+      } else if (message.requestId !== undefined && message.requestId !== requestId) {
+        return;
+      }
       if (message.type === 'error') {
         finish(new Error(typeof message.error === 'string'
           ? message.error
@@ -16328,7 +16745,10 @@ function runAddFilesWorker(workerPath, filePath, scanLease, options = {}) {
               options.consumer.check();
               busy = false;
               child.postMessage({ type: 'ack', sessionId: options.consumer.sessionId, seq });
-              if (value) finish(null, value);
+              if (value) {
+                awaitingIdle = true;
+                finish(null, value);
+              }
             } catch (error) { finish(error); }
           });
         }, error => { message = null; finish(error); });
@@ -16338,8 +16758,40 @@ function runAddFilesWorker(workerPath, filePath, scanLease, options = {}) {
         finish(new Error(options.invalidResultError || 'asset_baseline_worker_invalid_result'));
         return;
       }
+      if (message.keepAlive === true && !terminationRequested) {
+        detachJobListeners();
+        releasePooledAddFilesWorker(workerPath, child);
+        resolveSessionDone();
+      }
       finish(null, message.result);
-    });
+    };
+
+    const pooledChild = acquirePooledAddFilesWorker(workerPath);
+    if (pooledChild) {
+      child = pooledChild;
+      reused = true;
+    } else {
+      try {
+        child = utilityProcess.fork(workerPath, [], {
+          cwd: path.dirname(filePath),
+          env: {},
+          execArgv: [],
+          stdio: 'ignore',
+          serviceName: options.serviceName || 'Crate Add Files Parser',
+          allowLoadingUnsignedLibraries: false,
+          disclaim: false,
+        });
+      } catch (error) {
+        resolveSessionDone();
+        finish(error);
+        return;
+      }
+    }
+    child.on('error', onError);
+    child.once('exit', onExit);
+    child.on('message', onMessage);
+    if (!reused) child.once('spawn', onSpawn);
+
     if (scanLease && typeof scanLease.onCancel === 'function') {
       const unsubscribe = scanLease.onCancel(() => {
         finish(new Error('add_files_parser_cancelled'));
@@ -16347,7 +16799,141 @@ function runAddFilesWorker(workerPath, filePath, scanLease, options = {}) {
       if (settled) unsubscribe();
       else removeCancelListener = unsubscribe;
     }
+    if (reused && !settled) {
+      dispatchParse();
+    }
   });
+}
+
+function getAddFilesWorkerPool() {
+  if (!runAddFilesWorker._pool) {
+    runAddFilesWorker._pool = {
+      byPath: new Map(),
+      nextRequestId: 0,
+      maxIdlePerKind: 2,
+      idleTtlMs: 15_000,
+    };
+  }
+  return runAddFilesWorker._pool;
+}
+
+function detachPooledWorkerEntry(entry) {
+  if (entry.idleTimer !== null && typeof clearTimeout === 'function') {
+    clearTimeout(entry.idleTimer);
+    entry.idleTimer = null;
+  }
+  entry.child.removeListener('exit', entry.onIdleExit);
+  entry.child.removeListener('error', entry.onIdleError);
+  entry.child.removeListener('message', entry.onIdleMessage);
+}
+
+function shutdownIdleAddFilesWorker(child) {
+  if (!child) return Promise.resolve();
+  if (child.exitCode !== null && child.exitCode !== undefined) return Promise.resolve();
+  if (child.signalCode !== null && child.signalCode !== undefined) return Promise.resolve();
+  return new Promise(resolve => {
+    let done = false;
+    let timer = null;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      if (timer !== null && typeof clearTimeout === 'function') {
+        clearTimeout(timer);
+        timer = null;
+      }
+      resolve();
+    };
+    child.once('exit', finish);
+    child.removeAllListeners('error');
+    child.on('error', () => {});
+    try {
+      child.postMessage({ type: 'shutdown' });
+    } catch (_) {
+      let killed = false;
+      try { killed = child.kill() !== false; } catch (_) {}
+      if (!killed) finish();
+      return;
+    }
+    if (typeof setTimeout === 'function') {
+      timer = setTimeout(() => {
+        timer = null;
+        if (!done) {
+          let killed = false;
+          try { killed = child.kill() !== false; } catch (_) {}
+          if (!killed) finish();
+        }
+      }, 250);
+      if (typeof timer.unref === 'function') timer.unref();
+    }
+  });
+}
+
+function acquirePooledAddFilesWorker(workerPath) {
+  const pool = getAddFilesWorkerPool();
+  const list = pool.byPath.get(workerPath);
+  if (!list || list.length === 0) return null;
+  const entry = list.pop();
+  if (list.length === 0) pool.byPath.delete(workerPath);
+  detachPooledWorkerEntry(entry);
+  return entry.child;
+}
+
+function releasePooledAddFilesWorker(workerPath, child) {
+  if (!child) return false;
+  const pool = getAddFilesWorkerPool();
+  let list = pool.byPath.get(workerPath);
+  if (list && list.length >= pool.maxIdlePerKind) {
+    shutdownIdleAddFilesWorker(child);
+    return false;
+  }
+  if (!list) {
+    list = [];
+    pool.byPath.set(workerPath, list);
+  }
+  const evict = ({ kill = false } = {}) => {
+    const currentList = pool.byPath.get(workerPath);
+    if (currentList) {
+      const idx = currentList.indexOf(entry);
+      if (idx >= 0) currentList.splice(idx, 1);
+      if (currentList.length === 0) pool.byPath.delete(workerPath);
+    }
+    detachPooledWorkerEntry(entry);
+    if (kill) {
+      try { child.kill(); } catch (_) {}
+    }
+  };
+  const entry = {
+    child,
+    idleTimer: null,
+    onIdleExit: () => evict({ kill: false }),
+    onIdleError: () => evict({ kill: true }),
+    onIdleMessage: () => evict({ kill: true }),
+  };
+  child.once('exit', entry.onIdleExit);
+  child.on('error', entry.onIdleError);
+  child.on('message', entry.onIdleMessage);
+  if (typeof setTimeout === 'function') {
+    entry.idleTimer = setTimeout(() => {
+      evict({ kill: false });
+      shutdownIdleAddFilesWorker(child);
+    }, pool.idleTtlMs);
+    if (typeof entry.idleTimer.unref === 'function') entry.idleTimer.unref();
+  }
+  list.push(entry);
+  return true;
+}
+
+async function disposeAddFilesWorkerPool() {
+  const pool = getAddFilesWorkerPool();
+  const closing = [];
+  for (const [, list] of [...pool.byPath.entries()]) {
+    for (const entry of list) {
+      detachPooledWorkerEntry(entry);
+      closing.push(shutdownIdleAddFilesWorker(entry.child));
+    }
+  }
+  pool.byPath.clear();
+  await Promise.allSettled(closing);
 }
 
 function runAddFilesPsdWorker(filePath, scanLease, transaction) {
@@ -16507,13 +17093,17 @@ async function extractLinkedAssets(filePath, options = {}) {
           onOrdinaryScanFailure: options.onOrdinaryScanFailure,
           onOrdinaryScanLimit: options.onOrdinaryScanLimit,
           sourceBuffer: options.sourceBuffer,
+          sourceText: options.sourceText,
           addFilesAttempt: options.addFilesAttempt,
           validatedRegexResult: options.validatedRegexResult,
         });
       case '.psd':
         return await extractLinkedAssetsPhotoshop(filePath, { strict,
           onOrdinaryScanFailure: options.onOrdinaryScanFailure,
-          onOrdinaryScanLimit: options.onOrdinaryScanLimit });
+          onOrdinaryScanLimit: options.onOrdinaryScanLimit,
+          sourceBuffer: options.sourceBuffer,
+          sourceText: options.sourceText,
+          documentScopedOnly: options.documentScopedOnly === true });
       case '.indd':
       case '.idml':
         return await extractLinkedAssetsInDesign(filePath, { ...options, strict });
@@ -16578,6 +17168,9 @@ async function extractLinkedAssetsRegex(filePath, options = {}) {
       const workerResult = await runAddFilesRegexWorker(filePath, options.addFilesAttempt);
       return [...workerResult.paths];
     }
+    if (typeof options.sourceText === 'string') {
+      return extractLinkedAssetPaths(options.sourceText, filePath);
+    }
     const suppliedBuffer = Buffer.isBuffer(options.sourceBuffer) ? options.sourceBuffer : null;
     if (!suppliedBuffer) {
       // Guard: skip files larger than MAX_PARSE_FILE_SIZE to prevent OOM.
@@ -16609,10 +17202,14 @@ async function extractLinkedAssetsRegex(filePath, options = {}) {
  * AppleScript returns nothing.
  */
 async function extractLinkedAssetsPhotoshop(filePath, options = {}) {
-  // A dependable first scan must be scoped to this PSD. The live Photoshop
-  // script reports links from every open document, so baseline discovery
-  // delegates to the file-scoped ag-psd pass below instead.
+  // A dependable first scan or ownership-recording double-check must be scoped
+  // to this PSD. The live Photoshop script reports links from every open
+  // document, so baseline discovery (strict) delegates to the file-scoped
+  // ag-psd pass and document-scoped callers read only this PSD's own bytes.
   if (options.strict === true) return [];
+  if (options.documentScopedOnly === true) {
+    return extractLinkedAssetsRegex(filePath, options);
+  }
 
   try {
     // Check if Photoshop is running
@@ -16691,16 +17288,27 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       sourceDigest = crypto.createHash('sha256').update(buf).digest('hex');
     }
     const discoveredPaths = [];
+    const seenDiscovered = new Set();
+    const normalizePsdPath = rawPath => (
+      typeof normalizePsdExternalPath === 'function'
+        ? (normalizePsdExternalPath(rawPath) || (typeof rawPath === 'string' ? rawPath : ''))
+        : (typeof rawPath === 'string' ? rawPath : '')
+    );
+    const recordDiscoveredPath = (rawPath) => {
+      const fp = normalizePsdPath(rawPath);
+      if (!fp || seenDiscovered.has(fp)) return;
+      if (fs.existsSync(fp)) {
+        seenDiscovered.add(fp);
+        discoveredPaths.push({ filePath: fp, source: 'psd-linked' });
+      }
+    };
 
-    // Walk layers for linkedFile.fullPath
+    // Walk layers and global lnkE linkedFiles for linkedFile.fullPath
     function walkLayers(layers) {
       if (!layers) return;
       for (const layer of layers) {
         if (layer.linkedFile && layer.linkedFile.fullPath) {
-          const fp = layer.linkedFile.fullPath;
-          if (fs.existsSync(fp)) {
-            discoveredPaths.push({ filePath: fp, source: 'psd-linked' });
-          }
+          recordDiscoveredPath(layer.linkedFile.fullPath);
         }
         if (layer.children) walkLayers(layer.children);
       }
@@ -16709,15 +17317,24 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       for (const entry of workerResult.entries || []) {
         if (!isCurrent()) return [];
         if (typeof entry.filePath === 'string') {
-          try {
-            await fs.promises.access(entry.filePath, fs.constants.F_OK);
-            discoveredPaths.push({ filePath: entry.filePath, source: 'psd-linked' });
-          } catch (_) {}
+          const fp = normalizePsdPath(entry.filePath);
+          if (!seenDiscovered.has(fp)) {
+            try {
+              await fs.promises.access(fp, fs.constants.F_OK);
+              seenDiscovered.add(fp);
+              discoveredPaths.push({ filePath: fp, source: 'psd-linked' });
+            } catch (_) {}
+          }
         }
         await new Promise(resolve => setImmediate(resolve));
       }
     } else {
       walkLayers(psd.children);
+      for (const lf of psd.linkedFiles || []) {
+        if (lf?.linkedFile?.fullPath) {
+          recordDiscoveredPath(lf.linkedFile.fullPath);
+        }
+      }
     }
 
     if (workerResult) {
@@ -18438,6 +19055,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   const onOrdinaryScanLimit = () => { sideLedgerLimit = true; };
   const linkedPaths = await extractLinkedAssets(filePath, {
     strict: strictScan,
+    documentScopedOnly: true,
     ordinaryVerification: !!workingScan && !baselineScan,
     verifySelectedSource: options.verifySelectedSource === true && !baselineScan,
     onOrdinaryScanFailure,
@@ -18835,7 +19453,26 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
       : 'ordinary-scan-failed';
     publishWorkingSourceScan(workingScan, { status: 'failed', reason: scanFailureReason,
       unresolved: [{ reason: ext === '.indd' ? scanFailureReason : 'ordinary-scan-failed' }] });
-    console.error('[crate] scan-on-open: controlled failure:', baselineScan ? 'asset-baseline-scan-failed' : 'scan-on-open-failed');
+    const safeFailureCode = typeof error?.message === 'string' && new Set([
+      'asset_baseline_source_changed',
+      'asset_baseline_source_not_file',
+      'asset_baseline_source_too_large',
+      'asset_baseline_source_invalid_structure',
+      'asset_baseline_psd_worker_unavailable',
+      'asset_baseline_psd_worker_failed',
+      'asset_baseline_psd_worker_invalid_result',
+      'asset_baseline_psd_worker_exited',
+      'asset_baseline_psd_metadata_limit',
+      'asset_baseline_psd_metadata_invalid',
+      'asset_baseline_regex_worker_unavailable',
+      'asset_baseline_regex_worker_failed',
+      'asset_baseline_regex_worker_invalid_result',
+      'asset_baseline_regex_worker_exited',
+      'add_files_parser_cancelled',
+      'indesign-access-denied',
+      'indesign-query-failed',
+    ]).has(error.message) ? error.message : 'unknown';
+    console.error('[crate] scan-on-open: controlled failure:', baselineScan ? 'asset-baseline-scan-failed' : 'scan-on-open-failed', `code=${safeFailureCode}`);
     return {
       success: false,
       error: baselineScan ? 'asset_baseline_scan_incomplete' : 'scan_on_open_failed',
@@ -19500,6 +20137,10 @@ function verifyMainWindowVisible(reason = 'show') {
     return true;
   }
 
+  // Destroying a window does not end its attached destination sheet, so the
+  // chooser could never settle. Leave that window in place until it does.
+  if (isPackageDestinationSheetAttached(trayWindow)) return false;
+
   mainWindowHiddenShowAttempts += 1;
   console.warn('[main-window] window remained hidden after show:', redactFigmaLogText(`${reason} attempt=${mainWindowHiddenShowAttempts}`));
   if (mainWindowHiddenShowAttempts >= MAIN_WINDOW_HIDDEN_RECREATE_AFTER) {
@@ -19647,7 +20288,12 @@ function createMainWindow() {
   }
 
   const createdWindow = trayWindow;
+  // Closing a window ends its attached destination sheet with a response
+  // Electron reports as a choice, so a result after these events is a cancel.
+  trayWindow.on('close', () => abandonPackageDestinationChooser(createdWindow));
   trayWindow.on('closed', () => {
+    // Before the early return: a replaced window still owns its chooser.
+    abandonPackageDestinationChooser(createdWindow, { release: true });
     if (trayWindow !== createdWindow) return;
     mainWindowIdentities.delete(createdWindow);
     clearMainWindowShowFallback();
@@ -20803,6 +21449,12 @@ function startInactivityChecker() {
           continue;
         }
 
+        // One native modal per window: while the destination chooser is
+        // attached, show nothing and leave the project unmarked, so the next
+        // minute retries. This comes before the visibility branch because
+        // Electron's isVisible() can be false for a visible window.
+        if (isPackageDestinationSheetAttached(trayWindow)) continue;
+
         const assertAccountCurrent = captureAccountAuthorization();
         const operation = captureProjectOperation(project.id);
         const isCurrent = () => {
@@ -20837,17 +21489,37 @@ function startInactivityChecker() {
         const controller = new AbortController();
         const cancel = () => controller.abort();
         inactivityPromptCancellations.add(cancel);
-        // A parent is required for AbortSignal cancellation on macOS.
-        dialog.showMessageBox(trayWindow, {
-          signal: controller.signal,
-          type: 'question',
-          title: 'Crate — Still working?',
-          message: `⏸ Still working on "${project.name}"?`,
-          detail: `No new design files detected for 3 hours.`,
-          buttons: ['Keep Watching', 'Pause', 'Package Now'],
-          defaultId: 0,
-          cancelId: 0
-        }).then(({ response }) => {
+        // The prompt is a sheet on this window; the destination chooser stays
+        // closed while it is open. Release exactly once, however it ends.
+        const promptWindow = trayWindow;
+        let promptSheetHeld = true;
+        inactivityPromptSheetWindows.set(promptWindow, (inactivityPromptSheetWindows.get(promptWindow) || 0) + 1);
+        const releasePromptSheet = () => {
+          if (!promptSheetHeld) return;
+          promptSheetHeld = false;
+          const remaining = (inactivityPromptSheetWindows.get(promptWindow) || 0) - 1;
+          if (remaining > 0) inactivityPromptSheetWindows.set(promptWindow, remaining);
+          else inactivityPromptSheetWindows.delete(promptWindow);
+        };
+        let prompt;
+        try {
+          // A parent is required for AbortSignal cancellation on macOS.
+          prompt = dialog.showMessageBox(promptWindow, {
+            signal: controller.signal,
+            type: 'question',
+            title: 'Crate — Still working?',
+            message: `⏸ Still working on "${project.name}"?`,
+            detail: `No new design files detected for 3 hours.`,
+            buttons: ['Keep Watching', 'Pause', 'Package Now'],
+            defaultId: 0,
+            cancelId: 0
+          });
+        } catch (error) {
+          releasePromptSheet();
+          throw error;
+        }
+        prompt.then(({ response }) => {
+          releasePromptSheet();
           if (!isCurrent()) return;
           if (response === 0) {
             // Keep Watching — reset timer
@@ -20868,7 +21540,10 @@ function startInactivityChecker() {
               trayWindow.webContents.send('package:trigger', { projectId: project.id });
             }
           }
-        }).catch(() => {}).finally(() => inactivityPromptCancellations.delete(cancel));
+        }).catch(() => {}).finally(() => {
+          inactivityPromptCancellations.delete(cancel);
+          releasePromptSheet();
+        });
       }
     }
   }, 60 * 1000); // Check every minute
@@ -21029,18 +21704,22 @@ registerTrustedIpcHandler('projects:start-watching', async (event, id) => {
 
 registerTrustedIpcHandler('projects:pause', (event, id) => {
   const project = mutateProject(id, (proj) => {
-    proj.status = 'paused';
+    try {
+      projectLifecycleController.transition(proj, PROJECT_LIFECYCLE_EVENTS.PAUSE, { reason: 'user-pause' });
+    } catch (_) {
+      proj.status = 'paused';
+    }
     return proj;
   });
   if (project) {
     stopWatching(id);
   }
-  return getIllustratorScopedProjectView(getProjects().find(item => item.id === id) || null);
+  const latest = getProjectByIdFast(id);
+  return latest ? getIllustratorScopedProjectView(latest) : null;
 });
 
 registerTrustedIpcHandler('projects:get-files', (event, id) => {
-  const projects = getProjects();
-  const project = projects.find(p => p.id === id);
+  const project = getProjectByIdFast(id);
   return project ? getIllustratorScopedProjectView(project).files : [];
 });
 
@@ -21514,6 +22193,76 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   }
   const operation = captureProjectOperation(projectId); if (!operation) return null;
   const operationCurrent = operation.current;
+  const preScanStartedAt = Date.now();
+  const IN_SCAN_FILE_CACHE_MAX_BYTES = 128 * 1024 * 1024;
+  const IN_SCAN_BUFFER_EXTENSIONS = new Set(['.ai', '.pdf', '.xd', '.indd', '.psd']);
+  const inScanFileCache = new Map();
+  let inScanFileCacheBytes = 0;
+  const getInScanRunningApps = async (keywords = ['Figma', 'Adobe Photoshop', 'Adobe InDesign']) => {
+    if (canUseNativeProcessWatcher()) {
+      try {
+        const nativeApps = await nativeWatcherBridge.getNativeRunningDesignApps(keywords, 3000);
+        if (nativeApps && nativeApps.pidToCmd) {
+          return [...nativeApps.pidToCmd.entries()].map(([pid, cmd]) => ({ pid: String(pid), cmd }));
+        }
+      } catch (_) {}
+    }
+    try {
+      const { stdout: psOut } = await execAsync('/bin/ps ax -o pid= -o command= 2>/dev/null', {
+        timeout: 5000,
+        encoding: 'utf8',
+      });
+      const rows = [];
+      for (const line of psOut.trim().split('\n')) {
+        const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
+        if (m) rows.push({ pid: m[1], cmd: m[2] });
+      }
+      return rows;
+    } catch (_) {
+      return [];
+    }
+  };
+  const rememberInScanFileEntry = (key, entry) => {
+    const existing = inScanFileCache.get(key);
+    if (existing) {
+      inScanFileCacheBytes -= existing.buf.length;
+      inScanFileCache.delete(key);
+    }
+    if (entry.buf.length > IN_SCAN_FILE_CACHE_MAX_BYTES) {
+      return;
+    }
+    while (inScanFileCacheBytes + entry.buf.length > IN_SCAN_FILE_CACHE_MAX_BYTES && inScanFileCache.size > 0) {
+      const oldestKey = inScanFileCache.keys().next().value;
+      const oldest = inScanFileCache.get(oldestKey);
+      inScanFileCache.delete(oldestKey);
+      if (oldest) inScanFileCacheBytes -= oldest.buf.length;
+    }
+    inScanFileCache.set(key, entry);
+    inScanFileCacheBytes += entry.buf.length;
+  };
+  const getInScanFileEntry = async (filePath) => {
+    const key = normalizeTrackedFilePath(filePath);
+    if (!key) return null;
+    try {
+      const st = await fs.promises.stat(filePath, { bigint: true });
+      if (!st.isFile()) return null;
+      if (st.size > BigInt(MAX_PARSE_FILE_SIZE)) return { tooLarge: true };
+      const statKey = `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+      const cached = inScanFileCache.get(key);
+      if (cached && cached.statKey === statKey) {
+        // Refresh LRU position
+        inScanFileCache.delete(key);
+        inScanFileCache.set(key, cached);
+        return cached;
+      }
+      const buf = await fs.promises.readFile(filePath);
+      const entry = { statKey, buf };
+      rememberInScanFileEntry(key, entry);
+      return entry;
+    } catch (_) {
+      return null;
+    }
+  };
   const ordinaryPsdOutputBatches = [], ownerNotes = [], outputEvidenceRecords = new Set();
   // The Photoshop parse keeps its merged guard: only with a selection record,
   // and it goes on reading an individually excluded placed PSD.
@@ -21536,6 +22285,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   try {
   const watcherDrainStartedAt = Date.now();
   const watcherDrained = await pauseWatcherCoordinatorForPackage(projectId);
+  const watcherDrainElapsedMs = Math.max(0, Date.now() - watcherDrainStartedAt);
   if (!watcherDrained) {
     const drainDiagnostic = {
       failurePhase: 'background-watch-drain',
@@ -21591,18 +22341,27 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   // v1.3.29: Live lsof pass at package time — captures .fig files currently open in Figma,
   // bypassing Spotlight indexing delay. Runs once synchronously before the scan loops.
   try {
-    const figmaPids = [];
-    const { stdout: psOut } = await execAsync("/bin/ps ax -o pid= -o command= 2>/dev/null", { timeout: 5000, encoding: "utf8" });
+    const runningRows = await getInScanRunningApps(['Figma']);
     if (!operationCurrent()) return;
-    for (const line of psOut.trim().split("\n")) {
-      const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
-      if (m && m[2].includes("Figma")) figmaPids.push(m[1]);
-    }
+    const figmaPids = runningRows.filter(row => row.cmd.includes('Figma')).map(row => row.pid);
     if (figmaPids.length > 0) {
-      const { stdout: lsofOut } = await execAsync(
-        `/usr/sbin/lsof -F n -p ${figmaPids.join(",")} 2>/dev/null`,
-        { timeout: 10000, encoding: "utf8" }
-      );
+      let lsofOut = '';
+      if (canUseNativeProcessWatcher()) {
+        try {
+          const numericPids = figmaPids.map(p => parseInt(p, 10)).filter(p => Number.isInteger(p) && p > 0);
+          const nativeLsof = numericPids.length > 0
+            ? await nativeWatcherBridge.pollNativeOpenFilesAsLsofF(numericPids, 10000)
+            : null;
+          if (typeof nativeLsof === 'string') lsofOut = nativeLsof;
+        } catch (_) {}
+      }
+      if (!lsofOut) {
+        const res = await execAsync(
+          `/usr/sbin/lsof -F n -p ${figmaPids.join(",")} 2>/dev/null`,
+          { timeout: 10000, encoding: "utf8" }
+        );
+        lsofOut = res.stdout;
+      }
       if (!operationCurrent()) return;
       for (const line of lsofOut.trim().split("\n")) {
         if (!line.startsWith("n")) continue;
@@ -21903,13 +22662,11 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   // and regex fails because paths live in binary smart-object sections.
   // do javascript exposes embedded smart object paths via layer.smartObject.fileReference.
   try {
-    const { stdout: psPsCheck } = await execAsync(
-      "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe Photoshop' | grep -v grep",
-      { timeout: 3000, encoding: 'utf8' }
-    ).catch(() => ({ stdout: '' }));
+    const runningRows = await getInScanRunningApps(['Adobe Photoshop']);
     if (!operationCurrent()) return;
+    const psRunning = runningRows.some(row => row.cmd.toLowerCase().includes('adobe photoshop'));
 
-    if (psPsCheck.trim()) {
+    if (psRunning) {
       const { stdout: psPaths } = await runOsascriptInPrivateTemp(
         ({ resolveScriptPath }) => ({
           'crate-ps-scan.js': PS_DOJAVASCRIPT,
@@ -21920,8 +22677,9 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
       ).catch(() => ({ stdout: '' }));
       if (!operationCurrent()) return;
 
-      if (psPaths.trim()) {
-        for (const trimmed of psPaths.split('\n').filter(Boolean)) {
+      const psPathList = psPaths.trim() ? psPaths.split('\n').filter(Boolean) : [];
+      if (psPathList.length > 0) {
+        for (const trimmed of psPathList) {
           if (isAutoCaptureExcludedPath(trimmed)) continue;
           const normalizedTrimmed = normalizeTrackedFilePath(trimmed);
           if (existingPaths.has(normalizedTrimmed) || pendingPaths.has(normalizedTrimmed)) continue;
@@ -21957,7 +22715,10 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     for (const psdFile of psdFiles) {
       if (skipPsd(psdFile)) continue;
       if (!fs.existsSync(psdFile.path)) continue;
+      const cachedFile = await getInScanFileEntry(psdFile.path);
+      if (!operationCurrent()) return;
       const psdAssets = await extractPsdAssets(psdFile.path, projectId, operationCurrent, {
+        ...(cachedFile ? { sourceBuffer: cachedFile.buf } : {}),
         onOrdinaryPsdOutputs: outputs => ordinaryPsdOutputBatches.push(outputs),
         scanOwnsNewWorkingOutputs: true,
         onOutputEvidenceRecord: key => outputEvidenceRecords.add(key),
@@ -21990,30 +22751,32 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   // v2.2.7: AppleScript query to InDesign for linked files.
   // InDesign has excellent scripting support — query all links of each document.
   try {
-    const { stdout: inddPsCheck } = await execAsync(
-      "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe InDesign' | grep -v grep",
-      { timeout: 3000, encoding: 'utf8' }
-    ).catch(() => ({ stdout: '' }));
+    const runningRows = await getInScanRunningApps(['Adobe InDesign']);
     if (!operationCurrent()) return;
+    const inddRunning = runningRows.some(row => row.cmd.toLowerCase().includes('adobe indesign'));
 
-    if (inddPsCheck.trim()) {
-      const inddAppleScript = `tell application "Adobe InDesign"
-  try
-    set pathList to {}
-    repeat with aDoc in every document
-      repeat with aLink in every link of aDoc
-        try
-          set filePath to POSIX path of (file path of aLink as alias)
-          set end of pathList to filePath
-        end try
+    if (inddRunning) {
+      const inddAppleScript = `if application "Adobe InDesign" is running then
+  tell application "Adobe InDesign"
+    try
+      set pathList to {}
+      repeat with aDoc in every document
+        repeat with aLink in every link of aDoc
+          try
+            set filePath to POSIX path of (file path of aLink as alias)
+            set end of pathList to filePath
+          end try
+        end repeat
       end repeat
-    end repeat
-    set AppleScript's text item delimiters to linefeed
-    return pathList as text
-  on error
-    return ""
-  end try
-end tell`;
+      set AppleScript's text item delimiters to linefeed
+      return pathList as text
+    on error
+      return ""
+    end try
+  end tell
+else
+  return ""
+end if`;
 
       const { stdout: inddPaths } = await runOsascriptInPrivateTemp(
         () => ({ 'crate-indd-scan.applescript': inddAppleScript }),
@@ -22072,6 +22835,7 @@ end tell`;
   // v1.3.36: Extended from .ai-only to full Adobe suite + Affinity.
   // Pattern: if we parse the file format to extract links, those links are
   // always relevant — never filter by date.
+  const regexScanStartedAt = Date.now();
   const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig|heic|ttf|otf|woff2|woff|mp4|mov|avi|webm)/gi;
   const LINKABLE_EXTENSIONS = new Set(['.ai', '.indd', '.idml', '.psd', '.pdf', '.afdesign', '.afpub', '.afphoto']);
   const linkableFiles = project.files.filter(f => LINKABLE_EXTENSIONS.has(f.ext));
@@ -22083,9 +22847,21 @@ end tell`;
       try {
         if (skipLinkable(designFile)) continue;
         if (!fs.existsSync(designFile.path)) continue;
-        const buf = await fs.promises.readFile(designFile.path);
+        const cachedFile = await getInScanFileEntry(designFile.path);
         if (!operationCurrent()) return null;
-        const content = buf.toString('utf8');
+        let content;
+        if (cachedFile && cachedFile.tooLarge) {
+          // Preserve base 00c5e92 discovery for 300-512 MB design files via a
+          // transient uncached read without evicting or exceeding the 128 MiB cache.
+          const transientBuf = await fs.promises.readFile(designFile.path);
+          if (!operationCurrent()) return null;
+          content = transientBuf.toString('utf8');
+        } else if (cachedFile && cachedFile.buf) {
+          // Decode transiently so regex strings are never retained across files.
+          content = cachedFile.buf.toString('utf8');
+        } else {
+          continue;
+        }
         let match;
         LINKED_ASSET_REGEX.lastIndex = 0;
         while ((match = LINKED_ASSET_REGEX.exec(content)) !== null) {
@@ -22122,8 +22898,10 @@ end tell`;
     clearFileVisualProjectCache(projectId);
   }
 
+  const regexScanElapsedMs = Math.max(0, Date.now() - regexScanStartedAt);
   // v2.2.3: Pre-package double-check — re-extract linked assets from all scannable
   // design files in the project to catch anything missed during the session.
+  const doubleCheckStartedAt = Date.now();
   try {
     const existingPathsCheck = getNormalizedPathSet(project.files);
     let doubleCheckCount = 0;
@@ -22133,13 +22911,20 @@ end tell`;
       if (skipDoubleCheck(file)) continue;
       try {
         if (!fs.existsSync(file.path)) continue;
-        const linkedPaths = await extractLinkedAssets(file.path);
+        const cachedFile = IN_SCAN_BUFFER_EXTENSIONS.has(file.ext)
+          ? await getInScanFileEntry(file.path)
+          : null;
+        if (!operationCurrent()) return null;
+        const linkedPaths = await extractLinkedAssets(file.path, {
+          ...(cachedFile && !cachedFile.tooLarge && cachedFile.buf ? { sourceBuffer: cachedFile.buf } : {}),
+          documentScopedOnly: true,
+        });
         if (!operationCurrent()) return null;
         for (const lp of linkedPaths) {
           if (isAutoCaptureExcludedPath(lp)) continue;
           const normalizedLinkedPath = normalizeTrackedFilePath(lp);
           if (existingPathsCheck.has(normalizedLinkedPath) || pendingPaths.has(normalizedLinkedPath)) { ownerNotes.push([lp, file.path]); continue; }
-          if (!lp.startsWith('/Users/')) continue;
+          if (!lp.startsWith('/Users/') && !lp.startsWith('/Volumes/')) continue;
           const lpExt = path.extname(lp).toLowerCase();
           if (!DESIGN_FILE_EXTENSIONS.has(lpExt)) continue;
           if (!fs.existsSync(lp)) continue;
@@ -22422,12 +23207,21 @@ end tell`;
     ...scanMetrics,
     phaseElapsedMs: discoveryElapsedMs + appScanElapsedMs,
   });
+  const doubleCheckElapsedMs = Math.max(0, Date.now() - doubleCheckStartedAt);
+  if ((process.versions && process.versions.electron) || process.env.CRATE_LOG_PACKAGE_TIMING === '1') {
+    console.log(
+      `[crate][package-timing] phase=pre-scan drainMs=${watcherDrainElapsedMs} discoveryMs=${discoveryElapsedMs} ` +
+      `appScanMs=${appScanElapsedMs} regexMs=${regexScanElapsedMs} doubleCheckMs=${doubleCheckElapsedMs} ` +
+      `totalMs=${Math.max(0, Date.now() - preScanStartedAt)} files=${project.files.length} new=${newCount}`
+    );
+  }
   return {
     files: getIllustratorScopedProjectView(finalProject).files,
     newCount,
     ...(figmaPackageError ? { error: figmaPackageError } : {}),
   };
   } finally {
+    inScanFileCache.clear();
     // A regenerated legacy locator may already be a member without adding a
     // row or running the merge. Retain it only while the same operation owns
     // this account/project view; never adopt another account's membership.
@@ -23106,12 +23900,13 @@ function readStablePackageReviewBuffer(sourcePath, expectedFingerprint) {
   } finally { fs.closeSync(fd); }
 }
 
-function readStablePsdForPackageReview(sourcePath, expectedFingerprint) {
+function readStablePsdForPackageReview(sourcePath, expectedFingerprint, { includeBuffer = false } = {}) {
   const beforeFingerprint = getPackageReviewSourceFingerprint(sourcePath);
   if (!packageReviewFingerprintsMatch(expectedFingerprint, beforeFingerprint)) {
     throw new PackageReviewChangedError();
   }
 
+  let buffer;
   let descriptor;
   let fd = null;
   try {
@@ -23124,7 +23919,7 @@ function readStablePsdForPackageReview(sourcePath, expectedFingerprint) {
     ) {
       throw new PackageReviewChangedError();
     }
-    const buffer = fs.readFileSync(fd);
+    buffer = fs.readFileSync(fd);
     const afterStat = fs.fstatSync(fd, { bigint: true });
     if (!packageReviewFingerprintsMatch(expectedFingerprint.source, serializePackageReviewStat(afterStat))) {
       throw new PackageReviewChangedError();
@@ -23137,7 +23932,7 @@ function readStablePsdForPackageReview(sourcePath, expectedFingerprint) {
   if (!packageReviewFingerprintsMatch(expectedFingerprint, getPackageReviewSourceFingerprint(sourcePath))) {
     throw new PackageReviewChangedError();
   }
-  return descriptor;
+  return includeBuffer ? { descriptor, buffer } : descriptor;
 }
 
 function getStablePackageReviewSourceContentFingerprint(sourcePath, expectedFingerprint, maxBytes = Infinity) {
@@ -23194,6 +23989,80 @@ function getEmbeddedPsdResourceFingerprint(match) {
   };
 }
 
+// In-memory LRU memo for embedded PSD resource metadata + exact byte slices.
+// Keyed by normalized path + full stat fingerprint (dev, ino, mode, nlink, size,
+// mtimeNs, ctimeNs). Never persisted to SQLite; write-time extraction still reads
+// from the held reviewed fd and verifies size + SHA-256 against the reviewed resource
+// fingerprint (falling back to a full ag-psd parse on any mismatch).
+const MAX_EMBEDDED_PSD_REVIEW_CACHE_ENTRIES = 64;
+const embeddedPsdReviewCache = new Map();
+
+function getEmbeddedPsdReviewCacheKey(sourceFingerprint) {
+  if (!sourceFingerprint || sourceFingerprint.state !== 'present') return null;
+  return JSON.stringify({
+    normalizedPath: sourceFingerprint.normalizedPath,
+    source: sourceFingerprint.source,
+  });
+}
+
+function buildEmbeddedPsdReviewSummary(sourcePath, expectedFingerprint) {
+  const { descriptor, buffer } = readStablePsdForPackageReview(sourcePath, expectedFingerprint, { includeBuffer: true });
+  const linkedFiles = Array.isArray(descriptor?.linkedFiles) ? descriptor.linkedFiles : [];
+  const entries = linkedFiles.map((lf, embeddedIndex) => {
+    if (!lf || lf.data === undefined || lf.data === null) {
+      return { name: lf?.name, data: null, resourceFingerprint: null, slice: null };
+    }
+    let slice = null;
+    if (
+      lf.data instanceof Uint8Array &&
+      lf.data.buffer === buffer.buffer &&
+      lf.data.byteOffset >= buffer.byteOffset &&
+      lf.data.byteOffset + lf.data.byteLength <= buffer.byteOffset + buffer.byteLength
+    ) {
+      slice = {
+        byteOffset: lf.data.byteOffset - buffer.byteOffset,
+        byteLength: lf.data.byteLength,
+      };
+    }
+    return {
+      name: lf.name,
+      // Lightweight non-null sentinel for findEmbeddedPsdLinkedFileMatch(hasData)
+      data: true,
+      resourceFingerprint: getEmbeddedPsdResourceFingerprint({ linkedFile: lf, embeddedIndex }),
+      slice,
+    };
+  });
+  return { linkedFiles: entries };
+}
+
+function getCachedEmbeddedPsdReviewSummary(sourcePath, expectedFingerprint) {
+  if (typeof readPsd !== 'function' || readPsd.name !== 'readPsd') {
+    return buildEmbeddedPsdReviewSummary(sourcePath, expectedFingerprint);
+  }
+  const cacheKey = getEmbeddedPsdReviewCacheKey(expectedFingerprint);
+  if (!cacheKey) return null;
+  if (embeddedPsdReviewCache.has(cacheKey)) {
+    // Re-verify live stat/path before trusting the in-memory memo.
+    const currentFingerprint = getPackageReviewSourceFingerprint(sourcePath);
+    if (!packageReviewFingerprintsMatch(expectedFingerprint, currentFingerprint)) {
+      embeddedPsdReviewCache.delete(cacheKey);
+      throw new PackageReviewChangedError();
+    }
+    const cached = embeddedPsdReviewCache.get(cacheKey);
+    embeddedPsdReviewCache.delete(cacheKey);
+    embeddedPsdReviewCache.set(cacheKey, cached);
+    return cached;
+  }
+  const summary = buildEmbeddedPsdReviewSummary(sourcePath, expectedFingerprint);
+  if (Array.isArray(summary?.linkedFiles) && summary.linkedFiles.some(entry => entry && entry.slice)) {
+    if (embeddedPsdReviewCache.size >= MAX_EMBEDDED_PSD_REVIEW_CACHE_ENTRIES) {
+      embeddedPsdReviewCache.delete(embeddedPsdReviewCache.keys().next().value);
+    }
+    embeddedPsdReviewCache.set(cacheKey, summary);
+  }
+  return summary;
+}
+
 function bindEmbeddedPsdPackageReviewResources(files, entries) {
   const parsedBySource = new Map();
   entries.forEach((entry, entryIndex) => {
@@ -23202,24 +24071,21 @@ function bindEmbeddedPsdPackageReviewResources(files, entries) {
     const sourcePath = file && (file.parentPsd || file.path);
     if (!sourcePath) return;
 
-    const cacheKey = JSON.stringify({
-      normalizedPath: entry.sourceFingerprint.normalizedPath,
-      source: entry.sourceFingerprint.source,
-    });
+    const cacheKey = getEmbeddedPsdReviewCacheKey(entry.sourceFingerprint);
     let parsed = parsedBySource.get(cacheKey);
     if (!parsed) {
       try {
-        parsed = { psd: readStablePsdForPackageReview(sourcePath, entry.sourceFingerprint) };
+        parsed = { summary: getCachedEmbeddedPsdReviewSummary(sourcePath, entry.sourceFingerprint) };
       } catch (_) {
-        parsed = { psd: null };
+        parsed = { summary: null };
       }
       parsedBySource.set(cacheKey, parsed);
     }
-    if (!parsed.psd) return;
+    if (!parsed.summary) return;
 
-    const match = findEmbeddedPsdLinkedFileMatch(file, parsed.psd.linkedFiles || []);
-    if (!match) return;
-    entry.embeddedResource = getEmbeddedPsdResourceFingerprint(match);
+    const match = findEmbeddedPsdLinkedFileMatch(file, parsed.summary.linkedFiles || []);
+    if (!match || !match.linkedFile.resourceFingerprint) return;
+    entry.embeddedResource = { ...match.linkedFile.resourceFingerprint };
   });
 }
 
@@ -23434,6 +24300,12 @@ function inspectFontFile(sourcePath) {
   const cacheKey = JSON.stringify(fingerprint);
   const cached = fontFactsCache.get(cacheKey);
   if (cached) return { ...result, ...cached };
+  const persistedKey = fingerprint.normalizedPath || sourcePath;
+  const persistedCached = store?.getStatCache?.('font-inspect', persistedKey, fingerprint.source);
+  if (persistedCached && typeof persistedCached.sha256 === 'string') {
+    rememberFontFacts(cacheKey, persistedCached);
+    return { ...result, ...persistedCached };
+  }
   let buffer;
   try {
     buffer = readStablePackageReviewBuffer(sourcePath, fingerprint);
@@ -23442,6 +24314,7 @@ function inspectFontFile(sourcePath) {
   }
   const facts = getFontFactsFromBuffer(buffer);
   rememberFontFacts(cacheKey, facts);
+  store?.setStatCache?.('font-inspect', persistedKey, fingerprint.source, facts);
   return { ...result, ...facts };
 }
 
@@ -25328,7 +26201,12 @@ async function copyReviewedPackageSource(
     verifyWrite(finalPath);
     const destinationMode = Number(sourceStat.mode & 0o777n) || OWNER_ONLY_FILE_MODE;
     if (typeof materializeSource === 'function') {
-      await materializeSource(finalPath, sourceHandle.fd, sourceStat.size, destinationMode);
+      await materializeSource(finalPath, sourceHandle.fd, sourceStat.size, destinationMode, {
+        sourcePath: reviewedSource.sourcePath,
+        dev: sourceStat.dev,
+        ino: sourceStat.ino,
+        size: sourceStat.size,
+      });
       verifyWrite(finalPath);
       return;
     }
@@ -25369,6 +26247,20 @@ async function readReviewedPackageSourceBuffer(sourceHandle, size) {
   return buffer;
 }
 
+async function readReviewedPackageSourceSlice(sourceHandle, startOffset, length) {
+  if (!Number.isSafeInteger(startOffset) || startOffset < 0 || !Number.isSafeInteger(length) || length < 0) {
+    throw new PackageReviewChangedError();
+  }
+  const buffer = Buffer.allocUnsafe(length);
+  let offset = 0;
+  while (offset < length) {
+    const { bytesRead } = await sourceHandle.read(buffer, offset, length - offset, startOffset + offset);
+    if (bytesRead === 0) throw new PackageReviewChangedError();
+    offset += bytesRead;
+  }
+  return buffer;
+}
+
 async function writeEmbeddedPsdAssetToPackage(
   file,
   reviewedSource,
@@ -25378,18 +26270,48 @@ async function writeEmbeddedPsdAssetToPackage(
   materializeBuffer = null,
   rememberDestination = null
 ) {
-  const buf = await withStableReviewedPackageSource(reviewedSource, async (sourceHandle, stat) => {
-    if (stat.size > BigInt(MAX_PARSE_FILE_SIZE)) throw new PackageReviewChangedError();
-    return readReviewedPackageSourceBuffer(sourceHandle, stat.size);
-  });
-  const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true, totalMemoryLimit: -Infinity });
-  const match = findEmbeddedPsdLinkedFileMatch(file, psd.linkedFiles || []);
-  if (!match || !packageReviewFingerprintsMatch(expectedResource, getEmbeddedPsdResourceFingerprint(match))) {
-    throw new PackageReviewChangedError();
+  let data = null;
+  const cacheKey = getEmbeddedPsdReviewCacheKey(reviewedSource?.expectedFingerprint);
+  const cachedSummary = cacheKey ? embeddedPsdReviewCache.get(cacheKey) : null;
+  const cachedEntry = cachedSummary && Number.isInteger(expectedResource?.embeddedIndex)
+    ? cachedSummary.linkedFiles?.[expectedResource.embeddedIndex]
+    : null;
+  if (
+    cachedEntry?.slice &&
+    cachedEntry.slice.byteLength === expectedResource?.size &&
+    cachedEntry.resourceFingerprint &&
+    packageReviewFingerprintsMatch(expectedResource, cachedEntry.resourceFingerprint)
+  ) {
+    const { byteOffset, byteLength } = cachedEntry.slice;
+    const candidate = await withStableReviewedPackageSource(reviewedSource, async (sourceHandle, stat) => {
+      if (stat.size > BigInt(MAX_PARSE_FILE_SIZE)) throw new PackageReviewChangedError();
+      if (BigInt(byteOffset + byteLength) > stat.size) return null;
+      return readReviewedPackageSourceSlice(sourceHandle, byteOffset, byteLength);
+    });
+    if (
+      candidate &&
+      candidate.length === expectedResource.size &&
+      crypto.createHash('sha256').update(candidate).digest('hex') === expectedResource.sha256 &&
+      getPackageContentFingerprint(candidate) === expectedResource.contentFingerprint
+    ) {
+      data = candidate;
+    }
+  }
+
+  if (!data) {
+    const buf = await withStableReviewedPackageSource(reviewedSource, async (sourceHandle, stat) => {
+      if (stat.size > BigInt(MAX_PARSE_FILE_SIZE)) throw new PackageReviewChangedError();
+      return readReviewedPackageSourceBuffer(sourceHandle, stat.size);
+    });
+    const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true, totalMemoryLimit: -Infinity });
+    const match = findEmbeddedPsdLinkedFileMatch(file, psd.linkedFiles || []);
+    if (!match || !packageReviewFingerprintsMatch(expectedResource, getEmbeddedPsdResourceFingerprint(match))) {
+      throw new PackageReviewChangedError();
+    }
+    data = Buffer.from(match.linkedFile.data);
   }
 
   verifyWrite(finalPath);
-  const data = Buffer.from(match.linkedFile.data);
   if (typeof materializeBuffer === 'function') {
     await materializeBuffer(finalPath, data, OWNER_ONLY_FILE_MODE);
   } else {
@@ -26601,9 +27523,31 @@ function createPackageWriteTransaction(destFolder) {
     isDescriptorBound(filePath) {
       return !!getDescriptorBoundGroup(filePath);
     },
-    async materializeSource(filePath, sourceFd, sourceSize, mode) {
+    async materializeSource(filePath, sourceFd, sourceSize, mode, sourceMeta = null) {
       const group = getDescriptorBoundGroup(filePath);
       if (!group) throw new PackageTransactionInvariantError();
+      if (canUseNativePackageClone() && sourceMeta) {
+        const ancestries = Array.isArray(group.ancestries) && group.ancestries.length > 0
+          ? group.ancestries
+          : [capturePackageTransactionAncestry(group.path, group.identity)];
+        const clonedIdentity = await nativeWatcherBridge.tryNativeVerifiedClone({
+          sourceMeta,
+          group,
+          filePath,
+          ancestries,
+          mode: OWNER_ONLY_FILE_MODE,
+          PackageReviewChangedError,
+          PackageTransactionInvariantError,
+        });
+        if (clonedIdentity) {
+          group.ownedOutputs.set(path.basename(filePath), {
+            dev: clonedIdentity.dev,
+            ino: clonedIdentity.ino,
+          });
+          assertPhysicalDestination(filePath);
+          return;
+        }
+      }
       const result = await runDescriptorBoundPackageWriter(group, filePath, { fd: sourceFd, size: sourceSize, mode });
       group.ownedOutputs.set(path.basename(filePath), {
         dev: BigInt(result.outputIdentity.dev),
@@ -26751,7 +27695,10 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
   const limitResult = getPackageLimitResult();
   if (limitResult) return limitResult;
 
+  const packageStartedAt = Date.now();
+  const manifest1StartedAt = Date.now();
   const manifest = await buildCanonicalPackageReviewManifest(id);
+  const manifest1ElapsedMs = Math.max(0, Date.now() - manifest1StartedAt);
   if (manifest.error) return { error: manifest.error };
   if (!manifest.materializable) {
     return { error: 'package_review_changed', review: await createUnavailablePackageReview(id, manifest) };
@@ -26777,6 +27724,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
   }
   const project = manifest.project;
   const packageFiles = manifest.files;
+  const openSourcesStartedAt = Date.now();
   try {
     reviewedPackageSources = await openReviewedPackageSources(packageFiles, manifest.entries);
   } catch (error) {
@@ -26786,6 +27734,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
     }
     throw error;
   }
+  const openSourcesElapsedMs = Math.max(0, Date.now() - openSourcesStartedAt);
   if (!isPackageActivationCurrent()) throw new PackageReviewChangedError();
 
   const currentDestination = inspectPrivatePackageDestination(
@@ -26855,6 +27804,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
         })),
     ].sort((left, right) => left.entryIndex - right.entryIndex);
 
+    const materializeStartedAt = Date.now();
     for (const plannedOutput of plannedDesignOutputs) {
       const file = packageFiles[plannedOutput.entryIndex];
       const manifestEntry = manifest.entries[plannedOutput.entryIndex];
@@ -27086,8 +28036,13 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
           : packageWrites.materializeDirectBuffer(diagnosticPath, data, OWNER_ONLY_FILE_MODE);
       });
     }
+    const materializeElapsedMs = Math.max(0, Date.now() - materializeStartedAt);
+    const captureTreeStartedAt = Date.now();
     const stagedTreeSnapshot = packageWrites.captureTree();
+    const captureTreeElapsedMs = Math.max(0, Date.now() - captureTreeStartedAt);
+    const manifest2StartedAt = Date.now();
     const finalManifest = await buildCanonicalPackageReviewManifest(id);
+    const manifest2ElapsedMs = Math.max(0, Date.now() - manifest2StartedAt);
     if (
       finalManifest.error ||
       !finalManifest.materializable ||
@@ -27099,8 +28054,18 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
     if (!isPackageActivationCurrent()) throw new PackageReviewChangedError();
     reviewedPackageSources.assertCurrent();
     packageWrites.assertRoot();
+    const publishStartedAt = Date.now();
     publishPrivatePackageDestination(packageDestination, stagedTreeSnapshot);
+    const publishElapsedMs = Math.max(0, Date.now() - publishStartedAt);
     packageWrites.adoptPublishedRoot(packageDestination.destFolder);
+    if ((process.versions && process.versions.electron) || process.env.CRATE_LOG_PACKAGE_TIMING === '1') {
+      console.log(
+        `[crate][package-timing] phase=package manifest1Ms=${manifest1ElapsedMs} openSourcesMs=${openSourcesElapsedMs} ` +
+        `materializeMs=${materializeElapsedMs} captureTreeMs=${captureTreeElapsedMs} manifest2Ms=${manifest2ElapsedMs} ` +
+        `publishMs=${publishElapsedMs} totalMs=${Math.max(0, Date.now() - packageStartedAt)} ` +
+        `copied=${copiedCount} embedded=${embeddedCount}`
+      );
+    }
 
     persistPackageCompletion(id, {
       destFolder,
@@ -27147,6 +28112,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
       return refreshedPackageDestinationReviewChangedResult(id, outputPath);
     }
     if (err instanceof PackageReviewChangedError) {
+      embeddedPsdReviewCache.clear();
       if (!await cleanupStaging()) return { error: 'package_cleanup_failed' };
       if (!isPackageActivationCurrent()) return { error: 'stale_activation' };
       return refreshedPackageReviewChangedResult(id);
@@ -27163,24 +28129,74 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
   }
 });
 
-registerTrustedIpcHandler('projects:select-output', async () => {
-  const result = await dialog.showOpenDialog({
-    properties: ['openDirectory', 'createDirectory'],
-    title: 'Choose Package Destination',
-    defaultPath: path.join(os.homedir(), 'Desktop')
-  });
-  if (result.canceled) {
-    // Restore the app after canceling the picker so the user can continue editing.
-    showTrayWindow();
-    return null;
+// The destination chooser is a sheet on the window that asked for it, so it
+// stays with that window through hiding, minimizing, Spaces and activation.
+// Electron ends a sheet with a non-Cancel response when its window closes
+// (NativeWindowMac::Close calls endSheet:), and reports every response except
+// Cancel as a choice of the panel's current folder. So a result that arrives
+// after its window closed or was replaced, after quit began, or after the
+// account changed is a cancel: no folder, no raise, no foreground change.
+// Never call hide() or setEnabled() on a window while its destination sheet is
+// attached: hide() and setEnabled(true) end the sheet with no abandon signal,
+// and setEnabled(false) attaches another sheet. Crate calls neither.
+registerTrustedIpcHandler('projects:select-output', async (event) => {
+  const owner = BrowserWindow.fromWebContents(event.sender);
+  if (!owner || owner.isDestroyed() || isQuitting) return null;
+  const held = packageDestinationChooser;
+  if (held && (held.owner.isDestroyed() || held.owner !== trayWindow)) {
+    held.abandoned = true;
+    packageDestinationChooser = null;
   }
-  // Do not force foreground after a successful destination selection. Packaging may
-  // continue in the background so macOS can deliver the package-complete banner.
-  suppressPackageAutoForeground();
-  return result.filePaths[0];
+  // One chooser at a time, and never over an open inactivity prompt sheet.
+  if (packageDestinationChooser || hasInactivityPromptSheet(owner)) return null;
+  const assertAccountCurrent = captureAccountAuthorization();
+  const chooser = { owner, abandoned: false };
+  packageDestinationChooser = chooser;
+  try {
+    const isStale = () => {
+      if (chooser.abandoned || isQuitting || owner.isDestroyed() ||
+          trayWindow !== owner || !mainWindowIdentities.has(owner)) return true;
+      try {
+        assertAccountCurrent();
+        return false;
+      } catch (_) {
+        return true;
+      }
+    };
+    let result;
+    try {
+      result = await dialog.showOpenDialog(owner, {
+        properties: ['openDirectory', 'createDirectory'],
+        title: 'Choose Package Destination',
+        defaultPath: path.join(os.homedir(), 'Desktop')
+      });
+    } catch (error) {
+      if (isStale()) return null;
+      throw error;
+    }
+    if (isStale()) return null;
+    if (!result || typeof result !== 'object') return null;
+    if (result.canceled) {
+      // Restore the app after canceling the picker so the user can continue editing.
+      // This runs while the chooser is still held, so visibility recovery does not
+      // count it as a hidden attempt or re-create the window the user just used.
+      showTrayWindow();
+      return null;
+    }
+    const { filePaths } = result;
+    if (!Array.isArray(filePaths) || filePaths.length !== 1 ||
+        typeof filePaths[0] !== 'string' || !filePaths[0]) return null;
+    // Do not force foreground after a successful destination selection. Packaging may
+    // continue in the background so macOS can deliver the package-complete banner.
+    suppressPackageAutoForeground();
+    return filePaths[0];
+  } finally {
+    if (packageDestinationChooser === chooser) packageDestinationChooser = null;
+  }
 });
 
 registerTrustedIpcHandler('projects:delete', (event, id) => {
+  projectIpcDeltaBridge.clearProject(id);
   invalidatePackageReviewForProject(id);
   incompletePackageScans.delete(id);
   packageScanDiagnosticState.delete(id);
@@ -27201,6 +28217,8 @@ registerTrustedIpcHandler('projects:delete', (event, id) => {
     return projects;
   });
   if (removed) {
+    clearFileVisualProjectCache();
+    try { store?.clearStatCache?.(RASTER_THUMBNAIL_STAT_CACHE_NAMESPACE); } catch (_) {}
     scheduleProjectCacheCleanup({
       projectIds: [id],
       removeOrphans: false,
@@ -27265,9 +28283,12 @@ registerTrustedIpcHandler('projects:delete-all', () => {
   // v2.2.2: Clean up scan-on-open state
   scannedDesignFiles.clear();
   designFilePids.clear();
+  disposeAddFilesWorkerPool();
+  projectIpcDeltaBridge.clearAll();
   assetBaselineScans.clear();
 
   clearFileVisualProjectCache();
+  try { store?.clearStatCache?.(); } catch (_) {}
   store.set('projects', []);
   if (projectCacheIds !== null) {
     scheduleProjectCacheCleanup({
@@ -27627,7 +28648,14 @@ registerTrustedIpcHandler('inactivity:pause', (event, projectId) => {
 // --- App Lifecycle ---
 
 app.whenReady().then(async () => {
+  if (!gotLock) return;
   startupPhaseJournal.mark('ready-handler-entered');
+  if (process.versions && process.versions.electron) {
+    const storeKind = typeof store?.getProjectById === 'function' ? 'sqlite-wal' : 'electron-store';
+    const helperReady = canUseNativeProcessWatcher() ? 'arm64-ready' : 'fallback';
+    const cloneReady = canUseNativePackageClone() ? 'enabled' : 'fallback';
+    console.log(`[crate][fast-engine] store=${storeKind} nativeHelper=${helperReady} apfsClone=${cloneReady} deltaIpc=${projectIpcDeltaBridge.coalesceMs}ms`);
+  }
   if (localStoreStartupError) {
     startupPhaseJournal.mark('startup-error');
     dialog.showErrorBox(
@@ -27745,6 +28773,8 @@ app.on('window-all-closed', (e) => {
 });
 
 app.on('before-quit', () => {
+  // Any destination result from here on is a cancel.
+  abandonPackageDestinationChooser(null, { release: true });
   closeInactivityPrompts();
   closeExistingAssetsNotifications();
   closeNeedsSaveNotifications();
@@ -27788,11 +28818,15 @@ app.on('before-quit', () => {
   // v2.2.2: Clean up scan-on-open state
   scannedDesignFiles.clear();
   designFilePids.clear();
+  disposeAddFilesWorkerPool();
+  projectIpcDeltaBridge.clearAll();
   // C4: Clean up inactivity checker
   if (inactivityCheckerInterval) {
     clearInterval(inactivityCheckerInterval);
     inactivityCheckerInterval = null;
   }
+  try { store?.close?.(); } catch (_) {}
+  try { nativeWatcherBridge?.shutdownNativeHelper?.(); } catch (_) {}
   activeNativeNotifications.clear();
   // v2.5.0: Clean up scan-on-save timers
   for (const [, pending] of scanOnSaveTimers) {

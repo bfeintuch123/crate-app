@@ -647,13 +647,13 @@ class TestUtilityProcess extends EventEmitter {
             this.respond({ type: 'result', result: parseRegex(message.filePath) });
           } else {
             const { startAddFilesPsdWorker } = require('../parsers/add-files-psd-worker');
-            const fixture = structuredClone(currentPsdFixture);
             startAddFilesPsdWorker({
               on: (_, handler) => { this.psdPortHandler = handler; },
               postMessage: payload => this.respond(payload),
             }, {
               exit: code => { this.psdPortHandler = null; this.emit('exit', code); },
               parse: filePath => {
+                const fixture = structuredClone(currentPsdFixture);
                 if (fixture instanceof Error) throw fixture;
                 const stat = fs.statSync(filePath);
                 if (fixture?.readActualSavedPsd === true) {
@@ -3011,6 +3011,15 @@ async function assertPrePackageAwaitRaceFailsClosed(awaitPoint, race) {
       if (xattrPaths.length) return missingXattrError(xattrPaths);
       if (awaitPoint === 'metadata' && isBulkSpotlightRequest(request)) {
         return gateResult({ stdout: formatBulkSpotlightOutputForRoot(request, [candidatePath]) });
+      }
+      if (kind === 'exec' && command.includes('/bin/ps ax -o pid= -o command=')) {
+        if (awaitPoint === 'photoshop') {
+          return { stdout: '222 /Applications/Adobe Photoshop 2026/Adobe Photoshop 2026.app/Contents/MacOS/Adobe Photoshop 2026\n' };
+        }
+        if (awaitPoint === 'indesign') {
+          return { stdout: '223 /Applications/Adobe InDesign 2026/Adobe InDesign 2026.app/Contents/MacOS/Adobe InDesign 2026\n' };
+        }
+        return { stdout: '' };
       }
       if (kind === 'exec' && command.includes("grep -i 'Adobe Photoshop'")) {
         return { stdout: awaitPoint === 'photoshop' ? 'Adobe Photoshop\n' : '' };

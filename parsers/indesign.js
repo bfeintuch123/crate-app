@@ -38,6 +38,10 @@ const {
   isParserAdmissionError,
   parseArchiveListing,
 } = require('./admission-budgets');
+const {
+  isUnsupportedZipEntryError,
+  openZipArchive,
+} = require('./zip-reader');
 
 const execFileAsync = promisify(execFile);
 const IDML_ADMISSION_MESSAGE = 'This InDesign file contains too much document data for Crate to inspect safely.';
@@ -83,8 +87,80 @@ class InDesignParser extends BaseParser {
       IDML_ADMISSION_MESSAGE
     );
 
+    const scanXmlContent = xmlContent => {
+      extractedXmlBytes += Buffer.byteLength(xmlContent, 'utf8');
+      if (extractedXmlBytes > ADMISSION_LIMITS.idmlXmlBytes) {
+        throw admissionError(IDML_ADMISSION_MESSAGE);
+      }
+
+      // Find all LinkResourceURI values
+      LINK_URI_REGEX.lastIndex = 0;
+      let match;
+      while ((match = LINK_URI_REGEX.exec(xmlContent)) !== null) {
+        const uri = decodeXMLPath(match[1]);
+        const assetPath = this.decodeFileURI(uri);
+
+        if (assetPath && this.isUserPath(assetPath)) {
+          let exists = existence.get(assetPath);
+          if (exists === undefined) {
+            exists = this.fileExists(assetPath);
+            existence.set(assetPath, exists);
+          }
+          this.appendAsset(assets, {
+            path: assetPath,
+            source: 'idml-link',
+            exists
+          }, IDML_ADMISSION_MESSAGE);
+        }
+      }
+    };
+
+    let archive = null;
     try {
-      // List all files in the IDML archive
+      archive = openZipArchive(filePath, {
+        maxFileBytes: ADMISSION_LIMITS.archiveFileBytes,
+        maxEntries: ADMISSION_LIMITS.archiveEntries,
+        maxTotalBytes: ADMISSION_LIMITS.archiveUncompressedBytes,
+        message: IDML_ADMISSION_MESSAGE,
+      });
+
+      if (archive) {
+        const xmlFiles = archive.entries.filter(entry => entry.path.toLowerCase().endsWith('.xml'));
+        assertEntriesWithinBudget(xmlFiles, {
+          maxEntries: ADMISSION_LIMITS.idmlXmlEntries,
+          maxEntryBytes: ADMISSION_LIMITS.idmlXmlEntryBytes,
+          maxTotalBytes: ADMISSION_LIMITS.idmlXmlBytes,
+          message: IDML_ADMISSION_MESSAGE,
+        });
+
+        for (const xmlEntry of xmlFiles) {
+          try {
+            let xmlContent;
+            try {
+              xmlContent = archive.readEntry(xmlEntry, {
+                maxOutputBytes: ADMISSION_LIMITS.idmlXmlEntryBytes,
+                message: IDML_ADMISSION_MESSAGE,
+              }).toString('utf8');
+            } catch (entryError) {
+              if (!isUnsupportedZipEntryError(entryError)) throw entryError;
+              const { stdout } = await execFileAsync('/usr/bin/unzip', ['-p', filePath, xmlEntry.path], {
+                timeout: 10000,
+                encoding: 'utf8',
+                maxBuffer: ADMISSION_LIMITS.idmlXmlEntryBytes
+              });
+              xmlContent = stdout;
+            }
+            scanXmlContent(xmlContent);
+          } catch (e) {
+            if (isParserAdmissionError(e)) throw e;
+            if (isChildProcessAdmissionError(e)) throw admissionError(IDML_ADMISSION_MESSAGE);
+            // Failed to extract this XML file — continue with others
+          }
+        }
+        return this.deduplicateAssets(assets);
+      }
+
+      // Fallback for non-standard/legacy containers: list and extract via /usr/bin/unzip
       const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', filePath], {
         timeout: 10000,
         maxBuffer: ADMISSION_LIMITS.archiveListingBufferBytes,
@@ -110,31 +186,7 @@ class InDesignParser extends BaseParser {
             encoding: 'utf8',
             maxBuffer: ADMISSION_LIMITS.idmlXmlEntryBytes
           });
-          extractedXmlBytes += Buffer.byteLength(xmlContent, 'utf8');
-          if (extractedXmlBytes > ADMISSION_LIMITS.idmlXmlBytes) {
-            throw admissionError(IDML_ADMISSION_MESSAGE);
-          }
-
-          // Find all LinkResourceURI values
-          LINK_URI_REGEX.lastIndex = 0;
-          let match;
-          while ((match = LINK_URI_REGEX.exec(xmlContent)) !== null) {
-            const uri = decodeXMLPath(match[1]);
-            const assetPath = this.decodeFileURI(uri);
-
-            if (assetPath && this.isUserPath(assetPath)) {
-              let exists = existence.get(assetPath);
-              if (exists === undefined) {
-                exists = this.fileExists(assetPath);
-                existence.set(assetPath, exists);
-              }
-              this.appendAsset(assets, {
-                path: assetPath,
-                source: 'idml-link',
-                exists
-              }, IDML_ADMISSION_MESSAGE);
-            }
-          }
+          scanXmlContent(xmlContent);
         } catch (e) {
           if (isParserAdmissionError(e)) throw e;
           if (isChildProcessAdmissionError(e)) throw admissionError(IDML_ADMISSION_MESSAGE);
@@ -146,6 +198,8 @@ class InDesignParser extends BaseParser {
       if (isChildProcessAdmissionError(e)) throw admissionError(IDML_ADMISSION_MESSAGE);
       // Failed to list IDML contents — return empty array
       console.error('[InDesignParser] Could not inspect IDML contents.');
+    } finally {
+      if (archive) archive.close();
     }
 
     return this.deduplicateAssets(assets);
