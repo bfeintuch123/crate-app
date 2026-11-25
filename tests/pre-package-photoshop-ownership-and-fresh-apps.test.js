@@ -349,4 +349,191 @@ function cases() {
       }
     }
   );
+
+  prePkgTest(
+    'ordinary non-strict Photoshop watcher rescan preserves own PSD links and never attributes app-wide open-document links',
+    { timeout: 20000 },
+    async () => {
+      resetTestHomeWorkspace();
+      storeInstance.set('quickPackageOutputPaths', []);
+      setChildProcessHandler(() => ({ stdout: '' }));
+
+      // Active watching project (NOT paused), baseline completed (not awaiting-first-scan),
+      // and NO working-source selection record so watcher rescan runs non-strict runScanOnOpen.
+      const project = await createProject('Watcher PSD Ownership Isolation');
+      clearTrackedTimers();
+
+      const folder = path.join(TEST_HOME, 'Desktop', 'WatcherPsdOwnership');
+      fs.mkdirSync(folder, { recursive: true });
+
+      const assetA = path.join(folder, 'OwnLinkA.png');
+      const assetB = path.join(folder, 'OtherDocLinkB.png');
+      fs.writeFileSync(assetA, Buffer.from('synthetic-own-link-a'));
+      fs.writeFileSync(assetB, Buffer.from('synthetic-other-doc-link-b'));
+
+      const docA = path.join(folder, 'DocA.psd');
+      fs.writeFileSync(docA, buildSyntheticPsdWithLink(assetA));
+      const priorPsdFixture = currentPsdFixture;
+      currentPsdFixture = () => realAgPsd.readPsd(fs.readFileSync(docA), {
+        skipLayerImageData: true,
+        skipCompositeImageData: true,
+      });
+
+      await setProjectFiles(project.id, {
+        files: [{ path: docA, ext: '.psd', name: 'DocA.psd', source: 'manual-browse' }],
+      });
+      const before = await getProject(project.id);
+      assert.notEqual(before.assetBaseline?.status, 'awaiting-first-scan', 'fixture must run after baseline completion');
+      assert.equal(before.workingSourceSelection, undefined, 'fixture must have no working-source selection record');
+
+      let psScanScriptCalls = 0;
+      setChildProcessHandler(request => {
+        if (isPsCommand(request)) {
+          return {
+            stdout: '7101 /Applications/Adobe Photoshop 2025/Adobe Photoshop 2025.app/Contents/MacOS/Adobe Photoshop 2025\n',
+          };
+        }
+        const scriptPath = getOsascriptPath(request);
+        if (scriptPath && scriptPath.includes('crate-ps-scan.applescript')) {
+          psScanScriptCalls += 1;
+          // Would leak OtherDocLinkB.png from an unrelated open PSD if non-strict rescan ran app-wide query
+          return { stdout: `${assetA}\n${assetB}\n` };
+        }
+        return { stdout: '' };
+      });
+
+      try {
+        // Trigger chokidar 'add' rescan -> non-strict runScanOnOpen(projectId, docA)
+        const now = Date.now() + 1000;
+        await emitWatcherWithStats('add', docA, { mtimeMs: now, birthtimeMs: now });
+        const stored = await waitForProject(
+          project.id,
+          item => (item.files || []).some(f => f.path === assetA),
+          5000
+        );
+        // Let any async follow-up settle before checking negative assertions
+        await new Promise(resolve => originalSetTimeout(resolve, 150));
+        const finalProject = await getProject(project.id);
+
+        assert.equal(psScanScriptCalls, 0, 'ordinary non-strict PSD watcher rescan must NOT execute crate-ps-scan.applescript');
+        const storedA = finalProject.files.find(f => f.path === assetA);
+        assert.ok(storedA, 'DocA own link OwnLinkA.png must be discovered by watcher rescan');
+        assert.equal(storedA.source, 'psd-linked', 'OwnLinkA.png must be discovered via document-scoped ag-psd pass');
+        const ledgerA = finalProject.liveEvidenceLedger?.candidates?.[liveEvidenceKeyForTest(assetA)];
+        assert.equal(ledgerA?.latest?.relationship, 'source-linked', 'OwnLinkA.png must record source-linked relationship from DocA.psd');
+        assert.equal(ledgerA?.latest?.parserConfirmed, true);
+        assert.equal(ledgerA?.latest?.reason, 'scan-on-open-psd-parser');
+        const verificationRecords = Object.values(finalProject.workingSourceVerification || {});
+        const verifiedRefs = verificationRecords.flatMap(rec => (rec?.requiredReferences || []).map(ref => ref.path));
+        assert.equal(verifiedRefs.includes(assetB), false, 'DocA.psd workingSourceVerification must NOT record OtherDocLinkB.png');
+
+        const allRows = [...(finalProject.files || []), ...(finalProject.pendingFiles || [])];
+        const rowB = allRows.find(f => f.path === assetB);
+        assert.equal(rowB, undefined, 'OtherDocLinkB.png from unrelated open PSD must neither be staged nor attributed to DocA.psd');
+        const ledgerB = finalProject.liveEvidenceLedger?.candidates?.[liveEvidenceKeyForTest(assetB)];
+        assert.equal(ledgerB, undefined, 'OtherDocLinkB.png must have no live evidence ledger entry');
+        assert.ok(stored);
+      } finally {
+        currentPsdFixture = priorPsdFixture;
+        clearTrackedTimers();
+      }
+    }
+  );
+
+  prePkgTest(
+    'pre-package per-file InDesign double-check guards crate-indd-query.applescript when running and skips when stopped',
+    { timeout: 20000 },
+    async () => {
+      for (const inddRunning of [true, false]) {
+        resetTestHomeWorkspace();
+        storeInstance.set('quickPackageOutputPaths', []);
+        setChildProcessHandler(() => ({ stdout: '' }));
+
+        const project = await createProject(`Per-File InDesign Double-Check ${inddRunning ? 'Running' : 'Stopped'}`);
+        await callIpcRaw('projects:pause', project.id);
+        clearTrackedTimers();
+
+        const folder = path.join(TEST_HOME, 'Desktop', `InddDoubleCheck_${inddRunning ? 'On' : 'Off'}`);
+        fs.mkdirSync(folder, { recursive: true });
+        const inddPath = path.join(folder, 'Layout.indd');
+        // Deliberately omit linkedAsset path from .indd bytes so recovery proves crate-indd-query.applescript ran
+        fs.writeFileSync(inddPath, Buffer.from('SYNTHETIC-INDESIGN-HEADER-NO-RAW-LINK-PATHS'));
+        const linkedAsset = path.join(folder, 'PlacedArtwork.png');
+        fs.writeFileSync(linkedAsset, Buffer.from('synthetic-indesign-linked-png'));
+
+        await setProjectFiles(project.id, {
+          files: [{ path: inddPath, ext: '.indd', name: 'Layout.indd', source: 'manual-browse' }],
+        });
+
+        const broadScripts = [];
+        const queryScripts = [];
+        setChildProcessHandler(request => {
+          if (isPsCommand(request)) {
+            const cmd = String(request?.command || '');
+            if (cmd.includes("grep -i 'Adobe InDesign'")) {
+              return {
+                stdout: inddRunning
+                  ? '/Applications/Adobe InDesign 2025/Adobe InDesign 2025.app/Contents/MacOS/Adobe InDesign 2025\n'
+                  : '',
+              };
+            }
+            return {
+              stdout: inddRunning
+                ? '8101 /Applications/Adobe InDesign 2025/Adobe InDesign 2025.app/Contents/MacOS/Adobe InDesign 2025\n'
+                : '101 /usr/sbin/syslogd\n',
+            };
+          }
+          const scriptPath = getOsascriptPath(request);
+          if (scriptPath && scriptPath.includes('crate-indd-scan.applescript')) {
+            broadScripts.push(fs.existsSync(scriptPath) ? fs.readFileSync(scriptPath, 'utf8') : '');
+            // Broad observer returns empty so double-check per-file query is independently verified
+            return { stdout: '' };
+          }
+          if (scriptPath && scriptPath.includes('crate-indd-query.applescript')) {
+            queryScripts.push(fs.existsSync(scriptPath) ? fs.readFileSync(scriptPath, 'utf8') : '');
+            return {
+              stdout: [
+                `DOC\t${inddPath}\tLayout.indd\tfalse\ttrue\t1`,
+                `LINK\t${inddPath}\tLayout.indd\t${linkedAsset}\tfalse\ttrue`,
+                'END\t1\t1\t1\t0',
+              ].join('\n') + '\n',
+            };
+          }
+          return { stdout: '' };
+        });
+
+        try {
+          const res = await callIpcRaw('projects:pre-package-scan', project.id);
+          assert.equal(res.error, undefined);
+
+          if (inddRunning) {
+            assert.equal(broadScripts.length, 1, 'broad InDesign scan runs when InDesign is running');
+            assert.equal(queryScripts.length, 1, 'per-file crate-indd-query.applescript runs during double-check when InDesign is running');
+            const scriptText = queryScripts[0].trim();
+            assert.ok(
+              scriptText.startsWith('if application "Adobe InDesign" is running then'),
+              'crate-indd-query.applescript must start with is running guard'
+            );
+            assert.ok(
+              scriptText.includes('tell application "Adobe InDesign"') && scriptText.endsWith('end if'),
+              'is running guard must enclose the entire tell application block'
+            );
+            const stored = await getProject(project.id);
+            const allRows = [...(stored.files || []), ...(stored.pendingFiles || [])];
+            const linkedRow = allRows.find(f => f.path === linkedAsset);
+            assert.ok(linkedRow, 'PlacedArtwork.png must be recovered from per-file InDesign double-check');
+            const attributedToIndd =
+              (Array.isArray(linkedRow.dependencyOwners) && linkedRow.dependencyOwners.includes(inddPath)) ||
+              linkedRow.captureEvidence?.relationshipSourcePath === inddPath;
+            assert.equal(attributedToIndd, true, 'PlacedArtwork.png must be attributed to Layout.indd');
+          } else {
+            assert.equal(broadScripts.length, 0, 'broad InDesign scan must not run when InDesign is stopped');
+            assert.equal(queryScripts.length, 0, 'per-file crate-indd-query.applescript must NOT run when InDesign is stopped');
+          }
+        } finally {
+          clearTrackedTimers();
+        }
+      }
+    }
+  );
 }

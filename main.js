@@ -15098,77 +15098,81 @@ async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], 
   return result;
 }
 
-const INDD_APPLESCRIPT = `tell application "Adobe InDesign"
-  set rowList to {}
-  try
-    set documentCount to 0
-    set expectedLinkCount to 0
-    set emittedLinkCount to 0
-    set queryErrorCount to 0
-    repeat with aDoc in every document
-      set documentCount to documentCount + 1
-      set docName to ""
-      set docPathText to ""
-      set docModified to "unknown"
-      set docCurrent to false
-      set documentLinkCount to 0
-      try
-        set docName to name of aDoc
-      on error
-        set queryErrorCount to queryErrorCount + 1
-      end try
-      try
-        set docModified to modified of aDoc
-      on error
-        set queryErrorCount to queryErrorCount + 1
-      end try
-      try
-        set docCurrent to (aDoc is active document)
-      on error
-        set queryErrorCount to queryErrorCount + 1
-      end try
-      try
-        set docPathValue to file path of aDoc
-        if docPathValue is not missing value then
-          set docPathText to POSIX path of (docPathValue as alias)
-          if docPathText ends with "/" then set docPathText to docPathText & docName
-        end if
-      on error
-        set queryErrorCount to queryErrorCount + 1
-      end try
-      try
-        set documentLinkCount to count of every link of aDoc
-      on error
-        set queryErrorCount to queryErrorCount + 1
-      end try
-      set expectedLinkCount to expectedLinkCount + documentLinkCount
-      set end of rowList to "DOC" & tab & docPathText & tab & docName & tab & (docModified as text) & tab & (docCurrent as text) & tab & (documentLinkCount as text)
-      repeat with aLink in every link of aDoc
+const INDD_APPLESCRIPT = `if application "Adobe InDesign" is running then
+  tell application "Adobe InDesign"
+    set rowList to {}
+    try
+      set documentCount to 0
+      set expectedLinkCount to 0
+      set emittedLinkCount to 0
+      set queryErrorCount to 0
+      repeat with aDoc in every document
+        set documentCount to documentCount + 1
+        set docName to ""
+        set docPathText to ""
+        set docModified to "unknown"
+        set docCurrent to false
+        set documentLinkCount to 0
         try
-          set fp to file path of aLink
-          if fp is not missing value then
-            set linkPathText to POSIX path of (fp as alias)
-            set end of rowList to "LINK" & tab & docPathText & tab & docName & tab & linkPathText & tab & (docModified as text) & tab & (docCurrent as text)
-            set emittedLinkCount to emittedLinkCount + 1
-          else
-            set queryErrorCount to queryErrorCount + 1
+          set docName to name of aDoc
+        on error
+          set queryErrorCount to queryErrorCount + 1
+        end try
+        try
+          set docModified to modified of aDoc
+        on error
+          set queryErrorCount to queryErrorCount + 1
+        end try
+        try
+          set docCurrent to (aDoc is active document)
+        on error
+          set queryErrorCount to queryErrorCount + 1
+        end try
+        try
+          set docPathValue to file path of aDoc
+          if docPathValue is not missing value then
+            set docPathText to POSIX path of (docPathValue as alias)
+            if docPathText ends with "/" then set docPathText to docPathText & docName
           end if
         on error
           set queryErrorCount to queryErrorCount + 1
         end try
+        try
+          set documentLinkCount to count of every link of aDoc
+        on error
+          set queryErrorCount to queryErrorCount + 1
+        end try
+        set expectedLinkCount to expectedLinkCount + documentLinkCount
+        set end of rowList to "DOC" & tab & docPathText & tab & docName & tab & (docModified as text) & tab & (docCurrent as text) & tab & (documentLinkCount as text)
+        repeat with aLink in every link of aDoc
+          try
+            set fp to file path of aLink
+            if fp is not missing value then
+              set linkPathText to POSIX path of (fp as alias)
+              set end of rowList to "LINK" & tab & docPathText & tab & docName & tab & linkPathText & tab & (docModified as text) & tab & (docCurrent as text)
+              set emittedLinkCount to emittedLinkCount + 1
+            else
+              set queryErrorCount to queryErrorCount + 1
+            end if
+          on error
+            set queryErrorCount to queryErrorCount + 1
+          end try
+        end repeat
       end repeat
-    end repeat
-  on error
-    set rowList to {"ERROR" & tab & "query-failed"}
-    set documentCount to 0
-    set expectedLinkCount to 0
-    set emittedLinkCount to 0
-    set queryErrorCount to 1
-  end try
-  set end of rowList to "END" & tab & (documentCount as text) & tab & (expectedLinkCount as text) & tab & (emittedLinkCount as text) & tab & (queryErrorCount as text)
-  set AppleScript's text item delimiters to linefeed
-  return rowList as text
-end tell`;
+    on error
+      set rowList to {"ERROR" & tab & "query-failed"}
+      set documentCount to 0
+      set expectedLinkCount to 0
+      set emittedLinkCount to 0
+      set queryErrorCount to 1
+    end try
+    set end of rowList to "END" & tab & (documentCount as text) & tab & (expectedLinkCount as text) & tab & (emittedLinkCount as text) & tab & (queryErrorCount as text)
+    set AppleScript's text item delimiters to linefeed
+    return rowList as text
+  end tell
+else
+  return ""
+end if`;
 
 function parseInDesignActiveSessionOutput(output) {
   const documents = [];
@@ -18991,6 +18995,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   const onOrdinaryScanLimit = () => { sideLedgerLimit = true; };
   const linkedPaths = await extractLinkedAssets(filePath, {
     strict: strictScan,
+    documentScopedOnly: true,
     ordinaryVerification: !!workingScan && !baselineScan,
     verifySelectedSource: options.verifySelectedSource === true && !baselineScan,
     onOrdinaryScanFailure,

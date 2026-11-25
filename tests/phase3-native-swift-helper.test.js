@@ -1516,4 +1516,101 @@ test('Swift PdfAiParser isolates each stream dictionary and preserves Adler-32 t
     'unisolated stream dictionary must emit flate-stream-dict-unbounded'
   );
   assert.ok(elapsedMs < 2000, `repeated >>stream\\n lookback must stay linear-time (took ${elapsedMs}ms)`);
+
+  // 5. PDF literal strings (with `/Subtype /Image`, `%`, `>>`, `endobj`, nested/escaped parens),
+  //    adjacent hex strings (`<414243>>>`), and `%` comments (CR, LF, CRLF) inside the dictionary
+  //    and between `>>` and `stream` (including a comment mentioning `stream`) must not suppress
+  //    compressed link recovery through Quick Package, while real `/Subtype /Image` with a comment
+  //    remains skipped and repeated unclosed `<<stream\n` stays linear-time + fail-closed.
+  const stringHexAsset = path.join(workDir, 'StringAndHexHero.png');
+  const stringHexBytes = Buffer.from('synthetic-string-hex-png-bytes');
+  fs.writeFileSync(stringHexAsset, stringHexBytes);
+  const stringHexCompressed = zlib.deflateSync(Buffer.from(`BT (${stringHexAsset}) Tj ET\n`, 'utf8'));
+
+  const realCommentedImage = zlib.deflateSync(Buffer.from('% /Users/synthetic/commented-real-image-skip.png\n', 'utf8'));
+  const stringHexAiPath = path.join(workDir, 'DictStringAndAdjacentHex.ai');
+  fs.writeFileSync(stringHexAiPath, Buffer.concat([
+    Buffer.from('%PDF-1.6\n'),
+    Buffer.from(
+      `1 0 obj\n<< /Type /XObject /Subtype % genuine image comment\n /Image /Filter /FlateDecode /Length ${realCommentedImage.length} >>\nstream\n`
+    ),
+    realCommentedImage,
+    Buffer.from('\nendstream\nendobj\n'),
+    Buffer.from(
+      `2 0 obj\n<< /Filter /FlateDecode /Title (Contains /Subtype /Image % not a comment (nested) \\) >> endobj) /Length ${stringHexCompressed.length} /ID <414243>>>\nstream\n`
+    ),
+    stringHexCompressed,
+    Buffer.from('\nendstream\nendobj\n%%EOF\n'),
+  ]));
+
+  const stringHexParsed = await client.parsePdfAi(stringHexAiPath, { decompressStreams: true });
+  assert.equal(stringHexParsed.incomplete, false);
+  assert.deepEqual(stringHexParsed.issues, []);
+  assert.ok(
+    stringHexParsed.paths.includes(stringHexAsset),
+    'literal string with /Subtype /Image + % + >> + endobj and adjacent <414243>>> must still inflate metadata stream'
+  );
+  assert.equal(
+    stringHexParsed.paths.includes('/Users/synthetic/commented-real-image-skip.png'),
+    false,
+    'genuine /Subtype /Image with comment between key and value must remain skipped'
+  );
+
+  const stringHexOutDir = path.join(workDir, 'out-string-hex');
+  const stringHexPkg = await packageMasterFile(stringHexAiPath, stringHexOutDir);
+  assert.equal(stringHexPkg.assetsFound, 1);
+  assert.equal(stringHexPkg.assetsCopied, 1);
+  assert.deepEqual(stringHexPkg.assetsMissing, []);
+  assert.deepEqual(fs.readFileSync(path.join(stringHexOutDir, 'StringAndHexHero.png')), stringHexBytes);
+
+  // Comments inside dictionary AND between `>>` and `stream` across CR, LF, and CRLF
+  for (const [eolLabel, commentEol, streamEol] of [
+    ['lf', '\n', '\n'],
+    ['crlf', '\r\n', '\r\n'],
+    ['cr', '\r', '\n'],
+  ]) {
+    const commentAsset = path.join(workDir, `Comment_${eolLabel}_Hero.png`);
+    const commentAssetBytes = Buffer.from(`synthetic-comment-${eolLabel}-bytes`);
+    fs.writeFileSync(commentAsset, commentAssetBytes);
+    const commentCompressed = zlib.deflateSync(Buffer.from(`BT (${commentAsset}) Tj ET\n`, 'utf8'));
+
+    const commentAiPath = path.join(workDir, `DictComments_${eolLabel}.ai`);
+    fs.writeFileSync(commentAiPath, Buffer.concat([
+      Buffer.from('%PDF-1.6\n'),
+      Buffer.from(
+        `1 0 obj\n<< /Filter /FlateDecode % /Subtype /Image${commentEol}/Length ${commentCompressed.length} >> % trailing comment mentioning stream${commentEol}% second comment${commentEol}stream${streamEol}`
+      ),
+      commentCompressed,
+      Buffer.from('\nendstream\nendobj\n%%EOF\n'),
+    ]));
+
+    const commentParsed = await client.parsePdfAi(commentAiPath, { decompressStreams: true });
+    assert.equal(commentParsed.incomplete, false, `${eolLabel} comment stream must parse completely`);
+    assert.deepEqual(commentParsed.issues, [], `${eolLabel} comment stream must emit zero issues`);
+    assert.ok(commentParsed.paths.includes(commentAsset), `${eolLabel} comment stream must recover compressed link`);
+
+    const commentOutDir = path.join(workDir, `out-comment-${eolLabel}`);
+    const commentPkg = await packageMasterFile(commentAiPath, commentOutDir);
+    assert.equal(commentPkg.assetsFound, 1);
+    assert.equal(commentPkg.assetsCopied, 1);
+    assert.deepEqual(commentPkg.assetsMissing, []);
+    assert.deepEqual(fs.readFileSync(path.join(commentOutDir, path.basename(commentAsset))), commentAssetBytes);
+  }
+
+  // Repeated unclosed `<<stream\n` stays strictly linear-time and fails closed
+  const repeatedOpenPath = path.join(workDir, 'RepeatedUnclosedOpenDict.ai');
+  fs.writeFileSync(repeatedOpenPath, Buffer.concat([
+    Buffer.from('%PDF-1.6\n'),
+    Buffer.from('<<stream\n'.repeat(50000), 'ascii'),
+    Buffer.from('%%EOF\n'),
+  ]));
+  const tOpen0 = Date.now();
+  const openParsed = await client.parsePdfAi(repeatedOpenPath, { decompressStreams: true });
+  const openElapsedMs = Date.now() - tOpen0;
+  assert.equal(openParsed.incomplete, true, 'repeated unclosed <<stream\\n must fail closed');
+  assert.ok(
+    Array.isArray(openParsed.issues) && openParsed.issues.includes('flate-stream-dict-unbounded'),
+    'repeated unclosed <<stream\\n must emit flate-stream-dict-unbounded'
+  );
+  assert.ok(openElapsedMs < 2000, `repeated <<stream\\n must stay linear-time (took ${openElapsedMs}ms)`);
 });
