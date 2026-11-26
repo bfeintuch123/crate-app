@@ -14699,10 +14699,16 @@ function hasIllustratorPackageRelevance(project) {
       ? scopedFamily
       : (getAcceptedPendingAppFamily(file) || scopedFamily);
     if (family === 'illustrator') return true;
-    if (family && family !== 'generic') return false;
     const ext = (file.ext || path.extname(file.path || file.name || '') || '').toLowerCase();
     if (ext !== '.ai') return false;
-    if (isExplicitUserCapturedFile(file)) return true;
+    if (
+      isExplicitUserCapturedFile(file) &&
+      isWorkingSourceFile(file) &&
+      file.virtual !== true &&
+      file.embedded !== true &&
+      getFileCaptureSource(file) !== 'psd-embedded'
+    ) return true;
+    if (family && family !== 'generic') return false;
     return !isNonWorkingDependencyAssetRow(file);
   });
 }

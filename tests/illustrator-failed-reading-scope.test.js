@@ -1318,4 +1318,154 @@ function scopeCases() {
     assert.equal(pkg.totalFiles, 4);
     assert.deepEqual(collectPackagedFileNames(pkg.folderPath), ['Board.psd', 'Emblem.eps', 'Icon.svg', 'Spec.pdf']);
   });
+
+  scopeCase('failed-reading 34: former psd-linked .ai explicitly added via Add Files is held on failed Illustrator reading and packages cleanly after recovery', async () => {
+    const validPsdHeader = Buffer.from('8BPS\0\x01\0\0\0\0\0\0\0\x03\0\0\0\x01\0\0\0\x01\0\x08\0\x03\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0');
+    resetTestHomeWorkspace();
+    const psdDir = path.join(TEST_HOME, 'Desktop', 'Sample_psd_readd_ai');
+    const elsewhere = path.join(TEST_HOME, 'Documents', 'Elsewhere_psd_readd_ai');
+    fs.mkdirSync(psdDir, { recursive: true });
+    fs.mkdirSync(elsewhere, { recursive: true });
+    const psdPath = path.join(psdDir, 'Poster.psd');
+    const psdBadgeAi = path.join(psdDir, 'PsdBadge.ai');
+    const flyer = path.join(elsewhere, 'Flyer.ai');
+    const flyerArt = path.join(elsewhere, 'FlyerArt.png');
+    fs.writeFileSync(flyerArt, uniqueBytes('psd_readd_ai', flyerArt));
+    writeSyntheticAiFile(psdBadgeAi, '');
+    writeSyntheticAiFile(flyer, flyerArt);
+    fs.writeFileSync(psdPath, validPsdHeader);
+    currentPsdFixture = {
+      children: [{ name: 'PsdBadge', linkedFile: { fullPath: psdBadgeAi } }],
+      linkedFiles: [],
+    };
+
+    const app = illustrator();
+    app.running = false;
+    const project = await createProject('PSD Re-Add AI');
+    const c = { id: project.id, app, f: { dir: psdDir, psdPath, psdBadgeAi, flyer, flyerArt } };
+    await waitForCondition(() => status(c.id) === 'ready', 'activation scope ready');
+    await metadataTestHooks.waitForWatcherIdle(c.id);
+
+    // Add Poster.psd so PsdBadge.ai is captured as a Photoshop-linked asset (psd-linked).
+    await addManually(c, psdPath);
+    await callIpcRaw('projects:set-existing-assets-decision', c.id, 'include');
+    await metadataTestHooks.waitForWatcherIdle(c.id);
+
+    const beforeRow = (stored(c.id).files || []).find(row => row.path === psdBadgeAi);
+    assert.ok(beforeRow, 'psd-linked .ai row exists before Add Files');
+    assert.equal(beforeRow.source, 'psd-linked');
+    assert.equal(beforeRow.explicitUserAuthority, undefined);
+
+    // User explicitly adds that same .ai via real Add Files as a working file.
+    await addManually(c, psdBadgeAi);
+    const afterRow = (stored(c.id).files || []).find(row => row.path === psdBadgeAi);
+    assert.ok(afterRow, 're-added .ai row remains in project.files');
+    assert.equal(afterRow.source, 'psd-linked', 'capture source stays psd-linked');
+    assert.equal(afterRow.explicitUserAuthority?.granted, true, 'Add Files grants explicit user authority');
+    assert.equal(afterRow.explicitUserAuthority?.source, 'manual-browse');
+    assert.equal(afterRow.explicitUserAuthority?.method, 'projects:add-files');
+    assert.equal(afterRow.assetOrigin, 'added');
+    assert.equal(afterRow.assetBaselineSourcePath, undefined);
+
+    // Watch with Illustrator running and reading failing while an unrelated document is also open.
+    app.running = true;
+    app.docs = [{ path: psdBadgeAi, links: [] }, { path: flyer, links: [flyerArt] }];
+    await restart(c, { fail: 'osascript-timeout' });
+    assert.equal(status(c.id), 'failed-closed');
+
+    const blocked = await packageStep(c, { scan: false });
+    assert.equal(blocked.materializable, false, 'former psd-linked .ai added via Add Files must be held while Illustrator reading fails: ' + JSON.stringify(blocked));
+    assert.equal(blocked.token, null, 'no approval token while failed-closed');
+    assert.equal(blocked.message, UNRESOLVED_MESSAGE);
+
+    // Next complete reading in the same Watch session restores fresh review and packages only exact project files.
+    app.fail = null;
+    await poll(c.id);
+    assert.deepEqual([status(c.id), flag(c.id)], ['ready', 'recovered']);
+
+    const fresh = await packageStep(c, { scan: false });
+    assert.equal(fresh.materializable, true, 'fresh review ready after complete reading: ' + JSON.stringify(fresh));
+    assert.equal(typeof fresh.token, 'string');
+    assert.deepEqual(fresh.files, ['Poster.psd', 'PsdBadge.ai']);
+
+    const packaged = await runPackage(c, fresh.token, 'psd_readd_ai_recovered');
+    assert.equal(packaged.result?.success, true, JSON.stringify(packaged.result));
+    assert.equal(packaged.result.totalFiles, 2);
+    const writtenNames = collectPackagedFileNames(packaged.result.folderPath);
+    assert.deepEqual(writtenNames, ['Poster.psd', 'PsdBadge.ai'], 'package holds only project files, nothing from Flyer.ai');
+    assert.equal(writtenNames.includes('Flyer.ai') || writtenNames.includes('FlyerArt.png'), false);
+  });
+
+  scopeCase('failed-reading 35: in-session Add Files promotion of a psd-linked .ai during an Illustrator failure engages the hold until the next complete reading', async () => {
+    const validPsdHeader = Buffer.from('8BPS\0\x01\0\0\0\0\0\0\0\x03\0\0\0\x01\0\0\0\x01\0\x08\0\x03\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0');
+    resetTestHomeWorkspace();
+    const psdDir = path.join(TEST_HOME, 'Desktop', 'Sample_psd_readd_insession');
+    const elsewhere = path.join(TEST_HOME, 'Documents', 'Elsewhere_psd_readd_insession');
+    fs.mkdirSync(psdDir, { recursive: true });
+    fs.mkdirSync(elsewhere, { recursive: true });
+    const psdPath = path.join(psdDir, 'Poster.psd');
+    const psdBadgeAi = path.join(psdDir, 'PsdBadge.ai');
+    const flyer = path.join(elsewhere, 'Flyer.ai');
+    const flyerArt = path.join(elsewhere, 'FlyerArt.png');
+    fs.writeFileSync(flyerArt, uniqueBytes('psd_readd_insession', flyerArt));
+    writeSyntheticAiFile(psdBadgeAi, '');
+    writeSyntheticAiFile(flyer, flyerArt);
+    fs.writeFileSync(psdPath, validPsdHeader);
+    currentPsdFixture = {
+      children: [{ name: 'PsdBadge', linkedFile: { fullPath: psdBadgeAi } }],
+      linkedFiles: [],
+    };
+
+    const app = illustrator();
+    app.fail = 'osascript-timeout';
+    app.docs = [{ path: psdBadgeAi, links: [] }, { path: flyer, links: [flyerArt] }];
+    const project = await createProject('PSD Re-Add In-Session');
+    const c = { id: project.id, app, f: { dir: psdDir, psdPath, psdBadgeAi, flyer, flyerArt } };
+    await waitForCondition(() => app.queries >= 1, 'activation query failed');
+    assert.equal(status(c.id), 'failed-closed');
+
+    // Before Add Files: PsdBadge.ai is merely psd-linked, so Package Review remains materializable.
+    await addManually(c, psdPath);
+    await callIpcRaw('projects:set-existing-assets-decision', c.id, 'include');
+    await metadataTestHooks.waitForWatcherIdle(c.id);
+
+    const linkedOnlyRow = (stored(c.id).files || []).find(row => row.path === psdBadgeAi);
+    assert.equal(linkedOnlyRow?.source, 'psd-linked');
+    assert.equal(linkedOnlyRow?.explicitUserAuthority, undefined);
+
+    const beforeAddReview = await packageStep(c, { scan: false });
+    assert.equal(beforeAddReview.materializable, true, 'merely linked psd-linked .ai remains unblocked before Add Files: ' + JSON.stringify(beforeAddReview));
+    assert.equal(typeof beforeAddReview.token, 'string');
+
+    // Now the user adds PsdBadge.ai via real Add Files in this same Watch session.
+    await addManually(c, psdBadgeAi);
+    assert.equal(status(c.id), 'recovering-explicit');
+
+    const promotedRow = (stored(c.id).files || []).find(row => row.path === psdBadgeAi);
+    assert.equal(promotedRow?.source, 'psd-linked');
+    assert.equal(promotedRow?.explicitUserAuthority?.granted, true);
+    assert.equal(promotedRow?.explicitUserAuthority?.source, 'manual-browse');
+
+    const blocked = await packageStep(c, { scan: false });
+    assert.equal(blocked.materializable, false, 'promoted psd-linked .ai must be held while Illustrator reading is unresolved: ' + JSON.stringify(blocked));
+    assert.equal(blocked.token, null);
+    assert.equal(blocked.message, UNRESOLVED_MESSAGE);
+
+    // Next complete reading in the same Watch session restores fresh review and packages exact project files.
+    app.fail = null;
+    await poll(c.id);
+    assert.equal(status(c.id), 'ready');
+
+    const fresh = await packageStep(c, { scan: false });
+    assert.equal(fresh.materializable, true, 'fresh review ready after complete reading: ' + JSON.stringify(fresh));
+    assert.equal(typeof fresh.token, 'string');
+    assert.deepEqual(fresh.files, ['Poster.psd', 'PsdBadge.ai']);
+
+    const packaged = await runPackage(c, fresh.token, 'psd_readd_insession_recovered');
+    assert.equal(packaged.result?.success, true, JSON.stringify(packaged.result));
+    assert.equal(packaged.result.totalFiles, 2);
+    const writtenNames = collectPackagedFileNames(packaged.result.folderPath);
+    assert.deepEqual(writtenNames, ['Poster.psd', 'PsdBadge.ai'], 'package holds only project files, nothing from Flyer.ai');
+    assert.equal(writtenNames.includes('Flyer.ai') || writtenNames.includes('FlyerArt.png'), false);
+  });
 }
