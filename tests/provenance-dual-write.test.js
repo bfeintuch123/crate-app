@@ -19873,11 +19873,12 @@ test('unrelated app and generic assets survive ready and failed Illustrator scop
       if (['.ai','.pdf'].includes(path.extname(filePath))) writeSyntheticAiFile(filePath, 'saved source');
       if (path.extname(filePath) === '.psd') fs.writeFileSync(filePath, actualPsd.writePsdBuffer({ width: 1, height: 1 }));
     }
+    let illustratorFailed = scopeState === 'failed';
     setChildProcessHandler(({ kind, command, args }) => {
       if (kind === 'execFile' && command === '/bin/ps' && JSON.stringify(args) === JSON.stringify(['axww','-o','pid=','-o','comm='])) return { stdout: '0 kernel_task\n1 /sbin/launchd\n432 /bin/ps\n', stderr: '' };
       if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '321\n' };
       if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
-        if (scopeState === 'failed') return { stdout: 'ERROR\tillustrator-query-failed\nCOMPLETE\t0\t0\n' };
+        if (illustratorFailed) return { stdout: 'ERROR\tillustrator-query-failed\nCOMPLETE\t0\t0\n' };
         return {
           stdout: [
             `DOC\t${baselineSource}\t${path.basename(baselineSource)}\tfalse\ttrue`,
@@ -19960,6 +19961,20 @@ test('unrelated app and generic assets survive ready and failed Illustrator scop
       assert.equal(decision.success, true, JSON.stringify({file:path.basename(filePath),decision,card}));
     }
 
+    if (scopeState === 'failed') {
+      const blockedReview = await callIpcRaw('projects:prepare-package-review', project.id);
+      assert.equal(blockedReview?.materializable, false);
+      assert.equal(blockedReview?.token, undefined);
+      assert.equal(blockedReview?.message, 'Working-source verification is unresolved. Review the files and try again.');
+      assert.deepEqual(
+        blockedReview.files.map(item => item.name).sort(),
+        [trustedAiAnchor, ...appPaths, ...genericPaths].map(file => path.basename(file)).sort()
+      );
+      illustratorFailed = false;
+      await metadataTestHooks.pollPsForProject(project.id, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+      await metadataTestHooks.waitForWatcherIdle(project.id);
+    }
+
     const packageResult = await callIpc('projects:package', project.id, outputDir);
     assertPackageResultShape(packageResult);
     assert.equal(packageResult.success, true);
@@ -20012,12 +20027,13 @@ for (const scopeState of ['ready', 'failed']) {
       if (['.ai','.pdf'].includes(path.extname(filePath))) writeSyntheticAiFile(filePath, 'saved source');
       if (path.extname(filePath) === '.psd') fs.writeFileSync(filePath, actualPsd.writePsdBuffer({ width: 1, height: 1 }));
     }
+    let illustratorFailed = scopeState === 'failed';
     setChildProcessHandler(({ kind, command, args }) => {
       if (kind === 'execFile' && command === '/bin/ps' && JSON.stringify(args) === JSON.stringify(['axww','-o','pid=','-o','comm='])) return { stdout: '0 kernel_task\n1 /sbin/launchd\n432 /bin/ps\n', stderr: '' };
       if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '321\n' };
       if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
         const rows = [
-          ...(scopeState === 'failed' ? ['ERROR\tillustrator-query-failed'] : []),
+          ...(illustratorFailed ? ['ERROR\tillustrator-query-failed'] : []),
           `DOC\t${sourcePath}\t${path.basename(sourcePath)}\tfalse\ttrue`,
           ...candidates.map(candidate => (
             `LINK\t${sourcePath}\t${path.basename(sourcePath)}\t${candidate.path}\tfalse\ttrue`
@@ -20090,6 +20106,21 @@ for (const scopeState of ['ready', 'failed']) {
       assert.equal(decision.success, true, JSON.stringify({file:path.basename(filePath),decision,card}));
     }
     await callIpc('projects:pause', project.id);
+    if (scopeState === 'failed') {
+      const blockedReview = await callIpcRaw('projects:prepare-package-review', project.id);
+      assert.equal(blockedReview?.materializable, false);
+      assert.equal(blockedReview?.token, undefined);
+      assert.equal(blockedReview?.message, 'Working-source verification is unresolved. Review the files and try again.');
+      assert.deepEqual(
+        blockedReview.files.map(item => item.name).sort(),
+        [anchorPath, ...candidates.map(item => item.path)].map(file => path.basename(file)).sort()
+      );
+      illustratorFailed = false;
+      await callIpc('projects:start-watching', project.id);
+      await metadataTestHooks.waitForWatcherIdle(project.id);
+      await callIpc('projects:pause', project.id);
+      clearTrackedTimers();
+    }
     const result = await callIpc('projects:package', project.id, outputDir);
     assert.equal(
       result && result.error,

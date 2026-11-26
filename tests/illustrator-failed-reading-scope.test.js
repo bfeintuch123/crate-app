@@ -68,18 +68,51 @@ function scopeCases() {
   // Failure kinds: 'empty', 'count-mismatch', 'osascript-timeout', 'applescript-timeout-error',
   // 'osascript-exec-error', 'automation-denied', and 'pathless-untitled-doc'.
   function illustrator() {
-    const app = { running: true, docs: [], fail: null, failOnce: null, hold: null, queries: 0, openFiles: [] };
+    const app = { running: true, docs: [], fail: null, failOnce: null, hold: null, queries: 0, openFiles: [], recentLastUsedPaths: [], inddDocs: [], inddScanLinks: [] };
     setChildProcessHandler(request => {
       const { kind, command, args } = request;
       const xattrPaths = bulkXattrPaths(request);
-      if (xattrPaths.length) return { stdout: formatBulkXattrOutput(xattrPaths, () => encodeLastUsedXattr(Date.now() - 400 * 86400000)) };
+      if (xattrPaths.length) {
+        const recent = new Set(app.recentLastUsedPaths.map(item => path.resolve(item).toLowerCase()));
+        return {
+          stdout: formatBulkXattrOutput(xattrPaths, filePath => encodeLastUsedXattr(
+            recent.has(path.resolve(filePath).toLowerCase()) ? Date.now() + 5000 : Date.now() - 400 * 86400000
+          )),
+        };
+      }
       if (isIdentityRead(request)) return { stdout: '' };
       if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: app.running ? '654\n' : '' };
+      if (kind === 'exec' && String(command).includes('Adobe InDesign') && String(command).startsWith('/bin/ps ax -o command=')) {
+        return { stdout: (app.inddDocs.length || app.inddScanLinks.length) ? '/Applications/Adobe InDesign 2026/Adobe InDesign.app/Contents/MacOS/Adobe InDesign\n' : '' };
+      }
       if (kind === 'exec' && String(command).startsWith('/bin/ps ax -o pid= -o command=')) {
-        return { stdout: app.openFiles.length ? '888 /Applications/Adobe Illustrator 2026/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' : '' };
+        const lines = [];
+        if (app.openFiles.length) lines.push('888 /Applications/Adobe Illustrator 2026/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator');
+        if (app.inddDocs.length || app.inddScanLinks.length) lines.push('889 /Applications/Adobe InDesign 2026/Adobe InDesign.app/Contents/MacOS/Adobe InDesign');
+        return { stdout: lines.length ? lines.join('\n') + '\n' : '' };
       }
       if (kind === 'exec' && String(command).startsWith('/usr/sbin/lsof -F ptn -p 888')) {
         return { stdout: 'p888\n' + app.openFiles.map((item, index) => `f${20 + index}\ntREG\nn${item}\n`).join('') };
+      }
+      if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-scan.applescript')) {
+        return { stdout: app.inddScanLinks.length ? app.inddScanLinks.join('\n') + '\n' : '' };
+      }
+      if (
+        isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript') ||
+        isOsascriptInvocation({ kind, command, args }, 'crate-indd-poll.applescript')
+      ) {
+        const rows = [];
+        let totalLinks = 0;
+        app.inddDocs.forEach((doc, index) => {
+          const name = base(doc.path), current = index === 0, links = doc.links || [];
+          rows.push(`DOC\t${doc.path}\t${name}\t${doc.modified === true}\t${current}\t${links.length}`);
+          for (const link of links) {
+            rows.push(`LINK\t${doc.path}\t${name}\t${link}\t${doc.modified === true}\t${current}`);
+            totalLinks++;
+          }
+        });
+        rows.push(`END\t${app.inddDocs.length}\t${totalLinks}\t${totalLinks}\t0`);
+        return { stdout: rows.join('\n') + '\n' };
       }
       if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
         app.queries++;
@@ -1012,5 +1045,277 @@ function scopeCases() {
     const resumedPkg = await runPackage(c, resumedReview.token, 'resumed_healthy_ai');
     assert.equal(resumedPkg.result?.success, true, JSON.stringify(resumedPkg.result));
     assert.equal(resumedPkg.result.totalFiles, 5);
+  });
+
+  function collectPackagedFileNames(rootDir) {
+    const names = [];
+    const walk = dir => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name === 'Crate Diagnostics') continue;
+          walk(full);
+        } else if (entry.isFile()) {
+          names.push(entry.name);
+        }
+      }
+    };
+    walk(rootDir);
+    return names.sort();
+  }
+
+  // ===== Finding 2: Illustrator package relevance scoping =====
+  scopeCase('failed-reading 32: Add Files saved .ai working file (no Illustrator-tagged rows) is held on failed reading and packages cleanly after recovery', async () => {
+    resetTestHomeWorkspace();
+    currentPsdFixture = { children: [], linkedFiles: [] };
+    const dir = path.join(TEST_HOME, 'Desktop', 'Sample_add_files_ai');
+    const elsewhere = path.join(TEST_HOME, 'Documents', 'Elsewhere_add_files_ai');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(elsewhere, { recursive: true });
+    const doc = path.join(dir, 'ManualLayout.ai');
+    const flyer = path.join(elsewhere, 'Flyer.ai');
+    const flyerArt = path.join(elsewhere, 'FlyerArt.png');
+    fs.writeFileSync(flyerArt, uniqueBytes('add_files_ai', flyerArt));
+    writeSyntheticAiFile(doc, '');
+    writeSyntheticAiFile(flyer, flyerArt);
+
+    const app = illustrator();
+    app.running = false;
+    const project = await createProject('Add Files AI');
+    const c = { id: project.id, app, f: { dir, doc, flyer, flyerArt } };
+    await waitForCondition(() => app.queries >= 0, 'project ready');
+    await callIpcRaw('projects:pause', c.id);
+    clearTrackedTimers();
+
+    // Add saved .ai via the real projects:add-files route (no Illustrator-tagged rows).
+    await addManually(c, doc);
+    const storedRows = stored(c.id).files || [];
+    assert.deepEqual(storedRows.map(row => row.name), ['ManualLayout.ai']);
+    assert.equal(storedRows[0].source, 'manual-browse');
+    assert.equal(storedRows[0].captureEvidence, undefined, 'must not force captureEvidence on Add Files row');
+
+    // Watch with Illustrator running and first reading failing while another unrelated doc is open.
+    app.running = true;
+    app.docs = [{ path: doc, links: [] }, { path: flyer, links: [flyerArt] }];
+    await restart(c, { fail: 'osascript-timeout' });
+    assert.equal(status(c.id), 'failed-closed');
+
+    const blocked = await packageStep(c, { scan: false });
+    assert.equal(blocked.materializable, false, 'Add Files .ai must be held while Illustrator reading fails: ' + JSON.stringify(blocked));
+    assert.equal(blocked.token, null, 'no approval token while failed-closed');
+    assert.equal(blocked.message, UNRESOLVED_MESSAGE);
+
+    // Next complete reading restores fresh review and packages exact project files with intact manifest.
+    app.fail = null;
+    await poll(c.id);
+    assert.deepEqual([status(c.id), flag(c.id)], ['ready', 'recovered']);
+    const fresh = await packageStep(c, { scan: false });
+    assert.equal(fresh.materializable, true, 'fresh review ready after complete reading: ' + JSON.stringify(fresh));
+    assert.equal(typeof fresh.token, 'string');
+    assert.deepEqual(fresh.files, ['ManualLayout.ai'], 'review manifest holds only project files');
+
+    const packaged = await runPackage(c, fresh.token, 'add_files_ai_recovered');
+    assert.equal(packaged.result?.success, true, JSON.stringify(packaged.result));
+    assert.equal(packaged.result.totalFiles, 1);
+    const writtenNames = collectPackagedFileNames(packaged.result.folderPath);
+    assert.deepEqual(writtenNames, ['ManualLayout.ai'], 'package output holds only project files, nothing from Flyer.ai');
+    assert.equal(writtenNames.includes('Flyer.ai') || writtenNames.includes('FlyerArt.png'), false);
+  });
+
+  scopeCase('failed-reading 33 (lastused-scan): accepted .ai from ordinary open-file admission is held on failed reading and packages cleanly after recovery', async () => {
+    resetTestHomeWorkspace();
+    currentPsdFixture = { children: [], linkedFiles: [] };
+    const dir = path.join(TEST_HOME, 'Desktop', 'Sample_lastused_scan_ai');
+    const elsewhere = path.join(TEST_HOME, 'Documents', 'Elsewhere_lastused_scan_ai');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(elsewhere, { recursive: true });
+    const anchorPng = path.join(dir, 'Brief.png');
+    const doc = path.join(dir, 'LastUsedLayout.ai');
+    const flyer = path.join(elsewhere, 'Flyer.ai');
+    const flyerArt = path.join(elsewhere, 'FlyerArt.png');
+    fs.writeFileSync(anchorPng, uniqueBytes('lastused_scan', anchorPng));
+    fs.writeFileSync(flyerArt, uniqueBytes('lastused_scan', flyerArt));
+    writeSyntheticAiFile(doc, '');
+    writeSyntheticAiFile(flyer, flyerArt);
+
+    const app = illustrator();
+    app.running = false;
+    const project = await createProject('Open File lastused-scan');
+    const c = { id: project.id, app, f: { dir, doc, flyer, flyerArt } };
+    await waitForCondition(() => status(c.id) === 'ready', 'activation scope ready');
+    await metadataTestHooks.waitForWatcherIdle(c.id);
+
+    // Establish the project folder as the session anchor with a non-Illustrator file (no Illustrator rows).
+    await addManually(c, anchorPng);
+    assert.deepEqual((stored(c.id).files || []).map(row => row.name), ['Brief.png']);
+    await callIpcRaw('projects:pause', c.id);
+    clearTrackedTimers();
+
+    // Ordinary open-file discovery via lastused-scan stages LastUsedLayout.ai as pending; accept it.
+    app.recentLastUsedPaths = [doc];
+    await callIpcRaw('projects:pre-package-scan', c.id);
+    await metadataTestHooks.waitForWatcherIdle(c.id);
+    app.recentLastUsedPaths = [];
+
+    assert.ok((stored(c.id).pendingFiles || []).some(row => row.path === doc), 'lastused-scan staged pending .ai candidate');
+    const accepted = await callIpcRaw('projects:accept-pending', c.id, doc);
+    assert.ok(accepted, 'lastused-scan accept-pending succeeded');
+    await metadataTestHooks.waitForWatcherIdle(c.id);
+
+    const row = (stored(c.id).files || []).find(item => item.path === doc);
+    assert.ok(row, 'lastused-scan .ai admitted to project.files');
+    assert.equal(row.source, 'lastused-scan');
+    assert.equal(row.acceptedPending, true);
+    assert.equal(row.captureEvidence, undefined, 'accepted pending row has no forced captureEvidence');
+
+    // Watch with Illustrator running and first reading failing while another unrelated doc is open.
+    app.running = true;
+    app.docs = [{ path: doc, links: [] }, { path: flyer, links: [flyerArt] }];
+    await restart(c, { fail: 'osascript-timeout' });
+    assert.equal(status(c.id), 'failed-closed');
+
+    const blocked = await packageStep(c, { scan: false });
+    assert.equal(blocked.materializable, false, 'lastused-scan accepted .ai must be held while Illustrator reading fails: ' + JSON.stringify(blocked));
+    assert.equal(blocked.token, null);
+    assert.equal(blocked.message, UNRESOLVED_MESSAGE);
+
+    // Next complete reading recovers and packages exact project files.
+    app.fail = null;
+    await poll(c.id);
+    assert.deepEqual([status(c.id), flag(c.id)], ['ready', 'recovered']);
+    const fresh = await packageStep(c, { scan: false });
+    assert.equal(fresh.materializable, true, 'lastused-scan fresh review ready after recovery: ' + JSON.stringify(fresh));
+    assert.equal(typeof fresh.token, 'string');
+    assert.deepEqual(fresh.files, ['Brief.png', 'LastUsedLayout.ai']);
+
+    const packaged = await runPackage(c, fresh.token, 'lastused_scan_ai_recovered');
+    assert.equal(packaged.result?.success, true, JSON.stringify(packaged.result));
+    assert.equal(packaged.result.totalFiles, 2);
+    const writtenNames = collectPackagedFileNames(packaged.result.folderPath);
+    assert.deepEqual(writtenNames, ['Brief.png', 'LastUsedLayout.ai']);
+    assert.equal(writtenNames.includes('Flyer.ai') || writtenNames.includes('FlyerArt.png'), false);
+  });
+
+  scopeCase('control 26a: Photoshop project linking .ai assets still packages normally when Illustrator readings fail', async () => {
+    const validPsdHeader = Buffer.from('8BPS\0\x01\0\0\0\0\0\0\0\x03\0\0\0\x01\0\0\0\x01\0\x08\0\x03\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0');
+    resetTestHomeWorkspace();
+    const psdDir = path.join(TEST_HOME, 'Desktop', 'Sample_psd_links_ai');
+    fs.mkdirSync(psdDir, { recursive: true });
+    const psdPath = path.join(psdDir, 'Poster.psd');
+    const psdBadgeAi = path.join(psdDir, 'PsdBadge.ai');
+    writeSyntheticAiFile(psdBadgeAi, '');
+    fs.writeFileSync(psdPath, validPsdHeader);
+    currentPsdFixture = {
+      children: [{ name: 'PsdBadge', linkedFile: { fullPath: psdBadgeAi } }],
+      linkedFiles: [],
+    };
+
+    const psdApp = illustrator();
+    psdApp.fail = 'osascript-timeout';
+    const psdProject = await createProject('PSD Links AI');
+    await waitForCondition(() => psdApp.queries >= 1, 'psd project activation query failed');
+    assert.equal(status(psdProject.id), 'failed-closed');
+
+    manualDialogFor([psdPath]);
+    await callIpcRaw('projects:add-files', psdProject.id);
+    await metadataTestHooks.waitForWatcherIdle(psdProject.id);
+    await callIpcRaw('projects:set-existing-assets-decision', psdProject.id, 'include');
+
+    const psdRows = stored(psdProject.id).files || [];
+    assert.equal(psdRows.find(row => row.path === psdBadgeAi)?.source, 'psd-linked', 'psd-linked .ai present');
+
+    const psdReview = await callIpcRaw('projects:prepare-package-review', psdProject.id);
+    assert.equal(psdReview?.materializable, true, 'Photoshop project linking .ai must not be blocked: ' + JSON.stringify(psdReview));
+    assert.equal(typeof psdReview?.token, 'string');
+    const psdOut = path.join(TEST_HOME, 'Documents', `Package_psd_links_ai_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+    fs.mkdirSync(psdOut, { recursive: true });
+    const psdPkg = await callIpcRaw('projects:package', psdProject.id, psdOut, psdReview.token);
+    assert.equal(psdPkg?.success, true, JSON.stringify(psdPkg));
+    assert.equal(psdPkg.totalFiles, 2);
+    assert.deepEqual(collectPackagedFileNames(psdPkg.folderPath), ['Poster.psd', 'PsdBadge.ai']);
+  });
+
+  scopeCase('control 26b: InDesign project linking .ai assets still packages normally when Illustrator readings fail', async () => {
+    resetTestHomeWorkspace();
+    currentPsdFixture = { children: [], linkedFiles: [] };
+    const inddDir = path.join(TEST_HOME, 'Desktop', 'Sample_indd_links_ai');
+    fs.mkdirSync(inddDir, { recursive: true });
+    const inddPath = path.join(inddDir, 'Brochure.indd');
+    const inddScanAi = path.join(inddDir, 'InddScanMark.ai');
+    const inddScriptAi = path.join(inddDir, 'InddScriptMark.ai');
+    writeSyntheticAiFile(inddScanAi, '');
+    writeSyntheticAiFile(inddScriptAi, '');
+    fs.writeFileSync(inddPath, 'synthetic indesign document\n');
+
+    const inddApp = illustrator();
+    inddApp.fail = 'osascript-timeout';
+    inddApp.inddDocs = [{ path: inddPath, links: [inddScanAi] }];
+    inddApp.inddScanLinks = [inddScriptAi];
+    const inddProject = await createProject('InDesign Links AI');
+    await waitForCondition(() => inddApp.queries >= 1, 'indd project activation query failed');
+    assert.equal(status(inddProject.id), 'failed-closed');
+
+    manualDialogFor([inddPath]);
+    await callIpcRaw('projects:add-files', inddProject.id);
+    await metadataTestHooks.waitForWatcherIdle(inddProject.id);
+    await callIpcRaw('projects:set-existing-assets-decision', inddProject.id, 'include');
+
+    await callIpcRaw('projects:pre-package-scan', inddProject.id);
+    await metadataTestHooks.waitForWatcherIdle(inddProject.id);
+    if ((stored(inddProject.id).pendingFiles || []).some(row => row.path === inddScriptAi)) {
+      await callIpcRaw('projects:accept-pending', inddProject.id, inddScriptAi);
+      await metadataTestHooks.waitForWatcherIdle(inddProject.id);
+    }
+    await keepNewWorkingFiles({ id: inddProject.id });
+
+    const inddRows = stored(inddProject.id).files || [];
+    assert.equal(inddRows.find(row => row.path === inddScanAi)?.source, 'scan-on-open', 'scan-on-open InDesign-linked .ai present');
+    assert.equal(inddRows.find(row => row.path === inddScriptAi)?.source, 'indd-linked', 'indd-linked .ai present');
+
+    const inddReview = await callIpcRaw('projects:prepare-package-review', inddProject.id);
+    assert.equal(inddReview?.materializable, true, 'InDesign project linking .ai must not be blocked: ' + JSON.stringify(inddReview));
+    assert.equal(typeof inddReview?.token, 'string');
+    const inddOut = path.join(TEST_HOME, 'Documents', `Package_indd_links_ai_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+    fs.mkdirSync(inddOut, { recursive: true });
+    const inddPkg = await callIpcRaw('projects:package', inddProject.id, inddOut, inddReview.token);
+    assert.equal(inddPkg?.success, true, JSON.stringify(inddPkg));
+    assert.equal(inddPkg.totalFiles, 3);
+    assert.deepEqual(collectPackagedFileNames(inddPkg.folderPath), ['Brochure.indd', 'InddScanMark.ai', 'InddScriptMark.ai']);
+  });
+
+  scopeCase('control 27: non-Illustrator project with explicit Add Files .pdf, .svg, and .eps still packages normally when Illustrator readings fail', async () => {
+    resetTestHomeWorkspace();
+    currentPsdFixture = { children: [], linkedFiles: [] };
+    const dir = path.join(TEST_HOME, 'Desktop', 'Sample_generic_vector_files');
+    fs.mkdirSync(dir, { recursive: true });
+    const psdPath = path.join(dir, 'Board.psd');
+    const pdfPath = path.join(dir, 'Spec.pdf');
+    const svgPath = path.join(dir, 'Icon.svg');
+    const epsPath = path.join(dir, 'Emblem.eps');
+    fs.writeFileSync(psdPath, Buffer.from('8BPS\0\x01\0\0\0\0\0\0\0\x03\0\0\0\x01\0\0\0\x01\0\x08\0\x03\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0'));
+    writeSyntheticPdfFile(pdfPath, 'generic pdf spec');
+    fs.writeFileSync(svgPath, '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"></svg>');
+    fs.writeFileSync(epsPath, '%!PS-Adobe-3.0 EPSF-3.0\n%%EOF\n');
+
+    const app = illustrator();
+    app.fail = 'osascript-timeout';
+    const project = await createProject('Generic PDF SVG EPS');
+    await waitForCondition(() => app.queries >= 1, 'activation query failed');
+    assert.equal(status(project.id), 'failed-closed');
+
+    manualDialogFor([psdPath, pdfPath, svgPath, epsPath]);
+    await callIpcRaw('projects:add-files', project.id);
+    await metadataTestHooks.waitForWatcherIdle(project.id);
+    await keepNewWorkingFiles({ id: project.id });
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review?.materializable, true, 'explicit generic .pdf/.svg/.eps must not be blocked: ' + JSON.stringify(review));
+    assert.equal(typeof review?.token, 'string');
+    const out = path.join(TEST_HOME, 'Documents', `Package_generic_vectors_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+    fs.mkdirSync(out, { recursive: true });
+    const pkg = await callIpcRaw('projects:package', project.id, out, review.token);
+    assert.equal(pkg?.success, true, JSON.stringify(pkg));
+    assert.equal(pkg.totalFiles, 4);
+    assert.deepEqual(collectPackagedFileNames(pkg.folderPath), ['Board.psd', 'Emblem.eps', 'Icon.svg', 'Spec.pdf']);
   });
 }

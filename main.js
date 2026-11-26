@@ -14675,13 +14675,35 @@ function getIllustratorSnapshotFailureReason(queryResult) { if (!queryResult || 
 // closes the scope without putting the project's own documents, or the links listed under them, into the hidden
 // sets (rule F2, change 1), and the next complete reading taken while Illustrator is running recovers (rule F3).
 const ILLUSTRATOR_VERIFICATION_INCOMPLETE_PACKAGE_MESSAGE = 'Working-source verification is unresolved. Review the files and try again.';
+function isNonWorkingDependencyAssetRow(file) {
+  if (!file || typeof file !== 'object') return false;
+  if (file.embedded === true || isScanOnSaveEmbeddedPsdFile(file)) return true;
+  if (file.projectRole === 'asset') return true;
+  if (typeof file.assetBaselineSourcePath === 'string' && file.assetBaselineSourcePath.trim()) return true;
+  const source = getFileCaptureSource(file);
+  if (DEPENDENCY_CAPTURE_SOURCES.has(source) || OWNER_RECORD_ELIGIBLE_SOURCES.has(source)) return true;
+  if (Array.isArray(file.dependencyOwners) && file.dependencyOwners.length > 0) return true;
+  const selfPath = normalizeTrackedFilePath(file.path);
+  const evidence = file.captureEvidence && typeof file.captureEvidence === 'object' ? file.captureEvidence : null;
+  for (const ownerPath of [file.sourceDocumentPath, evidence?.relationshipSourcePath, evidence?.sourceDocumentPath]) {
+    const normalizedOwner = normalizeTrackedFilePath(ownerPath);
+    if (normalizedOwner && normalizedOwner !== selfPath) return true;
+  }
+  return false;
+}
 function hasIllustratorPackageRelevance(project) {
   return Array.isArray(project?.files) && project.files.some(file => {
     if (!file) return false;
-    const family = getScopedFileAppFamily(project, file);
+    const scopedFamily = getScopedFileAppFamily(project, file);
+    const family = (scopedFamily && scopedFamily !== 'generic')
+      ? scopedFamily
+      : (getAcceptedPendingAppFamily(file) || scopedFamily);
     if (family === 'illustrator') return true;
+    if (family && family !== 'generic') return false;
     const ext = (file.ext || path.extname(file.path || file.name || '') || '').toLowerCase();
-    return ext === '.ai' && !isExplicitUserCapturedFile(file) && family !== 'generic';
+    if (ext !== '.ai') return false;
+    if (isExplicitUserCapturedFile(file)) return true;
+    return !isNonWorkingDependencyAssetRow(file);
   });
 }
 function isIllustratorPackageVerificationIncomplete(project, scope = getIllustratorActivationScope(project?.id)) {
