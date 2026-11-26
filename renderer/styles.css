@@ -2883,12 +2883,14 @@ body {
   text-align: center;
 }
 
-/* Quick Package Complete: stack Done above Open Folder as equal full-width rows. */
+/* Package Complete (Project and Quick Package): stack Done above Open Folder as equal full-width rows. */
+#modal-success .modal-actions,
 #modal-v2-results .modal-actions {
   flex-direction: column;
   flex-wrap: nowrap;
 }
 
+#modal-success .modal-actions > button,
 #modal-v2-results .modal-actions > button {
   flex: 0 0 auto;
   width: 100%;
@@ -2905,6 +2907,7 @@ body {
   text-align: center;
 }
 
+#modal-success .modal-actions > .modal-btn-secondary,
 #modal-v2-results .modal-actions > .modal-btn-secondary {
   border-color: var(--gray-200);
 }

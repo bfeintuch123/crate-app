@@ -1512,3 +1512,227 @@ test('production renderer sizes Quick Package Complete Done exactly like Open Fo
     })}`);
   }
 });
+
+function productionProjectPackageSuccessFixture() {
+  // Real Project Package success markup, styles, renderer handlers, and the
+  // source-bound modal focus script. Only openFolder IPC is replaced, and every
+  // displayed name and path is synthetic.
+  const modalScript = rendererIndex.match(/<script>(\(\(\) => \{\s*const modalConfigs[\s\S]*?)<\/script>/u);
+  assert.ok(modalScript, 'renderer/index.html must contain the source-bound modal focus script');
+  const html = rendererIndex
+    .replace(/<meta http-equiv="Content-Security-Policy"[^>]+>/u, '')
+    .replace(/<link[^>]+https:\/\/fonts\.googleapis\.com[^>]+>/u, '')
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gu, '')
+    .replace('<head>', `<head><base href="${new URL(`file://${rendererDir}/`).href}">`);
+  const probe = String.raw`
+    document.removeEventListener('DOMContentLoaded', init);
+    document.addEventListener('DOMContentLoaded', async () => {
+      try {
+        const settle = () => new Promise(resolve => queueMicrotask(resolve));
+        const opened = [];
+        window.crate = { openFolder: folderPath => { opened.push(folderPath); return Promise.resolve(); } };
+        setupEventListeners();
+        accountStatus = { revision: 1, state: 'signed_in', canUseWorkspace: true, identity: { id: 'geometry-account' }, message: '' };
+        renderAccount();
+        const modal = document.querySelector('#modal-success');
+        const panel = modal.querySelector('.modal');
+        const actions = modal.querySelector('.modal-actions');
+        const details = document.querySelector('#package-details');
+        const done = document.querySelector('#btn-success-done');
+        const openFolder = document.querySelector('#btn-open-folder');
+        const opener = document.querySelector('.app-tab[data-tab="projects"]');
+        const folderPath = '/Users/synthetic-designer/Desktop/Crate Packages/Synthetic_Project_Package';
+        const longFolderPath = '/Users/synthetic-designer/Desktop/Crate Packages/Synthetic_Client_Brand_Refresh_Hero_Banner_Final_Final_Approved_Round_3_Revised_Extended_Name_For_Wrapping_Package';
+        const issue = index => 'Synthetic_Client_Brand_Refresh_Linked_Image_' + index + '.tif could not be read from /Users/synthetic-designer/Synthetic Links/';
+        const scenarios = [
+          ['details-hidden', { showPackageDetails: false, open: false, result: { folderPath, copiedCount: 14, embeddedCount: 0, errors: [] } }],
+          ['details-collapsed', { showPackageDetails: true, open: false, result: { folderPath, copiedCount: 12, embeddedCount: 2, errors: [] } }],
+          ['details-expanded', { showPackageDetails: true, open: true, result: { folderPath, copiedCount: 11, embeddedCount: 3, errors: Array.from({ length: 4 }, (_, index) => issue(index)) } }],
+          ['long-path', { showPackageDetails: true, open: false, result: { folderPath: longFolderPath, copiedCount: 1234, embeddedCount: 56, errors: [issue(0)] } }],
+        ];
+        const box = element => {
+          const rect = element.getBoundingClientRect();
+          return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width, height: rect.height };
+        };
+        const labelOffset = element => {
+          const range = document.createRange();
+          range.selectNodeContents(element);
+          const label = range.getBoundingClientRect();
+          const button = element.getBoundingClientRect();
+          return {
+            x: (label.left + label.width / 2) - (button.left + button.width / 2),
+            y: (label.top + label.height / 2) - (button.top + button.height / 2),
+            fits: label.left >= button.left && label.right <= button.right,
+          };
+        };
+        const style = element => {
+          const computed = getComputedStyle(element);
+          return {
+            background: computed.backgroundColor, color: computed.color,
+            borderColor: computed.borderTopColor, borderWidth: computed.borderTopWidth,
+            fontSize: computed.fontSize, fontWeight: computed.fontWeight,
+          };
+        };
+        let uncaught = 0;
+        window.addEventListener('error', event => { uncaught += 1; event.preventDefault(); });
+        // Mirrors the success branch of confirmPackage() without running packaging.
+        const show = async ({ showPackageDetails, open, result }) => {
+          state.settings.showPackageDetails = showPackageDetails;
+          const totalPackaged = result.copiedCount + result.embeddedCount;
+          document.querySelector('#success-message').textContent = totalPackaged + ' file' + (totalPackaged !== 1 ? 's' : '') + ' packaged.';
+          document.querySelector('#success-path').textContent = result.folderPath;
+          renderPackageDetails(result);
+          state.lastPackagedPath = result.folderPath;
+          opener.focus();
+          const shown = showPackageSuccessModal();
+          if (open) details.open = true;
+          await settle();
+          return shown;
+        };
+        const measure = () => {
+          const panelStyle = getComputedStyle(panel);
+          const panelBox = box(panel);
+          return {
+            order: Array.from(actions.children).map(child => child.id),
+            done: box(done), open: box(openFolder),
+            doneLabel: labelOffset(done), openLabel: labelOffset(openFolder),
+            contentLeft: panelBox.left + panel.clientLeft + parseFloat(panelStyle.paddingLeft),
+            contentRight: panelBox.left + panel.clientLeft + panel.clientWidth - parseFloat(panelStyle.paddingRight),
+            actionsGap: getComputedStyle(actions).rowGap,
+            actionsOverflowX: actions.scrollWidth - actions.clientWidth,
+            panelOverflowX: panel.scrollWidth - panel.clientWidth,
+            detailsShown: !details.classList.contains('hidden'),
+            detailsOpen: details.open,
+            detailsBox: box(details),
+            doneStyle: style(done), openStyle: style(openFolder),
+          };
+        };
+        const results = [];
+        for (const [name, scenario] of scenarios) {
+          const shown = await show(scenario);
+          const metrics = measure();
+          const initialFocus = document.activeElement?.id || null;
+          openFolder.scrollIntoView({ block: 'nearest' });
+          const openBox = box(openFolder);
+          const openReachable = openBox.top >= 0 && openBox.bottom <= window.innerHeight;
+          results.push({ name, shown, initialFocus, openReachable, ...metrics });
+          done.click();
+          await settle();
+        }
+
+        const success = scenarios[1][1];
+        const keyboard = {};
+        await show(success);
+        keyboard.initial = document.activeElement?.id || null;
+        keyboard.sequentialOrder = Array.from(actions.querySelectorAll('button'))
+          .filter(button => button.tabIndex >= 0 && !button.disabled)
+          .map(button => button.id);
+        keyboard.doneVisuallyFirst = done.getBoundingClientRect().bottom <= openFolder.getBoundingClientRect().top;
+        done.focus();
+        modal.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+        await settle();
+        keyboard.escapeCloses = modal.classList.contains('hidden') && opened.length === 0;
+
+        await show(success);
+        done.click();
+        await settle();
+        const doneCloses = modal.classList.contains('hidden') && opened.length === 0;
+        await show(success);
+        openFolder.click();
+        await settle();
+        const openFolderOpensAndCloses = modal.classList.contains('hidden') && opened.length === 1 && opened[0] === folderPath;
+        const reopens = await show(success);
+        done.click();
+        await settle();
+
+        const otherActionsDirection = ['modal-delete-confirm', 'modal-clear-all', 'modal-edit-figma-link']
+          .map(id => getComputedStyle(document.querySelector('#' + id + ' .modal-actions')).flexDirection);
+        document.querySelector('#geometry-result').textContent = JSON.stringify({
+          results, keyboard, doneCloses, openFolderOpensAndCloses, reopens, otherActionsDirection,
+          devicePixelRatio: window.devicePixelRatio, uncaught,
+        });
+      } catch (error) {
+        document.querySelector('#geometry-result').textContent = JSON.stringify({ error: error.message });
+      }
+    });
+  `;
+  return html.replace('</body>', `<pre id="geometry-result"></pre><script src="app.js"></script><script>${modalScript[1]}</script><script>${probe}</script></body>`);
+}
+
+test('production renderer sizes Project Package Complete Done exactly like Open Folder', {
+  skip: browser ? false : 'Chrome or Chromium is not available in this environment',
+  timeout: 120_000,
+}, async () => {
+  const near = (actual, expected, tolerance, message) => {
+    assert.ok(Math.abs(actual - expected) <= tolerance, `${message}: ${actual} vs ${expected}`);
+  };
+  const windows = [
+    [DESKTOP_WINDOW_MINIMUM.width, DESKTOP_WINDOW_MINIMUM.height],
+    [DESKTOP_WINDOW_MINIMUM.width, DESKTOP_WINDOW_MINIMUM.height - 28],
+    [1440, 900],
+    [1920, 1200],
+  ];
+  for (const [width, height] of windows) {
+    const metrics = await runGeometryProbe(browser, width, height, productionProjectPackageSuccessFixture());
+    // Print before asserting so a CI failure keeps the measured values.
+    console.log(`# project-package-geometry ${width}x${height} ${JSON.stringify((metrics.results || []).map(result => ({
+      name: result.name, done: [result.done.left, result.done.width, result.done.height],
+      open: [result.open.left, result.open.width, result.open.height], gap: result.open.top - result.done.bottom,
+      details: [result.detailsShown, result.detailsOpen], reachable: result.openReachable,
+    })))} error=${JSON.stringify(metrics.error)} uncaught=${metrics.uncaught}`);
+    assert.equal(metrics.error, undefined);
+    assert.equal(metrics.devicePixelRatio, 1, 'standard 100% zoom');
+    assert.equal(metrics.uncaught, 0);
+    assert.deepEqual(metrics.results.map(result => [result.name, result.detailsShown, result.detailsOpen]), [
+      ['details-hidden', false, false],
+      ['details-collapsed', true, false],
+      ['details-expanded', true, true],
+      ['long-path', true, false],
+    ]);
+    for (const result of metrics.results) {
+      const label = `${width}x${height} ${result.name}`;
+      assert.equal(result.shown, true, `${label}: success modal must open`);
+      assert.equal(result.initialFocus, 'btn-success-done', `${label}: Done keeps initial focus`);
+      assert.deepEqual(result.order, ['btn-success-done', 'btn-open-folder'], `${label}: action order`);
+      near(result.done.width, result.open.width, 0.5, `${label}: equal width`);
+      near(result.done.height, result.open.height, 0.5, `${label}: equal height`);
+      near(result.done.left, result.open.left, 0.5, `${label}: left edges aligned`);
+      near(result.done.right, result.open.right, 0.5, `${label}: right edges aligned`);
+      near(result.open.left, result.contentLeft, 0.5, `${label}: actions start at the modal content edge`);
+      near(result.open.right, result.contentRight, 0.5, `${label}: actions end at the modal content edge`);
+      if (result.detailsShown) {
+        near(result.done.left, result.detailsBox.left, 0.5, `${label}: actions share the Package Details left edge`);
+        near(result.done.right, result.detailsBox.right, 0.5, `${label}: actions share the Package Details right edge`);
+      }
+      assert.ok(result.done.bottom <= result.open.top, `${label}: Done stays above Open Folder`);
+      assert.equal(result.actionsGap, '10px', `${label}: existing modal action gap`);
+      near(result.open.top - result.done.bottom, 10, 0.5, `${label}: 10px between Done and Open Folder`);
+      assert.ok(result.done.height >= 44, `${label}: 44px minimum target`);
+      for (const [name, offset] of [['Done', result.doneLabel], ['Open Folder', result.openLabel]]) {
+        near(offset.x, 0, 1, `${label}: ${name} label centered horizontally`);
+        near(offset.y, 0, 1, `${label}: ${name} label centered vertically`);
+        assert.equal(offset.fits, true, `${label}: ${name} label fits inside the button`);
+      }
+      assert.ok(result.actionsOverflowX <= 0, `${label}: action row must not overflow horizontally`);
+      assert.ok(result.panelOverflowX <= 0, `${label}: modal must not overflow horizontally`);
+      assert.equal(result.openReachable, true, `${label}: Open Folder is fully in view`);
+      assert.equal(result.doneStyle.background, 'rgba(0, 0, 0, 0)', `${label}: Done stays secondary`);
+      assert.equal(result.doneStyle.borderColor, 'rgb(229, 231, 235)', `${label}: Done keeps the gray-200 outline`);
+      assert.equal(result.doneStyle.color, 'rgb(107, 114, 128)', `${label}: Done keeps the gray-500 label`);
+      assert.equal(result.openStyle.background, 'rgb(17, 17, 17)', `${label}: Open Folder stays primary`);
+      assert.equal(result.openStyle.color, 'rgb(255, 255, 255)', `${label}: Open Folder label stays white`);
+      assert.equal(result.doneStyle.borderWidth, result.openStyle.borderWidth, `${label}: equal border box`);
+      assert.equal(result.doneStyle.fontSize, result.openStyle.fontSize, `${label}: equal label size`);
+      assert.equal(result.doneStyle.fontWeight, result.openStyle.fontWeight, `${label}: equal label weight`);
+    }
+    const label = `${width}x${height}`;
+    assert.equal(metrics.keyboard.initial, 'btn-success-done', `${label}: Done keeps initial focus`);
+    assert.deepEqual(metrics.keyboard.sequentialOrder, ['btn-success-done', 'btn-open-folder'], `${label}: Tab order matches action order`);
+    assert.equal(metrics.keyboard.doneVisuallyFirst, true, `${label}: Tab order matches visual order`);
+    assert.equal(metrics.keyboard.escapeCloses, true, `${label}: Escape closes without opening the folder`);
+    assert.equal(metrics.doneCloses, true, `${label}: Done closes without opening the folder`);
+    assert.equal(metrics.openFolderOpensAndCloses, true, `${label}: Open Folder opens the package folder and closes`);
+    assert.equal(metrics.reopens, true, `${label}: modal lease is released after closing`);
+    assert.deepEqual(metrics.otherActionsDirection, ['row', 'row', 'row'], `${label}: other modal action rows are unchanged`);
+  }
+});
