@@ -7,6 +7,10 @@ const { createReader } = require('ag-psd/dist/psdReader');
 const { readVersionAndDescriptor } = require('ag-psd/dist/descriptor');
 
 const MAX_PARSE_FILE_SIZE = 300 * 1024 * 1024;
+const MAX_POOLED_PSD_REQUESTS = 16;
+const MAX_POOLED_RETAIN_FILE_BYTES = 32 * 1024 * 1024;
+const MAX_POOLED_RSS_BYTES = 256 * 1024 * 1024;
+const POOLED_IDLE_TIMEOUT_MS = 30_000;
 
 function getParentPort() {
   if (process.parentPort) return process.parentPort;
@@ -457,13 +461,46 @@ function startAddFilesPsdWorker(port = getParentPort(), options = {}) {
     throw new Error('Add Files PSD worker requires a parent port');
   }
   const exit = typeof options.exit === 'function' ? options.exit : code => process.exit(code);
+  const maxRequests = Number.isInteger(options.maxPooledRequests) && options.maxPooledRequests > 0
+    ? options.maxPooledRequests
+    : MAX_POOLED_PSD_REQUESTS;
+  const maxRetainFileBytes = Number.isInteger(options.maxPooledRetainFileBytes) && options.maxPooledRetainFileBytes >= 0
+    ? options.maxPooledRetainFileBytes
+    : MAX_POOLED_RETAIN_FILE_BYTES;
+  const maxRssBytes = Number.isInteger(options.maxPooledRssBytes) && options.maxPooledRssBytes > 0
+    ? options.maxPooledRssBytes
+    : MAX_POOLED_RSS_BYTES;
+  const idleTimeoutMs = Number.isInteger(options.idleTimeoutMs) && options.idleTimeoutMs > 0
+    ? options.idleTimeoutMs
+    : POOLED_IDLE_TIMEOUT_MS;
   let started = false;
   let finished = false;
   let sessionId;
   let seq = 0;
   let pending = null;
+  let requestCount = 0;
+  let idleTimer = null;
+
+  const clearIdleTimer = () => {
+    if (idleTimer !== null) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  };
+  const scheduleIdleExit = () => {
+    clearIdleTimer();
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      if (!finished && !started) {
+        finished = true;
+        exit(0);
+      }
+    }, idleTimeoutMs);
+    if (typeof idleTimer.unref === 'function') idleTimer.unref();
+  };
   const fail = () => {
     if (finished) return;
+    clearIdleTimer();
     finished = true;
     const waiting = pending;
     pending = null;
@@ -490,12 +527,54 @@ function startAddFilesPsdWorker(port = getParentPort(), options = {}) {
       waiting.resolve();
       return;
     }
+    if (message.type === 'shutdown') {
+      clearIdleTimer();
+      finished = true;
+      setImmediate(() => exit(0));
+      return;
+    }
     if (message.type !== 'parse' || typeof message.filePath !== 'string' || typeof message.sessionId !== 'string') return fail();
+    clearIdleTimer();
     started = true;
     sessionId = message.sessionId;
+    seq = 0;
+    pending = null;
+    const pooled = message.pooled === true;
+    let parsedFileSize = 0;
     Promise.resolve().then(() => (options.parse || parsePsd)(message.filePath))
-      .then(parsed => sendPsdRecords(parsed, send))
-      .then(() => { finished = true; setImmediate(() => exit(0)); }, fail);
+      .then(parsed => {
+        parsedFileSize = parsed && parsed.sourceIdentity && Number.isFinite(parsed.sourceIdentity.size)
+          ? parsed.sourceIdentity.size
+          : 0;
+        return sendPsdRecords(parsed, send);
+      })
+      .then(() => {
+        if (finished) return;
+        requestCount += 1;
+        const rss = typeof process.memoryUsage === 'function' ? process.memoryUsage().rss : 0;
+        const keepAlive = pooled
+          && requestCount < maxRequests
+          && parsedFileSize <= maxRetainFileBytes
+          && rss <= maxRssBytes;
+        if (keepAlive) {
+          const completedSessionId = sessionId;
+          started = false;
+          sessionId = undefined;
+          seq = 0;
+          pending = null;
+          scheduleIdleExit();
+          try {
+            port.postMessage({ type: 'session-idle', sessionId: completedSessionId });
+          } catch (_) {
+            clearIdleTimer();
+            finished = true;
+            setImmediate(() => exit(0));
+          }
+          return;
+        }
+        finished = true;
+        setImmediate(() => exit(0));
+      }, fail);
   });
 }
 
