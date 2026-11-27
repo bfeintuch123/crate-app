@@ -6851,13 +6851,20 @@ async function createRendererFilePresentation(project, file, membership = getWor
     || getPrimaryDesignAppFamilyForExt(ext)
     || scopedAppFamily
     || null;
-  const sourceDocumentName = captureEvidence.sourceName || captureEvidence.sourceDocumentName ||
+  // A retained shared Illustrator row is labelled only from its eligible
+  // visible owners (getIllustratorScopedProjectView). When the field is
+  // present there is no other fallback; a malformed field means no label.
+  const hasOwnerLabel = !!file && Object.prototype.hasOwnProperty.call(file, 'eligibleOwnerSourceLabel');
+  const ownerLabelName = hasOwnerLabel && isRecord(file.eligibleOwnerSourceLabel) ? file.eligibleOwnerSourceLabel.name : null;
+  const sourceDocumentName = hasOwnerLabel ? null : captureEvidence.sourceName || captureEvidence.sourceDocumentName ||
     ledgerEvidence?.sourceName || ledgerEvidence?.sourceDocumentName || (
     typeof captureEvidence.sourceDocumentPath === 'string' && captureEvidence.sourceDocumentPath
       ? path.basename(captureEvidence.sourceDocumentPath)
       : null
   );
-  const sourceName = sanitizeRendererSourceName(sourceDocumentName || file?.figmaFileName) || null;
+  const sourceName = hasOwnerLabel
+    ? sanitizeRendererSourceName(ownerLabelName) || null
+    : sanitizeRendererSourceName(sourceDocumentName || file?.figmaFileName) || null;
   const figmaFileKey = typeof file?.figmaFileKey === 'string' && file.figmaFileKey.trim()
     ? file.figmaFileKey.trim()
     : (typeof file?.fileKey === 'string' && file.fileKey.trim() ? file.fileKey.trim() : null);
@@ -11036,6 +11043,7 @@ const lastFileActivity = new Map(); // projectId -> timestamp
 const inactivityNotified = new Set(); // projectIds already notified
 const watchingActivationTokens = new Map(); // projectId -> current watch-session token
 const illustratorActivationScopes = new Map(); // projectId -> transient Illustrator activation scope
+const illustratorVerificationIncompleteByProject = new Map(); // projectId -> { activationToken, reason } when latest Illustrator read failed
 let watchingActivationSequence = 0;
 
 const BACKGROUND_WATCHER_BUDGET_MS = 2500;
@@ -11825,6 +11833,7 @@ function activateSingleWatchingProject(projectId, settings, { preserveWatchStart
   // startWatching, while this gate makes their ticks harmless in the gap.
   cancelWatcherCoordinator(projectId);
   illustratorActivationScopes.set(projectId, { activationToken, revision: 0, status: 'initializing', baselineDocumentPaths: new Set(), admittedDocumentPaths: new Set(), allowedLinkedPaths: new Set(), excludedLinkedPaths: new Set() });
+  illustratorVerificationIncompleteByProject.delete(projectId);
 
   return {
     activationToken,
@@ -14649,7 +14658,7 @@ function getScopedCaptureSourceAppFamily(value) { const normalized = normalizeLi
 function normalizeIllustratorDocumentName(value) { const safe = sanitizeLiveEvidenceText(value); return safe ? safe.toLowerCase() : null; } function getExplicitCaptureAppFamily(fileEntry, observation = {}) { const capture = fileEntry && fileEntry.captureEvidence, evidence = observation.liveEvidence || {}; for (const value of [observation.appFamily, evidence.appFamily, capture && capture.appFamily]) { const family = getExactAppFamilyMarker(value); if (family) return family; } return getScopedCaptureSourceAppFamily(fileEntry && fileEntry.source); }
 function getScopedFileAppFamily(project, fileEntry, observation = {}) { const explicit = getExplicitCaptureAppFamily(fileEntry, observation); if (explicit || !project || !fileEntry) return explicit; const key = getLiveEvidenceKeyHash(normalizeTrackedFilePath(fileEntry.path)), latest = key && project.liveEvidenceLedger?.candidates?.[key]?.latest; return getExplicitCaptureAppFamily(latest, latest || {}); } function isIllustratorSourceCandidate(file) { const family = getExplicitCaptureAppFamily(file); return family === 'illustrator' || ((!family || family === 'generic') && isExplicitUserCapturedFile(file) && ILLUSTRATOR_SOURCE_EXTENSIONS.has((file && (file.ext || path.extname(file.path || file.name || '')) || '').toLowerCase())); }
 function getIllustratorActivationScope(projectId, activationToken = null) { const scope = illustratorActivationScopes.get(projectId); return !scope || (activationToken !== null && scope.activationToken !== activationToken) ? null : scope; } function getFreshActiveWatchingProject(projectId, activationToken) { return isActiveWatchingProject(projectId, activationToken) ? getProjects().find(project => project && project.id === projectId) || null : null; }
-function isAcceptedIllustratorProjectFile(project, file) { const ext = (file?.ext || path.extname(file?.path || '') || '').toLowerCase(); const acceptedPendingIllustratorSource = file?.acceptedPending === true && file.projectRole !== 'asset' && ILLUSTRATOR_SOURCE_EXTENSIONS.has(ext) && (getAcceptedPendingAppFamily(file) === 'illustrator' || getScopedFileAppFamily(project, file) === 'illustrator') && isProjectAssetBaselineSource(file); return !!file && (isIllustratorSourceCandidate(file) || acceptedPendingIllustratorSource || isPersistedAcceptedWatcherSource(project, file)) && isTrustedSessionProjectFile(project, file); } function sameIllustratorActivationScope(a, b) { return a.status === b.status && ILLUSTRATOR_SCOPE_SET_KEYS.every(key => { const left = [...a[key]].sort(), right = [...b[key]].sort(); return left.length === right.length && left.every((value, index) => value === right[index]); }); } function reviseIllustratorActivationScope(projectId, scope, update) { if (!scope || illustratorActivationScopes.get(projectId) !== scope) return null; const next = { ...scope, ...Object.fromEntries(ILLUSTRATOR_SCOPE_SET_KEYS.map(key => [key, new Set(scope[key])])) }; update(next); if (illustratorActivationScopes.get(projectId) !== scope) return null; if (sameIllustratorActivationScope(scope, next)) return scope; next.revision = scope.revision + 1; illustratorActivationScopes.set(projectId, next); return next; }
+function isAcceptedIllustratorProjectFile(project, file) { const ext = (file?.ext || path.extname(file?.path || '') || '').toLowerCase(); const acceptedPendingIllustratorSource = file?.acceptedPending === true && file.projectRole !== 'asset' && ILLUSTRATOR_SOURCE_EXTENSIONS.has(ext) && (getAcceptedPendingAppFamily(file) === 'illustrator' || getScopedFileAppFamily(project, file) === 'illustrator') && isProjectAssetBaselineSource(file); return !!file && (isIllustratorSourceCandidate(file) || acceptedPendingIllustratorSource || isPersistedAcceptedWatcherSource(project, file)) && isTrustedSessionProjectFile(project, file); } function sameIllustratorActivationScope(a, b) { return a.status === b.status && (a.baselineFlag || null) === (b.baselineFlag || null) && ILLUSTRATOR_SCOPE_SET_KEYS.every(key => { const left = [...a[key]].sort(), right = [...b[key]].sort(); return left.length === right.length && left.every((value, index) => value === right[index]); }); } function reviseIllustratorActivationScope(projectId, scope, update) { if (!scope || illustratorActivationScopes.get(projectId) !== scope) return null; const next = { ...scope, ...Object.fromEntries(ILLUSTRATOR_SCOPE_SET_KEYS.map(key => [key, new Set(scope[key])])) }; update(next); if (illustratorActivationScopes.get(projectId) !== scope) return null; if (sameIllustratorActivationScope(scope, next)) return scope; next.revision = scope.revision + 1; illustratorActivationScopes.set(projectId, next); return next; }
 const ILLUSTRATOR_DIRECT_PATH_FALLBACK_FAILURES = new Set(['illustrator-placed-item-file-query-failed', 'illustrator-placed-item-file-of-query-failed']);
 const ILLUSTRATOR_DIRECT_PATH_FALLBACK_RECOVERY_STATUSES = new Set([
   ...ILLUSTRATOR_DIRECT_PATH_FALLBACK_FAILURES,
@@ -14667,23 +14676,159 @@ function getIllustratorStatusFailureReason(statuses = []) {
   return isIllustratorDirectPathFallbackRecovery(statuses) ? null : queryFailures[0];
 }
 function getIllustratorSnapshotFailureReason(queryResult) { if (!queryResult || queryResult.stale) return 'stale-activation'; if (queryResult.running === false) return null; if (queryResult.errorCategory) return queryResult.errorCategory; if (queryResult.outputEmpty) return 'empty-output'; const activeState = queryResult.activeState; if (!activeState || activeState.errors?.length) return 'illustrator-query-failed'; const { documents = [], links = [], diagnostics = {}, statuses = [] } = activeState; if (documents.some(doc => !normalizeTrackedFilePath(doc && doc.documentPath))) return 'pathless-document'; if (links.some(link => !normalizeTrackedFilePath(link?.documentPath) || !normalizeTrackedFilePath(link?.linkedPath))) return 'pathless-link'; if (!diagnostics.terminalSeen) return 'missing-terminal'; if (diagnostics.malformedRows) return 'malformed-snapshot'; if (diagnostics.documentCount !== diagnostics.docRowsSeen || diagnostics.docRowsSeen !== documents.length) return 'document-count-mismatch'; if (diagnostics.placedItemsCount !== diagnostics.linkRowsSeen || diagnostics.linkRowsSeen !== links.length) return 'placed-item-count-mismatch'; return getIllustratorStatusFailureReason(statuses) || (documents.length === 0 && !statuses.includes('no-documents') ? 'partial-document-snapshot' : null); }
+// The scope's baseline flag (absent means none): 'activation' after the activation's own complete reading, or
+// after a complete reading applied while the status is 'recovering-explicit'; 'recovered' after an automatic
+// recovery (rule F3). Once it is set, a failed reading changes nothing (rule F1). Until then a failed reading
+// closes the scope without putting the project's own documents, or the links listed under them, into the hidden
+// sets (rule F2, change 1), and the next complete reading taken while Illustrator is running recovers (rule F3).
+const ILLUSTRATOR_VERIFICATION_INCOMPLETE_PACKAGE_MESSAGE = 'Working-source verification is unresolved. Review the files and try again.';
+function isNonWorkingDependencyAssetRow(file) {
+  if (!file || typeof file !== 'object') return false;
+  if (file.embedded === true || isScanOnSaveEmbeddedPsdFile(file)) return true;
+  if (file.projectRole === 'asset') return true;
+  if (typeof file.assetBaselineSourcePath === 'string' && file.assetBaselineSourcePath.trim()) return true;
+  const source = getFileCaptureSource(file);
+  if (DEPENDENCY_CAPTURE_SOURCES.has(source) || OWNER_RECORD_ELIGIBLE_SOURCES.has(source)) return true;
+  if (Array.isArray(file.dependencyOwners) && file.dependencyOwners.length > 0) return true;
+  const selfPath = normalizeTrackedFilePath(file.path);
+  const evidence = file.captureEvidence && typeof file.captureEvidence === 'object' ? file.captureEvidence : null;
+  for (const ownerPath of [file.sourceDocumentPath, evidence?.relationshipSourcePath, evidence?.sourceDocumentPath]) {
+    const normalizedOwner = normalizeTrackedFilePath(ownerPath);
+    if (normalizedOwner && normalizedOwner !== selfPath) return true;
+  }
+  return false;
+}
+function hasIllustratorPackageRelevance(project) {
+  return Array.isArray(project?.files) && project.files.some(file => {
+    if (!file) return false;
+    const scopedFamily = getScopedFileAppFamily(project, file);
+    const family = (scopedFamily && scopedFamily !== 'generic')
+      ? scopedFamily
+      : (getAcceptedPendingAppFamily(file) || scopedFamily);
+    if (family === 'illustrator') return true;
+    const ext = (file.ext || path.extname(file.path || file.name || '') || '').toLowerCase();
+    if (ext !== '.ai') return false;
+    if (
+      isExplicitUserCapturedFile(file) &&
+      isWorkingSourceFile(file) &&
+      file.virtual !== true &&
+      file.embedded !== true &&
+      getFileCaptureSource(file) !== 'psd-embedded'
+    ) return true;
+    if (family && family !== 'generic') return false;
+    return !isNonWorkingDependencyAssetRow(file);
+  });
+}
+function isIllustratorPackageVerificationIncomplete(project, scope = getIllustratorActivationScope(project?.id)) {
+  if (!project || !scope || !hasIllustratorPackageRelevance(project)) return false;
+  if (scope.status !== 'ready') return true;
+  const incomplete = illustratorVerificationIncompleteByProject.get(project.id);
+  return !!incomplete && incomplete.activationToken === scope.activationToken;
+}
 function updateIllustratorActivationScope(projectId, activationToken, queryResult, isActivation = false) {
-  let scope = getIllustratorActivationScope(projectId, activationToken); const project = getFreshActiveWatchingProject(projectId, activationToken); if (!scope || !project) return null; if (getIllustratorSnapshotFailureReason(queryResult)) { scope = reviseIllustratorActivationScope(projectId, scope, next => { next.status = 'failed-closed'; const active = queryResult?.activeState || {}; for (const doc of active.documents || []) next.baselineDocumentPaths.add(normalizeTrackedFilePath(doc.documentPath)); for (const link of active.links || []) next.excludedLinkedPaths.add(normalizeTrackedFilePath(link.linkedPath)); next.baselineDocumentPaths.delete(null); next.excludedLinkedPaths.delete(null); }); return { scope, project, ready: false }; } if (scope.status === 'failed-closed' && !isActivation) return { scope, project, ready: false }; const active = queryResult.activeState || {}, recovery = scope.status === 'recovering-explicit', acceptedPaths = new Set((project.files || []).filter(file => isAcceptedIllustratorProjectFile(project, file)).map(file => normalizeTrackedFilePath(file.path)).filter(Boolean));
+  let scope = getIllustratorActivationScope(projectId, activationToken); const project = getFreshActiveWatchingProject(projectId, activationToken); if (!scope || !project) return null;
+  const baselineFlag = scope.baselineFlag || null;
+  const acceptedPaths = new Set((project.files || []).filter(file => isAcceptedIllustratorProjectFile(project, file)).map(file => normalizeTrackedFilePath(file.path)).filter(Boolean));
+  const failureReason = getIllustratorSnapshotFailureReason(queryResult);
+  if (failureReason) {
+    illustratorVerificationIncompleteByProject.set(projectId, { activationToken, reason: failureReason });
+    if (hasIllustratorPackageRelevance(project)) invalidatePackageReviewForProject(projectId);
+    if (baselineFlag) return { scope, project, ready: false };
+    const projectDocument = documentPath => acceptedPaths.has(documentPath) || scope.admittedDocumentPaths.has(documentPath);
+    scope = reviseIllustratorActivationScope(projectId, scope, next => { next.status = 'failed-closed'; const active = queryResult?.activeState || {}; for (const doc of active.documents || []) { const documentPath = normalizeTrackedFilePath(doc.documentPath); if (!projectDocument(documentPath)) next.baselineDocumentPaths.add(documentPath); } for (const link of active.links || []) { if (!projectDocument(normalizeTrackedFilePath(link.documentPath))) next.excludedLinkedPaths.add(normalizeTrackedFilePath(link.linkedPath)); } next.baselineDocumentPaths.delete(null); next.excludedLinkedPaths.delete(null); }); return { scope, project, ready: false };
+  }
+  const automaticRecovery = !isActivation && !baselineFlag && (scope.status === 'initializing' || scope.status === 'failed-closed');
+  if (automaticRecovery && queryResult.running === false) return { scope, project, ready: false };
+  if (scope.status === 'failed-closed' && !isActivation && !automaticRecovery) return { scope, project, ready: false }; const active = queryResult.activeState || {}, explicitRecovery = scope.status === 'recovering-explicit', recovery = explicitRecovery || automaticRecovery;
+  const nextFlag = isActivation || explicitRecovery ? 'activation' : automaticRecovery ? 'recovered' : baselineFlag;
   scope = reviseIllustratorActivationScope(projectId, scope, next => {
-    if (isActivation) for (const key of ILLUSTRATOR_SCOPE_SET_KEYS) next[key].clear(); for (const acceptedPath of acceptedPaths) { next.admittedDocumentPaths.add(acceptedPath); next.baselineDocumentPaths.delete(acceptedPath); } for (const doc of active.documents || []) { const documentPath = normalizeTrackedFilePath(doc.documentPath); if (!documentPath) continue; const admitted = acceptedPaths.has(documentPath) || (!isActivation && scope.status === 'ready' && !scope.baselineDocumentPaths.has(documentPath)); if (admitted) next.admittedDocumentPaths.add(documentPath); else if (isActivation || recovery) next.baselineDocumentPaths.add(documentPath); } for (const link of active.links || []) { const documentPath = normalizeTrackedFilePath(link.documentPath), linkedPath = normalizeTrackedFilePath(link.linkedPath); if (documentPath && linkedPath) (next.admittedDocumentPaths.has(documentPath) ? next.allowedLinkedPaths : next.excludedLinkedPaths).add(linkedPath); } next.status = 'ready'; }); return scope ? { scope, project, ready: true } : null; }
+    if (isActivation) for (const key of ILLUSTRATOR_SCOPE_SET_KEYS) next[key].clear(); for (const acceptedPath of acceptedPaths) { next.admittedDocumentPaths.add(acceptedPath); next.baselineDocumentPaths.delete(acceptedPath); } for (const doc of active.documents || []) { const documentPath = normalizeTrackedFilePath(doc.documentPath); if (!documentPath) continue; const admitted = acceptedPaths.has(documentPath) || (!isActivation && scope.status === 'ready' && baselineFlag !== 'recovered' && !scope.baselineDocumentPaths.has(documentPath)); if (admitted) next.admittedDocumentPaths.add(documentPath); else if (isActivation || (recovery && !next.admittedDocumentPaths.has(documentPath))) next.baselineDocumentPaths.add(documentPath); } for (const link of active.links || []) { const documentPath = normalizeTrackedFilePath(link.documentPath), linkedPath = normalizeTrackedFilePath(link.linkedPath); if (documentPath && linkedPath) (next.admittedDocumentPaths.has(documentPath) ? next.allowedLinkedPaths : next.excludedLinkedPaths).add(linkedPath); } next.status = 'ready'; if (nextFlag !== baselineFlag) next.baselineFlag = nextFlag; });
+  if (!scope) return null;
+  illustratorVerificationIncompleteByProject.delete(projectId);
+  return { scope, project, ready: true }; }
 function getIllustratorRelationshipSourcePath(fileEntry, observation = {}) { const evidence = observation.liveEvidence || {}; return normalizeTrackedFilePath(observation.relationshipSourcePath || evidence.relationshipSourcePath || evidence.sourceDocumentPath || fileEntry?.sourceDocumentPath); }
 function createIllustratorProjectFilePathSnapshot(projectFiles) { const files = Array.isArray(projectFiles) ? projectFiles : []; return { entries: files.map(file => ({ file, rawPath: file && file.path })), paths: files.map(file => normalizeTrackedFilePath(file && file.path)) }; }
 function isIllustratorScopedFileAllowed(project, fileEntry, observation = {}) { if (!project || !fileEntry) return true; if (isExplicitUserCapturedFile(fileEntry)) return true; const projectFiles = Array.isArray(project.files) ? project.files : []; const projectFilePathSnapshot = observation.projectFilePaths && !Array.isArray(observation.projectFilePaths) ? observation.projectFilePaths : null; const projectFilePaths = projectFilePathSnapshot && Array.isArray(projectFilePathSnapshot.entries) && Array.isArray(projectFilePathSnapshot.paths) && projectFilePathSnapshot.entries.length === projectFiles.length && projectFilePathSnapshot.paths.length === projectFiles.length && projectFilePathSnapshot.entries.every((entry, index) => entry && entry.file === projectFiles[index] && entry.rawPath === (projectFiles[index] && projectFiles[index].path)) ? projectFilePathSnapshot.paths : null; const projectFilePathAt = index => projectFilePaths ? projectFilePaths[index] : normalizeTrackedFilePath(projectFiles[index] && projectFiles[index].path); const hasPersistedBaselineSource = typeof fileEntry.assetBaselineSourcePath === 'string'; if (observation.explicitBaselineRelationship === true || hasPersistedBaselineSource) { const sourcePath = normalizeTrackedFilePath(fileEntry.assetBaselineSourcePath) || getIllustratorRelationshipSourcePath(fileEntry, observation); const acceptedSource = projectFiles.find((file, index) => projectFilePathAt(index) === sourcePath); return !!acceptedSource && isProjectAssetBaselineSource(acceptedSource); } if (getScopedFileAppFamily(project, fileEntry, observation) !== 'illustrator') return true; const normalizedPath = normalizeTrackedFilePath(fileEntry.path), scope = getIllustratorActivationScope(project.id);
   if (isExplicitUserCapturedFile(fileEntry) || isAcceptedPendingCapturedFile(project, fileEntry) || projectFiles.some((file, index) => projectFilePathAt(index) === normalizedPath && isAcceptedIllustratorProjectFile(project, file))) return true; if (!scope || !normalizedPath) return false; if (scope.allowedLinkedPaths.has(normalizedPath) || scope.admittedDocumentPaths.has(normalizedPath)) return true; if (scope.status !== 'ready' || scope.excludedLinkedPaths.has(normalizedPath) || scope.baselineDocumentPaths.has(normalizedPath)) return false; const sourcePath = getIllustratorRelationshipSourcePath(fileEntry, observation); return sourcePath ? scope.admittedDocumentPaths.has(sourcePath) : (!isWeakBroadObserverFile(fileEntry) && ILLUSTRATOR_SOURCE_EXTENSIONS.has(path.extname(fileEntry.path || '').toLowerCase())); }
 function getScopedRecordAppFamily(value) { const normalized = normalizeLiveCaptureReason(value, ''); if (!normalized) return null; if (CAPTURE_SOURCE_APP_FAMILY.has(normalized)) return CAPTURE_SOURCE_APP_FAMILY.get(normalized); if (normalized === 'illustrator' || normalized.startsWith('ai-') || normalized.includes('illustrator')) return 'illustrator'; if (normalized === 'photoshop' || normalized.startsWith('psd-') || normalized.startsWith('ps-') || normalized.includes('photoshop')) return 'photoshop'; if (normalized === 'indesign' || normalized.startsWith('indd-') || normalized.includes('indesign')) return 'indesign'; if (normalized === 'figma' || normalized.startsWith('fig-') || normalized.includes('figma')) return 'figma'; if (normalized.includes('powerpoint') || normalized.includes('keynote') || normalized.includes('presentation')) return 'presentation'; if (normalized === 'generic' || normalized.startsWith('lastused-') || normalized === 'manual-browse' || normalized === 'lsof') return 'generic'; return null; } function getScopedRecordFamilies(record) { const values = [record?.appFamily, record?.source, record?.explicitUserAuthority?.source, record?.captureEvidence?.appFamily, record?.captureEvidence?.source, record?.captureEvidence?.observerMethod, record?.latest?.appFamily, record?.latest?.source, record?.latest?.observerMethod, record?.observer?.appFamily, record?.observer?.method, record?.payload?.appFamily, record?.payload?.source, record?.payload?.authoritySource, record?.payload?.observer?.method]; return new Set(values.map(getScopedRecordAppFamily).filter(Boolean)); }
 const SCOPED_PRIMARY_PATH_FIELDS = ['path', 'filePath', 'localPath', 'normalizedPath']; function isScopedRecord(value) { return isRecord(value) && ['id', 'fileId', 'evidenceKey', 'path', 'source', 'appFamily', 'captureEvidence', 'latest', 'observer', 'relationType', 'subjectNodeId', 'objectNodeId', 'type'].some(key => Object.prototype.hasOwnProperty.call(value, key)); } function scopedRecordIdentities(entry) { const item = entry.item, ids = [item.id, item.fileId, item.evidenceKey]; if (!Array.isArray(entry.parent) && typeof entry.key === 'string' && !['captureEvidence', 'latest', 'observer', 'payload', 'metadata'].includes(entry.key)) ids.push(entry.key); return ids.filter(value => typeof value === 'string'); } function scopedRecordPrimaryPath(record, key, nodePaths, ledgerPaths) { const values = [...SCOPED_PRIMARY_PATH_FIELDS.map(field => record?.[field]), ...SCOPED_PRIMARY_PATH_FIELDS.map(field => record?.latest?.[field]), ...SCOPED_PRIMARY_PATH_FIELDS.map(field => record?.payload?.[field])]; for (const value of values) { const normalized = typeof value === 'string' && (path.isAbsolute(value) || /normalizedPath/.test(key || '')) ? normalizeTrackedFilePath(value) : null; if (normalized) return normalized; } return ledgerPaths.get(key) || nodePaths.get(record?.objectNodeId) || (typeof key === 'string' && path.isAbsolute(key) ? normalizeTrackedFilePath(key) : null); }
-function scopedRecordReferencesHidden(value, info, hiddenPaths, hiddenIds, nodePaths) { const ancestors = new Set(); let visited = 0; const visit = (item, key = '') => { if (++visited > 50000) return true; if (typeof item === 'string') { if (hiddenIds.has(item)) return true; const nodePath = /NodeId$/i.test(key) ? nodePaths.get(item) : null, normalized = (path.isAbsolute(item) || /paths?$/i.test(key)) ? normalizeTrackedFilePath(item) : null, deniedPath = nodePath || (normalized && hiddenPaths.has(normalized) ? normalized : null); return !!deniedPath && !(info.authorized && info.primaryPath === deniedPath); } if (!Array.isArray(item) && !isRecord(item)) return false; if (ancestors.has(item)) return true; ancestors.add(item); try { for (const childKey of Object.keys(item)) if (visit(item[childKey], childKey)) return true; return false; } catch (_) { return true; } finally { ancestors.delete(item); } }; return visit(value); }
-function getIllustratorScopedProjectView(project) { if (!project) return project; const scope = getIllustratorActivationScope(project.id), hiddenPaths = new Set(scope ? [...scope.baselineDocumentPaths, ...scope.excludedLinkedPaths] : []), hiddenPendingPaths = new Set(), stalePendingFiles = new Set(), scopeAllowedPaths = new Set(); for (const file of [...(project.files || []), ...(project.pendingFiles || [])]) { const filePath = normalizeTrackedFilePath(file?.path); if ((project.pendingFiles || []).includes(file) && !isCurrentWatchSessionPendingFile(project, file)) { hiddenPaths.add(filePath); hiddenPendingPaths.add(filePath); stalePendingFiles.add(file); } else if (!isIllustratorScopedFileAllowed(project, file)) hiddenPaths.add(filePath); else if (hiddenPaths.has(filePath) && !hiddenPendingPaths.has(filePath) && getScopedFileAppFamily(project, file) === 'illustrator') scopeAllowedPaths.add(filePath); } hiddenPaths.delete(null); if (!hiddenPaths.size) return project;
+function scopedRecordReferencesHidden(value, info, hiddenPaths, hiddenIds, nodePaths, ownerListKey = null) { const ancestors = new Set(); let visited = 0; const visit = (item, key = '') => { if (++visited > 50000) return true; if (typeof item === 'string') { if (hiddenIds.has(item)) return true; const nodePath = /NodeId$/i.test(key) ? nodePaths.get(item) : null, normalized = (path.isAbsolute(item) || /paths?$/i.test(key)) ? normalizeTrackedFilePath(item) : null, deniedPath = nodePath || (normalized && hiddenPaths.has(normalized) ? normalized : null); return !!deniedPath && !(info.authorized && info.primaryPath === deniedPath); } if (!Array.isArray(item) && !isRecord(item)) return false; if (ancestors.has(item)) return true; ancestors.add(item); try { for (const childKey of Object.keys(item)) { if (item === value && childKey === ownerListKey && Array.isArray(item[childKey])) { if (item[childKey].some(owner => typeof owner === 'string' ? hiddenIds.has(owner) : visit(owner, childKey))) return true; continue; } if (visit(item[childKey], childKey)) return true; } return false; } catch (_) { return true; } finally { ancestors.delete(item); } }; return visit(value); }
+// Rule F2, change 2: while a failed reading has closed the scope before any baseline is known ('failed-closed'),
+// or an explicit add is recovering from it ('recovering-explicit'), a stored project file the gate refuses is still
+// shown when its stored owner records tie it to one of the project's accepted Illustrator documents. It stands in
+// for the failed reading using stored records only; review rows are never covered.
+function createFailedReadingView(project, scope) {
+  if (!scope || (scope.status !== 'failed-closed' && scope.status !== 'recovering-explicit')) return null;
+  const projectFiles = Array.isArray(project.files) ? project.files : [];
+  return { projectFiles: new Set(projectFiles), acceptedDocuments: new Set(projectFiles.filter(file => isAcceptedIllustratorProjectFile(project, file))
+    .map(file => normalizeTrackedFilePath(file.path)).filter(Boolean)) };
+}
+function isShownWhileReadingsFail(failedReadingView, scope, file) {
+  if (!failedReadingView || !failedReadingView.projectFiles.has(file)) return false;
+  const filePath = normalizeTrackedFilePath(file?.path);
+  if (!filePath || scope.baselineDocumentPaths.has(filePath) || scope.excludedLinkedPaths.has(filePath)) return false;
+  if (typeof file.assetBaselineSourcePath === 'string') return false;
+  const owners = Array.isArray(file.dependencyOwners) ? file.dependencyOwners.filter(owner => typeof owner === 'string') : [];
+  const sourceDocument = typeof file.sourceDocumentPath === 'string' ? file.sourceDocumentPath : null;
+  if (!((owners.length > 0 && file.dependencyOwnersOverflow !== true) || sourceDocument)) return false;
+  return [...owners, ...(sourceDocument ? [sourceDocument] : [])].some(owner => failedReadingView.acceptedDocuments.has(normalizeTrackedFilePath(owner)));
+}
+// A retained shared Illustrator row: an accepted Illustrator row whose
+// recorded owners include a document this view hides and at least one
+// eligible visible owner (an accepted, allowed Illustrator project document).
+// Only that hidden owner entry is excused from hiding the row. The row's
+// displayed source label comes only from its eligible visible owners.
+const ILLUSTRATOR_SOURCE_NAME_FIELDS = ['sourceName', 'sourceDocumentName'];
+function createRetainedSharedIllustratorOwnerLookup(project, scope, hiddenPaths) {
+  const files = Array.isArray(project.files) ? project.files : [], rows = new Set(files), eligible = new Map();
+  let filesByPath = null;
+  const eligibleOwners = ownerPath => {
+    if (eligible.has(ownerPath)) return eligible.get(ownerPath);
+    if (!filesByPath) { filesByPath = new Map(); for (const file of files) { const key = normalizeTrackedFilePath(file?.path); if (key) filesByPath.set(key, [...(filesByPath.get(key) || []), file]); } }
+    const owners = (filesByPath.get(ownerPath) || []).filter(file => isAcceptedIllustratorProjectFile(project, file) && isIllustratorScopedFileAllowed(project, file));
+    eligible.set(ownerPath, owners);
+    return owners;
+  };
+  return row => {
+    if ((scope && scope.status !== 'ready') || !Array.isArray(row?.dependencyOwners) || row.dependencyOwnersOverflow === true ||
+        !rows.has(row) || getScopedFileAppFamily(project, row) !== 'illustrator') return [];
+    const rowPath = normalizeTrackedFilePath(row.path), ownerPaths = row.dependencyOwners
+      .map(owner => typeof owner === 'string' && path.isAbsolute(owner) ? normalizeTrackedFilePath(owner) : null);
+    if (!ownerPaths.some(ownerPath => ownerPath && hiddenPaths.has(ownerPath))) return [];
+    const owners = [];
+    for (const ownerPath of ownerPaths) {
+      if (!ownerPath || ownerPath === rowPath || hiddenPaths.has(ownerPath)) continue;
+      for (const file of eligibleOwners(ownerPath)) if (file !== row && !owners.includes(file)) owners.push(file);
+    }
+    return owners;
+  };
+}
+// The label depends only on stored rows and the scope (never on the ledger),
+// so an ordinary poll cannot change it or the package input signature.
+function getEligibleOwnerSourceLabel(row, owners) {
+  const names = [];
+  for (const owner of owners) {
+    const name = sanitizeRendererSourceName(owner?.name || path.basename(owner?.path || ''));
+    if (name && !names.some(existing => existing.toLowerCase() === name.toLowerCase())) names.push(name);
+  }
+  const evidenceKey = typeof row?.path === 'string' ? getLiveEvidenceKeyHash(normalizeTrackedFilePath(row.path)) : null;
+  return { allowed: new Set(names.map(name => name.toLowerCase())), evidenceKey, name: names[0] || null };
+}
+function keepEligibleOwnerSourceNames(record, allowed) {
+  if (!isRecord(record)) return;
+  for (const field of ILLUSTRATOR_SOURCE_NAME_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(record, field)) continue;
+    const name = sanitizeRendererSourceName(record[field]);
+    if (!name || !allowed.has(name.toLowerCase())) delete record[field];
+  }
+}
+function getIllustratorScopedProjectView(project) { if (!project) return project; const scope = getIllustratorActivationScope(project.id), hiddenPaths = new Set(scope ? [...scope.baselineDocumentPaths, ...scope.excludedLinkedPaths] : []), hiddenPendingPaths = new Set(), stalePendingFiles = new Set(), scopeAllowedPaths = new Set(); const failedReadingView = createFailedReadingView(project, scope); for (const file of [...(project.files || []), ...(project.pendingFiles || [])]) { const filePath = normalizeTrackedFilePath(file?.path); if ((project.pendingFiles || []).includes(file) && !isCurrentWatchSessionPendingFile(project, file)) { hiddenPaths.add(filePath); hiddenPendingPaths.add(filePath); stalePendingFiles.add(file); } else if (!isIllustratorScopedFileAllowed(project, file) && !isShownWhileReadingsFail(failedReadingView, scope, file)) hiddenPaths.add(filePath); else if (hiddenPaths.has(filePath) && !hiddenPendingPaths.has(filePath) && getScopedFileAppFamily(project, file) === 'illustrator') scopeAllowedPaths.add(filePath); } hiddenPaths.delete(null); if (!hiddenPaths.size) return project;
   const nodePaths = new Map(), ledgerPaths = new Map(); for (const hiddenPath of hiddenPaths) { nodePaths.set(createNodeId(NODE_TYPES.FILE, { normalizedPath: hiddenPath }), hiddenPath); const ledgerId = getLiveEvidenceKeyHash(hiddenPath); if (ledgerId) ledgerPaths.set(ledgerId, hiddenPath); } for (const [id, node] of Object.entries(project.provenance?.nodes || {})) { const nodePath = normalizeTrackedFilePath(node?.path || node?.normalizedPath); if (hiddenPaths.has(nodePath)) { nodePaths.set(id, nodePath); if (typeof node?.id === 'string') nodePaths.set(node.id, nodePath); } }
   const hiddenEntries = new WeakMap(), records = [], infos = [], infoByObject = new WeakMap(), markHidden = (parent, key) => { if (!parent) return false; let keys = hiddenEntries.get(parent); if (!keys) hiddenEntries.set(parent, keys = new Set()); const fresh = !keys.has(key); keys.add(key); return fresh; }, isHidden = (parent, key) => !!hiddenEntries.get(parent)?.has(key); let collected = 0; const collect = (value, parent, key, ancestors) => { if (!Array.isArray(value) && !isRecord(value)) return; if (++collected > 50000 || ancestors.has(value)) { markHidden(parent, key); return; } if (isScopedRecord(value)) records.push({ item: value, parent, key }); ancestors.add(value); try { for (const [childKey, child] of Object.entries(value)) { if (path.isAbsolute(childKey) && hiddenPaths.has(normalizeTrackedFilePath(childKey))) markHidden(value, childKey); else collect(child, value, childKey, ancestors); } } catch (_) { markHidden(parent, key); } finally { ancestors.delete(value); } }; for (const [key, value] of Object.entries(project)) collect(value, project, key, new Set());
-  for (const entry of records) { const families = getScopedRecordFamilies(entry.item); if ((project.files || []).includes(entry.item) || (project.pendingFiles || []).includes(entry.item)) { const family = getScopedFileAppFamily(project, entry.item); if (family) families.add(family); } const info = { families, primaryPath: scopedRecordPrimaryPath(entry.item, entry.key, nodePaths, ledgerPaths), authorized: false, entry }; infos.push(info); infoByObject.set(entry.item, info); } const allowedPaths = new Set(scopeAllowedPaths); for (const info of infos) if (!stalePendingFiles.has(info.entry.item) && hiddenPaths.has(info.primaryPath) && !info.families.has('illustrator') && (info.families.size || isExplicitUserCapturedFile(info.entry.item))) allowedPaths.add(info.primaryPath); for (const info of infos) info.authorized = !stalePendingFiles.has(info.entry.item) && allowedPaths.has(info.primaryPath) && ((scopeAllowedPaths.has(info.primaryPath) && info.families.size === 1 && info.families.has('illustrator')) || (!info.families.has('illustrator') && info.families.size > 0) || isExplicitUserCapturedFile(info.entry.item) || (info.entry.item.type === NODE_TYPES.FILE && info.families.size === 0));
-  const hiddenIds = new Set(); let changed = true; while (changed) { changed = false; for (const info of infos) { const { entry } = info; if (isHidden(entry.parent, entry.key)) continue; const identities = scopedRecordIdentities(entry), keyHidden = typeof entry.key === 'string' && (hiddenIds.has(entry.key) || (path.isAbsolute(entry.key) && hiddenPaths.has(normalizeTrackedFilePath(entry.key)))), deniedPrimary = hiddenPaths.has(info.primaryPath) && !info.authorized; if (!keyHidden && !deniedPrimary && !identities.some(id => hiddenIds.has(id)) && !scopedRecordReferencesHidden(entry.item, info, hiddenPaths, hiddenIds, nodePaths)) continue; changed = markHidden(entry.parent, entry.key) || changed; for (const id of [...identities, ...(entry.item.evidenceIds || [])]) if (typeof id === 'string' && !hiddenIds.has(id)) { hiddenIds.add(id); changed = true; } } }
-  const OMIT = Symbol('scoped-omit'); let filteredCount = 0; const filter = (value, parent = null, key = '', ancestors = new Set(), owner = null) => { if (parent && (isHidden(parent, key) || hiddenIds.has(key) || (path.isAbsolute(key) && hiddenPaths.has(normalizeTrackedFilePath(key))))) return OMIT; if (typeof value === 'string') { if (hiddenIds.has(value)) return OMIT; const nodePath = /NodeId$/i.test(key) ? nodePaths.get(value) : null, normalized = (path.isAbsolute(value) || /paths?$/i.test(key)) ? normalizeTrackedFilePath(value) : null, deniedPath = nodePath || (normalized && hiddenPaths.has(normalized) ? normalized : null); return deniedPath && !(owner?.authorized && owner.primaryPath === deniedPath) ? OMIT : value; } if (!Array.isArray(value) && !isRecord(value)) return value; if (++filteredCount > 50000 || ancestors.has(value)) return OMIT; const nextOwner = infoByObject.get(value) || owner, output = Array.isArray(value) ? [] : {}; ancestors.add(value); try { for (const [childKey, child] of Object.entries(value)) { const filtered = filter(child, value, childKey, ancestors, nextOwner); if (filtered !== OMIT) Array.isArray(output) ? output.push(filtered) : output[childKey] = filtered; } return output; } catch (_) { return OMIT; } finally { ancestors.delete(value); } }; const view = filter(project); return view === OMIT ? null : view; }
+  for (const entry of records) { const families = getScopedRecordFamilies(entry.item); if ((project.files || []).includes(entry.item) || (project.pendingFiles || []).includes(entry.item)) { const family = getScopedFileAppFamily(project, entry.item); if (family) families.add(family); } const info = { families, primaryPath: scopedRecordPrimaryPath(entry.item, entry.key, nodePaths, ledgerPaths), authorized: false, entry }; infos.push(info); infoByObject.set(entry.item, info); } const allowedPaths = new Set(scopeAllowedPaths); for (const info of infos) if (!stalePendingFiles.has(info.entry.item) && hiddenPaths.has(info.primaryPath) && !info.families.has('illustrator') && (info.families.size || isExplicitUserCapturedFile(info.entry.item))) allowedPaths.add(info.primaryPath); for (const info of infos) info.authorized = !stalePendingFiles.has(info.entry.item) && allowedPaths.has(info.primaryPath) && ((scopeAllowedPaths.has(info.primaryPath) && info.families.size === 1 && info.families.has('illustrator')) || (!info.families.has('illustrator') && info.families.size > 0) || isExplicitUserCapturedFile(info.entry.item) || (info.entry.item.type === NODE_TYPES.FILE && info.families.size === 0)); const retainingOwnersFor = createRetainedSharedIllustratorOwnerLookup(project, scope, hiddenPaths); for (const info of infos) info.retainingOwners = retainingOwnersFor(info.entry.item).map(file => infoByObject.get(file)).filter(Boolean); const hasVisibleRetainingOwner = info => info.retainingOwners.some(owner => !isHidden(owner.entry.parent, owner.entry.key));
+  const hiddenIds = new Set(); let changed = true; while (changed) { changed = false; for (const info of infos) { const { entry } = info; if (isHidden(entry.parent, entry.key)) continue; const identities = scopedRecordIdentities(entry), keyHidden = typeof entry.key === 'string' && (hiddenIds.has(entry.key) || (path.isAbsolute(entry.key) && hiddenPaths.has(normalizeTrackedFilePath(entry.key)))), deniedPrimary = hiddenPaths.has(info.primaryPath) && !info.authorized; if (!keyHidden && !deniedPrimary && !identities.some(id => hiddenIds.has(id)) && !scopedRecordReferencesHidden(entry.item, info, hiddenPaths, hiddenIds, nodePaths, hasVisibleRetainingOwner(info) ? 'dependencyOwners' : null)) continue; changed = markHidden(entry.parent, entry.key) || changed; for (const id of [...identities, ...(entry.item.evidenceIds || [])]) if (typeof id === 'string' && !hiddenIds.has(id)) { hiddenIds.add(id); changed = true; } } }
+  const retainedLabels = new Map(), retainedLedgerNames = new Map(); for (const info of infos) { if (isHidden(info.entry.parent, info.entry.key) || !hasVisibleRetainingOwner(info)) continue; const label = getEligibleOwnerSourceLabel(info.entry.item, info.retainingOwners.filter(owner => !isHidden(owner.entry.parent, owner.entry.key)).map(owner => owner.entry.item)); retainedLabels.set(info.entry.item, label); const candidate = label.evidenceKey && project.liveEvidenceLedger?.candidates?.[label.evidenceKey]; if (isRecord(candidate)) retainedLedgerNames.set(candidate, label.allowed); } const applyRetainedLabels = (value, output) => { const label = retainedLabels.get(value); if (label) { output.eligibleOwnerSourceLabel = { name: label.name }; keepEligibleOwnerSourceNames(output.captureEvidence, label.allowed); } const allowed = retainedLedgerNames.get(value); if (allowed) { keepEligibleOwnerSourceNames(output.latest, allowed); if (Array.isArray(output.observations)) for (const observation of output.observations) keepEligibleOwnerSourceNames(observation, allowed); } };
+  const OMIT = Symbol('scoped-omit'); let filteredCount = 0; const filter = (value, parent = null, key = '', ancestors = new Set(), owner = null) => { if (parent && (isHidden(parent, key) || hiddenIds.has(key) || (path.isAbsolute(key) && hiddenPaths.has(normalizeTrackedFilePath(key))))) return OMIT; if (typeof value === 'string') { if (hiddenIds.has(value)) return OMIT; const nodePath = /NodeId$/i.test(key) ? nodePaths.get(value) : null, normalized = (path.isAbsolute(value) || /paths?$/i.test(key)) ? normalizeTrackedFilePath(value) : null, deniedPath = nodePath || (normalized && hiddenPaths.has(normalized) ? normalized : null); return deniedPath && !(owner?.authorized && owner.primaryPath === deniedPath) ? OMIT : value; } if (!Array.isArray(value) && !isRecord(value)) return value; if (++filteredCount > 50000 || ancestors.has(value)) return OMIT; const nextOwner = infoByObject.get(value) || owner, output = Array.isArray(value) ? [] : {}; ancestors.add(value); try { for (const [childKey, child] of Object.entries(value)) { const filtered = filter(child, value, childKey, ancestors, nextOwner); if (filtered !== OMIT) Array.isArray(output) ? output.push(filtered) : output[childKey] = filtered; } if (!Array.isArray(output)) applyRetainedLabels(value, output); return output; } catch (_) { return OMIT; } finally { ancestors.delete(value); } }; const view = filter(project); return view === OMIT ? null : view; }
 function buildIllustratorSessionScope(project, activeState) {
   const trackedPaths = new Set();
   const trackedNames = new Set();
@@ -25370,6 +25515,7 @@ function getPackageSelectionInputSignature(project, reviewedSemantics = false) {
     illustratorScope: illustratorScope ? {
       revision: illustratorScope.revision,
       status: illustratorScope.status,
+      verificationIncomplete: isIllustratorPackageVerificationIncomplete(project, illustratorScope),
       baselineDocumentPaths: [...illustratorScope.baselineDocumentPaths].sort(),
       admittedDocumentPaths: [...illustratorScope.admittedDocumentPaths].sort(),
       allowedLinkedPaths: [...illustratorScope.allowedLinkedPaths].sort(),
@@ -25515,6 +25661,17 @@ async function buildCanonicalPackageReviewManifest(projectId) {
         entryStatuses: membership.blocked ? entryStatuses.map(() => 'unavailable') : entryStatuses,
         reviewedInputSignature, reviewedSettingsKey: packageSettingsKey,
         materializable: false,
+      };
+    }
+    if (isIllustratorPackageVerificationIncomplete(currentProject)) {
+      return {
+        project: currentProject,
+        files,
+        entries,
+        entryStatuses: entryStatuses.map(() => 'unavailable'),
+        reviewedInputSignature, reviewedSettingsKey: packageSettingsKey,
+        materializable: false,
+        packageMessage: ILLUSTRATOR_VERIFICATION_INCOMPLETE_PACKAGE_MESSAGE,
       };
     }
     // An asset whose earlier individual choice could not be carried to it.
@@ -28130,6 +28287,7 @@ registerTrustedIpcHandler('projects:delete', (event, id) => {
   packageScanDiagnosticState.delete(id);
   stopWatching(id);
   illustratorActivationScopes.delete(id);
+  illustratorVerificationIncompleteByProject.delete(id);
   figmaScopeRevisions.delete(id);
   pendingFigmaScopeUpdates.delete(id);
   figmaPollingRestartAfterScopeUpdate.delete(id);
@@ -28205,6 +28363,7 @@ registerTrustedIpcHandler('projects:delete-all', () => {
   inactivityNotified.clear();
   watchingActivationTokens.clear();
   illustratorActivationScopes.clear();
+  illustratorVerificationIncompleteByProject.clear();
   designAppRunningCache.clear(); // v2.4.2
   // v2.2.2: Clean up scan-on-open state
   scannedDesignFiles.clear();

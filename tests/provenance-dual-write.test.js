@@ -19873,11 +19873,12 @@ test('unrelated app and generic assets survive ready and failed Illustrator scop
       if (['.ai','.pdf'].includes(path.extname(filePath))) writeSyntheticAiFile(filePath, 'saved source');
       if (path.extname(filePath) === '.psd') fs.writeFileSync(filePath, actualPsd.writePsdBuffer({ width: 1, height: 1 }));
     }
+    let illustratorFailed = scopeState === 'failed';
     setChildProcessHandler(({ kind, command, args }) => {
       if (kind === 'execFile' && command === '/bin/ps' && JSON.stringify(args) === JSON.stringify(['axww','-o','pid=','-o','comm='])) return { stdout: '0 kernel_task\n1 /sbin/launchd\n432 /bin/ps\n', stderr: '' };
       if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '321\n' };
       if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
-        if (scopeState === 'failed') return { stdout: 'ERROR\tillustrator-query-failed\nCOMPLETE\t0\t0\n' };
+        if (illustratorFailed) return { stdout: 'ERROR\tillustrator-query-failed\nCOMPLETE\t0\t0\n' };
         return {
           stdout: [
             `DOC\t${baselineSource}\t${path.basename(baselineSource)}\tfalse\ttrue`,
@@ -19960,6 +19961,20 @@ test('unrelated app and generic assets survive ready and failed Illustrator scop
       assert.equal(decision.success, true, JSON.stringify({file:path.basename(filePath),decision,card}));
     }
 
+    if (scopeState === 'failed') {
+      const blockedReview = await callIpcRaw('projects:prepare-package-review', project.id);
+      assert.equal(blockedReview?.materializable, false);
+      assert.equal(blockedReview?.token, undefined);
+      assert.equal(blockedReview?.message, 'Working-source verification is unresolved. Review the files and try again.');
+      assert.deepEqual(
+        blockedReview.files.map(item => item.name).sort(),
+        [trustedAiAnchor, ...appPaths, ...genericPaths].map(file => path.basename(file)).sort()
+      );
+      illustratorFailed = false;
+      await metadataTestHooks.pollPsForProject(project.id, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+      await metadataTestHooks.waitForWatcherIdle(project.id);
+    }
+
     const packageResult = await callIpc('projects:package', project.id, outputDir);
     assertPackageResultShape(packageResult);
     assert.equal(packageResult.success, true);
@@ -20012,12 +20027,13 @@ for (const scopeState of ['ready', 'failed']) {
       if (['.ai','.pdf'].includes(path.extname(filePath))) writeSyntheticAiFile(filePath, 'saved source');
       if (path.extname(filePath) === '.psd') fs.writeFileSync(filePath, actualPsd.writePsdBuffer({ width: 1, height: 1 }));
     }
+    let illustratorFailed = scopeState === 'failed';
     setChildProcessHandler(({ kind, command, args }) => {
       if (kind === 'execFile' && command === '/bin/ps' && JSON.stringify(args) === JSON.stringify(['axww','-o','pid=','-o','comm='])) return { stdout: '0 kernel_task\n1 /sbin/launchd\n432 /bin/ps\n', stderr: '' };
       if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '321\n' };
       if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
         const rows = [
-          ...(scopeState === 'failed' ? ['ERROR\tillustrator-query-failed'] : []),
+          ...(illustratorFailed ? ['ERROR\tillustrator-query-failed'] : []),
           `DOC\t${sourcePath}\t${path.basename(sourcePath)}\tfalse\ttrue`,
           ...candidates.map(candidate => (
             `LINK\t${sourcePath}\t${path.basename(sourcePath)}\t${candidate.path}\tfalse\ttrue`
@@ -20090,6 +20106,21 @@ for (const scopeState of ['ready', 'failed']) {
       assert.equal(decision.success, true, JSON.stringify({file:path.basename(filePath),decision,card}));
     }
     await callIpc('projects:pause', project.id);
+    if (scopeState === 'failed') {
+      const blockedReview = await callIpcRaw('projects:prepare-package-review', project.id);
+      assert.equal(blockedReview?.materializable, false);
+      assert.equal(blockedReview?.token, undefined);
+      assert.equal(blockedReview?.message, 'Working-source verification is unresolved. Review the files and try again.');
+      assert.deepEqual(
+        blockedReview.files.map(item => item.name).sort(),
+        [anchorPath, ...candidates.map(item => item.path)].map(file => path.basename(file)).sort()
+      );
+      illustratorFailed = false;
+      await callIpc('projects:start-watching', project.id);
+      await metadataTestHooks.waitForWatcherIdle(project.id);
+      await callIpc('projects:pause', project.id);
+      clearTrackedTimers();
+    }
     const result = await callIpc('projects:package', project.id, outputDir);
     assert.equal(
       result && result.error,
@@ -26070,4 +26101,198 @@ test('Assets need save notice leaves stored rows unchanged and is independent of
   assert.equal(on.notices, 1, 'Existing Assets switch off does not block this notice');
   assert.equal(off.notices, 0);
   assert.deepEqual(on.rows, off.rows);
+});
+
+// A shared Illustrator link keeps its accepted owner across a normal re-Watch.
+// Session 1 records a second document (opened with unsaved edits, never
+// accepted) as an owner of the accepted link; after re-Watch that document is
+// out of the project, and it no longer takes the accepted owner's link with it.
+async function runSharedIllustratorOwnerSession(prefix, { acceptedDocLinksShared = true, extraAsset = false, otherLinksShared = true, acceptedDocName = null } = {}) {
+  resetTestHomeWorkspace();
+  storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+  const dir = path.join(TEST_HOME, 'Desktop', `${prefix}-work`);
+  fs.mkdirSync(dir, { recursive: true });
+  const aSource = path.join(dir, `${prefix}_Accepted.ai`);
+  const bSource = path.join(dir, `${prefix}_Other.ai`);
+  const sharedLink = path.join(dir, `${prefix}_Shared.png`);
+  const bOnlyLink = path.join(dir, `${prefix}_OtherOnly.png`);
+  const extra = path.join(dir, `${prefix}_Extra.png`);
+  const outputDir = path.join(TEST_HOME, 'Desktop', `${prefix}-package`);
+  for (const filePath of [sharedLink, bOnlyLink, extra]) fs.writeFileSync(filePath, `${path.basename(filePath)} bytes`);
+  writeSyntheticAiFile(aSource, 'accepted document');
+  writeSyntheticAiFile(bSource, 'other document');
+  fs.mkdirSync(outputDir, { recursive: true });
+  let mode = 'rows', rows = [];
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '654\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      if (mode === 'failed') return { stdout: 'ERROR\tillustrator-query-failed\nCOMPLETE\t0\t0\n' };
+      const docs = rows.filter(row => row.startsWith('DOC\t')).length, links = rows.filter(row => row.startsWith('LINK\t')).length;
+      return { stdout: [...(docs ? [] : ['STATUS\tno-documents']), ...rows, `COMPLETE\t${docs}\t${links}`].join('\n') + '\n' };
+    }
+    return { stdout: '' };
+  });
+  const docName = source => (source === aSource && acceptedDocName) || path.basename(source);
+  const doc = (source, modified) => `DOC\t${source}\t${docName(source)}\t${modified}\ttrue`;
+  const link = (source, linked, modified) => `LINK\t${source}\t${docName(source)}\t${linked}\t${modified}\ttrue`;
+  const aRows = [doc(aSource, false), ...(acceptedDocLinksShared ? [link(aSource, sharedLink, false)] : [])];
+  // Opened after activation with unsaved edits: staged pending, never accepted.
+  const bRows = [doc(bSource, true), ...(otherLinksShared ? [link(bSource, sharedLink, true)] : []), link(bSource, bOnlyLink, true)];
+
+  const project = await createProject(`${prefix} shared Illustrator owner`);
+  const poll = async () => { await runTrackedIntervalCallbacks(); await metadataTestHooks.waitForWatcherIdle(project.id); };
+  manualDialogFor(extraAsset ? [aSource, extra] : [aSource]);
+  await callIpc('projects:add-files', project.id);
+  rows = [...aRows, ...(acceptedDocLinksShared ? [] : bRows)];
+  await poll();
+  assert.ok((await getProject(project.id)).pendingFiles.some(file => file.path === sharedLink));
+  assert.ok(await callIpc('projects:accept-pending', project.id, sharedLink));
+  rows = [...aRows, ...bRows];
+  await poll();
+  const stored = () => storeInstance.get('projects', []).find(item => item.id === project.id);
+  const sharedRow = stored().files.find(file => file.path === sharedLink);
+  assert.deepEqual(sharedRow?.dependencyOwners, !otherLinksShared ? [aSource] : acceptedDocLinksShared ? [aSource, bSource] : [bSource]);
+  assert.equal(stored().files.some(file => file.path === bSource), false, 'the second document stays unaccepted');
+  return {
+    project, aSource, bSource, sharedLink, bOnlyLink, extra, outputDir, stored,
+    async reWatch(next) {
+      if (next === 'failed') mode = 'failed'; else { mode = 'rows'; rows = next; }
+      await callIpc('projects:pause', project.id);
+      await callIpc('projects:start-watching', project.id);
+      await poll();
+      return getProject(project.id);
+    },
+    bothOpen: [...aRows, ...bRows],
+  };
+}
+
+const sharedOwnerFileNames = files => files.map(file => path.basename(file.path)).sort();
+
+async function prepareSharedOwnerPackage(f) {
+  await callIpc('projects:pre-package-scan', f.project.id);
+  if ((await getProject(f.project.id)).assetBaseline?.status === 'decision-required') {
+    assert.equal((await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include')).success, true);
+  }
+}
+
+async function assertSharedLinkRetainedAfterReWatch(f, view) {
+  assert.deepEqual(sharedOwnerFileNames(view.files), [path.basename(f.aSource), path.basename(f.sharedLink)].sort());
+  assert.deepEqual(view.files.find(file => file.path === f.sharedLink).dependencyOwners, [f.aSource]);
+  const storedBefore = structuredClone(f.stored().files);
+  const ledgerKey = Object.keys(f.stored().liveEvidenceLedger?.candidates || {})
+    .find(key => f.stored().liveEvidenceLedger.candidates[key]?.latest?.candidateName === path.basename(f.sharedLink));
+  const ledgerBefore = structuredClone(f.stored().liveEvidenceLedger?.candidates?.[ledgerKey] ?? null);
+  assert.ok(ledgerBefore, 'the shared link has a stored evidence record');
+  assert.deepEqual(sharedOwnerFileNames(await callIpc('projects:get-files', f.project.id)), sharedOwnerFileNames(view.files));
+  const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+  await callIpc('projects:get-all');
+  assert.deepEqual(f.stored().liveEvidenceLedger.candidates[ledgerKey], ledgerBefore, 'view reads leave the stored evidence record unchanged');
+  const sharedRow = workspace.files.find(row => row.name === path.basename(f.sharedLink));
+  assert.equal(sharedRow?.sourceName, path.basename(f.aSource), 'the label comes from the accepted owner');
+  await prepareSharedOwnerPackage(f);
+  const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+  assert.equal(review.files.find(row => row.name === path.basename(f.sharedLink))?.sourceName, path.basename(f.aSource));
+  const result = await callIpc('projects:package', f.project.id, f.outputDir);
+  assert.equal(result.success, true, JSON.stringify(result));
+  assert.deepEqual(fs.readdirSync(result.folderPath).sort(), [path.basename(f.aSource), path.basename(f.sharedLink)].sort());
+  assert.deepEqual(fs.readFileSync(path.join(result.folderPath, path.basename(f.sharedLink))), fs.readFileSync(f.sharedLink));
+  const storedShared = f.stored().files.find(file => file.path === f.sharedLink);
+  assert.deepEqual(storedShared, storedBefore.find(file => file.path === f.sharedLink), 'reads and packaging leave the stored row unchanged');
+  assert.deepEqual(storedShared.dependencyOwners, [f.aSource, f.bSource]);
+  assert.equal(JSON.stringify(f.stored()).includes('eligibleOwnerSourceLabel'), false, 'the view-only label never reaches stored data');
+  assert.equal(JSON.stringify(storeInstance.data).includes('eligibleOwnerSourceLabel'), false);
+}
+
+test('shared Illustrator link keeps its accepted owner after re-Watch with the second document still open', async () => {
+  const f = await runSharedIllustratorOwnerSession('SharedOpen');
+  const view = await f.reWatch(f.bothOpen);
+  const scope = metadataTestHooks.getIllustratorActivationScopeSnapshot(f.project.id);
+  assert.equal(scope.status, 'ready');
+  assert.ok(scope.baselineDocumentPaths.includes(normalizeLedgerPathForTest(f.bSource)));
+  await assertSharedLinkRetainedAfterReWatch(f, view);
+});
+
+test('shared Illustrator link keeps its accepted owner after re-Watch with no documents open', async () => {
+  const f = await runSharedIllustratorOwnerSession('SharedClosed');
+  const view = await f.reWatch([]);
+  assert.equal(metadataTestHooks.getIllustratorActivationScopeSnapshot(f.project.id).status, 'ready');
+  await assertSharedLinkRetainedAfterReWatch(f, view);
+});
+
+test('shared Illustrator link owned only by a document outside the project stays hidden after re-Watch', async () => {
+  const f = await runSharedIllustratorOwnerSession('SharedHiddenOnly', { acceptedDocLinksShared: false, extraAsset: true });
+  const view = await f.reWatch(f.bothOpen);
+  assert.deepEqual(sharedOwnerFileNames(view.files), [path.basename(f.aSource), path.basename(f.extra)].sort());
+  assert.equal(f.stored().files.some(file => file.path === f.sharedLink), true, 'the stored row is kept, only hidden');
+});
+
+test('shared Illustrator link exclusion survives re-Watch and stays out of the package', async () => {
+  const f = await runSharedIllustratorOwnerSession('SharedExcluded', { extraAsset: true });
+  await callIpc('projects:remove-file', f.project.id, f.sharedLink);
+  const excludedKeys = [...(f.stored().excludedAssetKeys || [])];
+  assert.equal(excludedKeys.length, 1);
+  const view = await f.reWatch(f.bothOpen);
+  assert.deepEqual(sharedOwnerFileNames(view.files), [path.basename(f.aSource), path.basename(f.extra), path.basename(f.sharedLink)].sort());
+  const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+  assert.deepEqual(workspace.files.map(row => [row.name, row.excluded === true]).sort(), [
+    [path.basename(f.aSource), false], [path.basename(f.extra), false], [path.basename(f.sharedLink), true],
+  ].sort());
+  assert.deepEqual(f.stored().excludedAssetKeys, excludedKeys);
+  await prepareSharedOwnerPackage(f);
+  const result = await callIpc('projects:package', f.project.id, f.outputDir);
+  assert.equal(result.success, true, JSON.stringify(result));
+  assert.deepEqual(fs.readdirSync(result.folderPath).sort(), [path.basename(f.aSource), path.basename(f.extra)].sort());
+  assert.deepEqual(f.stored().excludedAssetKeys, excludedKeys);
+});
+
+test('excluding the accepted owner document gives the same package with or without a second owner', async () => {
+  const outcomes = [];
+  for (const otherLinksShared of [false, true]) {
+    const f = await runSharedIllustratorOwnerSession('SharedOwnerExcluded', { extraAsset: true, otherLinksShared });
+    await f.reWatch(f.bothOpen);
+    const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+    const owner = workspace.files.find(row => row.name === path.basename(f.aSource));
+    assert.ok(owner?.visualIdentity, JSON.stringify(workspace.files.map(row => row.name)));
+    const excluded = await callIpcRaw('projects:set-working-source-selection', f.project.id, owner.visualIdentity,
+      { action: 'exclude', expectedRevision: owner.selectionRevision });
+    assert.equal(excluded.success, true, JSON.stringify(excluded));
+    await prepareSharedOwnerPackage(f);
+    const rows = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files
+      .map(row => ({ name: row.name, excluded: row.excluded, included: row.included, sourceName: row.sourceName })).sort((x, y) => x.name.localeCompare(y.name));
+    const result = await callIpc('projects:package', f.project.id, f.outputDir);
+    assert.equal(result.success, true, JSON.stringify(result));
+    outcomes.push({ rows, packaged: fs.readdirSync(result.folderPath).sort() });
+  }
+  // The owner's exclusion applies; the individually accepted shared link keeps
+  // the outcome it has when only the accepted document records it.
+  assert.equal(outcomes[0].packaged.includes('SharedOwnerExcluded_Accepted.ai'), false);
+  assert.deepEqual(outcomes[1], outcomes[0]);
+});
+
+test('failed Illustrator reading at re-Watch keeps the shared link hidden as before', async () => {
+  const f = await runSharedIllustratorOwnerSession('SharedFailed');
+  const view = await f.reWatch('failed');
+  assert.equal(metadataTestHooks.getIllustratorActivationScopeSnapshot(f.project.id).status, 'failed-closed');
+  assert.deepEqual(sharedOwnerFileNames(view.files), [path.basename(f.aSource)]);
+});
+
+test('shared Illustrator link with only the accepted owner keeps its ordinary label', async () => {
+  const f = await runSharedIllustratorOwnerSession('SharedSingle', { otherLinksShared: false });
+  const view = await f.reWatch(f.bothOpen);
+  const shared = view.files.find(file => file.path === f.sharedLink);
+  assert.ok(shared);
+  assert.equal(Object.prototype.hasOwnProperty.call(shared, 'eligibleOwnerSourceLabel'), false, 'rows without a second owner are not relabelled');
+  const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+  assert.equal(workspace.files.find(row => row.name === path.basename(f.sharedLink))?.sourceName, path.basename(f.aSource));
+});
+
+test('shared Illustrator link label comes from the accepted owner file, not a reported document name', async () => {
+  const f = await runSharedIllustratorOwnerSession('SharedNamed', { acceptedDocName: 'Poster Draft' });
+  const view = await f.reWatch(f.bothOpen);
+  assert.deepEqual(sharedOwnerFileNames(view.files), [path.basename(f.aSource), path.basename(f.sharedLink)].sort());
+  const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+  assert.equal(workspace.files.find(row => row.name === path.basename(f.sharedLink))?.sourceName, path.basename(f.aSource));
+  await prepareSharedOwnerPackage(f);
+  const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+  assert.equal(review.files.find(row => row.name === path.basename(f.sharedLink))?.sourceName, path.basename(f.aSource));
 });
