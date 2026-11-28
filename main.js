@@ -17123,7 +17123,7 @@ async function extractLinkedAssetsRegex(filePath, options = {}) {
       }
     }
     const buf = suppliedBuffer || await fs.promises.readFile(filePath);
-    const content = buf.toString('utf8');
+    const content = extractLinkedAssetPaths.searchText(buf);
     return extractLinkedAssetPaths(content, filePath);
   } catch (e) {
     if (strict) throw e;
@@ -20950,7 +20950,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
               try {
                 if (!fs.existsSync(designFile.path)) continue;
                 const buf = fs.readFileSync(designFile.path);
-                const content = buf.toString('utf8');
+                const content = extractLinkedAssetPaths.searchText(buf);
                 let match;
                 LINKED_ASSET_REGEX_SNAPSHOT.lastIndex = 0;
                 while ((match = LINKED_ASSET_REGEX_SNAPSHOT.exec(content)) !== null) {
@@ -22795,10 +22795,10 @@ end if`;
           // transient uncached read without evicting or exceeding the 128 MiB cache.
           const transientBuf = await fs.promises.readFile(designFile.path);
           if (!operationCurrent()) return null;
-          content = transientBuf.toString('utf8');
+          content = extractLinkedAssetPaths.searchText(transientBuf);
         } else if (cachedFile && cachedFile.buf) {
           // Decode transiently so regex strings are never retained across files.
-          content = cachedFile.buf.toString('utf8');
+          content = extractLinkedAssetPaths.searchText(cachedFile.buf);
         } else {
           continue;
         }
