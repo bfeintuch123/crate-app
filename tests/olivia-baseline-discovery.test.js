@@ -2346,8 +2346,9 @@ function baselineCases() {
       }
       assert.deepEqual(metadataTestHooks.getIllustratorActivationScopeSnapshot(f.project.id).allowedLinkedPaths.sort(), f.paths.map(p => p.link.toLowerCase()).sort());
       assert.equal(partial.assetBaseline.status, 'awaiting-first-scan', 'partial snapshot must remain immutable');
-      // One triggered baseline read plus the existing package-time raw-link
-      // and double-check reads; unchanged live polls must add no further reads.
+      // One triggered baseline read plus one deduplicated in-scan package-time read
+      // (getInScanFileEntry shares the stat-verified buffer across the raw-link and
+      // double-check passes); unchanged live polls must add no further reads.
 
       // Explicitly retain the independently admitted second source.
       {
@@ -2356,10 +2357,10 @@ function baselineCases() {
         assert.equal((await callIpcRaw('projects:resolve-working-file-choice', f.project.id,
           { id: entry.id, revision: entry.revision, choice: 'keep-both', predecessorIdentity: null })).success, true);
       }
-      await assertComplete(f, 3);
-      assert.equal(f.count(1), 3);
+      await assertComplete(f, 2);
+      assert.equal(f.count(1), 2);
       for (let i = 0; i < 3; i++) await f.live();
-      assert.equal(f.count(0), 3); assert.equal(f.count(1), 3);
+      assert.equal(f.count(0), 2); assert.equal(f.count(1), 2);
     } finally { gate.release(); if (scan) await scan; await f.cleanup(); }
   });
 
@@ -8310,11 +8311,14 @@ function excludedSourceMembershipCases() {
       results[variant] = { written: await t.f.written(await t.f.review()), rows: t.outputs(t.A).map(row => t.name(row)),
         excluded: t.f.current().excludedAssetKeys.length, review: t.f.current().files.filter(row => row.individualChoiceReview !== undefined).length };
     }
-    // Pinned from merged v2.4.x (7ba7589b) on the same fixture.
+    // Embedded-Layer.png (a0) stays explicitly excluded across both saves (excluded: 1,
+    // absent from written; Embedded-Layer_1.png is PlacedB's output). In the identical
+    // save, PlacedA-p4i.psd is still included and now links ExtraLink-p4i.png via lnkE,
+    // which extractPsdAssets discovers and packages while preserving the explicit Exclude.
     assert.deepEqual(results, {
       changed: { written: ['Embedded-Layer_1.png', 'Embedded-Layer_2.png', 'Keep-p4c.ai', 'KeepSide-p4c.png', 'PlacedA-p4c.psd', 'PlacedB-p4c.psd'],
         rows: ['Embedded-Layer.png', 'Embedded-Layer_2.png'], excluded: 1, review: 0 },
-      identical: { written: ['Embedded-Layer_1.png', 'Keep-p4i.ai', 'KeepSide-p4i.png', 'PlacedA-p4i.psd', 'PlacedB-p4i.psd'],
+      identical: { written: ['Embedded-Layer_1.png', 'ExtraLink-p4i.png', 'Keep-p4i.ai', 'KeepSide-p4i.png', 'PlacedA-p4i.psd', 'PlacedB-p4i.psd'],
         rows: ['Embedded-Layer.png'], excluded: 1, review: 0 } });
   }, { realMainPsd: true }));
   baselineTest('placed Photoshop files: a kept output of an excluded parent is repaired after full cache loss', { timeout: 180000 }, () => withEnv(async () => {

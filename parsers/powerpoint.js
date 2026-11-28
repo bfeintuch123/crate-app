@@ -49,6 +49,11 @@ const {
   sanitizePackageFileName,
   writeFileIntoPackage,
 } = require('./package-safety');
+const {
+  computeCrc32,
+  isUnsupportedZipEntryError,
+  openZipArchive,
+} = require('./zip-reader');
 
 const execFileAsync = promisify(execFile);
 const PRESENTATION_ADMISSION_MESSAGE = 'This presentation contains too much embedded media for Crate to inspect safely.';
@@ -150,17 +155,231 @@ function getUniqueKeynoteWildcardFallback(zipPath, assets) {
   };
 }
 
-async function extractArchiveEntryData(archivePath, zipPath, ext, assets) {
+const UNZIP_GLOB_META_RE = /[*?[\]\\]/;
+const MAX_UNZIP_WILDCARD_CHECKS = 25_000;
+
+function findLastUnzipMetaIndex(pattern) {
+  for (let i = pattern.length - 1; i >= 0; i -= 1) {
+    const ch = pattern[i];
+    if (ch === '*' || ch === '?' || ch === '[' || ch === ']' || ch === '\\') return i;
+  }
+  return -1;
+}
+
+function countUnzipPatternMatches(entries, pattern, budget = null) {
+  if (typeof pattern !== 'string') return 0;
+  const firstMeta = pattern.search(UNZIP_GLOB_META_RE);
+  if (firstMeta < 0) {
+    let count = 0;
+    for (const entry of entries || []) {
+      if (entry && entry.path === pattern) {
+        count += 1;
+        if (count >= 2) return count;
+      }
+    }
+    return count;
+  }
+  // Provable superset of Info-ZIP /usr/bin/unzip matching across *, ?, [...],
+  // \], and byte-level ? matching over multi-byte UTF-8: any entry matched by
+  // unzip MUST start with the literal prefix before the first metacharacter and
+  // end with the literal suffix after the last metacharacter.
+  const lastMeta = findLastUnzipMetaIndex(pattern);
+  const prefix = pattern.slice(0, firstMeta);
+  const suffix = pattern.slice(lastMeta + 1);
+  const minLen = prefix.length + suffix.length;
+  let count = 0;
+  for (const entry of entries || []) {
+    if (budget) {
+      budget.checks += 1;
+      if (budget.checks > MAX_UNZIP_WILDCARD_CHECKS) {
+        throw admissionError(PRESENTATION_ADMISSION_MESSAGE);
+      }
+    }
+    const p = entry && entry.path;
+    if (typeof p !== 'string' || p.length < minLen) continue;
+    if (p.startsWith(prefix) && p.endsWith(suffix)) {
+      count += 1;
+      if (count >= 2) return count;
+    }
+  }
+  return count;
+}
+
+function buildListingPathIndex(entries) {
+  const counts = new Map();
+  const budget = { checks: 0 };
+  for (const entry of entries) {
+    if (!entry || typeof entry.path !== 'string') continue;
+    counts.set(entry.path, (counts.get(entry.path) || 0) + 1);
+  }
+  return {
+    entries,
+    counts,
+    budget,
+    hasAmbiguousPath(targetPath) {
+      if ((counts.get(targetPath) || 0) >= 2) return true;
+      if (typeof targetPath !== 'string' || !UNZIP_GLOB_META_RE.test(targetPath)) return false;
+      return countUnzipPatternMatches(entries, targetPath, budget) >= 2;
+    },
+  };
+}
+
+async function listArchiveEntriesWithUnzip(archivePath) {
   try {
-    const data = await readArchiveEntryData(archivePath, zipPath);
+    const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', archivePath], {
+      timeout: 10000,
+      maxBuffer: ADMISSION_LIMITS.archiveListingBufferBytes,
+      encoding: 'utf8',
+    });
+    const entries = parseArchiveListing(listing, { message: PRESENTATION_ADMISSION_MESSAGE });
+    return buildListingPathIndex(entries);
+  } catch (error) {
+    if (isChildProcessAdmissionError(error)) throw admissionError(PRESENTATION_ADMISSION_MESSAGE);
+    throw error;
+  }
+}
+
+async function extractArchiveEntryData(
+  archivePath,
+  zipPath,
+  ext,
+  assets,
+  archive = null,
+  fallbackListing = null,
+  archiveWildcardBudget = null
+) {
+  let expectedEntry = null;
+  if (archive) {
+    if (typeof archive.hasAmbiguousPath === 'function' && archive.hasAmbiguousPath(zipPath)) {
+      throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
+    }
+    const exactEntry = archive.findEntry(zipPath);
+    if (exactEntry) {
+      expectedEntry = exactEntry;
+      try {
+        const data = assertBufferWithinBudget(
+          archive.readEntry(exactEntry, {
+            maxOutputBytes: ADMISSION_LIMITS.presentationMediaEntryBytes,
+            message: PRESENTATION_ADMISSION_MESSAGE,
+          }),
+          ADMISSION_LIMITS.presentationMediaEntryBytes,
+          PRESENTATION_ADMISSION_MESSAGE
+        );
+        return { data, outputTail: ext === '.key' ? getKeynoteArchiveEntryOutputTail(zipPath) : null };
+      } catch (entryError) {
+        if (!isUnsupportedZipEntryError(entryError)) throw entryError;
+        // Fall through to /usr/bin/unzip only for unsupported ZIP compression methods.
+      }
+    } else if (ext === '.key') {
+      const fallback = getUniqueKeynoteWildcardFallback(zipPath, assets);
+      if (!fallback) {
+        throw Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
+      }
+      const archiveMatches = archive.entries.filter(entry => (
+        entry.path.startsWith('Data/')
+        && hasEmbeddedMediaExtension(entry.path)
+        && path.basename(entry.path).trim().endsWith(fallback.tail)
+      ));
+      if (archiveMatches.length !== 1) {
+        throw Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
+      }
+      if (typeof archive.hasAmbiguousPath === 'function' && archive.hasAmbiguousPath(archiveMatches[0].path)) {
+        throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
+      }
+      expectedEntry = archiveMatches[0];
+      try {
+        const data = assertBufferWithinBudget(
+          archive.readEntry(archiveMatches[0], {
+            maxOutputBytes: ADMISSION_LIMITS.presentationMediaEntryBytes,
+            message: PRESENTATION_ADMISSION_MESSAGE,
+          }),
+          ADMISSION_LIMITS.presentationMediaEntryBytes,
+          PRESENTATION_ADMISSION_MESSAGE
+        );
+        return { data, outputTail: getKeynoteArchiveEntryOutputTail(zipPath, fallback.tail) || fallback.tail };
+      } catch (entryError) {
+        if (!isUnsupportedZipEntryError(entryError)) throw entryError;
+      }
+    } else {
+      throw Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
+    }
+  } else if (fallbackListing) {
+    if (fallbackListing.hasAmbiguousPath(zipPath)) {
+      throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
+    }
+    const exactCount = fallbackListing.counts.get(zipPath) || 0;
+    let exactError = null;
+    if (exactCount === 1) {
+      try {
+        const data = await readArchiveEntryData(archivePath, zipPath);
+        return { data, outputTail: ext === '.key' ? getKeynoteArchiveEntryOutputTail(zipPath) : null };
+      } catch (err) {
+        if (
+          ext !== '.key'
+          || isParserAdmissionError(err)
+          || err?.code === 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME'
+        ) {
+          throw err;
+        }
+        exactError = err;
+      }
+    }
+    if (ext !== '.key') {
+      throw Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
+    }
+    const fallback = getUniqueKeynoteWildcardFallback(zipPath, assets);
+    if (!fallback) {
+      throw exactError || Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
+    }
+    const listingMatches = fallbackListing.entries.filter(entry => (
+      entry.path.startsWith('Data/')
+      && hasEmbeddedMediaExtension(entry.path)
+      && path.basename(entry.path).trim().endsWith(fallback.tail)
+    ));
+    if (listingMatches.length !== 1) {
+      throw exactError || Object.assign(new Error('zip_entry_not_found'), { code: 'CRATE_ZIP_ENTRY_NOT_FOUND' });
+    }
+    if (
+      fallbackListing.hasAmbiguousPath(listingMatches[0].path)
+      || countUnzipPatternMatches(fallbackListing.entries, fallback.wildcardPath, fallbackListing.budget) !== 1
+    ) {
+      throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
+    }
+    const data = await readArchiveEntryData(archivePath, fallback.wildcardPath);
+    return { data, outputTail: getKeynoteArchiveEntryOutputTail(zipPath, fallback.tail) || fallback.tail };
+  }
+
+  // Unsupported-compression fall-through from an open in-process archive must
+  // still ensure /usr/bin/unzip -p matches strictly one member and returns the
+  // exact admitted member's size and CRC-32.
+  const verifyExpectedEntry = data => {
+    if (expectedEntry && (data.length !== expectedEntry.size || computeCrc32(data) !== expectedEntry.crc32)) {
+      throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
+    }
+    return data;
+  };
+  if (archive && countUnzipPatternMatches(archive.entries, zipPath, archiveWildcardBudget) >= 2) {
+    throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
+  }
+  try {
+    const data = verifyExpectedEntry(await readArchiveEntryData(archivePath, zipPath));
     return { data, outputTail: ext === '.key' ? getKeynoteArchiveEntryOutputTail(zipPath) : null };
   } catch (exactError) {
-    if (ext !== '.key' || isParserAdmissionError(exactError)) throw exactError;
+    if (
+      ext !== '.key'
+      || isParserAdmissionError(exactError)
+      || exactError?.code === 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME'
+    ) {
+      throw exactError;
+    }
 
     const fallback = getUniqueKeynoteWildcardFallback(zipPath, assets);
     if (!fallback) throw exactError;
+    if (archive && countUnzipPatternMatches(archive.entries, fallback.wildcardPath, archiveWildcardBudget) !== 1) {
+      throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
+    }
 
-    const data = await readArchiveEntryData(archivePath, fallback.wildcardPath);
+    const data = verifyExpectedEntry(await readArchiveEntryData(archivePath, fallback.wildcardPath));
     return { data, outputTail: getKeynoteArchiveEntryOutputTail(zipPath, fallback.tail) || fallback.tail };
   }
 }
@@ -209,13 +428,24 @@ class PowerPointParser extends BaseParser {
       PRESENTATION_ADMISSION_MESSAGE
     );
 
+    let archive = null;
     try {
-      // List the ZIP contents
-      const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', filePath], {
-        timeout: 10000,
-        maxBuffer: ADMISSION_LIMITS.archiveListingBufferBytes,
-        encoding: 'utf8'
+      archive = openZipArchive(filePath, {
+        maxFileBytes: ADMISSION_LIMITS.archiveFileBytes,
+        maxEntries: ADMISSION_LIMITS.archiveEntries,
+        maxTotalBytes: ADMISSION_LIMITS.archiveUncompressedBytes,
+        message: PRESENTATION_ADMISSION_MESSAGE,
       });
+
+      let entries;
+      let fallbackListing = null;
+      if (archive) {
+        entries = archive.entries;
+      } else {
+        // Fallback for non-standard/legacy fixtures: list ZIP contents via /usr/bin/unzip
+        fallbackListing = await listArchiveEntriesWithUnzip(filePath);
+        entries = fallbackListing.entries;
+      }
 
       if (ext === '.pptx') {
         const source = readFileWithinBudget(filePath, ADMISSION_LIMITS.localParserFileBytes, PRESENTATION_ADMISSION_MESSAGE);
@@ -227,7 +457,6 @@ class PowerPointParser extends BaseParser {
           this.appendAsset(assets, { path: linkedPath, source: 'pptx-linked', exists }, PRESENTATION_ADMISSION_MESSAGE);
         }
       }
-      const entries = parseArchiveListing(listing, { message: PRESENTATION_ADMISSION_MESSAGE });
       for (const entry of entries) {
         const fileSize = entry.size;
         const zipPath = entry.path;
@@ -263,6 +492,17 @@ class PowerPointParser extends BaseParser {
           if (/-small(-\d{3,6})?\.[a-z]+$/i.test(entryName)) continue;
         }
 
+        const isAmbiguousPath = archive && typeof archive.hasAmbiguousPath === 'function'
+          ? archive.hasAmbiguousPath(zipPath)
+          : Boolean(fallbackListing && fallbackListing.hasAmbiguousPath(zipPath));
+        if (isAmbiguousPath) {
+          // Clear only embedded archive entries (preserve any validated pptx-linked entries)
+          for (let idx = assets.length - 1; idx >= 0; idx -= 1) {
+            if (assets[idx] && assets[idx].zipPath) assets.splice(idx, 1);
+          }
+          throw Object.assign(new Error('zip_ambiguous_entry_name'), { code: 'CRATE_ZIP_AMBIGUOUS_ENTRY_NAME' });
+        }
+
         this.appendAsset(assets, {
           path: path.basename(zipPath),  // Filename only (internal)
           source: sourceType,
@@ -293,6 +533,8 @@ class PowerPointParser extends BaseParser {
           console.warn('[PowerPointParser] Embedded inspection error callback skipped');
         }
       }
+    } finally {
+      if (archive) archive.close();
     }
 
     return this.deduplicateAssets(assets);
@@ -332,13 +574,42 @@ class PowerPointParser extends BaseParser {
     });
 
     const outputRoot = ensureSafePackageDirectory(destDir);
+    let archive = null;
 
     try {
+      archive = openZipArchive(archivePath, {
+        maxFileBytes: ADMISSION_LIMITS.archiveFileBytes,
+        maxEntries: ADMISSION_LIMITS.archiveEntries,
+        maxTotalBytes: ADMISSION_LIMITS.archiveUncompressedBytes,
+        message: PRESENTATION_ADMISSION_MESSAGE,
+      });
+
+      let fallbackListing = null;
+      let fallbackListingError = null;
+      const archiveWildcardBudget = { checks: 0 };
+      if (!archive && assets.some(asset => asset && asset.zipPath)) {
+        try {
+          fallbackListing = await listArchiveEntriesWithUnzip(archivePath);
+        } catch (listError) {
+          if (isParserAdmissionError(listError)) throw listError;
+          fallbackListingError = listError;
+        }
+      }
+
       for (const asset of assets) {
         if (!asset.zipPath) continue;
 
         try {
-          const { data, outputTail } = await extractArchiveEntryData(archivePath, asset.zipPath, ext, assets);
+          if (!archive && fallbackListingError) throw fallbackListingError;
+          const { data, outputTail } = await extractArchiveEntryData(
+            archivePath,
+            asset.zipPath,
+            ext,
+            assets,
+            archive,
+            fallbackListing,
+            archiveWildcardBudget
+          );
           extractedBytes += data.length;
           if (extractedBytes > ADMISSION_LIMITS.presentationMediaBytes) {
             throw admissionError(PRESENTATION_ADMISSION_MESSAGE);
@@ -391,6 +662,8 @@ class PowerPointParser extends BaseParser {
         removeCreatedPackageFiles(outputRoot, extracted.map(item => item.extractedPath));
       }
       throw error;
+    } finally {
+      if (archive) archive.close();
     }
 
     return extracted;

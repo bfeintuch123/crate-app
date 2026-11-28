@@ -83,7 +83,7 @@ function harness(t, options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-psd-transfer-'));
   const children = new Set();
   const finishes = [];
-  t.after(async () => { for (const child of children) child.kill(); await Promise.all(finishes.map(finish => finish())); fs.rmSync(root, { recursive: true, force: true }); });
+  t.after(async () => { await context.disposeAddFilesWorkerPool?.(); for (const child of children) child.kill(); await Promise.all(finishes.map(finish => finish())); fs.rmSync(root, { recursive: true, force: true }); });
   const events = [];
   const fsView = { ...fs, promises: { ...fs.promises, ...options.io } };
   // Output naming keeps font names font names, through the shipped font check.
@@ -159,6 +159,8 @@ test('Node advanced IPC: actual PSD parser, coordinator, stage bytes, digest and
   run.transaction.assertReady();
   run.transaction.accept({ files: assets.map(asset => ({ path: asset.filePath })) });
   await run.finish();
+  assert.equal(h.children.size, 1);
+  await h.context.disposeAddFilesWorkerPool();
   assert.equal(h.children.size, 0);
   assert.equal(fs.existsSync(assets[0].filePath), true);
 });

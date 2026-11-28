@@ -1,7 +1,8 @@
 'use strict';
 // The complete production routes against the real IPC/store harness, generated
 // binary files and modeled ps/lsof. Each case asserts the resulting rows first
-// and the absence of a large text decode last. Nothing here measures time.
+// and the absence of a large text decode last. Nothing here measures time: the
+// linked-path pair-search clock is frozen, so machine speed cannot change a route.
 const fs = require('node:fs'), path = require('node:path'), Module = require('node:module'), assert = require('./bounded-assert');
 const entry = path.join(__dirname, 'provenance-dual-write.test.js');
 let source = fs.readFileSync(entry, 'utf8');
@@ -75,9 +76,16 @@ function cases() {
     return [...project.files, ...(project.pendingFiles || [])].map(file => file.path).filter(file => file !== f.sourcePath).sort();
   };
 
-  // Records each text decode of 8 MB or more, whichever way it is asked for.
+  // The matcher main.js holds: its search-time bound reads an injectable clock.
+  const sharedMatcher = require(path.join(MAIN_UNDER_TEST_ROOT, 'parsers', 'linked-asset-matcher.js')).extractLinkedAssetPaths;
+  const realSearchText = sharedMatcher.searchText;
+
+  // Records each text decode of 8 MB or more, whichever way it is asked for,
+  // with the pair-search clock frozen for every search the route makes.
   async function watchLargeDecodes(run) {
     const large = [];
+    let frozenSearches = 0;
+    sharedMatcher.searchText = (buffer, options) => { frozenSearches++; return realSearchText(buffer, { ...options, now: () => 0 }); };
     Buffer.prototype.toString = function (...args) {
       const span = Math.min(args[2] ?? this.length, this.length) - (args[1] ?? 0);
       if (this.length >= LARGE_DECODE_BYTES || span >= LARGE_DECODE_BYTES) {
@@ -85,7 +93,11 @@ function cases() {
       }
       return realToString.apply(this, args);
     };
-    try { return { result: await run(), large }; } finally { Buffer.prototype.toString = realToString; }
+    try {
+      const result = await run();
+      assert.ok(frozenSearches > 0, 'the route searched through the frozen clock');
+      return { result, large };
+    } finally { Buffer.prototype.toString = realToString; sharedMatcher.searchText = realSearchText; }
   }
 
   function modelDesignAppWith(openPath) {
@@ -109,6 +121,42 @@ function cases() {
       assert.equal(result?.error, undefined);
       assert.deepEqual(linkedRows(f), f.links);
       assert.deepEqual(large, []);
+    });
+  }
+
+  // Over 300 MiB the pre-package pass reads the file transiently instead of
+  // through its cache, and the lazy double-check skips it. The stat reports that
+  // size for the 16 MB fixture; every read still returns the real bytes.
+  const TRANSIENT_FILE_BYTES = 320 * MB;
+  for (const ext of ['.ai', '.psd']) {
+    routeTest(`pre-package scan of a ${ext} over 300 MiB finds its links without decoding the file`, { timeout: 120000 }, async () => {
+      const f = await fixture(ext);
+      const realStat = fs.promises.stat;
+      let oversizedStats = 0, sourceReads = 0;
+      fs.promises.stat = async function (file, options, ...rest) {
+        const stats = await realStat.call(this, file, options, ...rest);
+        if (file !== f.sourcePath) return stats;
+        oversizedStats++;
+        const bigint = typeof stats.size === 'bigint';
+        return Object.assign(Object.create(Object.getPrototypeOf(stats)), stats, { size: bigint ? BigInt(TRANSIENT_FILE_BYTES) : TRANSIENT_FILE_BYTES });
+      };
+      fs.promises.readFile = async function (file, ...args) {
+        if (file === f.sourcePath) sourceReads++;
+        return realReadFile.call(this, file, ...args);
+      };
+      let outcome;
+      try {
+        outcome = await watchLargeDecodes(() => callIpcRaw('projects:pre-package-scan', f.id));
+      } finally { fs.promises.stat = realStat; fs.promises.readFile = realReadFile; }
+      assert.equal(outcome.result?.error, undefined);
+      assert.ok(oversizedStats > 0 && sourceReads > 0, 'the transient branch read the file');
+      const rows = linkedRows(f);
+      // Both grammars' links, including the row only the greedy search can produce.
+      for (const link of f.lazyLinks) assert.ok(rows.includes(link), `lazy-grammar link ${path.basename(link)}`);
+      assert.ok(rows.includes(f.links.find(link => !f.lazyLinks.includes(link))), 'greedy-only link');
+      assert.deepEqual(rows, f.links);
+      assert.ok(!rows.includes(f.missing));
+      assert.deepEqual(outcome.large, []);
     });
   }
 

@@ -254,6 +254,98 @@ function cleanOfficialElectronDistribution(context, version, snapshotPath) {
   });
 }
 
+function realDirectoryOrNull(directoryPath) {
+  try {
+    const metadata = fs.lstatSync(directoryPath);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory() ||
+        fs.realpathSync(directoryPath) !== directoryPath) {
+      throw new Error('Release native helper directory is invalid.');
+    }
+    return metadata;
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+// Compiles the committed Swift sources with the verifier's exact recipe and
+// writes only the fresh bytes to native/bin/crate-helper for extraResources.
+function stageNativeHelper(projectRoot, options = {}) {
+  const {
+    NATIVE_HELPER_SOURCE_DIR,
+    NATIVE_HELPER_SOURCE_FILES,
+    compileNativeHelper,
+  } = require('./verify-macos-release-app');
+  if (typeof projectRoot !== 'string' || !path.isAbsolute(projectRoot) ||
+      fs.realpathSync(projectRoot) !== projectRoot) {
+    throw new Error('Release native helper project root is invalid.');
+  }
+  const sourceDirectory = path.join(projectRoot, ...NATIVE_HELPER_SOURCE_DIR.split('/'));
+  if (!realDirectoryOrNull(sourceDirectory)) {
+    throw new Error('Release native helper sources are missing.');
+  }
+  const sourceNames = fs.readdirSync(sourceDirectory).sort();
+  const expectedNames = [...NATIVE_HELPER_SOURCE_FILES].sort();
+  if (sourceNames.length !== expectedNames.length ||
+      !sourceNames.every((name, index) => name === expectedNames[index])) {
+    throw new Error('Release native helper sources do not match the approved file set.');
+  }
+  const sourceBytesByName = {};
+  for (const name of NATIVE_HELPER_SOURCE_FILES) {
+    sourceBytesByName[name] = readStableReleaseFile(path.join(sourceDirectory, name));
+  }
+  const compile = options.compileNativeHelper || compileNativeHelper;
+  const compiled = compile(sourceBytesByName, { commandRunner: options.commandRunner });
+  if (!Buffer.isBuffer(compiled) || compiled.length === 0) {
+    throw new Error('Release native helper compilation failed.');
+  }
+  const compiledDigest = crypto.createHash('sha256').update(compiled).digest('hex');
+
+  const binDirectory = path.join(projectRoot, 'native', 'bin');
+  if (!realDirectoryOrNull(path.join(projectRoot, 'native'))) {
+    throw new Error('Release native helper directory is invalid.');
+  }
+  if (!realDirectoryOrNull(binDirectory)) {
+    fs.mkdirSync(binDirectory, { mode: 0o755 });
+    fs.chmodSync(binDirectory, 0o755);
+    if (!realDirectoryOrNull(binDirectory)) {
+      throw new Error('Release native helper directory is invalid.');
+    }
+  }
+  const outputPath = path.join(binDirectory, 'crate-helper');
+  let existing = null;
+  try {
+    existing = fs.lstatSync(outputPath);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  if (existing) {
+    if (existing.isSymbolicLink() || !existing.isFile()) {
+      throw new Error('Release native helper output is not a regular file.');
+    }
+    fs.unlinkSync(outputPath);
+  }
+  const descriptor = fs.openSync(
+    outputPath,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+    0o755
+  );
+  try {
+    fs.writeFileSync(descriptor, compiled);
+    // Set the exact packaged mode regardless of the caller's umask.
+    fs.fchmodSync(descriptor, 0o755);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  const written = readStableReleaseFile(outputPath);
+  const writtenMetadata = fs.lstatSync(outputPath);
+  if ((writtenMetadata.mode & 0o7777) !== 0o755 ||
+      crypto.createHash('sha256').update(written).digest('hex') !== compiledDigest) {
+    throw new Error('Release native helper output verification failed.');
+  }
+  return { path: outputPath, digest: compiledDigest, bytes: written.length };
+}
+
 async function runLocalRelease(argv, authenticated, projectRoot) {
   const snapshot = createElectronSnapshot(authenticated);
   try {
@@ -282,14 +374,16 @@ async function runLocalRelease(argv, authenticated, projectRoot) {
   }
 }
 
-function run(argv = process.argv.slice(2), env = process.env) {
+function run(argv = process.argv.slice(2), env = process.env, dependencies = {}) {
   if (!releaseArgsAreExact(argv)) {
     process.stderr.write(`${USAGE}\n`);
     return 2;
   }
   authenticateReleaseProcess(env);
+  const projectRoot = fs.realpathSync(path.join(__dirname, '..'));
+  // Stage the freshly compiled helper before any Builder route can copy extraResources.
+  (dependencies.stageNativeHelper || stageNativeHelper)(projectRoot);
   if (Object.hasOwn(env, 'CRATE_RELEASE_ELECTRON_ARCHIVE')) {
-    const projectRoot = fs.realpathSync(path.join(__dirname, '..'));
     if (fs.realpathSync(process.cwd()) !== projectRoot) {
       throw new Error('Release Electron archive requires the canonical project directory.');
     }
@@ -324,4 +418,5 @@ module.exports = {
   releaseArgsAreExact,
   run,
   sha256,
+  stageNativeHelper,
 };

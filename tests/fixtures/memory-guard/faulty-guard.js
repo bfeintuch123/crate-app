@@ -31,6 +31,10 @@
 //                                                  1100 ms on (900 ms with CRATE_GUARD_LATE=early-gone) and from then on shows it
 //                                                  as CRATE_GUARD_LATE says: gone (not listed), ended (a zombie), readable (as it
 //                                                  is), early-gone (not listed)
+//   CRATE_GUARD_FAULT=exiting-stepped:<role>       once the tree is up, that process reads as exiting. The guard's clock stands
+//                                                  still at the first scan that shows it so, and at each later scan is that
+//                                                  many milliseconds past it, as CRATE_GUARD_ELAPSED lists them (comma
+//                                                  separated); after the last, it stays there
 //   CRATE_GUARD_FAULT=exiting-at-exit:<role>       once the tree is up, that process reads as exiting and the guard's clock
 //                                                  stands still, through the first scan that no longer lists the test runner
 //                                                  (the one the guard sees the end of the run in). Then, by CRATE_GUARD_POST:
@@ -93,8 +97,14 @@ let exitingScans = 0;
 let inflated = false;
 let stalling = false;
 // The guard's clock for exiting allowances, which these faults may stop and set.
+// It stops at a whole number: the guard subtracts one reading from another and
+// rounds the result up, and with a fractional start (start + 1100) - start can
+// come out a hair above 1100.
 let fixed = null;
+const stopClock = () => { fixed = Math.floor(performance.now()); };
 const clock = () => (fixed === null ? performance.now() : fixed);
+let steppedScans = 0;
+let steppedFrom = null;
 let lateScans = 0;
 let toolScans = 0;
 let afterExit = 0;
@@ -153,11 +163,25 @@ function misread(rows) {
     const how = process.env.CRATE_GUARD_LATE;
     lateScans += 1;
     if (lateScans === 1) {
-      fixed = performance.now();
+      stopClock();
       return rows.map(row => (row.pid === target ? exitingRow(row) : row));
     }
     if (lateScans === 2) fixed += how === 'early-gone' ? 900 : 1100;
     return how === 'early-gone' ? rows.filter(row => row.pid !== target) : shownAs(rows, target);
+  }
+  if (kind === 'exiting-stepped') {
+    if (!recorded().has('ready')) return rows;
+    const target = recorded().get(role);
+    if (!rows.some(row => row.pid === target)) return rows;
+    if (steppedFrom === null) {
+      stopClock();
+      steppedFrom = fixed;
+    } else {
+      const elapsed = process.env.CRATE_GUARD_ELAPSED.split(',').map(Number);
+      fixed = steppedFrom + elapsed[Math.min(steppedScans, elapsed.length - 1)];
+      steppedScans += 1;
+    }
+    return rows.map(row => (row.pid === target ? exitingRow(row) : row));
   }
   if (kind === 'tool-exiting') {
     if (!recorded().has('ready')) return rows;
@@ -262,7 +286,7 @@ async function atExit(number, rows) {
       return rows;
     }
     if (!rows.some(row => row.pid === target)) return rows;
-    if (fixed === null) fixed = performance.now();
+    if (fixed === null) stopClock();
     if (!runnerRunning) {
       afterExit = 1;
       if (how === 'timeout') {

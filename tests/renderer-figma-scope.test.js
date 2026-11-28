@@ -5444,7 +5444,7 @@ test('renderer shows no guessed Package Review inventory when the asset workspac
 
   assert.equal(await renderer.showPackageModal({ runPreScan: false }), false);
   assert.equal(elements['modal-file-list'].children.length, 0);
-  assert.equal(elements['package-review-total'].textContent, '0 visual assets');
+  assert.equal(elements['package-review-total'].textContent, 'Visual assets unavailable');
   assert.equal(elements['btn-confirm-package'].disabled, true);
   assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
   const reviewText = getElementTreeText(elements['modal-package']);

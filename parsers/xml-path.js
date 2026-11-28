@@ -36,4 +36,47 @@ function fileUriToPath(value) {
   return decoded;
 }
 
-module.exports = { decodeXMLPath, fileUriToPath };
+// Normalizes a Photoshop linked-file fullPath descriptor value into an absolute
+// POSIX path. Pure string handling: no filesystem access.
+//
+// Native Adobe Photoshop CC writes macOS external links (`lnkE` / `liFE`) with
+// NUL-terminated UTF-16BE strings like `file:////Users/name/My Folder/a.jpg`
+// (four slashes and literal spaces), and may also emit `file:///...`,
+// `file://localhost/...`, `file:/...`, or plain `/Users/...`.
+// Rejects remote host authorities (e.g. `file://server/share`) and control chars.
+function normalizePsdExternalPath(value) {
+  if (typeof value !== 'string') return '';
+  // Strip only trailing NUL padding written by Photoshop's UTF-16BE descriptors.
+  // Never trim whitespace or invisible characters (e.g. trailing spaces or U+200B),
+  // which are valid literal macOS filename characters.
+  const trimmed = value.replace(/\0+$/u, '');
+  if (!trimmed || /[\x00-\x1f]/u.test(trimmed)) return '';
+  if (trimmed.slice(0, 5).toLowerCase() === 'file:') {
+    let rest = trimmed.slice(5);
+    let hasEmptyAuthority = false;
+    if (rest.startsWith('//')) {
+      const pathStart = rest.indexOf('/', 2);
+      if (pathStart === -1) return '';
+      const host = rest.slice(2, pathStart);
+      if (host !== '' && host.toLowerCase() !== 'localhost') return '';
+      hasEmptyAuthority = host === '';
+      rest = rest.slice(pathStart);
+    }
+    if (!rest.startsWith('/')) return '';
+    // Native macOS Photoshop CC emits four-slash `file:////Users/...` (empty
+    // authority + double leading slash). Collapse only that exact form before
+    // percent-decoding so `file:/%2F...` and `file://///...` stay rejected.
+    if (hasEmptyAuthority && rest.startsWith('//') && !rest.startsWith('///')) {
+      rest = rest.slice(1);
+    }
+    let decoded = rest;
+    try { decoded = decodeURIComponent(rest); } catch (_) {}
+    if (decoded.length < 2 || decoded[0] !== '/' || decoded[1] === '/' || /[\x00-\x1f]/u.test(decoded)) {
+      return '';
+    }
+    return decoded;
+  }
+  return trimmed.startsWith('/') && trimmed[1] !== '/' && trimmed.length > 1 ? trimmed : '';
+}
+
+module.exports = { decodeXMLPath, fileUriToPath, normalizePsdExternalPath };

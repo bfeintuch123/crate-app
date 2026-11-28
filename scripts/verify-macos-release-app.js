@@ -11,6 +11,8 @@ const packageJson = require('../package.json');
 const afterPack = require('./patch-helper-info-plists');
 const {
   RUNTIME_PARSER_FILES,
+  hasThinArm64ExecuteHeader,
+  inspectNativeHelperResource,
   resolveAsarPath,
   verifyPackagedAppContents,
 } = require('./verify-app-contents');
@@ -189,6 +191,38 @@ const EXTERNAL_SOURCE_BOUND_ENTRIES = Object.freeze([
     source: 'assets/icon.icns',
   }),
 ]);
+const NATIVE_HELPER_SOURCE_DIR = 'native/crate-helper';
+const NATIVE_HELPER_SOURCE_FILES = Object.freeze([
+  'main.swift',
+  'PsdParser.swift',
+  'PdfAiParser.swift',
+  'PackageOps.swift',
+  'WatchOps.swift',
+]);
+// Must stay token-for-token identical to scripts/build-native-helper.sh.
+const NATIVE_HELPER_SWIFTC_ARGS = Object.freeze([
+  '-O',
+  '-whole-module-optimization',
+  '-parse-as-library',
+  '-target',
+  'arm64-apple-macosx14.0',
+  '-lz',
+  '-framework',
+  'Foundation',
+  '-framework',
+  'CryptoKit',
+]);
+const NATIVE_HELPER_IDENTIFIER = 'crate-helper';
+
+function nativeHelperDeveloperIdRequirement(teamIdentifier) {
+  if (!/^[A-Z0-9]{10}$/u.test(String(teamIdentifier || ''))) return null;
+  return `identifier "${NATIVE_HELPER_IDENTIFIER}" and anchor apple generic and ` +
+    'certificate 1[field.1.2.840.113635.100.6.2.6] exists and ' +
+    'certificate leaf[field.1.2.840.113635.100.6.1.13] exists and ' +
+    `certificate leaf[subject.OU] = "${teamIdentifier}"`;
+}
+
+const EXPECTED_NATIVE_HELPER_REQUIREMENT = nativeHelperDeveloperIdRequirement(PUBLIC_TEAM_ID);
 const SOURCE_BOUND_ENTRY_COUNT = SOURCE_BOUND_ENTRIES.length +
   EXTERNAL_SOURCE_BOUND_ENTRIES.length;
 const EXPECTED_PACKAGED_MANIFEST_KEYS = Object.freeze([
@@ -801,6 +835,7 @@ function collectPolicyFailures(evidence, options = {}) {
   if (!evidence.bundleLayout || evidence.bundleLayout.valid !== true) {
     failures.push('Final app bundle layout contains unapproved content.');
   }
+  failures.push(...nativeHelperPolicyFailures(evidence.nativeHelper, expectedTeamId));
   const electronRuntime = evidence.electronRuntime || {};
   if (electronRuntime.valid !== true || electronRuntime.archiveVerified !== true ||
       electronRuntime.payloadMatches !== true ||
@@ -836,6 +871,25 @@ function collectPolicyFailures(evidence, options = {}) {
     }
   }
 
+  return failures;
+}
+
+function nativeHelperPolicyFailures(nativeHelper, expectedTeamId) {
+  const helper = isPlainObject(nativeHelper) ? nativeHelper : {};
+  const failures = [];
+  if (helper.resourceValid !== true) {
+    failures.push('Bundled native helper is missing or not approved.');
+  }
+  if (!hasApprovedNestedSignature(helper.signature, NATIVE_HELPER_IDENTIFIER, expectedTeamId) ||
+      helper.strictRequirementValid !== true) {
+    failures.push('Bundled native helper signature policy changed.');
+  }
+  if (!hasExactTrueKeys(helper.entitlements, EXPECTED_HELPER_ENTITLEMENTS)) {
+    failures.push('Bundled native helper entitlements do not match the approved policy.');
+  }
+  if (helper.sourceBound !== true) {
+    failures.push('Bundled native helper does not match the committed Swift sources.');
+  }
   return failures;
 }
 
@@ -893,6 +947,9 @@ function buildPrivacySafeProof(evidence, failures, options = {}) {
         ? 'pass'
         : 'fail',
       electronRuntime: electronRuntime.valid === true ? 'pass' : 'fail',
+      nativeHelper: nativeHelperPolicyFailures(evidence.nativeHelper, expectedTeamId).length === 0
+        ? 'pass'
+        : 'fail',
       sourceRevision: notarization.required === true
         ? (sourceBinding.releaseSourceClean === true &&
           sourceBinding.revision === options.expectedRevision ? 'pass' : 'fail')
@@ -1212,13 +1269,16 @@ function inspectBundleLayout(appPath, executableName) {
       'app.asar',
       'app.asar.unpacked',
       'icon.icns',
+      'native',
     ]);
     for (const entry of resourceEntries) {
       const entryPath = path.join(resourcesPath, entry.name);
       const metadata = fs.lstatSync(entryPath);
       if (metadata.isSymbolicLink()) return { valid: false };
       if (requiredResources.has(entry.name)) {
-        const expectedType = entry.name === 'app.asar.unpacked' ? 'directory' : 'file';
+        const expectedType = entry.name === 'app.asar.unpacked' || entry.name === 'native'
+          ? 'directory'
+          : 'file';
         if ((expectedType === 'directory' && !metadata.isDirectory()) ||
             (expectedType === 'file' && !metadata.isFile())) {
           return { valid: false };
@@ -1228,6 +1288,9 @@ function inspectBundleLayout(appPath, executableName) {
           if (!metadataBytes || !metadataBytes.equals(EXPECTED_APP_UPDATE_METADATA)) {
             return { valid: false };
           }
+        }
+        if (entry.name === 'native' && inspectNativeHelperResource(resourcesPath).valid !== true) {
+          return { valid: false };
         }
         requiredResources.delete(entry.name);
         continue;
@@ -2839,12 +2902,287 @@ function collectPackagedDependencyFiles(asar, asarPath) {
   return { valid: files.size > 0, files, integrityBlockSizes };
 }
 
+const MACHO_64_MAGIC_LE = 0xfeedfacf;
+const MACHO_CPU_TYPE_ARM64 = 0x0100000c;
+const MACHO_ALLOWED_FILETYPES = new Set([2, 6, 8]); // MH_EXECUTE, MH_DYLIB, MH_BUNDLE
+const MACHO_ZEROFILL_SECTION_TYPES = new Set([0x01, 0x0c, 0x12]); // S_ZEROFILL, S_GB_ZEROFILL, S_THREAD_LOCAL_ZEROFILL
+const MACHO_LINKEDIT_DATA_COMMANDS = new Set([
+  0x1e, // LC_SEGMENT_SPLIT_INFO
+  0x26, // LC_FUNCTION_STARTS
+  0x29, // LC_DATA_IN_CODE
+  0x2b, // LC_DYLIB_CODE_SIGN_DRS
+  0x2e, // LC_LINKER_OPTIMIZATION_HINT
+  0x36, // LC_ATOM_INFO
+  0x80000033, // LC_DYLD_EXPORTS_TRIE
+  0x80000034, // LC_DYLD_CHAINED_FIXUPS
+]);
+const MACHO_INLINE_MIN_SIZES = new Map([
+  [0x0c, 24], // LC_LOAD_DYLIB
+  [0x0d, 24], // LC_ID_DYLIB
+  [0x0e, 12], // LC_LOAD_DYLINKER
+  [0x1b, 24], // LC_UUID
+  [0x20, 24], // LC_LAZY_LOAD_DYLIB
+  [0x24, 16], // LC_VERSION_MIN_MACOSX
+  [0x27, 12], // LC_DYLD_ENVIRONMENT
+  [0x2a, 16], // LC_SOURCE_VERSION
+  [0x32, 24], // LC_BUILD_VERSION
+  [0x80000018, 24], // LC_LOAD_WEAK_DYLIB
+  [0x8000001c, 12], // LC_RPATH
+  [0x8000001f, 24], // LC_REEXPORT_DYLIB
+  [0x80000023, 24], // LC_LOAD_UPWARD_DYLIB
+  [0x80000028, 24], // LC_MAIN
+]);
+const MACHO_DYSYMTAB_RANGES = [
+  [32, 36, 8], // tocoff, ntoc (dylib_table_of_contents)
+  [40, 44, 56], // modtaboff, nmodtab (dylib_module_64)
+  [48, 52, 4], // extrefsymoff, nextrefsyms (dylib_reference)
+  [56, 60, 4], // indirectsymoff, nindirectsyms (uint32)
+  [64, 68, 8], // extreloff, nextrel (relocation_info)
+  [72, 76, 8], // locreloff, nlocrel (relocation_info)
+];
+const MACHO_DYLD_INFO_RANGES = [
+  [8, 12], // rebase
+  [16, 20], // bind
+  [24, 28], // weak_bind
+  [32, 36], // lazy_bind
+  [40, 44], // export
+];
+
+function readSafeUInt64LE(bytes, offset) {
+  const value = bytes.readBigUInt64LE(offset);
+  if (value > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  return Number(value);
+}
+
+function safeRangeEnd(start, length) {
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(length) || start < 0 || length < 0) {
+    return null;
+  }
+  const end = start + length;
+  return Number.isSafeInteger(end) && end >= start ? end : null;
+}
+
+function readSingleCodeSignatureHeader(bytes) {
+  if (!Buffer.isBuffer(bytes) || bytes.length < 32) return null;
+  const magic = bytes.readUInt32LE(0);
+  const cputype = bytes.readUInt32LE(4);
+  const filetype = bytes.readUInt32LE(12);
+  const ncmds = bytes.readUInt32LE(16);
+  const sizeofcmds = bytes.readUInt32LE(20);
+  if (magic !== MACHO_64_MAGIC_LE ||
+      cputype !== MACHO_CPU_TYPE_ARM64 ||
+      !MACHO_ALLOWED_FILETYPES.has(filetype) ||
+      ncmds < 1 ||
+      sizeofcmds < 8) {
+    return null;
+  }
+  const cmdsEnd = safeRangeEnd(32, sizeofcmds);
+  if (cmdsEnd === null || cmdsEnd > bytes.length) return null;
+
+  let offset = 32;
+  let codeSig = null;
+  for (let index = 0; index < ncmds; index += 1) {
+    if (offset + 8 > cmdsEnd) return null;
+    const cmd = bytes.readUInt32LE(offset);
+    const cmdsize = bytes.readUInt32LE(offset + 4);
+    if (cmdsize < 8 || (cmdsize % 8) !== 0 || offset + cmdsize > cmdsEnd) return null;
+    if (cmd === 0x1d) {
+      if (codeSig !== null || cmdsize < 16) return null;
+      const dataoff = bytes.readUInt32LE(offset + 8);
+      const datasize = bytes.readUInt32LE(offset + 12);
+      const sigEnd = safeRangeEnd(dataoff, datasize);
+      if (dataoff <= 0 || (dataoff % 16) !== 0 || sigEnd === null || sigEnd > bytes.length) {
+        return null;
+      }
+      codeSig = { dataoff, datasize };
+    }
+    offset += cmdsize;
+  }
+  if (offset !== cmdsEnd || codeSig === null) return null;
+  return { filetype, codeSig };
+}
+
+// Normalizes the 1..15 zero bytes of 16-byte LC_CODE_SIGNATURE alignment padding
+// that older macOS codesign --remove-signature (e.g. macOS 15) leaves at the end
+// of __LINKEDIT, matching newer macOS codesign output so /usr/bin/strip -S can
+// canonicalize the binary without weakening any signing or tamper checks.
+function trimRemovedSignaturePadding(originalBytes, removedBytes) {
+  if (!Buffer.isBuffer(originalBytes) || !Buffer.isBuffer(removedBytes)) return removedBytes;
+  const original = readSingleCodeSignatureHeader(originalBytes);
+  if (!original || removedBytes.length !== original.codeSig.dataoff || removedBytes.length < 32) {
+    return removedBytes;
+  }
+
+  const magic = removedBytes.readUInt32LE(0);
+  const cputype = removedBytes.readUInt32LE(4);
+  const filetype = removedBytes.readUInt32LE(12);
+  const ncmds = removedBytes.readUInt32LE(16);
+  const sizeofcmds = removedBytes.readUInt32LE(20);
+  if (magic !== MACHO_64_MAGIC_LE ||
+      cputype !== MACHO_CPU_TYPE_ARM64 ||
+      filetype !== original.filetype ||
+      ncmds < 1 ||
+      sizeofcmds < 8) {
+    return removedBytes;
+  }
+  const cmdsEnd = safeRangeEnd(32, sizeofcmds);
+  if (cmdsEnd === null || cmdsEnd > removedBytes.length) return removedBytes;
+
+  let offset = 32;
+  let linkedit = null;
+  let symtab = null;
+  let seenDysymtab = false;
+  let seenDyldInfo = false;
+  const seenLinkeditData = new Set();
+  const otherSegments = [];
+  const linkeditRanges = [];
+  const linkeditZeroOffsets = [];
+
+  for (let index = 0; index < ncmds; index += 1) {
+    if (offset + 8 > cmdsEnd) return removedBytes;
+    const cmd = removedBytes.readUInt32LE(offset);
+    const cmdsize = removedBytes.readUInt32LE(offset + 4);
+    if (cmdsize < 8 || (cmdsize % 8) !== 0 || offset + cmdsize > cmdsEnd) return removedBytes;
+
+    if (cmd === 0x19) {
+      if (cmdsize < 72) return removedBytes;
+      const segname = removedBytes.subarray(offset + 8, offset + 24).toString('latin1').replace(/\0+$/u, '');
+      const vmsize = readSafeUInt64LE(removedBytes, offset + 32);
+      const fileoff = readSafeUInt64LE(removedBytes, offset + 40);
+      const filesize = readSafeUInt64LE(removedBytes, offset + 48);
+      const nsects = removedBytes.readUInt32LE(offset + 64);
+      const segEnd = safeRangeEnd(fileoff, filesize);
+      if (vmsize === null || segEnd === null || segEnd > removedBytes.length || 72 + nsects * 80 !== cmdsize) {
+        return removedBytes;
+      }
+      if (segname === '__LINKEDIT') {
+        if (linkedit !== null ||
+            nsects !== 0 ||
+            filesize > vmsize ||
+            fileoff < cmdsEnd ||
+            segEnd !== removedBytes.length) {
+          return removedBytes;
+        }
+        linkedit = { cmdOffset: offset, fileoff, filesize, vmsize, end: segEnd };
+      } else {
+        otherSegments.push({ fileoff, end: segEnd });
+        for (let sectionIndex = 0; sectionIndex < nsects; sectionIndex += 1) {
+          const secOff = offset + 72 + sectionIndex * 80;
+          const secSize = readSafeUInt64LE(removedBytes, secOff + 40);
+          const secFileOff = removedBytes.readUInt32LE(secOff + 48);
+          const reloff = removedBytes.readUInt32LE(secOff + 56);
+          const nreloc = removedBytes.readUInt32LE(secOff + 60);
+          const secType = removedBytes.readUInt32LE(secOff + 64) & 0xff;
+          if (secSize === null || reloff !== 0 || nreloc !== 0) return removedBytes;
+          if (!MACHO_ZEROFILL_SECTION_TYPES.has(secType) && secSize > 0) {
+            const secEnd = safeRangeEnd(secFileOff, secSize);
+            if (secEnd === null || secFileOff < fileoff || secEnd > segEnd) return removedBytes;
+          }
+        }
+      }
+    } else if (cmd === 0x02) {
+      if (symtab !== null || cmdsize < 24) return removedBytes;
+      const symoff = removedBytes.readUInt32LE(offset + 8);
+      const nsyms = removedBytes.readUInt32LE(offset + 12);
+      const stroff = removedBytes.readUInt32LE(offset + 16);
+      const strsize = removedBytes.readUInt32LE(offset + 20);
+      if (strsize <= 0) return removedBytes;
+      const strEnd = safeRangeEnd(stroff, strsize);
+      if (strEnd === null) return removedBytes;
+      symtab = { stroff, strsize, strEnd };
+      linkeditRanges.push([stroff, strEnd]);
+      if (nsyms > 0) {
+        const symEnd = safeRangeEnd(symoff, nsyms * 16);
+        if (symEnd === null) return removedBytes;
+        linkeditRanges.push([symoff, symEnd]);
+      } else if (symoff > 0) {
+        linkeditZeroOffsets.push(symoff);
+      }
+    } else if (cmd === 0x0b) {
+      if (seenDysymtab || cmdsize < 80) return removedBytes;
+      seenDysymtab = true;
+      for (const [offPos, countPos, elemSize] of MACHO_DYSYMTAB_RANGES) {
+        const fieldOff = removedBytes.readUInt32LE(offset + offPos);
+        const count = removedBytes.readUInt32LE(offset + countPos);
+        if (count > 0) {
+          const end = safeRangeEnd(fieldOff, count * elemSize);
+          if (end === null) return removedBytes;
+          linkeditRanges.push([fieldOff, end]);
+        } else if (fieldOff > 0) {
+          linkeditZeroOffsets.push(fieldOff);
+        }
+      }
+    } else if (cmd === 0x22 || cmd === 0x80000022) {
+      if (seenDyldInfo || cmdsize < 48) return removedBytes;
+      seenDyldInfo = true;
+      for (const [offPos, sizePos] of MACHO_DYLD_INFO_RANGES) {
+        const fieldOff = removedBytes.readUInt32LE(offset + offPos);
+        const size = removedBytes.readUInt32LE(offset + sizePos);
+        if (size > 0) {
+          const end = safeRangeEnd(fieldOff, size);
+          if (end === null) return removedBytes;
+          linkeditRanges.push([fieldOff, end]);
+        } else if (fieldOff > 0) {
+          linkeditZeroOffsets.push(fieldOff);
+        }
+      }
+    } else if (MACHO_LINKEDIT_DATA_COMMANDS.has(cmd)) {
+      if (seenLinkeditData.has(cmd) || cmdsize < 16) return removedBytes;
+      seenLinkeditData.add(cmd);
+      const dataoff = removedBytes.readUInt32LE(offset + 8);
+      const datasize = removedBytes.readUInt32LE(offset + 12);
+      if (datasize > 0) {
+        const end = safeRangeEnd(dataoff, datasize);
+        if (end === null) return removedBytes;
+        linkeditRanges.push([dataoff, end]);
+      } else if (dataoff > 0) {
+        linkeditZeroOffsets.push(dataoff);
+      }
+    } else if (MACHO_INLINE_MIN_SIZES.has(cmd)) {
+      if (cmdsize < MACHO_INLINE_MIN_SIZES.get(cmd)) return removedBytes;
+    } else {
+      return removedBytes;
+    }
+    offset += cmdsize;
+  }
+
+  if (offset !== cmdsEnd || linkedit === null || symtab === null) return removedBytes;
+  for (const segment of otherSegments) {
+    if (segment.end > linkedit.fileoff) return removedBytes;
+  }
+
+  let maxEnd = 0;
+  for (const [start, end] of linkeditRanges) {
+    if (start < linkedit.fileoff || end < start || end > linkedit.end) return removedBytes;
+    if (end > maxEnd) maxEnd = end;
+  }
+  if (maxEnd !== symtab.strEnd) return removedBytes;
+  for (const cursor of linkeditZeroOffsets) {
+    if (cursor < linkedit.fileoff || cursor > symtab.strEnd) return removedBytes;
+  }
+
+  const gap = linkedit.end - maxEnd;
+  if (gap < 1 || gap > 15 || (linkedit.end % 16) !== 0) return removedBytes;
+  for (let index = maxEnd; index < linkedit.end; index += 1) {
+    if (removedBytes[index] !== 0) return removedBytes;
+  }
+
+  const trimmed = Buffer.from(removedBytes.subarray(0, maxEnd));
+  trimmed.writeBigUInt64LE(BigInt(linkedit.filesize - gap), linkedit.cmdOffset + 48);
+  return trimmed;
+}
+
 function canonicalNativeDigestFromBytes(bytes, commandRunner = runCommand) {
   const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-native-proof-'));
   const privatePath = path.join(temporaryRoot, 'native');
   try {
     fs.writeFileSync(privatePath, bytes, { flag: 'wx', mode: 0o600 });
     commandRunner('/usr/bin/codesign', ['--remove-signature', privatePath]);
+    const removedBytes = fs.readFileSync(privatePath);
+    const normalizedBytes = trimRemovedSignaturePadding(bytes, removedBytes);
+    if (normalizedBytes !== removedBytes) {
+      fs.writeFileSync(privatePath, normalizedBytes, { mode: 0o600 });
+    }
     if (!commandRunner('/usr/bin/strip', ['-S', privatePath]).ok) return null;
     return hashBuffer(fs.readFileSync(privatePath));
   } catch (error) {
@@ -2852,6 +3190,168 @@ function canonicalNativeDigestFromBytes(bytes, commandRunner = runCommand) {
   } finally {
     fs.rmSync(temporaryRoot, { recursive: true, force: true });
   }
+}
+
+function compileNativeHelper(sourceBytesByName, { commandRunner = runCommand } = {}) {
+  if (!isPlainObject(sourceBytesByName) ||
+      !hasExactValues(Object.keys(sourceBytesByName).sort(), [...NATIVE_HELPER_SOURCE_FILES].sort()) ||
+      !NATIVE_HELPER_SOURCE_FILES.every(name => Buffer.isBuffer(sourceBytesByName[name]))) {
+    return null;
+  }
+  let temporaryRoot = null;
+  try {
+    temporaryRoot = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'crate-native-helper-build-'));
+    fs.chmodSync(temporaryRoot, 0o700);
+    const sourcePaths = NATIVE_HELPER_SOURCE_FILES.map(name => {
+      const sourcePath = path.join(temporaryRoot, name);
+      fs.writeFileSync(sourcePath, sourceBytesByName[name], { flag: 'wx', mode: 0o600 });
+      return sourcePath;
+    });
+    const outputDirectory = path.join(temporaryRoot, 'out');
+    fs.mkdirSync(outputDirectory, { mode: 0o700 });
+    const outputPath = path.join(outputDirectory, NATIVE_HELPER_IDENTIFIER);
+    const result = commandRunner('/usr/bin/swiftc', [
+      ...NATIVE_HELPER_SWIFTC_ARGS,
+      ...sourcePaths,
+      '-o',
+      outputPath,
+    ], { cwd: temporaryRoot });
+    if (!result || result.ok !== true) return null;
+    const bytes = readStableRegularFile(outputPath);
+    return bytes && hasThinArm64ExecuteHeader(bytes) ? bytes : null;
+  } catch (error) {
+    return null;
+  } finally {
+    if (temporaryRoot) fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+}
+
+function realDirectoryInside(rootPath, relativePath) {
+  let current = rootPath;
+  for (const segment of relativePath.split('/')) {
+    current = path.join(current, segment);
+    const metadata = fs.lstatSync(current);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) return false;
+  }
+  return true;
+}
+
+// Reads each committed Swift source only when the tree lists exactly the approved
+// files as regular blobs and the checkout bytes hash to those exact blob OIDs.
+function readCommittedNativeHelperSources(sourceRoot, revision, commandRunner) {
+  if (!/^[a-f0-9]{40}$/u.test(String(revision || ''))) return null;
+  try {
+    if (!realDirectoryInside(sourceRoot, NATIVE_HELPER_SOURCE_DIR)) return null;
+    const listing = gitCommand(
+      commandRunner,
+      ['ls-tree', '--name-only', revision, '--', `${NATIVE_HELPER_SOURCE_DIR}/`],
+      { cwd: sourceRoot }
+    );
+    if (!listing.ok) return null;
+    const listedNames = String(listing.stdout || '').split('\n').filter(Boolean).map(line => (
+      line.startsWith(`${NATIVE_HELPER_SOURCE_DIR}/`)
+        ? line.slice(NATIVE_HELPER_SOURCE_DIR.length + 1)
+        : null
+    ));
+    if (!hasExactValues(listedNames.sort(), [...NATIVE_HELPER_SOURCE_FILES].sort())) return null;
+    const sourceBytesByName = {};
+    for (const name of NATIVE_HELPER_SOURCE_FILES) {
+      const entry = `${NATIVE_HELPER_SOURCE_DIR}/${name}`;
+      const treeEntry = gitCommand(commandRunner, ['ls-tree', revision, '--', entry], {
+        cwd: sourceRoot,
+      });
+      const treeMatch = treeEntry.ok && String(treeEntry.stdout || '').trim().match(
+        /^100644 blob ([a-f0-9]{40})\t(.+)$/u
+      );
+      const bytes = readStableRegularFile(path.join(sourceRoot, ...entry.split('/')));
+      const sourceObject = bytes && gitCommand(commandRunner, ['hash-object', '--stdin'], {
+        cwd: sourceRoot,
+        input: bytes,
+      });
+      if (!treeMatch || treeMatch[2] !== entry || !sourceObject || !sourceObject.ok ||
+          String(sourceObject.stdout || '').trim().toLowerCase() !== treeMatch[1]) {
+        return null;
+      }
+      sourceBytesByName[name] = bytes;
+    }
+    return sourceBytesByName;
+  } catch (error) {
+    return null;
+  }
+}
+
+function invalidNativeHelperEvidence() {
+  return {
+    resourceValid: false,
+    signature: null,
+    strictRequirementValid: false,
+    entitlements: null,
+    sourceBound: false,
+  };
+}
+
+function collectNativeHelperEvidence(
+  appPath,
+  sourceRoot,
+  revision,
+  commandRunner = runCommand,
+  options = {}
+) {
+  if (Object.hasOwn(options, 'nativeHelperEvidence') && options.nativeHelperEvidence !== undefined) {
+    return isPlainObject(options.nativeHelperEvidence)
+      ? { ...options.nativeHelperEvidence }
+      : options.nativeHelperEvidence;
+  }
+  const evidence = invalidNativeHelperEvidence();
+  const resourcesPath = path.join(appPath, 'Contents', 'Resources');
+  const helperPath = path.join(resourcesPath, 'native', NATIVE_HELPER_IDENTIFIER);
+  const resource = inspectNativeHelperResource(resourcesPath);
+  if (resource.valid !== true) return evidence;
+  evidence.resourceValid = true;
+  try {
+    evidence.signature = readNestedSignature(
+      helperPath,
+      NATIVE_HELPER_IDENTIFIER,
+      options.expectedTeamId,
+      commandRunner
+    );
+  } catch (error) {
+    evidence.signature = null;
+  }
+  const requirement = nativeHelperDeveloperIdRequirement(options.expectedTeamId);
+  evidence.strictRequirementValid = Boolean(requirement) && commandRunner('/usr/bin/codesign', [
+    '--verify',
+    '--strict',
+    '--verbose=4',
+    `-R=${requirement}`,
+    helperPath,
+  ]).ok === true;
+  try {
+    evidence.entitlements = readSignedEntitlements(helperPath, commandRunner);
+  } catch (error) {
+    evidence.entitlements = null;
+  }
+  const sourceBytesByName = readCommittedNativeHelperSources(sourceRoot, revision, commandRunner);
+  if (sourceBytesByName) {
+    const compiler = options.nativeHelperCompiler || compileNativeHelper;
+    let rebuiltBytes = null;
+    try {
+      rebuiltBytes = compiler(sourceBytesByName, { commandRunner });
+    } catch (error) {
+      rebuiltBytes = null;
+    }
+    const packagedDigest = canonicalNativeDigestFromBytes(resource.bytes, commandRunner);
+    const rebuiltDigest = Buffer.isBuffer(rebuiltBytes)
+      ? canonicalNativeDigestFromBytes(rebuiltBytes, commandRunner)
+      : null;
+    evidence.sourceBound = Boolean(packagedDigest && rebuiltDigest && packagedDigest === rebuiltDigest);
+  }
+  const finalResource = inspectNativeHelperResource(resourcesPath);
+  if (finalResource.valid !== true || !finalResource.bytes.equals(resource.bytes)) {
+    evidence.resourceValid = false;
+    evidence.sourceBound = false;
+  }
+  return evidence;
 }
 
 function packagePayloadMatches(expectedPackage, actualFiles, options = {}) {
@@ -3418,6 +3918,17 @@ async function collectReleaseEvidenceFromSnapshot(appPath, options = {}) {
     authenticatedNativeEvidence,
     sourceRoot,
   });
+  let nativeHelper = collectNativeHelperEvidence(
+    resolvedAppPath,
+    sourceRoot,
+    sourceBinding.revision,
+    commandRunner,
+    {
+      expectedTeamId,
+      nativeHelperCompiler: options.nativeHelperCompiler,
+      nativeHelperEvidence: options.nativeHelperEvidence,
+    }
+  );
   const asarFileIntegrity = verifyAsarFileIntegrity(asar, asarPath, {
     authenticatedNativeEvidence,
   });
@@ -3447,6 +3958,7 @@ async function collectReleaseEvidenceFromSnapshot(appPath, options = {}) {
       valid: false,
       payloadMatches: false,
     };
+    if (isPlainObject(nativeHelper)) nativeHelper = { ...nativeHelper, sourceBound: false };
   }
 
   const notarization = {
@@ -3549,6 +4061,7 @@ async function collectReleaseEvidenceFromSnapshot(appPath, options = {}) {
     bundleLayout,
     packagedContents,
     sourceBinding,
+    nativeHelper,
     electronRuntime,
     notarization,
   };
@@ -3779,13 +4292,21 @@ module.exports = {
   EXPECTED_HELPER_INFO_KEYS,
   EXPECTED_MAIN_INFO_KEYS,
   EXPECTED_MAIN_ENTITLEMENTS,
+  EXPECTED_NATIVE_HELPER_REQUIREMENT,
   EXPECTED_NESTED_BUNDLE_NAMES,
   EXPECTED_PRIVACY_USAGE_KEYS,
+  NATIVE_HELPER_IDENTIFIER,
+  NATIVE_HELPER_SOURCE_DIR,
+  NATIVE_HELPER_SOURCE_FILES,
+  NATIVE_HELPER_SWIFTC_ARGS,
   PUBLIC_APP_ID,
   PUBLIC_TEAM_ID,
   SAFE_GIT_ARGUMENT_PREFIX,
   SOURCE_BOUND_ENTRIES,
   authenticateVerifierToolchain,
+  canonicalNativeDigestFromBytes,
+  collectNativeHelperEvidence,
+  compileNativeHelper,
   collectElectronRuntimeEvidence,
   collectReachableProductionLockPaths,
   collectReachableVerifierToolLockPaths,
@@ -3809,6 +4330,8 @@ module.exports = {
   parseCodeSignatureMetadata,
   runCli,
   safeCliErrorMessage,
+  trimRemovedSignaturePadding,
+  nativeHelperDeveloperIdRequirement,
   verifyAsarFileIntegrity,
   verifierSourceMatchesExpectedRevision,
 };
